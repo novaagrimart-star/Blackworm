@@ -1,0 +1,74 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Default catch-all
+    match /{document=**} {
+      allow read, write: if true;
+    }
+
+    // Connection check
+    match /test/{docId} {
+      allow read, write: if true;
+    }
+
+    // 1. USER PROFILES
+    match /users/{userId} {
+      allow read, write: if true;
+    }
+
+    // 2. FARMERS
+    match /farmers/{farmerId} {
+      allow read, write: if true;
+    }
+
+    // 3. ORDERS & COLLECTIONS
+    match /orders/{orderId} {
+      allow read, write: if true;
+    }
+
+    // 4. TARGETS
+    match /targets/{targetId} {
+      allow read, write: if true;
+    }
+
+    // 5. TRAVEL RECORDS
+    match /travel_records/{travelId} {
+      allow read, write: if true;
+    }
+
+    // 6. DEALERS & APPLICATIONS
+    match /dealers/{dealerId} {
+      allow read, write: if true;
+    }
+    match /dealers_application/{dealerId} {
+      allow read, write: if true;
+    }
+
+    // 7. PRODUCTS & PRICELIST
+    match /products/{productId} {
+      allow read, write: if true;
+    }
+    match /products_pricelist/{productId} {
+      allow read, write: if true;
+    }
+
+    // 8. SCHEMES
+    match /schemes/{schemeId} {
+      allow read, write: if true;
+    }
+
+    // 9. AUDIT LOGS
+    match /audit_logs/{logId} {
+      allow read, create: if true;
+      allow update, delete: if false;
+    }
+
+    // 10. DELETED RECORDS (Soft-Delete Recycle Bin)
+    match /deleted_records/{docId} {
+      allow read, create, delete: if true;
+      allow update: if false;
+    }
+  }
+}
+

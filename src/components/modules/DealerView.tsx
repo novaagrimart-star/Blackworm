@@ -1,0 +1,1373 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { collection, query, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
+import { db } from '../../firebase';
+import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
+import { logAudit } from '../../lib/dataService';
+import { Language } from '../../lib/i18n';
+import { CustomDialogModal } from '../CustomDialogModal';
+import jsPDF from 'jspdf';
+import html2canvas from 'html2canvas-pro';
+import { 
+  Plus, 
+  Search, 
+  Trash2, 
+  Printer, 
+  Edit3, 
+  Check, 
+  X, 
+  Camera, 
+  Image as ImageIcon,
+  Phone, 
+  Mail, 
+  ArrowLeft,
+  FileCheck,
+  CheckCircle2,
+  Copy,
+  Save,
+  Download,
+  Loader2
+} from 'lucide-react';
+
+export interface DealershipFormItem {
+  id: string;
+  center: string;
+  shopOpeningDate: string;
+  dealerCode: string;
+  village: string;
+  securityDeposit: string;
+  firmName: string;
+  proprietorName: string;
+  contactNumber: string;
+  state: string;
+  emailId: string;
+  responsiblePerson: string;
+  responsibleContact: string;
+  aadhaarNo: string;
+  district: string;
+  panNo: string;
+  dateOfBirth: string;
+  gstNo: string;
+  pinCode: string;
+  dealershipAddressPhoto?: string;
+  
+  // Bank Details
+  bankName: string;
+  bankAddress: string;
+  accountNo: string;
+  ifscCode: string;
+  chequeNos: string;
+
+  // Declaration & Office
+  place: string;
+  declarationDate: string;
+  remarks: string;
+  officerName: string;
+  status: 'Approved' | 'Pending' | 'Draft';
+  
+  // Office Use Fields
+  officeDate?: string;
+  officeTime?: string;
+  officePlace?: string;
+
+  createdAt?: string;
+  updatedAt?: string;
+  isArchived?: boolean;
+  ownerId?: string;
+  userId?: string;
+  loginId?: string;
+  createdByUid?: string;
+}
+
+interface Props {
+  profile: UserProfile;
+  lang: Language;
+}
+
+export const DealerView: React.FC<Props> = ({ profile }) => {
+  const [dealers, setDealers] = useState<DealershipFormItem[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [activeFilter, setActiveFilter] = useState<'all' | 'active'>('all');
+  
+  // View mode: 'list' | 'form'
+  const [viewMode, setViewMode] = useState<'list' | 'form'>('list');
+  const [isEditing, setIsEditing] = useState(true);
+  const [currentId, setCurrentId] = useState<string | null>(null);
+
+  // Form fields
+  const [center, setCenter] = useState('Sangli');
+  const [shopOpeningDate, setShopOpeningDate] = useState('2021-09-04');
+  const [dealerCode, setDealerCode] = useState('');
+  const [village, setVillage] = useState('');
+  const [securityDeposit, setSecurityDeposit] = useState('NA');
+  const [dealershipAddressPhoto, setDealershipAddressPhoto] = useState('');
+  const [firmName, setFirmName] = useState('');
+  const [proprietorName, setProprietorName] = useState('');
+  const [stateName, setStateName] = useState('Maharashtra');
+  const [contactNumber, setContactNumber] = useState('');
+  const [emailId, setEmailId] = useState('');
+  const [responsiblePerson, setResponsiblePerson] = useState('');
+  const [responsibleContact, setResponsibleContact] = useState('');
+  const [aadhaarNo, setAadhaarNo] = useState('');
+  const [district, setDistrict] = useState('SANGLI');
+  const [panNo, setPanNo] = useState('');
+  const [dateOfBirth, setDateOfBirth] = useState('');
+  const [gstNo, setGstNo] = useState('');
+  const [pinCode, setPinCode] = useState('');
+
+  const [bankName, setBankName] = useState('');
+  const [bankAddress, setBankAddress] = useState('');
+  const [accountNo, setAccountNo] = useState('');
+  const [ifscCode, setIfscCode] = useState('');
+  const [chequeNos, setChequeNos] = useState('');
+
+  const [place, setPlace] = useState('Sangli');
+  const [declarationDate, setDeclarationDate] = useState(new Date().toISOString().slice(0, 10));
+  const [remarks, setRemarks] = useState('');
+  const [officerName, setOfficerName] = useState('SHRIDHAR BALKRUSHNA SHINDE');
+  const [status, setStatus] = useState<'Approved' | 'Pending' | 'Draft'>('Approved');
+  
+  // Office Use Fields
+  const [officeDate, setOfficeDate] = useState('');
+  const [officeTime, setOfficeTime] = useState('');
+  const [officePlace, setOfficePlace] = useState('');
+
+  const [logoUrl, setLogoUrl] = useState<string>('');
+  const [logoSize, setLogoSize] = useState<number>(80);
+
+  const [saveSuccess, setSaveSuccess] = useState(false);
+  const [showPhotoModal, setShowPhotoModal] = useState(false);
+  const [actionModalDealer, setActionModalDealer] = useState<DealershipFormItem | null>(null);
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const cameraInputRef = useRef<HTMLInputElement>(null);
+  const galleryInputRef = useRef<HTMLInputElement>(null);
+  const printableFormRef = useRef<HTMLDivElement>(null);
+
+  // Mobile Hardware / Navigation Back Button Integration
+  useEffect(() => {
+    if (viewMode === 'form') {
+      window.history.pushState({ tab: 'dealer', dealerFormOpen: true }, '');
+      const handlePopState = () => {
+        setViewMode('list');
+      };
+      window.addEventListener('popstate', handlePopState);
+      return () => {
+        window.removeEventListener('popstate', handlePopState);
+      };
+    }
+  }, [viewMode]);
+
+  const handleDownloadPdf = async () => {
+    if (!printableFormRef.current) return;
+    try {
+      setIsGeneratingPdf(true);
+      const element = printableFormRef.current;
+      
+      const canvas = await html2canvas(element, {
+        scale: 3, // Even higher resolution
+        useCORS: true,
+        logging: false,
+        backgroundColor: '#ffffff',
+        windowWidth: 1024,
+      });
+
+      const imgData = canvas.toDataURL('image/jpeg', 1.0);
+      const pdf = new jsPDF({
+        orientation: 'portrait',
+        unit: 'mm',
+        format: 'a4'
+      });
+
+      const pageWidth = pdf.internal.pageSize.getWidth(); // 210
+      const pageHeight = pdf.internal.pageSize.getHeight(); // 297
+      
+      const imgWidth = pageWidth;
+      const imgHeight = (canvas.height * imgWidth) / canvas.width;
+      
+      let finalWidth = imgWidth;
+      let finalHeight = imgHeight;
+      let xOffset = 0;
+      let yOffset = 0;
+
+      // STRICT ONE-PAGE FIT LOGIC
+      // If height is more than A4, scale down to fit height
+      if (imgHeight > pageHeight) {
+        const ratio = pageHeight / imgHeight;
+        finalHeight = pageHeight;
+        finalWidth = imgWidth * ratio;
+        xOffset = (pageWidth - finalWidth) / 2; // Center horizontally
+      }
+
+      pdf.addImage(imgData, 'JPEG', xOffset, yOffset, finalWidth, finalHeight);
+      const sanitizedName = (firmName || dealerCode || 'Dealership_Form').replace(/[^a-zA-Z0-9_-]/g, '_');
+      pdf.save(`${sanitizedName}.pdf`);
+    } catch (err: any) {
+      console.error('PDF download error:', err);
+      window.print();
+    } finally {
+      setIsGeneratingPdf(false);
+    }
+  };
+
+  useEffect(() => {
+    // Fetch branding config
+    const unsubBranding = onSnapshot(doc(db, 'config', 'branding'), (snap) => {
+      if (snap.exists()) {
+        const data = snap.data();
+        setLogoUrl(data.logoUrl || '');
+        setLogoSize(data.logoSize || 80);
+      }
+    });
+    return () => unsubBranding();
+  }, []);
+
+  useEffect(() => {
+    const q = query(collection(db, 'dealers_application'));
+    const unsub = onSnapshot(q, (snap) => {
+      const list: DealershipFormItem[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as DealershipFormItem;
+        // Data Isolation: Admin sees all; non-admin only sees their own dealer forms
+        if (!data.isArchived && isUserRecord(data, profile)) {
+          list.push({ ...data, id: d.id });
+        }
+      });
+
+      // Sort by dealerCode or createdAt
+      list.sort((a, b) => (b.dealerCode || '').localeCompare(a.dealerCode || ''));
+      setDealers(list);
+    });
+    return () => unsub();
+  }, [profile]);
+
+  // Real-time listener for individual dealer document updates across all devices in milliseconds
+  useEffect(() => {
+    if (viewMode === 'form' && currentId) {
+      const unsubDoc = onSnapshot(doc(db, 'dealers_application', currentId), (docSnap) => {
+        if (docSnap.exists()) {
+          const item = docSnap.data() as DealershipFormItem;
+          setCenter(item.center || '');
+          setShopOpeningDate(item.shopOpeningDate || '');
+          setDealerCode(item.dealerCode || '');
+          setVillage(item.village || '');
+          setSecurityDeposit(item.securityDeposit || 'NA');
+          setDealershipAddressPhoto(item.dealershipAddressPhoto || '');
+          setFirmName(item.firmName || '');
+          setProprietorName(item.proprietorName || '');
+          setStateName(item.state || 'Maharashtra');
+          setContactNumber(item.contactNumber || '');
+          setEmailId(item.emailId || '');
+          setResponsiblePerson(item.responsiblePerson || '');
+          setResponsibleContact(item.responsibleContact || '');
+          setAadhaarNo(item.aadhaarNo || '');
+          setDistrict(item.district || '');
+          setPanNo(item.panNo || '');
+          setDateOfBirth(item.dateOfBirth || '');
+          setGstNo(item.gstNo || '');
+          setPinCode(item.pinCode || '');
+          setBankName(item.bankName || '');
+          setBankAddress(item.bankAddress || '');
+          setAccountNo(item.accountNo || '');
+          setIfscCode(item.ifscCode || '');
+          setChequeNos(item.chequeNos || '');
+          setPlace(item.place || 'Sangli');
+          setDeclarationDate(item.declarationDate || new Date().toISOString().slice(0, 10));
+          setRemarks(item.remarks || '');
+          setOfficerName(item.officerName || 'SHRIDHAR BALKRUSHNA SHINDE');
+          setOfficeDate(item.officeDate || '');
+          setOfficeTime(item.officeTime || '');
+          setOfficePlace(item.officePlace || '');
+          setStatus(item.status || 'Approved');
+        }
+      });
+      return () => unsubDoc();
+    }
+  }, [viewMode, currentId]);
+
+  const resetForm = (customCode?: string) => {
+    const nextCode = customCode || `DEALER ${String(dealers.length + 1).padStart(3, '0')}`;
+    setCurrentId(null);
+    setCenter('');
+    setShopOpeningDate(new Date().toISOString().slice(0, 10));
+    setDealerCode(nextCode);
+    setVillage('');
+    setSecurityDeposit('NA');
+    setDealershipAddressPhoto('');
+    setFirmName('');
+    setProprietorName('');
+    setStateName('Maharashtra');
+    setContactNumber('');
+    setEmailId('');
+    setResponsiblePerson('');
+    setResponsibleContact('');
+    setAadhaarNo('');
+    setDistrict('');
+    setPanNo('');
+    setDateOfBirth('');
+    setGstNo('');
+    setPinCode('');
+    setBankName('');
+    setBankAddress('');
+    setAccountNo('');
+    setIfscCode('');
+    setChequeNos('');
+    setPlace('Sangli');
+    setDeclarationDate(new Date().toISOString().slice(0, 10));
+    setRemarks('');
+    setOfficerName('SHRIDHAR BALKRUSHNA SHINDE');
+    setOfficeDate(new Date().toISOString().slice(0, 10));
+    setOfficeTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }));
+    setOfficePlace('SANGLI');
+    setStatus('Approved');
+    setIsEditing(true);
+  };
+
+  const loadDealerToForm = (item: DealershipFormItem, editMode: boolean = false) => {
+    setCurrentId(item.id);
+    setCenter(item.center || '');
+    setShopOpeningDate(item.shopOpeningDate || '');
+    setDealerCode(item.dealerCode || '');
+    setVillage(item.village || '');
+    setSecurityDeposit(item.securityDeposit || 'NA');
+    setDealershipAddressPhoto(item.dealershipAddressPhoto || '');
+    setFirmName(item.firmName || '');
+    setProprietorName(item.proprietorName || '');
+    setStateName(item.state || 'Maharashtra');
+    setContactNumber(item.contactNumber || '');
+    setEmailId(item.emailId || '');
+    setResponsiblePerson(item.responsiblePerson || '');
+    setResponsibleContact(item.responsibleContact || '');
+    setAadhaarNo(item.aadhaarNo || '');
+    setDistrict(item.district || '');
+    setPanNo(item.panNo || '');
+    setDateOfBirth(item.dateOfBirth || '');
+    setGstNo(item.gstNo || '');
+    setPinCode(item.pinCode || '');
+    setBankName(item.bankName || '');
+    setBankAddress(item.bankAddress || '');
+    setAccountNo(item.accountNo || '');
+    setIfscCode(item.ifscCode || '');
+    setChequeNos(item.chequeNos || '');
+    setPlace(item.place || 'Sangli');
+    setDeclarationDate(item.declarationDate || new Date().toISOString().slice(0, 10));
+    setRemarks(item.remarks || '');
+    setOfficerName(item.officerName || 'SHRIDHAR BALKRUSHNA SHINDE');
+    setOfficeDate(item.officeDate || '');
+    setOfficeTime(item.officeTime || '');
+    setOfficePlace(item.officePlace || '');
+    setStatus(item.status || 'Approved');
+    setIsEditing(editMode);
+    setViewMode('form');
+  };
+
+  const [dialogConfig, setDialogConfig] = useState<{
+    isOpen: boolean;
+    type?: 'confirm' | 'alert' | 'success';
+    title?: string;
+    message: string;
+    confirmText?: string;
+    cancelText?: string;
+    onConfirm: () => void;
+    onCancel?: () => void;
+  }>({
+    isOpen: false,
+    message: '',
+    onConfirm: () => {},
+  });
+
+  const handleSave = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!firmName.trim()) {
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'Validation Error',
+        message: 'Please enter Firm Name',
+        onConfirm: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
+      });
+      return;
+    }
+
+    const id = currentId || `dealer_app_${Date.now()}`;
+    const generatedCode = dealerCode.trim() || `DEALER ${String(dealers.length + 1).padStart(3, '0')}`;
+
+    const payload: DealershipFormItem = {
+      id,
+      center: center.trim(),
+      shopOpeningDate,
+      dealerCode: generatedCode,
+      village: village.trim(),
+      securityDeposit: securityDeposit.trim(),
+      dealershipAddressPhoto,
+      firmName: firmName.trim().toUpperCase(),
+      proprietorName: proprietorName.trim().toUpperCase(),
+      contactNumber: contactNumber.trim(),
+      state: stateName.trim(),
+      emailId: emailId.trim(),
+      responsiblePerson: responsiblePerson.trim().toUpperCase(),
+      responsibleContact: responsibleContact.trim(),
+      aadhaarNo: aadhaarNo.trim(),
+      district: district.trim().toUpperCase(),
+      panNo: panNo.trim().toUpperCase(),
+      dateOfBirth,
+      gstNo: gstNo.trim().toUpperCase(),
+      pinCode: pinCode.trim(),
+      bankName: bankName.trim().toUpperCase(),
+      bankAddress: bankAddress.trim().toUpperCase(),
+      accountNo: accountNo.trim(),
+      ifscCode: ifscCode.trim().toUpperCase(),
+      chequeNos: chequeNos.trim(),
+      place: place.trim(),
+      declarationDate,
+      remarks: remarks.trim(),
+      officeDate,
+      officeTime,
+      officePlace: officePlace.trim().toUpperCase(),
+      officerName: officerName.trim().toUpperCase() || profile.fullName?.toUpperCase() || '',
+      status,
+      isArchived: false,
+      ownerId: profile.uid,
+      userId: profile.uid,
+      loginId: profile.loginId || '',
+      createdByUid: profile.uid,
+      updatedAt: new Date().toISOString(),
+    };
+
+    if (!currentId) {
+      payload.createdAt = new Date().toISOString();
+    }
+
+    try {
+      await setDoc(doc(db, 'dealers_application', id), payload, { merge: true });
+      await logAudit(
+        currentId ? 'UPDATE' : 'CREATE',
+        'dealers_application',
+        id,
+        `${currentId ? 'Updated' : 'Created'} Dealership Form for ${payload.firmName} (${payload.dealerCode})`,
+        profile
+      );
+
+      setCurrentId(id);
+      setDealerCode(generatedCode);
+      setIsEditing(false);
+      setSaveSuccess(true);
+      setTimeout(() => setSaveSuccess(false), 3000);
+    } catch (err: any) {
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'Save Error',
+        message: `Save error: ${err.message || err}`,
+        onConfirm: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
+      });
+    }
+  };
+
+  const handleDelete = async (id: string, name: string) => {
+    setDialogConfig({
+      isOpen: true,
+      type: 'confirm',
+      title: 'Delete Confirmation',
+      message: 'Are you sure you want to delete this Dealer?',
+      confirmText: 'Delete',
+      cancelText: 'Cancel',
+      onConfirm: async () => {
+        setDialogConfig(prev => ({ ...prev, isOpen: false }));
+        try {
+          await deleteDoc(doc(db, 'dealers_application', id));
+          if (currentId === id) {
+            setViewMode('list');
+          }
+        } catch (err: any) {
+          setDialogConfig({
+            isOpen: true,
+            type: 'alert',
+            title: 'Delete Failed',
+            message: 'Delete failed: ' + err.message,
+            onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+          });
+        }
+      },
+      onCancel: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
+    });
+  };
+
+  const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setDealershipAddressPhoto(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
+  };
+
+  const filteredDealers = dealers.filter((d) => {
+    const q = searchQuery.toLowerCase().trim();
+    const matchQuery =
+      !q ||
+      d.dealerCode.toLowerCase().includes(q) ||
+      d.firmName.toLowerCase().includes(q) ||
+      d.proprietorName.toLowerCase().includes(q) ||
+      d.village.toLowerCase().includes(q);
+
+    if (activeFilter === 'active') {
+      return matchQuery && d.status === 'Approved';
+    }
+    return matchQuery;
+  });
+
+  return (
+    <div className="space-y-4 pb-24">
+      {/* CSS Forcing One Page Print */}
+      <style dangerouslySetInnerHTML={{ __html: `
+        @media print {
+          @page {
+            size: A4 portrait;
+            margin: 0mm;
+          }
+          body {
+            background: white !important;
+            padding: 0 !important;
+            margin: 0 !important;
+          }
+          #dealer-application-form {
+            padding: 0 !important;
+            margin: 0 !important;
+            width: 100% !important;
+          }
+          .no-print {
+            display: none !important;
+          }
+          /* Force container to fit height */
+          #printable-wrapper {
+            height: 297mm !important;
+            display: flex !important;
+            flex-direction: column !important;
+            border-width: 1px !important;
+          }
+          /* Scale down slightly to ensure zero cuts */
+          #printable-wrapper {
+            zoom: 0.94;
+            -moz-transform: scale(0.94);
+            -moz-transform-origin: top center;
+          }
+        }
+      `}} />
+      
+      {/* Top Bar: Search & Action Header (Only shown in List View) */}
+      {viewMode === 'list' && (
+        <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-md flex items-center gap-3 no-print">
+          <button
+            onClick={() => {
+              resetForm();
+              setViewMode('form');
+            }}
+            className="flex items-center justify-center bg-red-600 hover:bg-red-700 text-white p-2.5 rounded-xl transition shadow-lg shrink-0 active:scale-95"
+            title="New Dealer Form"
+          >
+            <Plus className="w-6 h-6 stroke-[3.5px]" />
+          </button>
+
+          <div className="relative flex-1">
+            <Search className="w-5 h-5 absolute left-3.5 top-2.5 text-slate-400" />
+            <input
+              type="text"
+              placeholder="Search by Dealer Code, Name..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full pl-11 pr-4 py-2.5 text-sm rounded-xl border border-slate-100 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-red-500 transition-all font-medium"
+            />
+          </div>
+        </div>
+      )}
+
+      {/* Success notification */}
+      {saveSuccess && (
+        <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl flex items-center justify-between no-print animate-fade-in">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span className="font-semibold">Dealership Form saved successfully!</span>
+          </div>
+          <button onClick={() => setSaveSuccess(false)} className="text-emerald-700">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* ======================= VIEW MODE: LIST ======================= */}
+      {viewMode === 'list' && (
+        <div className="space-y-4 no-print">
+          {/* Filter Pills matching screenshot */}
+          <div className="flex items-center gap-2 px-1">
+            <button
+              onClick={() => setActiveFilter('all')}
+              className={`px-5 py-1.5 rounded-lg text-xs font-black transition ${
+                activeFilter === 'all'
+                  ? 'bg-slate-900 text-white shadow-md'
+                  : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
+              }`}
+            >
+              All Applications ({dealers.length})
+            </button>
+            <button
+              onClick={() => setActiveFilter('active')}
+              className={`px-5 py-1.5 rounded-lg text-xs font-black transition ${
+                activeFilter === 'active'
+                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-sm'
+                  : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
+              }`}
+            >
+              Active ({dealers.filter((d) => d.status === 'Approved').length})
+            </button>
+          </div>
+
+           {/* Cards List: Clean Single Line Dealer Code + Full Firm Name (No cutting) */}
+          <div className="space-y-2.5">
+            {filteredDealers.map((d) => (
+              <div
+                key={d.id}
+                onClick={() => loadDealerToForm(d, true)}
+                className="bg-white rounded-2xl border border-slate-200 hover:border-red-400 hover:shadow-md p-3.5 sm:p-4 transition-all cursor-pointer flex items-center justify-between gap-3 group relative overflow-hidden"
+              >
+                <div className="flex items-center gap-3 flex-1 min-w-0">
+                  <span className="text-xs font-black text-red-600 bg-red-50 border border-red-200 px-2.5 py-1 rounded-lg uppercase tracking-wider shrink-0 font-mono">
+                    {d.dealerCode || 'DEALER'}
+                  </span>
+                  
+                  <div className="flex-1 min-w-0">
+                    <span className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 transition-colors uppercase">
+                      {d.firmName || 'Unnamed Dealership'}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-xs font-bold text-slate-400 group-hover:text-red-600 transition">
+                    👉
+                  </span>
+                </div>
+              </div>
+            ))}
+
+            {filteredDealers.length === 0 && (
+              <div className="bg-white rounded-2xl border border-dashed border-slate-300 p-8 text-center text-slate-500">
+                <p className="text-sm font-semibold">No dealership applications found.</p>
+                <p className="text-xs text-slate-400 mt-1">Click "New Dealer Form" above to add the first application.</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ======================= VIEW MODE: THE FULL STRUCTURED APPLICATION FORM ======================= */}
+      {viewMode === 'form' && (
+        <div className="space-y-4">
+          {/* Scrollable Container Form Sheet - Added overflow-x-auto for side-to-side scrolling on mobile */}
+          <div className="bg-white rounded-2xl border-2 border-slate-300 shadow-xl overflow-x-auto print:border-none print:shadow-none print:m-0 print:p-0">
+            {/* Top action toolbar inside form card */}
+            <div className="bg-slate-50 border-b border-slate-200 px-4 py-2.5 flex items-center justify-between no-print sticky left-0 min-w-max">
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (window.history.state?.dealerFormOpen) {
+                      window.history.back();
+                    } else {
+                      setViewMode('list');
+                    }
+                  }}
+                  className="p-1.5 px-2.5 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 flex items-center gap-1.5 text-xs font-bold transition shadow-sm active:scale-95 cursor-pointer"
+                  title="Back to Dealer List"
+                >
+                  <ArrowLeft className="w-4 h-4 text-slate-600" />
+                  <span>Back</span>
+                </button>
+                <span className="text-xs font-black text-slate-800 uppercase tracking-wide">
+                  {dealerCode || firmName || 'DEALERSHIP APPLICATION FORM'}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2">
+                {(profile.role === 'owner' || profile.role === 'admin') && (
+                  <button
+                    type="button"
+                    onClick={() => setIsEditing(!isEditing)}
+                    className={`p-2 rounded-lg text-xs font-bold transition shadow-sm border ${
+                      isEditing ? 'bg-emerald-600 text-white border-emerald-500' : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-100'
+                    }`}
+                    title={isEditing ? 'Viewing Mode' : 'Edit Mode'}
+                  >
+                    <Edit3 className="w-4 h-4" />
+                  </button>
+                )}
+
+                {isEditing && (
+                  <button
+                    type="submit"
+                    form="dealer-application-form"
+                    className="text-xs font-bold px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white flex items-center gap-1 shadow-sm transition"
+                    title="Save Form"
+                  >
+                    <Save className="w-3.5 h-3.5" />
+                    <span>Save</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleDownloadPdf}
+                  disabled={isGeneratingPdf}
+                  className="text-xs font-bold px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white flex items-center gap-1.5 shadow-sm transition disabled:opacity-50"
+                  title="Download A4 PDF Form"
+                >
+                  {isGeneratingPdf ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                  <span>{isGeneratingPdf ? 'Generating...' : 'Download'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => window.print()}
+                  className="p-2 rounded-lg bg-red-600 hover:bg-red-700 text-white flex items-center shadow-sm transition"
+                  title="Print Form"
+                >
+                  <Printer className="w-4 h-4" />
+                </button>
+
+                {currentId && (
+                  <button
+                    type="button"
+                    onClick={() => handleDelete(currentId, firmName)}
+                    className="p-2 rounded-lg bg-white border border-slate-200 text-slate-400 hover:text-red-600 hover:bg-red-50 transition"
+                    title="Delete Form"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <form id="dealer-application-form" onSubmit={handleSave} className="p-2 sm:p-4 space-y-0 text-[10px] min-w-[750px] sm:min-w-0 font-sans">
+              {/* Full Form Outer Border Wrapper */}
+              <div id="printable-wrapper" ref={printableFormRef} className="border-2 border-black bg-white shadow-sm overflow-hidden">
+                {/* 1. Header Section - Logo (Left), Name (Center), Photo (Right) */}
+                <div className="p-3 relative bg-white border-b-2 border-black">
+                  <div className="flex items-center justify-between gap-3">
+                    {/* Company Logo (Left) */}
+                    <div className="w-20 h-20 flex items-center justify-center shrink-0">
+                      {logoUrl && (
+                        <img 
+                          src={logoUrl} 
+                          alt="Logo" 
+                          style={{ width: `${logoSize}px`, height: `${logoSize}px` }} 
+                          className="object-contain" 
+                        />
+                      )}
+                    </div>
+
+                    {/* Company Info (Center) */}
+                    <div className="flex-1 text-center space-y-1">
+                      <h1 className="text-2xl font-black text-red-600 uppercase tracking-tight leading-none">
+                        BLACKWORM AGRITECH PVT LTD
+                      </h1>
+                      <p className="text-[10px] font-black text-[#D4AF37] uppercase tracking-tighter">
+                        AGRICULTURE WITH NEW PERSPECTIVE
+                      </p>
+                      <div className="text-[9px] text-black font-black leading-tight mt-2">
+                        <p>CIN : U01409PN2022PTC217246, GST No. 27AALCB3069J1ZC</p>
+                        <p>Address - Gat No. 17 Vijaynagar (Mhaisal), Tal - Miraj, Dist - Sangli. 416409.</p>
+                        <p className="flex items-center justify-center gap-4 mt-1">
+                          <span className="flex items-center gap-1 text-red-600"><Phone className="w-2.5 h-2.5" /> +91 7798716201</span>
+                          <span className="flex items-center gap-1 text-red-600 underline"><Mail className="w-2.5 h-2.5" /> blackwormagritechpvtltd@gmail.com</span>
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Dealer/Officer Photo (Right) */}
+                    <div 
+                      onClick={() => isEditing && setShowPhotoModal(true)}
+                      className={`w-28 h-24 border-2 border-black bg-white flex items-center justify-center overflow-hidden relative group shrink-0 ${isEditing ? 'cursor-pointer hover:border-emerald-600' : ''}`}
+                      title={isEditing ? "Click to add or change photo" : undefined}
+                    >
+                       {dealershipAddressPhoto ? (
+                          <img src={dealershipAddressPhoto} className="w-full h-full object-cover" />
+                       ) : (
+                          <div className="text-center p-2 text-slate-400">
+                            <Camera className="w-8 h-8 mx-auto mb-1 opacity-40 text-black" />
+                            <span className="text-[7.5px] font-black uppercase tracking-tight text-black">Camera / Gallery</span>
+                          </div>
+                       )}
+                       {isEditing && (
+                         <div className="absolute inset-0 bg-black/10 opacity-0 group-hover:opacity-100 flex items-center justify-center transition no-print">
+                            <Camera className="w-6 h-6 text-black/80" />
+                         </div>
+                       )}
+                    </div>
+
+                    {/* Hidden inputs for Camera and Gallery */}
+                    <input
+                      type="file"
+                      ref={cameraInputRef}
+                      className="hidden"
+                      accept="image/*"
+                      capture="environment"
+                      onChange={handlePhotoUpload}
+                    />
+                    <input
+                      type="file"
+                      ref={galleryInputRef}
+                      className="hidden"
+                      accept="image/*"
+                      onChange={handlePhotoUpload}
+                    />
+                  </div>
+                </div>
+
+                {/* 2. Red Section Title Banner */}
+                <div className="bg-red-400 text-white font-black px-3 py-1.5 flex items-center justify-center uppercase tracking-widest text-xs border-b-2 border-black">
+                  APPLICATION FOR DEALERSHIP
+                </div>
+
+                {/* 3. Dealer Data Green Header */}
+                <div className="bg-emerald-500 text-white font-bold px-3 py-1 flex items-center justify-center uppercase tracking-wider text-[10px] border-b-2 border-black">
+                  DEALER DATA
+                </div>
+
+                <div className="divide-y-2 divide-black bg-white border-b-2 border-black">
+                  {/* Row 1: Center & Shop Opening Date */}
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Center -</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={center}
+                          onChange={(e) => setCenter(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Date -</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="date"
+                          disabled={!isEditing}
+                          value={shopOpeningDate}
+                          onChange={(e) => setShopOpeningDate(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Rows for Code, Village, Security Deposit - Center sub-grid structure */}
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                     <div className="bg-slate-50 flex items-center justify-center p-4 relative">
+                       <span className="text-slate-300 font-black text-[9px] uppercase text-center leading-tight">DEALER STAMP & ADDRESS</span>
+                     </div>
+                     <div className="divide-y-2 divide-black">
+                        <div className="flex items-center p-0 h-9">
+                          <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Code</span>
+                          <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                            <input
+                              type="text"
+                              disabled={!isEditing}
+                              value={dealerCode}
+                              onChange={(e) => setDealerCode(e.target.value)}
+                              className="w-full bg-transparent font-black text-red-600 focus:outline-none"
+                              placeholder="DEALER-004"
+                            />
+                          </div>
+                        </div>
+                        <div className="flex items-center p-0 h-9">
+                          <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Village</span>
+                          <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                            <input
+                              type="text"
+                              disabled={!isEditing}
+                              value={village}
+                              onChange={(e) => setVillage(e.target.value)}
+                              className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
+                            />
+                          </div>
+                        </div>
+                        <div className="flex items-center p-0 h-9">
+                          <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Deposit</span>
+                          <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                            <input
+                              type="text"
+                              disabled={!isEditing}
+                              value={securityDeposit}
+                              onChange={(e) => setSecurityDeposit(e.target.value)}
+                              className="w-full bg-transparent font-black text-black focus:outline-none"
+                            />
+                          </div>
+                        </div>
+                     </div>
+                  </div>
+
+                  {/* Row 3: Firm Name */}
+                  <div className="flex items-center p-0 h-9">
+                    <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Firm Name -</span>
+                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <input
+                        type="text"
+                        required
+                        disabled={!isEditing}
+                        value={firmName}
+                        onChange={(e) => setFirmName(e.target.value)}
+                        className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Row 4: Proprietor Name */}
+                  <div className="flex items-center p-0 h-9">
+                    <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Proprietor Name -</span>
+                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <input
+                        type="text"
+                        required
+                        disabled={!isEditing}
+                        value={proprietorName}
+                        onChange={(e) => setProprietorName(e.target.value)}
+                        className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Row 5: Contact Number & State */}
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 flex items-center gap-1 px-2 uppercase tracking-tighter text-[10px]">
+                        <Phone className="w-3 h-3 text-red-600" /> Contact -
+                      </span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="tel"
+                          required
+                          disabled={!isEditing}
+                          value={contactNumber}
+                          onChange={(e) => setContactNumber(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">State</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={stateName}
+                          onChange={(e) => setStateName(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Row 6: E-mail ID */}
+                  <div className="flex items-center p-0 h-9">
+                    <span className="font-black text-black w-44 shrink-0 flex items-center gap-1 px-2 uppercase tracking-tighter">
+                      <Mail className="w-3 h-3 text-red-600" /> E-mail ID -
+                    </span>
+                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <input
+                        type="email"
+                        disabled={!isEditing}
+                        value={emailId}
+                        onChange={(e) => setEmailId(e.target.value)}
+                        className="w-full bg-transparent font-black text-black focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Row 7: Responsible Person & Contact */}
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">Responsible Person -</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={responsiblePerson}
+                          onChange={(e) => setResponsiblePerson(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">Contact</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="tel"
+                          disabled={!isEditing}
+                          value={responsibleContact}
+                          onChange={(e) => setResponsibleContact(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Row 8: Aadhaar No & District */}
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Aadhaar No -</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={aadhaarNo}
+                          onChange={(e) => setAadhaarNo(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">District</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={district}
+                          onChange={(e) => setDistrict(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Row 9: Pan No & Date of Birth */}
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Pan No -</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={panNo}
+                          onChange={(e) => setPanNo(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono uppercase"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">D.O.B.</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="date"
+                          disabled={!isEditing}
+                          value={dateOfBirth}
+                          onChange={(e) => setDateOfBirth(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Row 10: GST No & Pin Code */}
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">GST No -</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={gstNo}
+                          onChange={(e) => setGstNo(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono uppercase"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">Pin Code</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={pinCode}
+                          onChange={(e) => setPinCode(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 5. Bank Details Header */}
+                <div className="bg-emerald-500 text-white font-bold px-3 py-1 flex items-center justify-center uppercase tracking-wider text-[10px] border-b-2 border-black">
+                  BANK DETAILS
+                </div>
+
+                <div className="divide-y-2 divide-black bg-white border-b-2 border-black">
+                  <div className="flex items-center p-0 h-9">
+                    <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Bank Name -</span>
+                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <input
+                        type="text"
+                        disabled={!isEditing}
+                        value={bankName}
+                        onChange={(e) => setBankName(e.target.value)}
+                        className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="flex items-center p-0 h-9">
+                    <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Bank Address -</span>
+                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <input
+                        type="text"
+                        disabled={!isEditing}
+                        value={bankAddress}
+                        onChange={(e) => setBankAddress(e.target.value)}
+                        className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Account No -</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={accountNo}
+                          onChange={(e) => setAccountNo(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex items-center p-0 h-9">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">IFSC Code -</span>
+                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={ifscCode}
+                          onChange={(e) => setIfscCode(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono uppercase"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Security Cheque note box */}
+                  <div className="p-1 bg-amber-50 text-center border-b-2 border-black">
+                    <span className="text-[9px] font-black text-amber-900 italic uppercase">
+                      Security Cheque Details (Blank Cheque crossed on 'BLACKWORM AGRITECH PVT LTD'. Issue Nationalised bank cheque only.)
+                    </span>
+                  </div>
+
+                  <div className="flex items-center p-0 h-9">
+                    <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Cheque no -</span>
+                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <input
+                        type="text"
+                        disabled={!isEditing}
+                        value={chequeNos}
+                        onChange={(e) => setChequeNos(e.target.value)}
+                        className="w-full bg-transparent font-black text-black focus:outline-none font-mono"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* 6. Declaration Section */}
+                <div className="bg-slate-500 text-white font-black px-3 py-1.5 flex items-center justify-center uppercase tracking-widest text-[11px] border-b-2 border-black">
+                  DECLARATION
+                </div>
+
+                <div className="p-3 bg-white space-y-6 border-b-2 border-black">
+                  <p className="text-[10px] text-black leading-tight text-justify font-bold uppercase italic">
+                    I / we certify that the foregoing information is correct and complete to the best of my/our knowledge and belief and nothing has been concealed. I shall abide to policies & procedure laid by company from time to time. If at any time, I / we have concealed any material / information or given any false details, our appointment shall be liable to summary termination without notice or compensation.
+                  </p>
+
+                  <div className="flex items-end justify-between gap-10 pt-4 border-t-2 border-black">
+                    {/* Dealer Stamp Area without box, just top line and Place/Date at bottom */}
+                    <div className="flex-1 h-32 p-2 flex flex-col justify-between relative bg-white">
+                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none opacity-[0.08] no-print">
+                        <span className="text-2xl font-black uppercase rotate-[-15deg] tracking-widest">DEALER STAMP & ADDRESS</span>
+                      </div>
+                      <div className="text-[9px] font-black text-black uppercase no-print">
+                        Dealer Stamp & Address
+                      </div>
+                      <div className="text-[9px] font-black text-black space-y-1 pt-2">
+                        <div className="flex items-center gap-1.5">
+                          <span className="shrink-0 uppercase font-black">Place -</span>
+                          <input
+                            type="text"
+                            disabled={!isEditing}
+                            value={officePlace || place}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setOfficePlace(val);
+                              setPlace(val);
+                            }}
+                            placeholder="SANGLI"
+                            className="bg-transparent font-black text-black uppercase focus:outline-none flex-1 max-w-[200px] border-b border-dashed border-slate-400 focus:border-black disabled:border-transparent py-0.5"
+                          />
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="shrink-0 uppercase font-black">Date -</span>
+                          <span className="font-black">
+                            {new Date(officeDate || new Date()).toLocaleDateString('en-GB')}. {new Date(`2000-01-01T${officeTime || '12:00'}`).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}.
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="text-right pb-1 shrink-0 w-64">
+                      <div className="h-24 flex items-center justify-end">
+                        {/* Signature space */}
+                      </div>
+                      <div className="border-t-2 border-black pt-1 text-center">
+                        <span className="font-black text-black uppercase text-xs">Proprietor Sign</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Footer Section - Unified Office Use & Signature Area (No box around Office Use, Officer signature anchored to bottom line) */}
+                <div className="p-3 bg-white">
+                  <div className="flex justify-between items-end gap-6">
+                    {/* Office Use Section - Box border removed as requested */}
+                    <div className="flex-1 bg-white p-1">
+                      <div className="bg-slate-900 text-white text-[9px] font-black px-2 py-0.5 mb-2 inline-block uppercase">
+                        FOR OFFICE USE
+                      </div>
+                      
+                      <div className="space-y-1">
+                        <div className="pt-1">
+                          <span className="font-black text-black uppercase block text-[9px] mb-1 italic opacity-60 underline">Remarks :-</span>
+                          <textarea
+                            disabled={!isEditing}
+                            value={remarks}
+                            onChange={(e) => setRemarks(e.target.value)}
+                            className="w-full bg-transparent text-[10px] text-black focus:outline-none font-black uppercase leading-tight resize-none italic"
+                            rows={3}
+                            placeholder="WRITE REMARKS HERE..."
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Officer Signature Area - Placed cleanly against bottom border */}
+                    <div className="flex flex-col items-center shrink-0 w-64 pb-1">
+                      <div className="text-center w-full">
+                        <div className="text-xs font-black text-black uppercase mb-1">
+                          {profile.fullName || 'OFFICER'}
+                        </div>
+                        <div className="border-t-2 border-black w-full mb-1"></div>
+                        <div className="text-[10px] font-black text-black uppercase tracking-tight">
+                          Officer Name & Signature
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Action Buttons Removed from bottom as requested */}
+            </form>
+          </div>
+        </div>
+      )}
+      {/* ======================= PHOTO SELECTION MODAL ======================= */}
+      {showPhotoModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 no-print animate-in fade-in duration-150">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-5 space-y-4 border border-slate-200">
+            <div className="flex items-center justify-between border-b pb-3">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-700">
+                  <Camera className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900">फोटो ॲड करा (Add Photo)</h3>
+                  <p className="text-[11px] text-slate-500">पर्याय निवडा (Choose an option)</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowPhotoModal(false)}
+                className="w-7 h-7 rounded-full hover:bg-slate-100 flex items-center justify-center text-slate-400 hover:text-slate-600 transition"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-2.5">
+              {/* Option 1: Direct Camera Capture */}
+              <button
+                type="button"
+                onClick={() => {
+                  setShowPhotoModal(false);
+                  cameraInputRef.current?.click();
+                }}
+                className="w-full flex items-center gap-3 p-3.5 rounded-xl border-2 border-emerald-500/30 bg-emerald-50/50 hover:bg-emerald-100/70 text-emerald-950 font-bold transition text-left group"
+              >
+                <div className="w-10 h-9 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0 shadow-sm group-hover:scale-105 transition">
+                  <Camera className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="text-xs font-black">कॅमेऱ्याने थेट फोटो काढा</div>
+                  <div className="text-[10px] text-emerald-700 font-semibold">Take Live Photo / Open Camera</div>
+                </div>
+              </button>
+
+              {/* Option 2: Choose from Gallery / Files */}
+              <button
+                type="button"
+                onClick={() => {
+                  setShowPhotoModal(false);
+                  galleryInputRef.current?.click();
+                }}
+                className="w-full flex items-center gap-3 p-3.5 rounded-xl border-2 border-blue-500/30 bg-blue-50/50 hover:bg-blue-100/70 text-blue-950 font-bold transition text-left group"
+              >
+                <div className="w-10 h-9 rounded-xl bg-blue-600 text-white flex items-center justify-center shrink-0 shadow-sm group-hover:scale-105 transition">
+                  <ImageIcon className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="text-xs font-black">मोबाईल गॅलरीमधून निवडा</div>
+                  <div className="text-[10px] text-blue-700 font-semibold">Choose from Gallery / Files</div>
+                </div>
+              </button>
+
+              {/* Option 3: Remove photo (if existing) */}
+              {dealershipAddressPhoto && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDealershipAddressPhoto('');
+                    setShowPhotoModal(false);
+                  }}
+                  className="w-full flex items-center gap-3 p-3 rounded-xl border border-red-200 bg-red-50/50 hover:bg-red-100 text-red-700 font-bold transition text-left text-xs"
+                >
+                  <Trash2 className="w-4 h-4 text-red-600" />
+                  <span>सध्याचा फोटो काढून टाका (Remove Photo)</span>
+                </button>
+              )}
+            </div>
+
+            <div className="pt-2">
+              <button
+                type="button"
+                onClick={() => setShowPhotoModal(false)}
+                className="w-full py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 transition"
+              >
+                रद्द करा (Cancel)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      <CustomDialogModal {...dialogConfig} />
+    </div>
+  );
+};

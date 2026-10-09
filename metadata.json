@@ -1,0 +1,6 @@
+{
+  "name": "Blackworm Agritech MIS",
+  "description": "Official Management Information System for Blackworm Agritech Pvt Ltd. Secure dashboard for orders, targets, and field records.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

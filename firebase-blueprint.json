@@ -1,0 +1,254 @@
+{
+  "entities": {
+    "user": {
+      "title": "User",
+      "description": "Application users (Admin, Owner, Staff, Dealer, Farmer)",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "fullName": { "type": "string" },
+        "mobileNumber": { "type": "string" },
+        "emailId": { "type": "string" },
+        "address": { "type": "string" },
+        "designation": { "type": "string" },
+        "loginId": { "type": "string" },
+        "password": { "type": "string" },
+        "role": { "type": "string", "enum": ["admin", "owner", "staff", "dealer", "farmer"] },
+        "territory": { "type": "string" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "fullName", "role", "loginId", "password"]
+    },
+    "farmer": {
+      "title": "Farmer",
+      "description": "Farmer records managed by field executives",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "mobile": { "type": "string" },
+        "village": { "type": "string" },
+        "taluka": { "type": "string" },
+        "district": { "type": "string" },
+        "acres": { "type": "number" },
+        "crops": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "createdBy": { "type": "string" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "ownerId"]
+    },
+    "order": {
+      "title": "Order",
+      "description": "Sales and payment collection records",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "orderNumber": { "type": "string" },
+        "dealerId": { "type": "string" },
+        "dealerName": { "type": "string" },
+        "farmerName": { "type": "string" },
+        "items": { "type": "array" },
+        "totalAmount": { "type": "number" },
+        "paidAmount": { "type": "number" },
+        "balanceAmount": { "type": "number" },
+        "paymentMode": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "confirmed", "delivered", "collected"] },
+        "ownerId": { "type": "string" },
+        "createdByName": { "type": "string" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerId", "totalAmount"]
+    },
+    "target": {
+      "title": "Target Sheet",
+      "description": "Monthly performance targets for sales staff",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "month": { "type": "string" },
+        "year": { "type": "number" },
+        "targetSales": { "type": "number" },
+        "achievedSales": { "type": "number" },
+        "targetCollection": { "type": "number" },
+        "achievedCollection": { "type": "number" },
+        "ownerId": { "type": "string" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "month", "year"]
+    },
+    "yearlyTarget": {
+      "title": "Yearly Target Sheet",
+      "description": "Comprehensive yearly sales and collection targets with metadata",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "fullName": { "type": "string" },
+        "designation": { "type": "string" },
+        "center": { "type": "string" },
+        "year": { "type": "string" },
+        "lastYearSale": { "type": "number" },
+        "lastYearCollection": { "type": "number" },
+        "salesTarget": { "type": "number" },
+        "lastYearOutstanding": { "type": "number" },
+        "outstandingPercent": { "type": "number" },
+        "months": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "year"]
+    },
+    "travel": {
+      "title": "Travel Record",
+      "description": "Daily travel logs, kilometers, and daily allowances",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "date": { "type": "string", "format": "date" },
+        "startLocation": { "type": "string" },
+        "endLocation": { "type": "string" },
+        "vehicleType": { "type": "string" },
+        "kmTravelled": { "type": "number" },
+        "kmRate": { "type": "number" },
+        "fuelExpense": { "type": "number" },
+        "daFoodExpense": { "type": "number" },
+        "lodgingExpense": { "type": "number" },
+        "totalExpense": { "type": "number" },
+        "purpose": { "type": "string" },
+        "status": { "type": "string", "enum": ["submitted", "approved", "reimbursed"] },
+        "ownerId": { "type": "string" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "date"]
+    },
+    "dealer": {
+      "title": "Dealer",
+      "description": "Agricultural input dealers and distributors",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "shopName": { "type": "string" },
+        "proprietorName": { "type": "string" },
+        "mobile": { "type": "string" },
+        "village": { "type": "string" },
+        "district": { "type": "string" },
+        "gstNo": { "type": "string" },
+        "creditLimit": { "type": "number" },
+        "outstandingBalance": { "type": "number" },
+        "ownerId": { "type": "string" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "shopName"]
+    },
+    "product": {
+      "title": "Product",
+      "description": "Inventory products, package sizes, and price tiers",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "category": { "type": "string" },
+        "packSize": { "type": "string" },
+        "mrp": { "type": "number" },
+        "dealerPrice": { "type": "number" },
+        "farmerPrice": { "type": "number" },
+        "inStock": { "type": "boolean" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "dealerPrice"]
+    },
+    "scheme": {
+      "title": "Scheme",
+      "description": "Seasonal promotional schemes and target bonuses",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "validFrom": { "type": "string" },
+        "validTo": { "type": "string" },
+        "eligibility": { "type": "string" },
+        "bonusOffer": { "type": "string" },
+        "isActive": { "type": "boolean" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "title"]
+    },
+    "auditLog": {
+      "title": "Audit Log",
+      "description": "Permanent trace of data creation, modifications, deletions, and recoveries",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "action": { "type": "string" },
+        "collection": { "type": "string" },
+        "recordId": { "type": "string" },
+        "recordSummary": { "type": "string" },
+        "performedByUid": { "type": "string" },
+        "performedByName": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "action", "collection"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "user",
+      "description": "User profiles with role-based access"
+    },
+    "farmers/{farmerId}": {
+      "schema": "farmer",
+      "description": "Farmers database"
+    },
+    "orders/{orderId}": {
+      "schema": "order",
+      "description": "Orders and collection payments"
+    },
+    "targets/{targetId}": {
+      "schema": "target",
+      "description": "Monthly sales & collection targets"
+    },
+    "travel_records/{travelId}": {
+      "schema": "travel",
+      "description": "Staff travel sheets and KM expense logs"
+    },
+    "dealers/{dealerId}": {
+      "schema": "dealer",
+      "description": "Dealer profiles and credit balances"
+    },
+    "products/{productId}": {
+      "schema": "product",
+      "description": "Price list and catalog"
+    },
+    "schemes/{schemeId}": {
+      "schema": "scheme",
+      "description": "Promotional offers and seasonal schemes"
+    },
+    "audit_logs/{logId}": {
+      "schema": "auditLog",
+      "description": "Immutable audit trails for compliance and data recovery"
+    },
+    "deleted_records/{docId}": {
+      "schema": "user",
+      "description": "Soft-deleted documents saved in Recycle Bin for accident recovery"
+    }
+  }
+}
