@@ -132,6 +132,18 @@ async function createServer() {
     }
   });
 
+  // Never cache Service Worker or manifest
+  app.use((req, res, next) => {
+    if (req.url === '/sw.js' || req.url === '/manifest.webmanifest' || req.url === '/registerSW.js') {
+      res.set({
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      });
+    }
+    next();
+  });
+
   const distPath = path.join(process.cwd(), 'dist');
   const indexPath = path.join(distPath, 'index.html');
 
@@ -145,6 +157,11 @@ async function createServer() {
         res.status(404).json({ error: 'API route not found' });
         return;
       }
+      res.set({
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+      });
       res.sendFile(indexPath);
     });
   } else {
@@ -160,7 +177,12 @@ async function createServer() {
       try {
         let template = fs.readFileSync(path.resolve(process.cwd(), 'index.html'), 'utf-8');
         template = await vite.transformIndexHtml(url, template);
-        res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
+        res.status(200).set({
+          'Content-Type': 'text/html',
+          'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0',
+        }).end(template);
       } catch (e) {
         next(e);
       }

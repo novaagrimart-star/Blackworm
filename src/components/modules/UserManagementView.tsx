@@ -40,7 +40,8 @@ import {
   BarChart3, 
   Settings,
   ShieldCheck,
-  ArrowLeft
+  ArrowLeft,
+  Clock
 } from 'lucide-react';
 
 export interface SystemModuleItem {
@@ -220,6 +221,10 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
   const [logoUrl, setLogoUrl] = useState<string>('');
   const [logoSize, setLogoSize] = useState<number>(80);
 
+  // Approval requests state for Admin
+  const [pendingRequests, setPendingRequests] = useState<any[]>([]);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+
   // UI state & refs
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [showPhotoModal, setShowPhotoModal] = useState(false);
@@ -282,6 +287,91 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
     });
     return () => unsubBranding();
   }, []);
+
+  // Pending profile update requests listener
+  useEffect(() => {
+    const qReq = query(collection(db, 'user_approval_requests'));
+    const unsub = onSnapshot(qReq, (snap) => {
+      const list: any[] = [];
+      snap.forEach((d) => {
+        const data = d.data();
+        if (data.status === 'pending') {
+          list.push({ ...data, id: d.id });
+        }
+      });
+      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      setPendingRequests(list);
+    });
+    return () => unsub();
+  }, []);
+
+  const handleApproveRequest = async (req: any) => {
+    setActionLoading(req.id);
+    try {
+      await setDoc(doc(db, 'users', req.targetUserId), {
+        ...req.proposedData,
+        updatedAt: new Date().toISOString(),
+      }, { merge: true });
+
+      await setDoc(doc(db, 'user_approval_requests', req.id), {
+        status: 'approved',
+        approvedAt: new Date().toISOString(),
+        approvedByUid: profile.uid,
+        approvedByName: profile.fullName || 'Admin',
+      }, { merge: true });
+
+      await logAudit(
+        'UPDATE',
+        'users',
+        req.targetUserId,
+        `Admin approved profile updates for ${req.targetUserName} (${req.targetUserCode})`,
+        profile
+      );
+
+      setDialogConfig({
+        isOpen: true,
+        type: 'success',
+        title: 'बदल मंजूर केले',
+        message: `${req.targetUserName} यांचे प्रोफाईल बदल यशस्वीरित्या मंजूर आणि अपडेट झाले आहेत.`,
+        onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+      });
+    } catch (err: any) {
+      console.error('Approve error:', err);
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'त्रुटी',
+        message: err.message || 'मंजूर करताना त्रुटी आली.',
+        onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+      });
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleRejectRequest = async (req: any) => {
+    setActionLoading(req.id);
+    try {
+      await setDoc(doc(db, 'user_approval_requests', req.id), {
+        status: 'rejected',
+        rejectedAt: new Date().toISOString(),
+        rejectedByUid: profile.uid,
+        rejectedByName: profile.fullName || 'Admin',
+      }, { merge: true });
+
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'बदल नाकारले',
+        message: `${req.targetUserName} यांची प्रोफाईल बदल विनंती नाकारण्यात आली.`,
+        onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+      });
+    } catch (err: any) {
+      console.error('Reject error:', err);
+    } finally {
+      setActionLoading(null);
+    }
+  };
 
   const handleRoleChange = (newRole: string) => {
     setRole(newRole);
@@ -458,6 +548,64 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
       createdAt: currentUid ? (formatSafeDateString(users.find(u => u.uid === currentUid)?.createdAt) || new Date().toISOString()) : new Date().toISOString(),
     };
 
+    // If the user is NOT an Admin/Owner, submit updates for Admin approval
+    if (!isAdmin(profile)) {
+      try {
+        const approvalId = `req_${uid}_${Date.now()}`;
+        await setDoc(doc(db, 'user_approval_requests', approvalId), {
+          id: approvalId,
+          targetUserId: uid,
+          targetUserCode: code,
+          targetUserName: fullName.trim().toUpperCase(),
+          requestedByUid: profile.uid,
+          requestedByName: profile.fullName || profile.loginId || 'User',
+          status: 'pending',
+          createdAt: new Date().toISOString(),
+          proposedData: {
+            fullName: fullName.trim().toUpperCase(),
+            designation: designation.trim().toUpperCase(),
+            center: center.trim().toUpperCase(),
+            mobileNumber: trimmedMobile,
+            altPhone: altPhone.trim(),
+            emailId: emailId.trim() || `${trimmedMobile}@blackwormagri.com`,
+            role,
+            address: address.trim().toUpperCase(),
+            village: village.trim().toUpperCase(),
+            taluka: taluka.trim().toUpperCase(),
+            district: district.trim().toUpperCase(),
+            state: stateName.trim(),
+            pinCode: pinCode.trim(),
+            dateOfBirth,
+            joiningDate,
+            aadhaarNo: aadhaarNo.trim(),
+            panNo: panNo.trim().toUpperCase(),
+            photoUrl,
+          }
+        });
+
+        setIsEditing(false);
+        setDialogConfig({
+          isOpen: true,
+          type: 'success',
+          title: 'बदल मंजुरीसाठी पाठवले',
+          message: 'तुमचे बदल मंजुरीसाठी ॲडमिनकडे पाठवण्यात आले आहेत. ॲडमिनने मंजूर केल्यानंतर माहिती लगेच अपडेट होईल.',
+          confirmText: 'ठीक आहे',
+          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+        });
+        return;
+      } catch (err: any) {
+        console.error('Approval submission error:', err);
+        setDialogConfig({
+          isOpen: true,
+          type: 'alert',
+          title: 'त्रुटी',
+          message: err.message || 'विनंती पाठवण्यात अडचण आली.',
+          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+        });
+        return;
+      }
+    }
+
     try {
       await setDoc(doc(db, 'users', uid), payload, { merge: true });
 
@@ -617,28 +765,89 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
     return (lang as string) === 'mr' ? mod.mr : mod.en;
   };
 
-  if (!isAdmin(profile)) {
-    return (
-      <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center max-w-md mx-auto my-12">
-        <ShieldCheck className="w-12 h-12 text-rose-500 mx-auto mb-3" />
-        <h3 className="text-base font-bold text-slate-900">फक्त ॲडमिनसाठी उपलब्ध (Admin Access Only)</h3>
-        <p className="text-xs text-slate-500 mt-1">युजर मॅनेजमेंट फक्त ॲडमिन उघडू शकतात.</p>
-      </div>
-    );
-  }
-
   return (
     <div className="space-y-4 font-sans">
+      {/* ======================= PENDING APPROVALS SECTION (FOR ADMIN) ======================= */}
+      {isAdmin(profile) && pendingRequests.length > 0 && viewMode === 'list' && (
+        <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-4 space-y-3 shadow-md animate-in fade-in no-print">
+          <div className="flex items-center justify-between border-b border-amber-200 pb-2">
+            <div className="flex items-center gap-2">
+              <Clock className="w-5 h-5 text-amber-700 animate-pulse" />
+              <h3 className="text-sm font-black text-amber-950 uppercase tracking-tight">
+                बदल मंजुरी विनंत्या (Pending Profile Approvals: {pendingRequests.length})
+              </h3>
+            </div>
+            <span className="text-[10px] font-black text-amber-800 bg-amber-200/70 px-2 py-0.5 rounded-full uppercase">
+              Action Required
+            </span>
+          </div>
+
+          <div className="space-y-2.5">
+            {pendingRequests.map((req) => (
+              <div 
+                key={req.id} 
+                className="bg-white rounded-xl border border-amber-200 p-3 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-sm hover:border-amber-400 transition"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-black font-mono text-red-600 bg-red-50 border border-red-200 px-2 py-0.5 rounded">
+                      {req.targetUserCode || 'EMP'}
+                    </span>
+                    <span className="text-sm font-black text-slate-900 uppercase truncate">
+                      {req.proposedData?.fullName || req.targetUserName}
+                    </span>
+                  </div>
+                  <div className="text-[11px] text-slate-600 font-bold mt-1 flex flex-wrap gap-x-3 gap-y-0.5">
+                    <span>हुद्दा: <strong className="text-slate-900">{req.proposedData?.designation || '-'}</strong></span>
+                    <span>मोबाईल: <strong className="text-slate-900">{req.proposedData?.mobileNumber || '-'}</strong></span>
+                    <span>सेंटर: <strong className="text-slate-900">{req.proposedData?.center || '-'}</strong></span>
+                  </div>
+                  <p className="text-[10px] text-slate-400 font-bold mt-1">
+                    विनंती दिनांक: {new Date(req.createdAt).toLocaleString('en-GB')} ({req.requestedByName} द्वारे)
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 w-full sm:w-auto justify-end shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => handleApproveRequest(req)}
+                    disabled={actionLoading === req.id}
+                    className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 text-white px-3.5 py-2 rounded-xl text-xs font-black shadow-sm transition active:scale-95 disabled:opacity-50 cursor-pointer"
+                    title="बदल मंजूर करा व लागू करा"
+                  >
+                    {actionLoading === req.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                    <span>मंजूर करा (Approve)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => handleRejectRequest(req)}
+                    disabled={actionLoading === req.id}
+                    className="flex items-center gap-1.5 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 px-3 py-2 rounded-xl text-xs font-black shadow-sm transition active:scale-95 disabled:opacity-50 cursor-pointer"
+                    title="विनंती नाकारा"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>नाकारा (Reject)</span>
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* ======================= TOP BAR (LIST VIEW) ======================= */}
       {viewMode === 'list' && (
         <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-md flex items-center gap-3 no-print">
-          <button
-            onClick={() => resetForm()}
-            className="flex items-center justify-center bg-red-600 hover:bg-red-700 text-white p-2.5 rounded-xl transition shadow-lg shrink-0 active:scale-95"
-            title="New User Form"
-          >
-            <UserPlus className="w-6 h-6 stroke-[3.5px]" />
-          </button>
+          {isAdmin(profile) && (
+            <button
+              onClick={() => resetForm()}
+              className="flex items-center justify-center bg-red-600 hover:bg-red-700 text-white p-2.5 rounded-xl transition shadow-lg shrink-0 active:scale-95 cursor-pointer"
+              title="New User Form"
+            >
+              <UserPlus className="w-6 h-6 stroke-[3.5px]" />
+            </button>
+          )}
 
           <div className="relative flex-1">
             <Search className="w-5 h-5 absolute left-3.5 top-2.5 text-slate-400" />
@@ -793,7 +1002,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                     title="Save Form"
                   >
                     <Save className="w-3.5 h-3.5" />
-                    <span>Save</span>
+                    <span>{isAdmin(profile) ? 'Save' : 'अपडेट विनंती पाठवा (Submit for Approval)'}</span>
                   </button>
                 )}
 

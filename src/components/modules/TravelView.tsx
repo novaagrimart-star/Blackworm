@@ -128,6 +128,48 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const [selectedUserPhoto, setSelectedUserPhoto] = useState<string>('');
 
   const printableSheetRef = useRef<HTMLDivElement>(null);
+  const suppressedCommaMap = useRef<Record<number, boolean>>({});
+
+  // Route input handler: Auto-inserts comma on space after word, but remembers if comma was deleted
+  const handleRouteKeyDown = (idx: number, e: React.KeyboardEvent<HTMLInputElement>) => {
+    const input = e.currentTarget;
+    const cursorPos = input.selectionStart || 0;
+    const val = input.value;
+
+    if (e.key === 'Backspace') {
+      const textBefore = val.slice(0, cursorPos);
+      // If user deletes a comma or comma-space, suppress auto-comma so subsequent space does not re-add comma
+      if (textBefore.endsWith(',') || textBefore.endsWith(', ')) {
+        suppressedCommaMap.current[idx] = true;
+      }
+      return;
+    }
+
+    if (e.key === ' ') {
+      // If user previously deleted the comma, allow standard space without adding comma
+      if (suppressedCommaMap.current[idx]) {
+        return;
+      }
+
+      // If typed space immediately following a word (letter or digit), auto-insert comma and space
+      const textBefore = val.slice(0, cursorPos);
+      if (/[A-Za-z0-9]$/.test(textBefore)) {
+        e.preventDefault();
+        const textAfter = val.slice(cursorPos);
+        const newVal = (textBefore + ', ' + textAfter).toUpperCase();
+        updateRow(idx, { route: newVal });
+        setTimeout(() => {
+          input.setSelectionRange(cursorPos + 2, cursorPos + 2);
+        }, 0);
+        return;
+      }
+    }
+
+    // Typing a new word character resets suppression for the subsequent word
+    if (e.key.length === 1 && /[A-Za-z0-9]/.test(e.key)) {
+      suppressedCommaMap.current[idx] = false;
+    }
+  };
 
   // User photo listener
   useEffect(() => {
@@ -193,7 +235,8 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       if (existingMap.has(d)) {
         const ext = existingMap.get(d)!;
         const km = ext.closingKm >= ext.openingKm && ext.openingKm > 0 ? ext.closingKm - ext.openingKm : (ext.km || 0);
-        const amount = ext.amount !== undefined && ext.amount > 0 ? ext.amount : Math.round(km * rate * 100) / 100;
+        // Manual amount strictly preserved from user input, not auto-calculated
+        const amount = ext.amount !== undefined && ext.amount !== null ? Number(ext.amount) || 0 : 0;
         const otherExpenses = Number(ext.otherExpenses) || 0;
         const subtotal = Math.round((amount + otherExpenses) * 100) / 100;
 
@@ -308,7 +351,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     const currentRow = newRows[index];
     const updated = { ...currentRow, ...updates };
 
-    // Auto-calculate KM
+    // Auto-calculate KM (Closing KM - Opening KM)
     if ('openingKm' in updates || 'closingKm' in updates) {
       if (updated.closingKm >= updated.openingKm && updated.openingKm > 0) {
         updated.km = updated.closingKm - updated.openingKm;
@@ -317,12 +360,12 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       }
     }
 
-    // Auto-calculate Amount
-    if ('openingKm' in updates || 'closingKm' in updates || 'km' in updates) {
-      updated.amount = Math.round((updated.km * (sheet.ratePerKm || ratePerKm || 3.5)) * 100) / 100;
+    // Manual Amount: strictly set by user input, not auto-calculated from KM
+    if ('amount' in updates) {
+      updated.amount = updates.amount !== undefined && updates.amount !== null ? Number(updates.amount) || 0 : 0;
     }
 
-    // Auto-calculate Subtotal (Amount + Other Expenses)
+    // Auto-calculate Subtotal (Manual Amount + Other Expenses)
     const amount = Number(updated.amount) || 0;
     const other = Number(updated.otherExpenses) || 0;
     updated.subtotal = Math.round((amount + other) * 100) / 100;
@@ -352,33 +395,10 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const handleRateChange = (newRate: number) => {
     if (!sheet) return;
     setRatePerKm(newRate);
-    const newRows = sheet.rows.map(r => {
-      const amount = Math.round((r.km * newRate) * 100) / 100;
-      const other = Number(r.otherExpenses) || 0;
-      return {
-        ...r,
-        amount,
-        subtotal: Math.round((amount + other) * 100) / 100
-      };
-    });
-
-    const totalKm = newRows.reduce((acc, r) => acc + (r.km || 0), 0);
-    const totalAmount = newRows.reduce((acc, r) => acc + (r.amount || 0), 0);
-    const totalOtherExpenses = newRows.reduce((acc, r) => acc + (r.otherExpenses || 0), 0);
-    const subtotalAmount = Math.round((totalAmount + totalOtherExpenses) * 100) / 100;
-    const totalExpensesAmount = subtotalAmount;
-    const averageCostPerKm = totalKm > 0 ? Math.round((totalExpensesAmount / totalKm) * 100) / 100 : 0;
-
+    // Amount is strictly manual per user instruction - never auto-calculate
     setSheet({
       ...sheet,
       ratePerKm: newRate,
-      rows: newRows,
-      totalKm,
-      totalAmount,
-      totalOtherExpenses,
-      subtotalAmount,
-      averageCostPerKm,
-      totalExpensesAmount
     });
   };
 
@@ -680,14 +700,15 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                         </span>
                       </td>
 
-                      {/* Route (Auto-resizes height dynamically for long entries without any text cutoff or overlap) */}
+                      {/* Route (Strictly single line, auto comma on space after word unless manually removed) */}
                       <td className="p-1 border-r-2 border-black align-middle">
-                        <textarea 
-                          rows={routeRowCount} 
+                        <input 
+                          type="text" 
                           value={row.route} 
+                          onKeyDown={e => handleRouteKeyDown(idx, e)}
                           onChange={e => updateRow(idx, { route: e.target.value.toUpperCase() })}
                           placeholder={isSunday ? "SUNDAY / OFF" : "ENTER ROUTE"}
-                          className="w-full px-1.5 py-0.5 bg-transparent border-none focus:outline-none font-black uppercase text-center text-[10.5px] resize-none overflow-hidden min-h-[26px] break-words whitespace-pre-wrap leading-tight block" 
+                          className="w-full px-1.5 py-0.5 bg-transparent border-none focus:outline-none font-black uppercase text-center text-[10.5px] truncate block leading-tight" 
                         />
                       </td>
 
@@ -696,9 +717,9 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                         <input 
                           type="number" 
                           value={row.openingKm || ''} 
-                          onChange={e => updateRow(idx, { openingKm: Number(e.target.value) })}
+                          onChange={e => updateRow(idx, { openingKm: Number(e.target.value) })} 
                           placeholder="0"
-                          className="w-full px-1 py-0.5 bg-transparent border-none focus:outline-none font-black font-mono text-center text-[10.5px]" 
+                          className="w-full px-1 py-0.5 bg-transparent border-none focus:outline-none font-black font-mono text-center text-[10.5px] [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none m-0" 
                         />
                       </td>
 
@@ -707,9 +728,9 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                         <input 
                           type="number" 
                           value={row.closingKm || ''} 
-                          onChange={e => updateRow(idx, { closingKm: Number(e.target.value) })}
+                          onChange={e => updateRow(idx, { closingKm: Number(e.target.value) })} 
                           placeholder="0"
-                          className="w-full px-1 py-0.5 bg-transparent border-none focus:outline-none font-black font-mono text-center text-[10.5px]" 
+                          className="w-full px-1 py-0.5 bg-transparent border-none focus:outline-none font-black font-mono text-center text-[10.5px] [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none m-0" 
                         />
                       </td>
 
@@ -718,25 +739,25 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                         {row.km || 0}
                       </td>
 
-                      {/* Amount (Auto calculated: KM * Rate) */}
+                      {/* Amount (Manual Input - No arrows) */}
                       <td className="p-0.5 border-r-2 border-black align-middle">
                         <input 
                           type="number" 
                           value={row.amount || ''} 
-                          onChange={e => updateRow(idx, { amount: Number(e.target.value) })}
+                          onChange={e => updateRow(idx, { amount: e.target.value === '' ? 0 : Number(e.target.value) })} 
                           placeholder="0"
-                          className="w-full px-1 py-0.5 bg-transparent border-none focus:outline-none font-black font-mono text-center text-[10.5px]" 
+                          className="w-full px-1 py-0.5 bg-transparent border-none focus:outline-none font-black font-mono text-center text-[10.5px] [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none m-0" 
                         />
                       </td>
 
-                      {/* Other Expenses */}
+                      {/* Other Expenses (No arrows) */}
                       <td className="p-0.5 border-r-2 border-black align-middle">
                         <input 
                           type="number" 
                           value={row.otherExpenses || ''} 
-                          onChange={e => updateRow(idx, { otherExpenses: Number(e.target.value) })}
+                          onChange={e => updateRow(idx, { otherExpenses: Number(e.target.value) })} 
                           placeholder="0"
-                          className="w-full px-1 py-0.5 bg-transparent border-none focus:outline-none font-black font-mono text-center text-[10.5px]" 
+                          className="w-full px-1 py-0.5 bg-transparent border-none focus:outline-none font-black font-mono text-center text-[10.5px] [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none m-0" 
                         />
                       </td>
 

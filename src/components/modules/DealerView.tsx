@@ -747,9 +747,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               </div>
             </div>
 
-            <form id="dealer-application-form" onSubmit={handleSave} className="p-2 sm:p-4 space-y-0 text-[10px] min-w-[750px] sm:min-w-0 font-sans">
+            <form id="dealer-application-form" onSubmit={handleSave} className="p-2 sm:p-4 space-y-0 text-[10px] min-w-[750px] sm:min-w-0 font-sans font-black">
               {/* Full Form Outer Border Wrapper */}
-              <div id="printable-wrapper" ref={printableFormRef} className="border-2 border-black bg-white shadow-sm overflow-hidden">
+              <div id="printable-wrapper" ref={printableFormRef} className="border-2 border-black bg-white shadow-sm overflow-hidden font-black text-black">
                 {/* 1. Header Section - Logo (Left), Name (Center), Photo (Right) */}
                 <div className="p-3 relative bg-white border-b-2 border-black">
                   <div className="flex items-center justify-between gap-3">
@@ -1184,21 +1184,15 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   DECLARATION
                 </div>
 
-                <div className="p-3 bg-white space-y-6 border-b-2 border-black">
-                  <p className="text-[10px] text-black leading-tight text-justify font-bold uppercase italic">
+                <div className="p-3 bg-white space-y-4 border-b-2 border-black">
+                  <p className="text-[10.5px] text-black leading-tight text-justify font-black uppercase italic">
                     I / we certify that the foregoing information is correct and complete to the best of my/our knowledge and belief and nothing has been concealed. I shall abide to policies & procedure laid by company from time to time. If at any time, I / we have concealed any material / information or given any false details, our appointment shall be liable to summary termination without notice or compensation.
                   </p>
 
                   <div className="flex items-end justify-between gap-10 pt-4 border-t-2 border-black">
-                    {/* Dealer Stamp Area without box, just top line and Place/Date at bottom */}
-                    <div className="flex-1 h-32 p-2 flex flex-col justify-between relative bg-white">
-                      <div className="absolute inset-0 flex items-center justify-center pointer-events-none opacity-[0.08] no-print">
-                        <span className="text-2xl font-black uppercase rotate-[-15deg] tracking-widest">DEALER STAMP & ADDRESS</span>
-                      </div>
-                      <div className="text-[9px] font-black text-black uppercase no-print">
-                        Dealer Stamp & Address
-                      </div>
-                      <div className="text-[9px] font-black text-black space-y-1 pt-2">
+                    {/* Place and Date at bottom left - Dealer Stamp & Address removed as requested */}
+                    <div className="flex-1 h-24 p-1 flex flex-col justify-end relative bg-white">
+                      <div className="text-[10.5px] font-black text-black space-y-1.5 pt-2">
                         <div className="flex items-center gap-1.5">
                           <span className="shrink-0 uppercase font-black">Place -</span>
                           <input
@@ -1211,7 +1205,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                               setPlace(val);
                             }}
                             placeholder="SANGLI"
-                            className="bg-transparent font-black text-black uppercase focus:outline-none flex-1 max-w-[200px] border-b border-dashed border-slate-400 focus:border-black disabled:border-transparent py-0.5"
+                            className="bg-transparent font-black text-black uppercase focus:outline-none flex-1 max-w-[200px] border-b-2 border-black focus:border-black disabled:border-transparent py-0.5"
                           />
                         </div>
                         <div className="flex items-center gap-1.5">
@@ -1224,7 +1218,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                     </div>
 
                     <div className="text-right pb-1 shrink-0 w-64">
-                      <div className="h-24 flex items-center justify-end">
+                      <div className="h-20 flex items-center justify-end">
                         {/* Signature space */}
                       </div>
                       <div className="border-t-2 border-black pt-1 text-center">
@@ -1282,15 +1276,15 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       {/* ======================= PHOTO SELECTION MODAL ======================= */}
       {showPhotoModal && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 no-print animate-in fade-in duration-150">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-5 space-y-4 border border-slate-200">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-5 space-y-4 border border-slate-200 font-sans">
             <div className="flex items-center justify-between border-b pb-3">
               <div className="flex items-center gap-2">
                 <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-700">
                   <Camera className="w-4 h-4" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-bold text-slate-900">फोटो ॲड करा (Add Photo)</h3>
-                  <p className="text-[11px] text-slate-500">पर्याय निवडा (Choose an option)</p>
+                  <h3 className="text-sm font-black text-slate-900 uppercase">Add Photo</h3>
+                  <p className="text-[11px] font-bold text-slate-500">Select source</p>
                 </div>
               </div>
               <button
@@ -1316,8 +1310,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   <Camera className="w-5 h-5" />
                 </div>
                 <div>
-                  <div className="text-xs font-black">कॅमेऱ्याने थेट फोटो काढा</div>
-                  <div className="text-[10px] text-emerald-700 font-semibold">Take Live Photo / Open Camera</div>
+                  <div className="text-xs font-black uppercase">Camera</div>
+                  <div className="text-[10px] text-emerald-700 font-bold">Take Photo / Open Camera</div>
                 </div>
               </button>
 
@@ -1334,8 +1328,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   <ImageIcon className="w-5 h-5" />
                 </div>
                 <div>
-                  <div className="text-xs font-black">मोबाईल गॅलरीमधून निवडा</div>
-                  <div className="text-[10px] text-blue-700 font-semibold">Choose from Gallery / Files</div>
+                  <div className="text-xs font-black uppercase">Gallery</div>
+                  <div className="text-[10px] text-blue-700 font-bold">Choose from Gallery / Files</div>
                 </div>
               </button>
 
@@ -1350,7 +1344,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   className="w-full flex items-center gap-3 p-3 rounded-xl border border-red-200 bg-red-50/50 hover:bg-red-100 text-red-700 font-bold transition text-left text-xs"
                 >
                   <Trash2 className="w-4 h-4 text-red-600" />
-                  <span>सध्याचा फोटो काढून टाका (Remove Photo)</span>
+                  <span className="font-black uppercase">Remove Photo</span>
                 </button>
               )}
             </div>
@@ -1359,9 +1353,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               <button
                 type="button"
                 onClick={() => setShowPhotoModal(false)}
-                className="w-full py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100 transition"
+                className="w-full py-2.5 rounded-xl text-xs font-black text-slate-700 hover:bg-slate-100 transition uppercase tracking-wider"
               >
-                रद्द करा (Cancel)
+                Cancel
               </button>
             </div>
           </div>

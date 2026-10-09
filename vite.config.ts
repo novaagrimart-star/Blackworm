@@ -11,8 +11,11 @@ export default defineConfig(() => {
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
-        devOptions: {
-          enabled: true
+        workbox: {
+          cleanupOutdatedCaches: true,
+          skipWaiting: true,
+          clientsClaim: true,
+          maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
         },
         manifest: {
           name: 'Blackworm Agritech MIS',

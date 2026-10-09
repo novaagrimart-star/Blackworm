@@ -52,6 +52,8 @@ export function isAdmin(user?: Partial<UserProfile> | null): boolean {
 export function canAccessModule(user: Partial<UserProfile> | null | undefined, moduleId: string): boolean {
   if (!user) return false;
   if (isAdmin(user)) return true;
+  // User data should be visible to every user as requested
+  if (moduleId === 'user') return true;
   if (!user.allowedModules || !Array.isArray(user.allowedModules)) return false;
   return user.allowedModules.includes(moduleId);
 }

@@ -5,7 +5,7 @@ import { UserProfile, isAdmin } from '../../lib/auth';
 import { restoreRecord, DeletedRecordItem, AuditLogItem } from '../../lib/dataService';
 import { Language, translations } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
-import { Settings, Trash2, RotateCcw, ShieldAlert, History, Globe, HardDrive } from 'lucide-react';
+import { Settings, Trash2, RotateCcw, ShieldAlert, History, Globe, HardDrive, RefreshCw, CheckCircle2 } from 'lucide-react';
 
 interface Props {
   profile: UserProfile;
@@ -17,10 +17,11 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
   const t = translations[lang];
   const [deletedItems, setDeletedItems] = useState<DeletedRecordItem[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
-  const [activeTab, setActiveTab] = useState<'trash' | 'branding'>('trash');
+  const [activeTab, setActiveTab] = useState<'trash' | 'branding' | 'cache'>('trash');
   const [logoUrl, setLogoUrl] = useState<string>('');
   const [logoSize, setLogoSize] = useState<number>(80);
   const [isSavingLogo, setIsSavingLogo] = useState<boolean>(false);
+  const [isClearingCache, setIsClearingCache] = useState<boolean>(false);
 
   useEffect(() => {
     // Fetch branding config
@@ -136,6 +137,26 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
     });
   };
 
+  const handleClearCacheAndSync = async () => {
+    setIsClearingCache(true);
+    try {
+      if ('caches' in window) {
+        const cacheNames = await caches.keys();
+        await Promise.all(cacheNames.map((name) => caches.delete(name)));
+      }
+      if ('serviceWorker' in navigator) {
+        const registrations = await navigator.serviceWorker.getRegistrations();
+        for (const reg of registrations) {
+          await reg.unregister();
+        }
+      }
+      // Force reload without cache
+      window.location.href = window.location.origin + window.location.pathname + '?fresh=' + Date.now();
+    } catch (e) {
+      window.location.reload();
+    }
+  };
+
   return (
     <div className="space-y-6 max-w-4xl mx-auto">
       <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex items-center justify-between">
@@ -162,6 +183,13 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
         >
           <Globe className="w-4 h-4" />
           <span>Branding</span>
+        </button>
+        <button
+          onClick={() => setActiveTab('cache')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition shrink-0 ${activeTab === 'cache' ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 border border-slate-200'}`}
+        >
+          <RefreshCw className="w-4 h-4" />
+          <span>App Update & Cache</span>
         </button>
       </div>
 
@@ -259,6 +287,56 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
               </div>
               <p className="text-[10px] text-slate-400 mt-3 uppercase tracking-widest font-bold text-center">Square aspect ratio recommended</p>
             </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'cache' && (
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-6 text-xs">
+          <div>
+            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+              <RefreshCw className="w-4 h-4 text-rose-600" />
+              <span>App Version & Cache Refresh (ॲप अपडेट व कॅशे साफ करा)</span>
+            </h3>
+            <p className="text-[11px] text-slate-500 mt-1">
+              नवीन बदल (उदा. प्राईस लिस्ट, डिझाईन किंवा ऑप्शन्स) मोबाईल ॲप/APK मध्ये त्वरित दिसण्यासाठी येथून कॅशे रिफ्रेश करा.
+            </p>
+          </div>
+
+          <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-3">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-bold text-slate-600">Current App Build Version:</span>
+              <span className="font-black text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-200 flex items-center gap-1.5">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                <span>v1.0.2 (Clean Build)</span>
+              </span>
+            </div>
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-bold text-slate-600">Price List Structure:</span>
+              <span className="font-bold text-blue-700 bg-blue-50 px-2.5 py-1 rounded-lg border border-blue-200">
+                Continuous Excel-Style Table (No Card Boxes)
+              </span>
+            </div>
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-bold text-slate-600">Share App Option:</span>
+              <span className="font-bold text-slate-500 bg-slate-100 px-2.5 py-1 rounded-lg">
+                Completely Removed
+              </span>
+            </div>
+          </div>
+
+          <div className="pt-2">
+            <button
+              onClick={handleClearCacheAndSync}
+              disabled={isClearingCache}
+              className="w-full py-3.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs sm:text-sm font-black shadow-md shadow-rose-200 transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:opacity-50"
+            >
+              <RefreshCw className={`w-4 h-4 ${isClearingCache ? 'animate-spin' : ''}`} />
+              <span>{isClearingCache ? 'कॅशे साफ होत आहे...' : 'कॅशे साफ करा आणि ॲप त्वरित रिफ्रेश करा (Clear Cache & Refresh Now)'}</span>
+            </button>
+            <p className="text-[10px] text-slate-400 text-center mt-2">
+              हे बटण दाबल्यावर मोबाईलमधील जुनी कॅशे मेमरी डिलीट होऊन नवीन अपडेटेड फाईल्स थेट लोड होतात.
+            </p>
           </div>
         </div>
       )}
