@@ -296,10 +296,10 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
           <div>
             <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
               <RefreshCw className="w-4 h-4 text-rose-600" />
-              <span>App Version & Cache Refresh (ॲप अपडेट व कॅशे साफ करा)</span>
+              <span>App Update & Cache</span>
             </h3>
             <p className="text-[11px] text-slate-500 mt-1">
-              नवीन बदल (उदा. प्राईस लिस्ट, डिझाईन किंवा ऑप्शन्स) मोबाईल ॲप/APK मध्ये त्वरित दिसण्यासाठी येथून कॅशे रिफ्रेश करा.
+              Automatic background updates are enabled. The app keeps all features and data synchronized automatically across web and mobile.
             </p>
           </div>
 
@@ -308,19 +308,14 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
               <span className="font-bold text-slate-600">Current App Build Version:</span>
               <span className="font-black text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-200 flex items-center gap-1.5">
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                <span>v1.0.2 (Clean Build)</span>
+                <span>v1.0.3 (Latest Production)</span>
               </span>
             </div>
             <div className="flex items-center justify-between text-xs">
-              <span className="font-bold text-slate-600">Price List Structure:</span>
-              <span className="font-bold text-blue-700 bg-blue-50 px-2.5 py-1 rounded-lg border border-blue-200">
-                Continuous Excel-Style Table (No Card Boxes)
-              </span>
-            </div>
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-bold text-slate-600">Share App Option:</span>
-              <span className="font-bold text-slate-500 bg-slate-100 px-2.5 py-1 rounded-lg">
-                Completely Removed
+              <span className="font-bold text-slate-600">Auto-Update Status:</span>
+              <span className="font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-200 flex items-center gap-1">
+                <CheckCircle2 className="w-3 h-3 text-emerald-600" />
+                <span>Active (Automatic Sync)</span>
               </span>
             </div>
           </div>
@@ -332,11 +327,8 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
               className="w-full py-3.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs sm:text-sm font-black shadow-md shadow-rose-200 transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:opacity-50"
             >
               <RefreshCw className={`w-4 h-4 ${isClearingCache ? 'animate-spin' : ''}`} />
-              <span>{isClearingCache ? 'कॅशे साफ होत आहे...' : 'कॅशे साफ करा आणि ॲप त्वरित रिफ्रेश करा (Clear Cache & Refresh Now)'}</span>
+              <span>{isClearingCache ? 'Refreshing...' : 'Refresh Now'}</span>
             </button>
-            <p className="text-[10px] text-slate-400 text-center mt-2">
-              हे बटण दाबल्यावर मोबाईलमधील जुनी कॅशे मेमरी डिलीट होऊन नवीन अपडेटेड फाईल्स थेट लोड होतात.
-            </p>
           </div>
         </div>
       )}

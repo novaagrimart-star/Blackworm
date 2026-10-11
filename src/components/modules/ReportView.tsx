@@ -237,14 +237,34 @@ export const ReportView: React.FC<Props> = ({ profile, lang }) => {
         </div>
       </div>
 
-      {/* Report Table Section - Fully scrollable horizontally with larger font */}
+      {/* Report Table Section - Fully scrollable horizontally with larger font & scroll helper buttons */}
       <div className="space-y-2">
         <div className="text-xs font-bold text-slate-500 flex items-center justify-between px-1 no-print">
-          <span className="md:hidden">👉 पूर्ण टेबल पाहण्यासाठी डावीकडून उजवीकडे स्क्रोल करा (Swipe/Scroll)</span>
+          <span className="font-black text-slate-700">👉 पूर्ण रिपोर्ट पाहण्यासाठी डावीकडून उजवीकडे स्क्रोल करा (Scroll/Swipe)</span>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => scrollTable('left')}
+              className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-black flex items-center gap-1 border border-slate-300 transition active:scale-95 shadow-xs cursor-pointer"
+              title="Scroll Left"
+            >
+              <ChevronLeft className="w-3.5 h-3.5 stroke-[3px]" />
+              <span>डावीकडे</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => scrollTable('right')}
+              className="px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-xs font-black flex items-center gap-1 border border-indigo-200 transition active:scale-95 shadow-xs cursor-pointer"
+              title="Scroll Right"
+            >
+              <span>उजवीकडे</span>
+              <ChevronRight className="w-3.5 h-3.5 stroke-[3px]" />
+            </button>
+          </div>
         </div>
 
-        <div className="bg-white rounded-2xl border-2 border-slate-300 shadow-xl overflow-x-auto scrollbar-thin">
-          <div ref={reportRef} className="p-4 sm:p-6 bg-white min-w-[1150px]">
+        <div ref={tableScrollRef} className="bg-white rounded-2xl border-2 border-slate-300 shadow-xl overflow-x-auto touch-pan-x scroll-smooth overscroll-x-contain scrollbar-thin">
+          <div ref={reportRef} className="p-4 sm:p-6 bg-white min-w-[1300px]">
             {/* Internal Print Header */}
             <div className="text-center mb-6 space-y-1">
               <h1 className="text-2xl sm:text-3xl font-black text-slate-900 uppercase tracking-tight">
@@ -262,72 +282,70 @@ export const ReportView: React.FC<Props> = ({ profile, lang }) => {
               </div>
             </div>
 
-            <div className="overflow-x-auto">
-              <table className="w-full border-collapse border-2 border-slate-900 text-xs sm:text-sm">
-                <thead>
-                  <tr className="bg-slate-900 text-white font-black uppercase text-center text-xs sm:text-sm">
-                    <th className="p-2.5 sm:p-3 border border-slate-700 w-12">Sr.</th>
-                    <th className="p-2.5 sm:p-3 border border-slate-700 text-left min-w-[180px]">Officer Name</th>
-                    <th className="p-2.5 sm:p-3 border border-slate-700 min-w-[150px]">Today's Route</th>
-                    <th className="p-2.5 sm:p-3 border border-slate-700 min-w-[90px]">Open KM</th>
-                    <th className="p-2.5 sm:p-3 border border-slate-700 min-w-[90px]">Close KM</th>
-                    <th className="p-2.5 sm:p-3 border border-slate-700 min-w-[90px]">Total KM</th>
-                    <th className="p-2.5 sm:p-3 border border-slate-700 min-w-[130px]">Payment Collection</th>
-                    <th className="p-2.5 sm:p-3 border border-slate-700 min-w-[100px]">Daily Exp.</th>
-                    <th className="p-2.5 sm:p-3 border border-slate-700 min-w-[120px]">Mon. Target (Lakh)</th>
-                    <th className="p-2.5 sm:p-3 border border-slate-700 min-w-[120px]">Mon. Achieve (Lakh)</th>
-                    <th className="p-2.5 sm:p-3 border border-slate-700 min-w-[100px]">Backlog</th>
+            <table className="w-full border-collapse border-2 border-slate-900 text-xs sm:text-sm">
+              <thead>
+                <tr className="bg-slate-900 text-white font-black uppercase text-center text-xs sm:text-sm">
+                  <th className="p-3 border border-slate-700 w-12">Sr.</th>
+                  <th className="p-3 border border-slate-700 text-left min-w-[190px]">Officer Name</th>
+                  <th className="p-3 border border-slate-700 min-w-[160px]">Today's Route</th>
+                  <th className="p-3 border border-slate-700 min-w-[100px]">Open KM</th>
+                  <th className="p-3 border border-slate-700 min-w-[100px]">Close KM</th>
+                  <th className="p-3 border border-slate-700 min-w-[100px]">Total KM</th>
+                  <th className="p-3 border border-slate-700 min-w-[140px]">Payment Collection</th>
+                  <th className="p-3 border border-slate-700 min-w-[110px]">Daily Exp.</th>
+                  <th className="p-3 border border-slate-700 min-w-[130px]">Mon. Target (Lakh)</th>
+                  <th className="p-3 border border-slate-700 min-w-[130px]">Mon. Achieve (Lakh)</th>
+                  <th className="p-3 border border-slate-700 min-w-[110px]">Backlog</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y-2 divide-slate-300 border-b-2 border-slate-900">
+                {reportData.map((row) => (
+                  <tr key={row.uid} className="hover:bg-slate-50 font-black text-slate-900 text-center uppercase tracking-tight">
+                    <td className="p-3 border border-slate-300 font-mono font-black">{row.srNo}</td>
+                    <td className="p-3 border border-slate-300 text-left whitespace-nowrap font-black text-slate-900">{row.name}</td>
+                    <td className="p-3 border border-slate-300 italic lowercase first-letter:uppercase text-slate-800 font-bold">{row.route}</td>
+                    <td className="p-3 border border-slate-300 font-mono font-bold">{row.openingKm}</td>
+                    <td className="p-3 border border-slate-300 font-mono font-bold">{row.closingKm}</td>
+                    <td className="p-3 border border-slate-300 font-mono font-black text-indigo-700">{row.totalKm}</td>
+                    <td className="p-3 border border-slate-300 font-mono font-black text-emerald-700">₹{row.paymentCollection.toLocaleString()}</td>
+                    <td className="p-3 border border-slate-300 font-mono font-black text-rose-700">₹{row.dailyExpense.toLocaleString()}</td>
+                    <td className="p-3 border border-slate-300 font-mono font-bold">{row.monthlySalesTarget.toFixed(2)}</td>
+                    <td className="p-3 border border-slate-300 font-mono font-black text-blue-700">{row.monthlyAchievement.toFixed(2)}</td>
+                    <td className="p-3 border border-slate-300 font-mono font-black text-red-600">{row.targetBacklog.toFixed(2)}</td>
                   </tr>
-                </thead>
-                <tbody className="divide-y-2 divide-slate-300 border-b-2 border-slate-900">
-                  {reportData.map((row) => (
-                    <tr key={row.uid} className="hover:bg-slate-50 font-bold text-slate-900 text-center uppercase tracking-tight">
-                      <td className="p-2.5 sm:p-3 border border-slate-300 font-mono font-black">{row.srNo}</td>
-                      <td className="p-2.5 sm:p-3 border border-slate-300 text-left whitespace-nowrap font-black text-slate-900">{row.name}</td>
-                      <td className="p-2.5 sm:p-3 border border-slate-300 italic lowercase first-letter:uppercase text-slate-800 font-bold">{row.route}</td>
-                      <td className="p-2.5 sm:p-3 border border-slate-300 font-mono font-bold">{row.openingKm}</td>
-                      <td className="p-2.5 sm:p-3 border border-slate-300 font-mono font-bold">{row.closingKm}</td>
-                      <td className="p-2.5 sm:p-3 border border-slate-300 font-mono font-black text-indigo-700">{row.totalKm}</td>
-                      <td className="p-2.5 sm:p-3 border border-slate-300 font-mono font-black text-emerald-700">₹{row.paymentCollection.toLocaleString()}</td>
-                      <td className="p-2.5 sm:p-3 border border-slate-300 font-mono font-black text-rose-700">₹{row.dailyExpense.toLocaleString()}</td>
-                      <td className="p-2.5 sm:p-3 border border-slate-300 font-mono font-bold">{row.monthlySalesTarget.toFixed(2)}</td>
-                      <td className="p-2.5 sm:p-3 border border-slate-300 font-mono font-black text-blue-700">{row.monthlyAchievement.toFixed(2)}</td>
-                      <td className="p-2.5 sm:p-3 border border-slate-300 font-mono font-black text-red-600">{row.targetBacklog.toFixed(2)}</td>
-                    </tr>
-                  ))}
-                  {reportData.length === 0 && !loading && (
-                    <tr>
-                      <td colSpan={11} className="p-12 text-center text-slate-400 font-bold uppercase italic text-sm">
-                        No data available for the selected date.
-                      </td>
-                    </tr>
-                  )}
-                  {loading && (
-                    <tr>
-                      <td colSpan={11} className="p-12 text-center">
-                        <Loader2 className="w-8 h-8 animate-spin mx-auto text-indigo-600" />
-                        <p className="mt-2 text-xs font-bold text-slate-500 uppercase">Fetching latest data...</p>
-                      </td>
-                    </tr>
-                  )}
-                </tbody>
-                {reportData.length > 0 && (
-                  <tfoot className="bg-slate-100 font-black text-slate-900 uppercase text-center border-t-2 border-slate-900 text-xs sm:text-sm">
-                    <tr>
-                      <td colSpan={3} className="p-3 text-right border-r-2 border-slate-900 font-black">TOTAL SUMMARY</td>
-                      <td className="p-3 border-r border-slate-300">-</td>
-                      <td className="p-3 border-r border-slate-300">-</td>
-                      <td className="p-3 border-r border-slate-300 font-mono font-black text-indigo-700">{reportData.reduce((acc, r) => acc + r.totalKm, 0)}</td>
-                      <td className="p-3 border-r border-slate-300 font-mono font-black text-emerald-700">₹{reportData.reduce((acc, r) => acc + r.paymentCollection, 0).toLocaleString()}</td>
-                      <td className="p-3 border-r border-slate-300 font-mono font-black text-rose-700">₹{reportData.reduce((acc, r) => acc + r.dailyExpense, 0).toLocaleString()}</td>
-                      <td className="p-3 border-r border-slate-300 font-mono font-bold">{reportData.reduce((acc, r) => acc + r.monthlySalesTarget, 0).toFixed(2)}</td>
-                      <td className="p-3 border-r border-slate-300 font-mono font-black text-blue-700">{reportData.reduce((acc, r) => acc + r.monthlyAchievement, 0).toFixed(2)}</td>
-                      <td className="p-3 font-mono font-black text-red-600">{reportData.reduce((acc, r) => acc + r.targetBacklog, 0).toFixed(2)}</td>
-                    </tr>
-                  </tfoot>
+                ))}
+                {reportData.length === 0 && !loading && (
+                  <tr>
+                    <td colSpan={11} className="p-12 text-center text-slate-400 font-bold uppercase italic text-sm">
+                      No data available for the selected date.
+                    </td>
+                  </tr>
                 )}
-              </table>
-            </div>
+                {loading && (
+                  <tr>
+                    <td colSpan={11} className="p-12 text-center">
+                      <Loader2 className="w-8 h-8 animate-spin mx-auto text-indigo-600" />
+                      <p className="mt-2 text-xs font-bold text-slate-500 uppercase">Fetching latest data...</p>
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+              {reportData.length > 0 && (
+                <tfoot className="bg-slate-100 font-black text-slate-900 uppercase text-center border-t-2 border-slate-900 text-xs sm:text-sm">
+                  <tr>
+                    <td colSpan={3} className="p-3 text-right border-r-2 border-slate-900 font-black">TOTAL SUMMARY</td>
+                    <td className="p-3 border-r border-slate-300">-</td>
+                    <td className="p-3 border-r border-slate-300">-</td>
+                    <td className="p-3 border-r border-slate-300 font-mono font-black text-indigo-700">{reportData.reduce((acc, r) => acc + r.totalKm, 0)}</td>
+                    <td className="p-3 border-r border-slate-300 font-mono font-black text-emerald-700">₹{reportData.reduce((acc, r) => acc + r.paymentCollection, 0).toLocaleString()}</td>
+                    <td className="p-3 border-r border-slate-300 font-mono font-black text-rose-700">₹{reportData.reduce((acc, r) => acc + r.dailyExpense, 0).toLocaleString()}</td>
+                    <td className="p-3 border-r border-slate-300 font-mono font-bold">{reportData.reduce((acc, r) => acc + r.monthlySalesTarget, 0).toFixed(2)}</td>
+                    <td className="p-3 border-r border-slate-300 font-mono font-black text-blue-700">{reportData.reduce((acc, r) => acc + r.monthlyAchievement, 0).toFixed(2)}</td>
+                    <td className="p-3 font-mono font-black text-red-600">{reportData.reduce((acc, r) => acc + r.targetBacklog, 0).toFixed(2)}</td>
+                  </tr>
+                </tfoot>
+              )}
+            </table>
 
             <div className="mt-12 flex justify-between items-end no-print">
               <div className="text-center w-48">

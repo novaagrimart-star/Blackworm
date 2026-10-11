@@ -222,12 +222,15 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout })
       default:
         return (
           <div className="space-y-6">
-            {/* Logged-In User Profile: Strictly Name and Designation in Single Line Black Color - No Boxes & No Initials Circle */}
+            {/* Logged-In User Profile: Full Officer Name with Compressed Designation */}
             <div className="flex items-center gap-3 mx-auto max-w-2xl px-2">
-              <div className="min-w-0 flex-1">
-                <h3 className="text-sm sm:text-base font-black text-slate-900 uppercase tracking-tight truncate whitespace-nowrap">
-                  {currentUserData.fullName || 'USER'} ({isUserAdmin ? (currentUserData.role === 'owner' ? 'OWNER / MD' : 'ADMIN') : (currentUserData.designation || currentUserData.role)})
-                </h3>
+              <div className="min-w-0 flex-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                <span className="text-sm sm:text-base font-black text-slate-900 uppercase tracking-tight">
+                  {currentUserData.fullName || 'USER'}
+                </span>
+                <span className="text-[10px] sm:text-xs font-bold text-slate-500 uppercase tracking-tight bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded">
+                  {isUserAdmin ? (currentUserData.role === 'owner' ? 'OWNER / MD' : 'ADMIN') : (currentUserData.designation || currentUserData.role)}
+                </span>
               </div>
             </div>
 
@@ -268,13 +271,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout })
   };
 
   return (
-    <div className="flex flex-col min-h-screen bg-slate-50 pb-20">
-      <header className="bg-white border-b border-slate-200 px-4 py-2.5 flex items-center justify-between sticky top-0 z-10 shadow-xs">
+    <div className="flex flex-col min-h-dvh bg-slate-50 mobile-safe-container">
+      <header className="bg-white border-b border-slate-200 px-4 py-2.5 flex items-center justify-between sticky top-0 z-10 shadow-xs mobile-safe-header">
         <div className="flex items-center gap-3">
           {activeTab !== 'dashboard' && (
             <button
               onClick={() => handleTabChange('dashboard')}
-              className="p-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 transition shrink-0"
+              className="p-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 transition shrink-0 cursor-pointer"
               title="Back to Dashboard"
             >
               <ArrowLeft className="w-5 h-5" />
@@ -292,16 +295,19 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout })
 
           {/* Company Title - Updated to full name after login */}
           <div className="flex flex-col justify-center min-w-0">
-            <h1 className="text-sm sm:text-base font-black text-rose-600 tracking-tight leading-tight uppercase whitespace-nowrap">
+            <h1 className="text-xs sm:text-sm md:text-base font-black text-rose-600 tracking-tight leading-tight uppercase break-words sm:whitespace-nowrap">
               BLACKWORM AGRITECH PVT LTD
             </h1>
           </div>
         </div>
 
-        {/* Current Active Logged-In User Badge in Header (Black Single Line - No Circle) */}
-        <div className="hidden sm:flex items-center gap-2 px-3">
-          <span className="text-[11px] font-black text-slate-900 uppercase leading-none whitespace-nowrap">
-            {currentUserData.fullName || 'OWNER'} ({currentUserData.role === 'owner' ? 'OWNER / MD' : (currentUserData.designation || currentUserData.role)})
+        {/* Current Active Logged-In User Badge in Header */}
+        <div className="hidden sm:flex items-center gap-1.5 px-3">
+          <span className="text-xs font-black text-slate-900 uppercase leading-none">
+            {currentUserData.fullName || 'OWNER'}
+          </span>
+          <span className="text-[9.5px] font-bold text-slate-500 uppercase leading-none bg-slate-100 border border-slate-200 px-1 py-0.5 rounded">
+            {currentUserData.role === 'owner' ? 'OWNER / MD' : (currentUserData.designation || currentUserData.role)}
           </span>
         </div>
       </header>
@@ -312,7 +318,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout })
 
       <OfflineIndicator />
 
-      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 px-6 py-2 flex justify-around items-center z-20 shadow-lg">
+      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 px-4 pt-2 flex justify-around items-center z-20 shadow-lg mobile-safe-nav">
         <NavItem icon={BarChart3} label={t.dashboard} active={activeTab === 'dashboard'} onClick={() => handleTabChange('dashboard')} />
         {canAccessModule(currentUserData, 'target') && (
           <NavItem icon={Target} label={t.target} active={activeTab === 'target'} onClick={() => handleTabChange('target')} />

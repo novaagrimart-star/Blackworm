@@ -1,5 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { collection, query, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
+import { 
+  collection, 
+  query, 
+  onSnapshot, 
+  doc, 
+  setDoc, 
+  deleteDoc, 
+  runTransaction, 
+  getDocs, 
+  getDoc, 
+  writeBatch 
+} from 'firebase/firestore';
 import { db } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { logAudit } from '../../lib/dataService';
@@ -25,7 +36,11 @@ import {
   Copy,
   Save,
   Download,
-  Loader2
+  Loader2,
+  RefreshCw,
+  FileText,
+  LayoutList,
+  Table as TableIcon
 } from 'lucide-react';
 
 export interface DealershipFormItem {
@@ -33,6 +48,8 @@ export interface DealershipFormItem {
   center: string;
   shopOpeningDate: string;
   dealerCode: string;
+  created_by_user_id?: string;
+  created_by_name?: string;
   village: string;
   securityDeposit: string;
   firmName: string;
@@ -123,7 +140,10 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const [place, setPlace] = useState('Sangli');
   const [declarationDate, setDeclarationDate] = useState(new Date().toISOString().slice(0, 10));
   const [remarks, setRemarks] = useState('');
-  const [officerName, setOfficerName] = useState('SHRIDHAR BALKRUSHNA SHINDE');
+  const [officerName, setOfficerName] = useState((profile.fullName || profile.loginId || 'OFFICER').toUpperCase());
+  const [createdByUserId, setCreatedByUserId] = useState<string>(profile.uid || '');
+  const [createdByName, setCreatedByName] = useState<string>((profile.fullName || profile.loginId || 'OFFICER').toUpperCase());
+  const [globalSequence, setGlobalSequence] = useState<number>(0);
   const [status, setStatus] = useState<'Approved' | 'Pending' | 'Draft'>('Approved');
   
   // Office Use Fields
@@ -136,17 +156,32 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [showPhotoModal, setShowPhotoModal] = useState(false);
-  const [actionModalDealer, setActionModalDealer] = useState<DealershipFormItem | null>(null);
+  const [listDisplayMode, setListDisplayMode] = useState<'cards' | 'table'>('cards');
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
   const printableFormRef = useRef<HTMLDivElement>(null);
+  const [usersMap, setUsersMap] = useState<Record<string, string>>({});
 
-  // Mobile Hardware / Navigation Back Button Integration
+  useEffect(() => {
+    const unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
+      const map: Record<string, string> = {};
+      snap.forEach((d) => {
+        const u = d.data();
+        if (u.fullName) {
+          map[d.id] = u.fullName;
+          if (u.loginId) map[u.loginId.toLowerCase()] = u.fullName;
+          if (u.userCode) map[u.userCode.toLowerCase()] = u.fullName;
+        }
+      });
+      setUsersMap(map);
+    });
+    return () => unsubUsers();
+  }, []);
   useEffect(() => {
     if (viewMode === 'form') {
-      window.history.pushState({ tab: 'dealer', dealerFormOpen: true }, '');
-      const handlePopState = () => {
+      const handlePopState = (e: PopStateEvent) => {
+        // If user hits browser back button while in form, return directly to dealer list
         setViewMode('list');
       };
       window.addEventListener('popstate', handlePopState);
@@ -220,20 +255,167 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     return () => unsubBranding();
   }, []);
 
+  // Real-time listener for global sequence counter
+  useEffect(() => {
+    const unsubSeq = onSnapshot(doc(db, 'config', 'dealer_sequence'), (snap) => {
+      if (snap.exists()) {
+        const val = Number(snap.data()?.currentSequence) || 0;
+        setGlobalSequence(val);
+      }
+    });
+    return () => unsubSeq();
+  }, []);
+
+  // Re-index all saved dealers with continuous clean serial numbers (001, 002, 003...)
+  // and sync config/dealer_sequence with the highest number so next form gets (highest + 1)
+  const reindexAllDealersSequence = async (showModalAlert = false) => {
+    try {
+      const snap = await getDocs(collection(db, 'dealers_application'));
+      if (snap.empty) {
+        if (showModalAlert) {
+          setDialogConfig({
+            isOpen: true,
+            type: 'alert',
+            title: 'माहिती',
+            message: 'डेटाबेसमध्ये सध्या कोणताही सेव्ह केलेला डीलर उपलब्ध नाही.',
+            onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+          });
+        }
+        return;
+      }
+
+      interface ItemInfo {
+        id: string;
+        data: DealershipFormItem;
+        rawCode: string;
+        num: number;
+        createdTime: number;
+      }
+
+      const items: ItemInfo[] = [];
+
+      snap.forEach((d) => {
+        const data = d.data() as DealershipFormItem;
+        if (data.isArchived) return;
+        const rawCode = String(data.dealerCode || '').trim();
+        const cleanNum = parseInt(rawCode.replace(/\D/g, ''), 10);
+
+        let time = 0;
+        if (data.createdAt) {
+          time = new Date(data.createdAt).getTime();
+        } else if (data.shopOpeningDate) {
+          time = new Date(data.shopOpeningDate).getTime();
+        } else {
+          const match = d.id.match(/\d+/);
+          time = match ? parseInt(match[0], 10) : 0;
+        }
+
+        items.push({
+          id: d.id,
+          data,
+          rawCode,
+          num: isNaN(cleanNum) ? 0 : cleanNum,
+          createdTime: isNaN(time) ? 0 : time,
+        });
+      });
+
+      // Sort strictly by submission/creation time
+      items.sort((a, b) => a.createdTime - b.createdTime);
+
+      const batch = writeBatch(db);
+      let updateCount = 0;
+
+      items.forEach((item, index) => {
+        const targetCode = String(index + 1).padStart(3, '0');
+        if (item.rawCode !== targetCode) {
+          batch.update(doc(db, 'dealers_application', item.id), {
+            dealerCode: targetCode,
+            updatedAt: new Date().toISOString(),
+          });
+          updateCount++;
+        }
+      });
+
+      const totalDealers = items.length;
+      if (updateCount > 0) {
+        await batch.commit();
+      }
+
+      // Sync Firestore sequence config
+      const seqRef = doc(db, 'config', 'dealer_sequence');
+      await setDoc(
+        seqRef,
+        {
+          currentSequence: totalDealers,
+          updatedAt: new Date().toISOString(),
+          lastAllocatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+
+      setGlobalSequence(totalDealers);
+
+      if (showModalAlert) {
+        const nextPreview = String(totalDealers + 1).padStart(3, '0');
+        setDialogConfig({
+          isOpen: true,
+          type: 'success',
+          title: 'सिरीयल नंबर सिंक झाले!',
+          message: `एकूण ${totalDealers} जुन्या डीलर ॲप्लिकेशन्सना सलग सिरीयल नंबर (001 ते ${String(totalDealers).padStart(3, '0')}) मिळाले आहेत. पुढील नवीन डीलरला ऑटोमॅटिक #${nextPreview} नंबर मिळेल.`,
+          confirmText: 'ठीक आहे',
+          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+        });
+      }
+    } catch (err: any) {
+      console.warn('Dealer sequence sync error:', err);
+      if (showModalAlert) {
+        setDialogConfig({
+          isOpen: true,
+          type: 'alert',
+          title: 'त्रुटी',
+          message: 'सिरीयल नंबर सिंक करताना अडचण आली: ' + (err.message || err),
+          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+        });
+      }
+    }
+  };
+
+  useEffect(() => {
+    reindexAllDealersSequence(false);
+  }, []);
+
   useEffect(() => {
     const q = query(collection(db, 'dealers_application'));
     const unsub = onSnapshot(q, (snap) => {
       const list: DealershipFormItem[] = [];
       snap.forEach((d) => {
         const data = d.data() as DealershipFormItem;
-        // Data Isolation: Admin sees all; non-admin only sees their own dealer forms
-        if (!data.isArchived && isUserRecord(data, profile)) {
-          list.push({ ...data, id: d.id });
+        if (!data.isArchived) {
+          // Data Isolation: Admin sees all; non-admin strictly sees ONLY their own dealer forms
+          if (isAdmin(profile)) {
+            list.push({ ...data, id: d.id });
+          } else {
+            const isOwner = (data.created_by_user_id && data.created_by_user_id === profile.uid) ||
+                            (data.createdByUid && data.createdByUid === profile.uid) ||
+                            (data.userId && data.userId === profile.uid) ||
+                            (data.ownerId && data.ownerId === profile.uid) ||
+                            (data.loginId && profile.loginId && data.loginId.toLowerCase() === profile.loginId.toLowerCase()) ||
+                            (data.created_by_name && profile.fullName && data.created_by_name.toUpperCase() === profile.fullName.toUpperCase()) ||
+                            (data.officerName && profile.fullName && data.officerName.toUpperCase() === profile.fullName.toUpperCase());
+            if (isOwner) {
+              list.push({ ...data, id: d.id });
+            }
+          }
         }
       });
 
-      // Sort by dealerCode or createdAt
-      list.sort((a, b) => (b.dealerCode || '').localeCompare(a.dealerCode || ''));
+      // Sort by global serial number descending
+      list.sort((a, b) => {
+        const aNum = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
+        const bNum = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
+        if (aNum && bNum && aNum !== bNum) return bNum - aNum;
+        return (b.createdAt || '').localeCompare(a.createdAt || '');
+      });
       setDealers(list);
     });
     return () => unsub();
@@ -272,7 +454,12 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           setPlace(item.place || 'Sangli');
           setDeclarationDate(item.declarationDate || new Date().toISOString().slice(0, 10));
           setRemarks(item.remarks || '');
-          setOfficerName(item.officerName || 'SHRIDHAR BALKRUSHNA SHINDE');
+          // Preserve strictly the officer name of the user who filled the form
+          const origOfficer = item.officerName || item.created_by_name || (item.userId && usersMap[item.userId]) || (item.created_by_user_id && usersMap[item.created_by_user_id]) || (item.loginId && usersMap[item.loginId.toLowerCase()]) || '';
+          const displayOfficer = (origOfficer || profile.fullName || 'OFFICER').toUpperCase();
+          setOfficerName(displayOfficer);
+          setCreatedByUserId(item.created_by_user_id || item.createdByUid || item.userId || '');
+          setCreatedByName(displayOfficer);
           setOfficeDate(item.officeDate || '');
           setOfficeTime(item.officeTime || '');
           setOfficePlace(item.officePlace || '');
@@ -283,12 +470,89 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     }
   }, [viewMode, currentId]);
 
-  const resetForm = (customCode?: string) => {
-    const nextCode = customCode || `DEALER ${String(dealers.length + 1).padStart(3, '0')}`;
+  // Global Auto-Increment Sequence Counter (Guaranteed continuous sequence across ALL users)
+  const allocateGlobalDealerCode = async (): Promise<string> => {
+    const seqRef = doc(db, 'config', 'dealer_sequence');
+
+    // 1. Scan existing applications in Firestore to know the current highest saved number
+    let maxKnownFromDocs = 0;
+    try {
+      const snapAll = await getDocs(collection(db, 'dealers_application'));
+      snapAll.forEach((d) => {
+        const data = d.data();
+        if (!data.isArchived) {
+          const raw = String(data.dealerCode || '').trim();
+          const n = parseInt(raw.replace(/\D/g, ''), 10);
+          if (!isNaN(n) && n > maxKnownFromDocs) {
+            maxKnownFromDocs = n;
+          }
+        }
+      });
+    } catch (e) {
+      console.warn('Could not scan existing dealer codes:', e);
+    }
+
+    // 2. Perform atomic transaction on config/dealer_sequence document
+    try {
+      const nextCode = await runTransaction(db, async (transaction) => {
+        const snap = await transaction.get(seqRef);
+        let currentInSeq = 0;
+        if (snap.exists()) {
+          currentInSeq = Number(snap.data()?.currentSequence) || 0;
+        }
+
+        // Sequence must strictly continue from the highest saved number across all users
+        const baseNum = Math.max(currentInSeq, maxKnownFromDocs, globalSequence);
+        const nextNum = baseNum + 1;
+
+        transaction.set(
+          seqRef,
+          { 
+            currentSequence: nextNum, 
+            lastAllocatedAt: new Date().toISOString() 
+          },
+          { merge: true }
+        );
+
+        return String(nextNum).padStart(3, '0');
+      });
+
+      setGlobalSequence(parseInt(nextCode, 10));
+      return nextCode;
+    } catch (txErr) {
+      console.warn('Transaction fallback for dealer sequence:', txErr);
+      const fallbackNum = Math.max(maxKnownFromDocs, globalSequence) + 1;
+      const formatted = String(fallbackNum).padStart(3, '0');
+      try {
+        await setDoc(
+          seqRef,
+          { currentSequence: fallbackNum, lastAllocatedAt: new Date().toISOString() },
+          { merge: true }
+        );
+        setGlobalSequence(fallbackNum);
+      } catch (err) {
+        console.error('Failed fallback write to sequence config:', err);
+      }
+      return formatted;
+    }
+  };
+
+  const resetForm = async (customCode?: string) => {
+    // Determine the next preview number: strictly highest existing + 1
+    let previewNum = (globalSequence || 0) + 1;
+    if (dealers.length > 0) {
+      const maxInLocal = dealers.reduce((max, d) => {
+        const n = parseInt(String(d.dealerCode || '').replace(/\D/g, ''), 10);
+        return !isNaN(n) ? Math.max(max, n) : max;
+      }, 0);
+      previewNum = Math.max(previewNum, maxInLocal + 1);
+    }
+    const previewCode = customCode || String(previewNum).padStart(3, '0');
+
     setCurrentId(null);
     setCenter('');
     setShopOpeningDate(new Date().toISOString().slice(0, 10));
-    setDealerCode(nextCode);
+    setDealerCode(previewCode);
     setVillage('');
     setSecurityDeposit('NA');
     setDealershipAddressPhoto('');
@@ -313,15 +577,27 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     setPlace('Sangli');
     setDeclarationDate(new Date().toISOString().slice(0, 10));
     setRemarks('');
-    setOfficerName('SHRIDHAR BALKRUSHNA SHINDE');
+    // For a new form: the officer is strictly the logged-in user filling the form
+    const myName = (profile.fullName || profile.loginId || 'OFFICER').toUpperCase();
+    setOfficerName(myName);
+    setCreatedByUserId(profile.uid || '');
+    setCreatedByName(myName);
     setOfficeDate(new Date().toISOString().slice(0, 10));
     setOfficeTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }));
     setOfficePlace('SANGLI');
     setStatus('Approved');
     setIsEditing(true);
+    setViewMode('form');
   };
 
-  const loadDealerToForm = (item: DealershipFormItem, editMode: boolean = false) => {
+  // ============================================================================
+  // PERMANENT ARCHITECTURAL LOCK:
+  // When a user clicks on any saved dealer's name (किंवा डीलर कोड / कार्ड / रो),
+  // loadDealerToForm directly and immediately opens their full dealership application form.
+  // NO intermediate modal, popup, action drawer, or confirmation dialog should EVER intercept.
+  // Do not revert this behavior under any circumstances!
+  // ============================================================================
+  const loadDealerToForm = (item: DealershipFormItem, editMode: boolean = true) => {
     setCurrentId(item.id);
     setCenter(item.center || '');
     setShopOpeningDate(item.shopOpeningDate || '');
@@ -350,13 +626,22 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     setPlace(item.place || 'Sangli');
     setDeclarationDate(item.declarationDate || new Date().toISOString().slice(0, 10));
     setRemarks(item.remarks || '');
-    setOfficerName(item.officerName || 'SHRIDHAR BALKRUSHNA SHINDE');
+    // Strictly display the officer name of the user who filled the form!
+    const originalOfficer = item.officerName || item.created_by_name || (item.userId && usersMap[item.userId]) || (item.created_by_user_id && usersMap[item.created_by_user_id]) || (item.loginId && usersMap[item.loginId.toLowerCase()]) || '';
+    const displayOfficer = (originalOfficer || profile.fullName || 'OFFICER').toUpperCase();
+    setOfficerName(displayOfficer);
+    setCreatedByUserId(item.created_by_user_id || item.createdByUid || item.userId || '');
+    setCreatedByName(displayOfficer);
     setOfficeDate(item.officeDate || '');
     setOfficeTime(item.officeTime || '');
     setOfficePlace(item.officePlace || '');
     setStatus(item.status || 'Approved');
     setIsEditing(editMode);
     setViewMode('form');
+    // Scroll directly to the top so user immediately views the form
+    if (typeof window !== 'undefined') {
+      window.scrollTo({ top: 0, behavior: 'instant' });
+    }
   };
 
   const [dialogConfig, setDialogConfig] = useState<{
@@ -388,13 +673,31 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     }
 
     const id = currentId || `dealer_app_${Date.now()}`;
-    const generatedCode = dealerCode.trim() || `DEALER ${String(dealers.length + 1).padStart(3, '0')}`;
+
+    // For new forms: allocate Global Auto-Increment Code across ALL users atomically
+    let finalCode = dealerCode.trim();
+    if (!currentId) {
+      try {
+        finalCode = await allocateGlobalDealerCode();
+      } catch (err) {
+        console.warn('Fallback sequence allocation:', err);
+        const nextNum = (globalSequence || 0) + 1;
+        finalCode = String(nextNum).padStart(3, '0');
+      }
+    }
+
+    // Preserve the original officer name and creator UID
+    const finalOfficer = currentId 
+      ? (officerName || createdByName || profile.fullName || '').toUpperCase()
+      : (profile.fullName || profile.loginId || officerName || 'OFFICER').toUpperCase();
+    const finalCreatorId = currentId ? (createdByUserId || profile.uid) : profile.uid;
+    const finalCreatorName = currentId ? (createdByName || finalOfficer) : (profile.fullName || profile.loginId || 'OFFICER');
 
     const payload: DealershipFormItem = {
       id,
       center: center.trim(),
       shopOpeningDate,
-      dealerCode: generatedCode,
+      dealerCode: finalCode,
       village: village.trim(),
       securityDeposit: securityDeposit.trim(),
       dealershipAddressPhoto,
@@ -422,13 +725,15 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       officeDate,
       officeTime,
       officePlace: officePlace.trim().toUpperCase(),
-      officerName: officerName.trim().toUpperCase() || profile.fullName?.toUpperCase() || '',
+      officerName: finalOfficer,
+      created_by_user_id: finalCreatorId,
+      created_by_name: finalCreatorName,
       status,
       isArchived: false,
-      ownerId: profile.uid,
-      userId: profile.uid,
+      ownerId: finalCreatorId,
+      userId: finalCreatorId,
       loginId: profile.loginId || '',
-      createdByUid: profile.uid,
+      createdByUid: finalCreatorId,
       updatedAt: new Date().toISOString(),
     };
 
@@ -442,15 +747,29 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         currentId ? 'UPDATE' : 'CREATE',
         'dealers_application',
         id,
-        `${currentId ? 'Updated' : 'Created'} Dealership Form for ${payload.firmName} (${payload.dealerCode})`,
+        `${currentId ? 'Updated' : 'Created'} Dealership Form for ${payload.firmName} (${payload.dealerCode}) by ${payload.officerName}`,
         profile
       );
 
       setCurrentId(id);
-      setDealerCode(generatedCode);
+      setDealerCode(finalCode);
+      setOfficerName(finalOfficer);
+      setCreatedByUserId(finalCreatorId);
+      setCreatedByName(finalCreatorName);
       setIsEditing(false);
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
+
+      if (!currentId) {
+        setDialogConfig({
+          isOpen: true,
+          type: 'success',
+          title: `डीलर नंबर ऍड झाला: #${finalCode}`,
+          message: `डीलर डेटा यशस्वीरित्या सेव्ह झाला आहे. या फॉर्मला अधिकृत सिरीयल नंबर #${finalCode} मिळाला आहे.`,
+          confirmText: 'ठीक आहे',
+          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+        });
+      }
     } catch (err: any) {
       setDialogConfig({
         isOpen: true,
@@ -579,6 +898,19 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               className="w-full pl-11 pr-4 py-2.5 text-sm rounded-xl border border-slate-100 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-red-500 transition-all font-medium"
             />
           </div>
+
+          {/* Re-sync Serial Numbers button for Admin */}
+          {isAdmin(profile) && (
+            <button
+              type="button"
+              onClick={() => reindexAllDealersSequence(true)}
+              className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 px-3 py-2.5 rounded-xl transition text-xs font-black shrink-0 border border-slate-300 active:scale-95 shadow-xs cursor-pointer"
+              title="जुन्या सर्व डीलर्सना सलग सिरीयल नंबर (001, 002...) द्या आणि काउंटर सिंक करा"
+            >
+              <RefreshCw className="w-3.5 h-3.5 text-slate-700" />
+              <span className="hidden sm:inline">सिरीयल नंबर सिंक</span>
+            </button>
+          )}
         </div>
       )}
 
@@ -598,11 +930,12 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       {/* ======================= VIEW MODE: LIST ======================= */}
       {viewMode === 'list' && (
         <div className="space-y-4 no-print">
+
           {/* Filter Pills matching screenshot */}
           <div className="flex items-center gap-2 px-1">
             <button
               onClick={() => setActiveFilter('all')}
-              className={`px-5 py-1.5 rounded-lg text-xs font-black transition ${
+              className={`px-5 py-1.5 rounded-lg text-xs font-black transition cursor-pointer ${
                 activeFilter === 'all'
                   ? 'bg-slate-900 text-white shadow-md'
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
@@ -612,7 +945,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
             </button>
             <button
               onClick={() => setActiveFilter('active')}
-              className={`px-5 py-1.5 rounded-lg text-xs font-black transition ${
+              className={`px-5 py-1.5 rounded-lg text-xs font-black transition cursor-pointer ${
                 activeFilter === 'active'
                   ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-sm'
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
@@ -622,41 +955,149 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
             </button>
           </div>
 
-           {/* Cards List: Clean Single Line Dealer Code + Full Firm Name (No cutting) */}
-          <div className="space-y-2.5">
-            {filteredDealers.map((d) => (
-              <div
-                key={d.id}
-                onClick={() => loadDealerToForm(d, true)}
-                className="bg-white rounded-2xl border border-slate-200 hover:border-red-400 hover:shadow-md p-3.5 sm:p-4 transition-all cursor-pointer flex items-center justify-between gap-3 group relative overflow-hidden"
-              >
-                <div className="flex items-center gap-3 flex-1 min-w-0">
-                  <span className="text-xs font-black text-red-600 bg-red-50 border border-red-200 px-2.5 py-1 rounded-lg uppercase tracking-wider shrink-0 font-mono">
-                    {d.dealerCode || 'DEALER'}
-                  </span>
-                  
-                  <div className="flex-1 min-w-0">
-                    <span className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 transition-colors uppercase">
-                      {d.firmName || 'Unnamed Dealership'}
-                    </span>
+          {/* TABLE DISPLAY MODE */}
+          {listDisplayMode === 'table' && (
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="bg-slate-900 text-white font-black uppercase text-[11px]">
+                    <th className="p-3 border-b border-slate-700 w-12 text-center">Sr.</th>
+                    <th className="p-3 border-b border-slate-700 w-24">Dealer Code</th>
+                    <th className="p-3 border-b border-slate-700 min-w-[200px]">Dealer / Firm Name (क्लिक करा)</th>
+                    <th className="p-3 border-b border-slate-700 min-w-[140px]">Proprietor</th>
+                    <th className="p-3 border-b border-slate-700 min-w-[140px]">Officer</th>
+                    <th className="p-3 border-b border-slate-700 min-w-[120px]">Village / Center</th>
+                    <th className="p-3 border-b border-slate-700 w-28 text-center">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 font-medium">
+                  {filteredDealers.map((d, index) => (
+                    <tr
+                      key={d.id}
+                      onClick={() => loadDealerToForm(d, true)}
+                      className="hover:bg-red-50/60 transition cursor-pointer group"
+                    >
+                      <td className="p-3 text-center font-mono font-bold text-slate-500">
+                        {index + 1}
+                      </td>
+                      <td className="p-3 font-mono font-black text-red-600">
+                        <span className="bg-red-50 border border-red-200 px-2 py-0.5 rounded text-[11px]">
+                          #{d.dealerCode || 'DEALER'}
+                        </span>
+                      </td>
+                      <td className="p-3">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            loadDealerToForm(d, true);
+                          }}
+                          className="font-black text-slate-900 group-hover:text-red-600 hover:underline uppercase text-left transition block cursor-pointer"
+                          title="डीलरचा संपूर्ण फॉर्म उघडा"
+                        >
+                          {d.firmName || 'Unnamed Dealership'}
+                        </button>
+                      </td>
+                      <td className="p-3 font-bold text-slate-700 uppercase">
+                        {d.proprietorName || '-'}
+                      </td>
+                      <td className="p-3 font-bold text-slate-800 uppercase">
+                        {d.officerName || d.created_by_name || 'OFFICER'}
+                      </td>
+                      <td className="p-3 text-slate-600 uppercase">
+                        {d.village || d.center || '-'}
+                      </td>
+                      <td className="p-3 text-center">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            loadDealerToForm(d, true);
+                          }}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 bg-red-600 text-white rounded-lg text-[11px] font-black hover:bg-red-700 transition shadow-xs cursor-pointer active:scale-95"
+                          title="फॉर्म उघडा"
+                        >
+                          <FileText className="w-3 h-3" />
+                          <span>उघडा</span>
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {filteredDealers.length === 0 && (
+                    <tr>
+                      <td colSpan={7} className="p-8 text-center text-slate-400">
+                        कोणतेही डीलर सापडले नाहीत.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* CARDS DISPLAY MODE */}
+          {listDisplayMode === 'cards' && (
+            <div className="space-y-2.5">
+              {filteredDealers.map((d) => (
+                <div
+                  key={d.id}
+                  onClick={() => loadDealerToForm(d, true)}
+                  className="bg-white rounded-2xl border border-slate-200 hover:border-red-400 hover:shadow-md p-3.5 sm:p-4 transition-all cursor-pointer flex items-center justify-between gap-3 group relative overflow-hidden"
+                >
+                  <div className="flex items-center gap-3 flex-1 min-w-0">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        loadDealerToForm(d, true);
+                      }}
+                      className="text-xs font-black text-red-600 bg-red-50 hover:bg-red-100 border border-red-200 px-2.5 py-1 rounded-lg uppercase tracking-wider shrink-0 font-mono transition cursor-pointer"
+                      title="फॉर्म उघडण्यासाठी क्लिक करा"
+                    >
+                      #{d.dealerCode || 'DEALER'}
+                    </button>
+                    
+                    <div className="flex-1 min-w-0">
+                      {/* Direct Clickable Dealer Firm Name on single line */}
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          loadDealerToForm(d, true);
+                        }}
+                        className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 hover:underline transition-colors uppercase block text-left w-full cursor-pointer break-words leading-snug"
+                        title="डीलरचा संपूर्ण फॉर्म थेट उघडा"
+                      >
+                        {d.firmName || 'Unnamed Dealership'}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        loadDealerToForm(d, true);
+                      }}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-red-50 group-hover:bg-red-600 text-red-600 group-hover:text-white rounded-xl text-xs font-black transition border border-red-200 cursor-pointer shadow-xs active:scale-95"
+                      title="फॉर्म उघडा"
+                    >
+                      <FileText className="w-3.5 h-3.5" />
+                      <span className="hidden sm:inline">फॉर्म उघडा</span>
+                    </button>
                   </div>
                 </div>
+              ))}
 
-                <div className="flex items-center gap-2 shrink-0">
-                  <span className="text-xs font-bold text-slate-400 group-hover:text-red-600 transition">
-                    👉
-                  </span>
+              {filteredDealers.length === 0 && (
+                <div className="bg-white rounded-2xl border border-dashed border-slate-300 p-8 text-center text-slate-500">
+                  <p className="text-sm font-semibold">No dealership applications found.</p>
+                  <p className="text-xs text-slate-400 mt-1">Click "New Dealer Form" above to add the first application.</p>
                 </div>
-              </div>
-            ))}
-
-            {filteredDealers.length === 0 && (
-              <div className="bg-white rounded-2xl border border-dashed border-slate-300 p-8 text-center text-slate-500">
-                <p className="text-sm font-semibold">No dealership applications found.</p>
-                <p className="text-xs text-slate-400 mt-1">Click "New Dealer Form" above to add the first application.</p>
-              </div>
-            )}
-          </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -666,30 +1107,25 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           {/* Scrollable Container Form Sheet - Added overflow-x-auto for side-to-side scrolling on mobile */}
           <div className="bg-white rounded-2xl border-2 border-slate-300 shadow-xl overflow-x-auto print:border-none print:shadow-none print:m-0 print:p-0">
             {/* Top action toolbar inside form card */}
-            <div className="bg-slate-50 border-b border-slate-200 px-4 py-2.5 flex items-center justify-between no-print sticky left-0 min-w-max">
-              <div className="flex items-center gap-2">
+            <div className="bg-slate-50 border-b border-slate-200 p-2.5 sm:px-4 sm:py-2.5 flex flex-wrap items-center justify-between gap-2 no-print sticky left-0 w-full">
+              <div className="flex items-center gap-2 flex-wrap min-w-0">
                 <button
                   type="button"
                   onClick={() => {
-                    if (window.history.state?.dealerFormOpen) {
-                      window.history.back();
-                    } else {
-                      setViewMode('list');
-                    }
+                    setViewMode('list');
                   }}
-                  className="p-1.5 px-2.5 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 flex items-center gap-1.5 text-xs font-bold transition shadow-sm active:scale-95 cursor-pointer"
-                  title="Back to Dealer List"
+                  className="p-1.5 px-3 rounded-lg bg-white border border-slate-200 text-slate-800 hover:bg-slate-100 text-xs font-bold transition shadow-sm active:scale-95 cursor-pointer shrink-0"
+                  title="Back"
                 >
-                  <ArrowLeft className="w-4 h-4 text-slate-600" />
-                  <span>Back</span>
+                  Back
                 </button>
-                <span className="text-xs font-black text-slate-800 uppercase tracking-wide">
-                  {dealerCode || firmName || 'DEALERSHIP APPLICATION FORM'}
+                <span className="text-xs font-black text-slate-800 uppercase tracking-wide break-words">
+                  {dealerCode ? `#${dealerCode} - ` : ''}{firmName || 'DEALERSHIP APPLICATION FORM'}
                 </span>
               </div>
 
               <div className="flex items-center gap-2">
-                {(profile.role === 'owner' || profile.role === 'admin') && (
+                {(profile.role === 'owner' || profile.role === 'admin' || profile.uid === createdByUserId) && (
                   <button
                     type="button"
                     onClick={() => setIsEditing(!isEditing)}
@@ -836,9 +1272,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                 <div className="divide-y-2 divide-black bg-white border-b-2 border-black">
                   {/* Row 1: Center & Shop Opening Date */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Center -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -849,9 +1285,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                       </div>
                     </div>
 
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Date -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="date"
                           disabled={!isEditing}
@@ -865,26 +1301,28 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
                   {/* Rows for Code, Village, Security Deposit - Center sub-grid structure */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                     <div className="bg-slate-50 flex items-center justify-center p-4 relative">
-                       <span className="text-slate-300 font-black text-[9px] uppercase text-center leading-tight">DEALER STAMP & ADDRESS</span>
+                     <div className="bg-white flex items-center justify-center p-4 relative">
                      </div>
                      <div className="divide-y-2 divide-black">
-                        <div className="flex items-center p-0 h-9">
-                          <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Code</span>
-                          <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                        <div className="flex items-center p-0 min-h-[38px] py-0.5">
+                          <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter flex items-center justify-between">
+                            <span>Code</span>
+                            <span className="text-[7.5px] font-black text-red-600 uppercase tracking-tighter mr-1 bg-red-50 border border-red-200 px-1 py-0.5 rounded">Auto Serial</span>
+                          </span>
+                          <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                             <input
                               type="text"
-                              disabled={!isEditing}
+                              disabled={!isAdmin(profile) || !isEditing}
                               value={dealerCode}
-                              onChange={(e) => setDealerCode(e.target.value)}
-                              className="w-full bg-transparent font-black text-red-600 focus:outline-none"
-                              placeholder="DEALER-004"
+                              onChange={(e) => isAdmin(profile) && setDealerCode(e.target.value)}
+                              className="w-full bg-transparent font-black text-red-600 focus:outline-none font-mono text-sm uppercase"
+                              placeholder="AUTO"
                             />
                           </div>
                         </div>
-                        <div className="flex items-center p-0 h-9">
+                        <div className="flex items-center p-0 min-h-[38px] py-0.5">
                           <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Village</span>
-                          <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                          <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                             <input
                               type="text"
                               disabled={!isEditing}
@@ -894,9 +1332,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                             />
                           </div>
                         </div>
-                        <div className="flex items-center p-0 h-9">
+                        <div className="flex items-center p-0 min-h-[38px] py-0.5">
                           <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Deposit</span>
-                          <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                          <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                             <input
                               type="text"
                               disabled={!isEditing}
@@ -910,9 +1348,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   </div>
 
                   {/* Row 3: Firm Name */}
-                  <div className="flex items-center p-0 h-9">
+                  <div className="flex items-center p-0 min-h-[38px] py-0.5">
                     <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Firm Name -</span>
-                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                    <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                       <input
                         type="text"
                         required
@@ -925,9 +1363,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   </div>
 
                   {/* Row 4: Proprietor Name */}
-                  <div className="flex items-center p-0 h-9">
+                  <div className="flex items-center p-0 min-h-[38px] py-0.5">
                     <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Proprietor Name -</span>
-                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                    <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                       <input
                         type="text"
                         required
@@ -941,11 +1379,11 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
                   {/* Row 5: Contact Number & State */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 flex items-center gap-1 px-2 uppercase tracking-tighter text-[10px]">
                         <Phone className="w-3 h-3 text-red-600" /> Contact -
                       </span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="tel"
                           required
@@ -956,9 +1394,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">State</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -971,11 +1409,11 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   </div>
 
                   {/* Row 6: E-mail ID */}
-                  <div className="flex items-center p-0 h-9">
+                  <div className="flex items-center p-0 min-h-[38px] py-0.5">
                     <span className="font-black text-black w-44 shrink-0 flex items-center gap-1 px-2 uppercase tracking-tighter">
                       <Mail className="w-3 h-3 text-red-600" /> E-mail ID -
                     </span>
-                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                    <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                       <input
                         type="email"
                         disabled={!isEditing}
@@ -988,9 +1426,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
                   {/* Row 7: Responsible Person & Contact */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">Responsible Person -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1000,9 +1438,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">Contact</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="tel"
                           disabled={!isEditing}
@@ -1016,9 +1454,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
                   {/* Row 8: Aadhaar No & District */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Aadhaar No -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1028,9 +1466,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">District</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1044,9 +1482,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
                   {/* Row 9: Pan No & Date of Birth */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Pan No -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1056,9 +1494,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">D.O.B.</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="date"
                           disabled={!isEditing}
@@ -1072,9 +1510,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
                   {/* Row 10: GST No & Pin Code */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">GST No -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1084,9 +1522,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">Pin Code</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1105,9 +1543,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                 </div>
 
                 <div className="divide-y-2 divide-black bg-white border-b-2 border-black">
-                  <div className="flex items-center p-0 h-9">
+                  <div className="flex items-center p-0 min-h-[38px] py-0.5">
                     <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Bank Name -</span>
-                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                    <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                       <input
                         type="text"
                         disabled={!isEditing}
@@ -1118,9 +1556,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                     </div>
                   </div>
 
-                  <div className="flex items-center p-0 h-9">
+                  <div className="flex items-center p-0 min-h-[38px] py-0.5">
                     <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Bank Address -</span>
-                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                    <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                       <input
                         type="text"
                         disabled={!isEditing}
@@ -1132,9 +1570,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   </div>
 
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Account No -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1144,9 +1582,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-9">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">IFSC Code -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1165,9 +1603,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                     </span>
                   </div>
 
-                  <div className="flex items-center p-0 h-9">
+                  <div className="flex items-center p-0 min-h-[38px] py-0.5">
                     <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Cheque no -</span>
-                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                    <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                       <input
                         type="text"
                         disabled={!isEditing}
@@ -1256,7 +1694,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                     <div className="flex flex-col items-center shrink-0 w-64 pb-1">
                       <div className="text-center w-full">
                         <div className="text-xs font-black text-black uppercase mb-1">
-                          {profile.fullName || 'OFFICER'}
+                          {officerName || createdByName || profile.fullName || 'OFFICER'}
                         </div>
                         <div className="border-t-2 border-black w-full mb-1"></div>
                         <div className="text-[10px] font-black text-black uppercase tracking-tight">
@@ -1276,7 +1714,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       {/* ======================= PHOTO SELECTION MODAL ======================= */}
       {showPhotoModal && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 no-print animate-in fade-in duration-150">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-5 space-y-4 border border-slate-200 font-sans">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-5 space-y-4 border border-slate-200 font-sans max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b pb-3">
               <div className="flex items-center gap-2">
                 <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-700">

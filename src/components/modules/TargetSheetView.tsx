@@ -492,9 +492,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile, lang }) => {
           <div className="grid grid-cols-3 divide-x-2 divide-black border-b-2 border-black bg-white text-[10px]">
             {/* Column 1: Basic Info */}
             <div className="divide-y-2 divide-black">
-              <div className="flex items-center p-0 h-10">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5">
                 <span className="font-black text-black w-24 shrink-0 px-2 uppercase tracking-tighter">Officer -</span>
-                <div className="flex-1 border-l-2 border-black h-full flex items-center px-1">
+                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
                   <input disabled={isOwnerView} 
                     type="text" 
                     value={sheet.fullName} 
@@ -504,9 +504,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile, lang }) => {
                 </div>
               </div>
 
-              <div className="flex items-center p-0 h-10">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5">
                 <span className="font-black text-black w-24 shrink-0 px-2 uppercase tracking-tighter">Designation -</span>
-                <div className="flex-1 border-l-2 border-black h-full flex items-center px-1">
+                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
                   <input disabled={isOwnerView} 
                     type="text" 
                     value={sheet.designation} 
@@ -516,9 +516,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile, lang }) => {
                 </div>
               </div>
 
-              <div className="flex items-center p-0 h-10">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5">
                 <span className="font-black text-black w-24 shrink-0 px-2 uppercase tracking-tighter">Center (HQ) -</span>
-                <div className="flex-1 border-l-2 border-black h-full flex items-center px-1">
+                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
                   <input disabled={isOwnerView} 
                     type="text" 
                     value={sheet.center} 
@@ -531,9 +531,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile, lang }) => {
 
             {/* Column 2: Sales Data */}
             <div className="divide-y-2 divide-black">
-              <div className="flex items-center p-0 h-10">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5">
                 <span className="font-black text-black w-28 shrink-0 px-2 uppercase tracking-tighter">L.Y. Sale -</span>
-                <div className="flex-1 border-l-2 border-black h-full flex items-center justify-center px-1">
+                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
                   <input disabled={isOwnerView} 
                     type="number" 
                     value={sheet.lastYearSale || ''} 
@@ -544,9 +544,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile, lang }) => {
                 </div>
               </div>
 
-              <div className="flex items-center p-0 h-10 bg-red-50/50">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-red-50/50">
                 <span className="font-black text-red-600 w-28 shrink-0 px-2 uppercase tracking-tighter">Target -</span>
-                <div className="flex-1 border-l-2 border-black h-full flex items-center justify-center px-1">
+                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
                   <input disabled={isOwnerView} 
                     type="number" 
                     value={sheet.salesTarget || ''} 
@@ -557,9 +557,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile, lang }) => {
                 </div>
               </div>
 
-              <div className="flex items-center p-0 h-10">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5">
                 <span className="font-black text-black w-28 shrink-0 px-2 uppercase tracking-tighter">L.Y. Outstd -</span>
-                <div className="flex-1 border-l-2 border-black h-full flex items-center justify-center px-1">
+                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
                   <input disabled={isOwnerView} 
                     type="number" 
                     value={sheet.lastYearOutstanding || ''} 
@@ -573,9 +573,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile, lang }) => {
 
             {/* Column 3: Collection Data & Calculations */}
             <div className="divide-y-2 divide-black">
-              <div className="flex items-center p-0 h-10">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5">
                 <span className="font-black text-black w-28 shrink-0 px-2 uppercase tracking-tighter">L.Y. Coll. -</span>
-                <div className="flex-1 border-l-2 border-black h-full flex items-center justify-center px-1">
+                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
                   <input disabled={isOwnerView} 
                     type="number" 
                     value={sheet.lastYearCollection || ''} 
@@ -586,9 +586,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile, lang }) => {
                 </div>
               </div>
 
-              <div className="flex items-center p-0 h-10 bg-amber-50">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-amber-50">
                 <span className="font-black text-amber-900 w-28 shrink-0 px-2 uppercase tracking-tighter text-[9px]">Curr. L.Y. Outstd -</span>
-                <div className="flex-1 border-l-2 border-black h-full flex items-center justify-center px-1">
+                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
                   <span className="w-full font-black text-amber-900 font-mono text-center">
                     {(sheet.lastYearOutstanding - sheet.lastYearCollection).toFixed(2)}
                   </span>
@@ -596,9 +596,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile, lang }) => {
                 </div>
               </div>
 
-              <div className="flex items-center p-0 h-10 bg-blue-50">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-blue-50">
                 <span className="font-black text-blue-800 w-28 shrink-0 px-2 uppercase tracking-tighter">Coll. Target -</span>
-                <div className="flex-1 border-l-2 border-black h-full flex items-center justify-center px-1">
+                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
                   <input disabled={isOwnerView} 
                     type="number" 
                     value={sheet.collectionPercent || ''} 

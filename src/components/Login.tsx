@@ -163,7 +163,13 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
   };
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-start pt-6 pb-10 sm:py-12 sm:justify-center bg-slate-50 p-4 sm:p-6 font-sans">
+    <div 
+      className="min-h-dvh flex flex-col items-center justify-start sm:justify-center bg-slate-50 p-4 sm:p-6 font-sans"
+      style={{
+        paddingTop: 'max(1.5rem, calc(1rem + env(safe-area-inset-top, 0px)))',
+        paddingBottom: 'max(2.5rem, calc(1.5rem + env(safe-area-inset-bottom, 0px)))',
+      }}
+    >
       <div className="w-full max-w-sm bg-white rounded-3xl shadow-xl p-6 sm:p-8 border border-slate-100 flex flex-col items-center text-center">
         {/* Brand Logo Header */}
         <div className="mb-4 flex items-center justify-center overflow-hidden">

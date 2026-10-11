@@ -58,3 +58,52 @@ input[type="number"] {
   -moz-appearance: textfield;
 }
 
+/* Identical mobile viewport & safe area rules for both browser link and installed mobile app */
+html, body {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  overscroll-behavior-y: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  height: 100%;
+  min-width: 320px;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+/* Fluid typography and anti-clipping for Marathi and English text */
+p, span, h1, h2, h3, h4, h5, h6, label, button, a {
+  overflow-wrap: break-word;
+}
+
+/* Ensure interactive controls maintain touch targets and expand gracefully if font size is increased */
+button, input, select, textarea {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+#root {
+  min-height: 100%;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Standalone & Browser Header Top Padding (protects notch / camera cutout) */
+.mobile-safe-header {
+  padding-top: calc(0.625rem + env(safe-area-inset-top, 0px));
+}
+
+/* Standalone & Browser Bottom Nav Padding (protects swipe gesture bar / home indicator) */
+.mobile-safe-nav {
+  padding-bottom: max(0.5rem, calc(0.375rem + env(safe-area-inset-bottom, 0px)));
+}
+
+/* Content Container Bottom Clearance */
+.mobile-safe-container {
+  padding-bottom: calc(5.25rem + env(safe-area-inset-bottom, 0px));
+}
+
+

@@ -495,8 +495,13 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             </div>
           ) : (
             <div className="flex items-center gap-2 px-3 py-2 bg-slate-100 border border-slate-200 rounded-xl text-xs font-black uppercase text-slate-800">
-              <UserIcon className="w-4 h-4 text-slate-500" />
-              <span>{profile.fullName || 'OFFICER'} ({profile.designation || 'OFFICER'})</span>
+              <UserIcon className="w-4 h-4 text-slate-500 shrink-0" />
+              <div className="flex items-baseline gap-1.5 flex-wrap">
+                <span className="font-black text-slate-900">{profile.fullName || 'OFFICER'}</span>
+                <span className="text-[10px] font-bold text-slate-500 bg-white border border-slate-200 px-1 py-0.5 rounded">
+                  ({profile.designation || 'OFFICER'})
+                </span>
+              </div>
             </div>
           )}
 
@@ -619,33 +624,33 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             </span>
           </div>
 
-          {/* 3. Header Fields: Officer Name, Designation, Date (Strictly exact options only) */}
-          <div className="grid grid-cols-[1.2fr_1fr_0.8fr] divide-x-2 divide-black border-b-2 border-black bg-white text-[11px] font-black">
+          {/* 3. Header Fields: Officer Name, Designation, Date */}
+          <div className="grid grid-cols-[1.9fr_0.85fr_0.75fr] divide-x-2 divide-black border-b-2 border-black bg-white text-[11px] font-black">
             
-            {/* Officer Name */}
+            {/* Officer Name - Fully visible with expanded width */}
             <div className="flex items-center p-0 min-h-10">
-              <span className="font-black text-black shrink-0 px-2 uppercase tracking-tighter">Officer Name -</span>
-              <div className="flex-1 border-l-2 border-black h-full flex items-center px-2 min-w-0">
+              <span className="font-black text-black shrink-0 px-2 uppercase tracking-tighter text-xs">Officer Name -</span>
+              <div className="flex-1 border-l-2 border-black min-h-10 flex items-center px-2 min-w-0">
                 <input 
                   type="text" 
                   value={sheet.officerName} 
                   onChange={e => setSheet({ ...sheet, officerName: e.target.value.toUpperCase() })} 
                   placeholder="OFFICER NAME"
-                  className="w-full bg-transparent font-black text-black uppercase focus:outline-none text-left" 
+                  className="w-full bg-transparent font-black text-black uppercase focus:outline-none text-left text-xs sm:text-[12.5px] tracking-tight" 
                 />
               </div>
             </div>
 
-            {/* Designation */}
-            <div className="flex items-center p-0 min-h-10">
-              <span className="font-black text-black shrink-0 px-2 uppercase tracking-tighter whitespace-nowrap">Designation -</span>
-              <div className="flex-1 border-l-2 border-black h-full flex items-center px-2 min-w-0">
+            {/* Designation - Compressed and compact */}
+            <div className="flex items-center p-0 min-h-10 bg-slate-50/40">
+              <span className="font-black text-slate-800 shrink-0 px-2 uppercase tracking-tighter whitespace-nowrap text-[9px] sm:text-[9.5px]">Designation -</span>
+              <div className="flex-1 border-l-2 border-black min-h-10 flex items-center px-2 min-w-0">
                 <input 
                   type="text" 
                   value={sheet.designation} 
                   onChange={e => setSheet({ ...sheet, designation: e.target.value.toUpperCase() })} 
                   placeholder="DESIGNATION"
-                  className="w-full bg-transparent font-black text-black uppercase focus:outline-none text-left" 
+                  className="w-full bg-transparent font-black text-slate-800 uppercase focus:outline-none text-left text-[9px] sm:text-[9.5px] tracking-tight" 
                 />
               </div>
             </div>
@@ -653,7 +658,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             {/* Date */}
             <div className="flex items-center p-0 min-h-10 bg-slate-50">
               <span className="font-black text-black shrink-0 px-2 uppercase tracking-tighter whitespace-nowrap">Date -</span>
-              <div className="flex-1 border-l-2 border-black h-full flex items-center justify-center px-2 min-w-0">
+              <div className="flex-1 border-l-2 border-black min-h-10 flex items-center justify-center px-2 min-w-0">
                 <span className="font-black text-black text-center uppercase whitespace-nowrap">
                   {sheet.monthName} {sheet.yearNumber}
                 </span>
@@ -708,7 +713,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                           onKeyDown={e => handleRouteKeyDown(idx, e)}
                           onChange={e => updateRow(idx, { route: e.target.value.toUpperCase() })}
                           placeholder={isSunday ? "SUNDAY / OFF" : "ENTER ROUTE"}
-                          className="w-full px-1.5 py-0.5 bg-transparent border-none focus:outline-none font-black uppercase text-center text-[10.5px] truncate block leading-tight" 
+                          className="w-full px-1.5 py-0.5 bg-transparent border-none focus:outline-none font-black uppercase text-center text-[10.5px] truncate block leading-tight whitespace-nowrap" 
                         />
                       </td>
 

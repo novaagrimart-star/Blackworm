@@ -74,20 +74,20 @@ export function isUserRecord(record: any, user?: Partial<UserProfile> | null): b
   const userName = (user.fullName || '').trim().toLowerCase();
   const userMobile = (user.mobileNumber || '').replace(/\D/g, '').slice(-10);
 
-  // Check IDs in record
-  const recUid = (record.ownerId || record.userId || record.collectedByUid || record.createdByUid || record.uid || '').toString().trim().toLowerCase();
+  // Check creator / owner user ID in record
+  const recUid = (record.created_by_user_id || record.createdByUid || record.userId || record.ownerId || record.collectedByUid || record.uid || '').toString().trim().toLowerCase();
   if (userUid && recUid === userUid) return true;
 
   // Check Login ID in record
   const recLoginId = (record.loginId || '').toString().trim().toLowerCase();
   if (userLoginId && recLoginId === userLoginId) return true;
 
-  // Check User Code in record
-  const recCode = (record.userCode || record.dealerCode || '').toString().trim().toLowerCase();
+  // Check User Code in record (do NOT match dealerCode, only userCode)
+  const recCode = (record.userCode || record.createdByUserCode || '').toString().trim().toLowerCase();
   if (userCode && recCode && (recCode === userCode || recCode.replace(/^emp-/, '') === userCode.replace(/^emp-/, ''))) return true;
 
   // Check Full Name
-  const recName = (record.createdByName || record.collectedByName || record.officerName || record.userName || record.fullName || '').toString().trim().toLowerCase();
+  const recName = (record.created_by_name || record.createdByName || record.collectedByName || record.officerName || record.userName || record.fullName || '').toString().trim().toLowerCase();
   if (userName && recName && (recName === userName || recName.includes(userName) || userName.includes(recName))) return true;
 
   // Check Phone Number

@@ -269,12 +269,19 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
         if (b.role === 'owner' && a.role !== 'owner') return 1;
         return (a.fullName || '').localeCompare(b.fullName || '');
       });
-      setUsers(list);
+
+      // Data Isolation: If standard user, strictly show ONLY own profile. Admin sees all users.
+      if (!isAdmin(profile)) {
+        const ownUsers = list.filter((u) => u.uid === profile.uid || (u.loginId && profile.loginId && u.loginId.toLowerCase() === profile.loginId.toLowerCase()));
+        setUsers(ownUsers);
+      } else {
+        setUsers(list);
+      }
     }, (error) => {
       console.error("Users firestore error:", error);
     });
     return () => unsubscribe();
-  }, []);
+  }, [profile]);
 
   // Branding listener
   useEffect(() => {
@@ -836,18 +843,16 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
         </div>
       )}
 
-      {/* ======================= TOP BAR (LIST VIEW) ======================= */}
-      {viewMode === 'list' && (
+      {/* ======================= TOP BAR (LIST VIEW - ADMIN ONLY) ======================= */}
+      {viewMode === 'list' && isAdmin(profile) && (
         <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-md flex items-center gap-3 no-print">
-          {isAdmin(profile) && (
-            <button
-              onClick={() => resetForm()}
-              className="flex items-center justify-center bg-red-600 hover:bg-red-700 text-white p-2.5 rounded-xl transition shadow-lg shrink-0 active:scale-95 cursor-pointer"
-              title="New User Form"
-            >
-              <UserPlus className="w-6 h-6 stroke-[3.5px]" />
-            </button>
-          )}
+          <button
+            onClick={() => resetForm()}
+            className="flex items-center justify-center bg-red-600 hover:bg-red-700 text-white p-2.5 rounded-xl transition shadow-lg shrink-0 active:scale-95 cursor-pointer"
+            title="New User Form"
+          >
+            <UserPlus className="w-6 h-6 stroke-[3.5px]" />
+          </button>
 
           <div className="relative flex-1">
             <Search className="w-5 h-5 absolute left-3.5 top-2.5 text-slate-400" />
@@ -878,36 +883,42 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
       {/* ======================= VIEW MODE: LIST ======================= */}
       {viewMode === 'list' && (
         <div className="space-y-4 no-print">
-          {/* Filter Pills */}
-          <div className="flex items-center gap-2 px-1 overflow-x-auto pb-1">
-            <button
-              onClick={() => setActiveFilter('all')}
-              className={`px-4 py-1.5 rounded-lg text-xs font-black transition shrink-0 ${
-                activeFilter === 'all'
-                  ? 'bg-slate-900 text-white shadow-md'
-                  : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
-              }`}
-            >
-              All Users ({users.length})
-            </button>
-            {SYSTEM_ROLES.map((r) => {
-              const count = users.filter((u) => u.role === r.id).length;
-              if (count === 0 && activeFilter !== r.id) return null;
-              return (
-                <button
-                  key={r.id}
-                  onClick={() => setActiveFilter(r.id)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-black transition shrink-0 ${
-                    activeFilter === r.id
-                      ? 'bg-red-600 text-white shadow-sm'
-                      : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
-                  }`}
-                >
-                  {r.label} ({count})
-                </button>
-              );
-            })}
-          </div>
+          {/* Filter Pills for Admin only */}
+          {isAdmin(profile) ? (
+            <div className="flex items-center gap-2 px-1 overflow-x-auto pb-1">
+              <button
+                onClick={() => setActiveFilter('all')}
+                className={`px-4 py-1.5 rounded-lg text-xs font-black transition shrink-0 ${
+                  activeFilter === 'all'
+                    ? 'bg-slate-900 text-white shadow-md'
+                    : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
+                }`}
+              >
+                All Users ({users.length})
+              </button>
+              {SYSTEM_ROLES.map((r) => {
+                const count = users.filter((u) => u.role === r.id).length;
+                if (count === 0 && activeFilter !== r.id) return null;
+                return (
+                  <button
+                    key={r.id}
+                    onClick={() => setActiveFilter(r.id)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-black transition shrink-0 ${
+                      activeFilter === r.id
+                        ? 'bg-red-600 text-white shadow-sm'
+                        : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    {r.label} ({count})
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="text-xs font-black text-slate-800 uppercase px-1">
+              माझे युझर प्रोफाईल (My User Profile)
+            </div>
+          )}
 
           {/* User Cards Grid: Strictly Code and Full Name in Single Line */}
           <div className="space-y-2.5">
@@ -923,9 +934,12 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                   </span>
                   
                   <div className="flex-1 min-w-0">
-                    <h3 className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 transition-colors uppercase truncate tracking-wide">
+                    <h3 className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 transition-colors uppercase tracking-wide block break-words leading-snug">
                       {u.fullName || 'Unnamed User'}
                     </h3>
+                    <span className="text-[10px] font-bold text-slate-500 uppercase block mt-0.5 break-words">
+                      {u.designation || u.role} {u.center && `• ${u.center}`}
+                    </span>
                   </div>
                 </div>
 
@@ -952,8 +966,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
         <div className="space-y-4">
           <div className="bg-white rounded-2xl border-2 border-slate-300 shadow-xl overflow-x-auto print:border-none print:shadow-none print:m-0 print:p-0">
             {/* Top Action Toolbar inside form card */}
-            <div className="bg-slate-50 border-b border-slate-200 px-4 py-2.5 flex items-center justify-between no-print sticky left-0 min-w-max">
-              <div className="flex items-center gap-2">
+            <div className="bg-slate-50 border-b border-slate-200 p-2.5 sm:px-4 sm:py-2.5 flex flex-wrap items-center justify-between gap-2 no-print sticky left-0 w-full">
+              <div className="flex items-center gap-2 flex-wrap min-w-0">
                 <button
                   type="button"
                   onClick={() => {
@@ -1002,7 +1016,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                     title="Save Form"
                   >
                     <Save className="w-3.5 h-3.5" />
-                    <span>{isAdmin(profile) ? 'Save' : 'अपडेट विनंती पाठवा (Submit for Approval)'}</span>
+                    <span>{isAdmin(profile) ? 'Save' : 'Submit for Approval'}</span>
                   </button>
                 )}
 
@@ -1026,7 +1040,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                   <Printer className="w-4 h-4" />
                 </button>
 
-                {currentUid && (
+                {isAdmin(profile) && currentUid && (
                   <button
                     type="button"
                     onClick={() => handleDelete(currentUid, fullName)}
@@ -1038,6 +1052,16 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                 )}
               </div>
             </div>
+
+            {/* Pending Approval Notice for Standard User */}
+            {!isAdmin(profile) && pendingRequests.some(r => r.targetUserId === profile.uid || r.requestedByUid === profile.uid) && (
+              <div className="mx-4 sm:mx-6 mt-3 p-3 bg-amber-50 border-2 border-amber-300 text-amber-950 rounded-xl text-xs font-bold flex items-center justify-between shadow-xs no-print">
+                <div className="flex items-center gap-2">
+                  <Clock className="w-4 h-4 text-amber-600 animate-pulse shrink-0" />
+                  <span>तुमच्या प्रोफाईल बदलांची विनंती ॲडमिन मंजुरीसाठी प्रलंबित आहे. ॲडमिनने मंजूर केल्यानंतर नवीन माहिती लगेच लागू होईल.</span>
+                </div>
+              </div>
+            )}
 
             {/* Official Full Page Form */}
             <form id="user-profile-form" onSubmit={handleSave} className="p-4 sm:p-6 space-y-0 text-[11px] min-w-[800px] sm:min-w-0 font-sans">
@@ -1109,18 +1133,21 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                 <div className="divide-y-2 divide-black bg-white text-[11px]">
                   {/* Row 1: User / Emp Code No (Auto Generated & Manually Editable) & Joining Date */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-10 bg-slate-50/50">
-                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">User / Emp Code No -</span>
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-slate-50/50">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter flex items-center gap-1">
+                        User / Emp Code No -
+                        {!isAdmin(profile) && <span title="Locked by Admin"><Lock className="w-3 h-3 text-slate-500" /></span>}
+                      </span>
                       <div className="flex-1 border-l-2 border-black h-full flex items-center justify-between px-3 gap-2">
                         <input
                           type="text"
-                          disabled={!isEditing}
+                          disabled={!isAdmin(profile) || !isEditing}
                           value={userCode}
-                          onChange={(e) => setUserCode(e.target.value)}
+                          onChange={(e) => isAdmin(profile) && setUserCode(e.target.value)}
                           placeholder={calculateNextUserCode(role, users)}
-                          className="w-full bg-transparent font-black text-red-600 focus:outline-none font-mono text-sm uppercase disabled:text-red-600"
+                          className="w-full bg-transparent font-black text-red-600 focus:outline-none font-mono text-sm uppercase disabled:text-red-600 disabled:opacity-90"
                         />
-                        {isEditing && (
+                        {isAdmin(profile) && isEditing && (
                           <button
                             type="button"
                             onClick={() => setUserCode(calculateNextUserCode(role, users))}
@@ -1130,16 +1157,17 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                             Auto (#{calculateNextUserCode(role, users)})
                           </button>
                         )}
-                        {!isEditing && (
-                          <span className="text-[9px] font-bold text-slate-500 uppercase tracking-tight bg-white border border-slate-200 px-1.5 py-0.5 rounded shrink-0">
-                            No. {userCode || calculateNextUserCode(role, users)}
+                        {!isAdmin(profile) && (
+                          <span className="text-[9px] font-bold text-slate-500 uppercase tracking-tight bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded shrink-0 flex items-center gap-1">
+                            <Lock className="w-2.5 h-2.5" />
+                            कायमस्वरूपी (Locked)
                           </span>
                         )}
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Joining Date -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="date"
                           disabled={!isEditing}
@@ -1151,25 +1179,27 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                     </div>
                   </div>
 
-                  {/* Row 2: Full Name & Designation */}
-                  <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-10">
-                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Full Name -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
-                        <input
-                          type="text"
-                          required
-                          disabled={!isEditing}
-                          value={fullName}
-                          onChange={(e) => setFullName(e.target.value)}
-                          placeholder="SHRIDHAR BALKRUSHNA SHINDE"
-                          className="w-full bg-transparent font-black text-black uppercase focus:outline-none"
-                        />
-                      </div>
+                  {/* Row 2: Full Name (Dedicated Full Single Line Across Entire Form) */}
+                  <div className="flex items-center p-0 min-h-[40px] py-0.5">
+                    <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Full Name -</span>
+                    <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                      <input
+                        type="text"
+                        required
+                        disabled={!isEditing}
+                        value={fullName}
+                        onChange={(e) => setFullName(e.target.value)}
+                        placeholder="SHRIDHAR BALKRUSHNA SHINDE"
+                        className="w-full bg-transparent font-black text-black uppercase focus:outline-none"
+                      />
                     </div>
-                    <div className="flex items-center p-0 h-10">
+                  </div>
+
+                  {/* Row 3: Designation & Center (HQ) */}
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Designation -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1180,13 +1210,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                         />
                       </div>
                     </div>
-                  </div>
-
-                  {/* Row 3: Center (HQ) & System Role */}
-                  <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-10 bg-slate-50/40">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-slate-50/40">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Center (HQ) -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1197,33 +1223,35 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-10">
-                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">System Role -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
-                        {isEditing ? (
-                          <select
-                            value={role}
-                            onChange={(e) => handleRoleChange(e.target.value)}
-                            className="w-full bg-transparent font-black text-black focus:outline-none"
-                          >
-                            {SYSTEM_ROLES.map((r) => (
-                              <option key={r.id} value={r.id}>
-                                {r.label}
-                              </option>
-                            ))}
-                          </select>
-                        ) : (
-                          <span className="font-black text-black">{getRoleLabel(role)}</span>
-                        )}
-                      </div>
+                  </div>
+
+                  {/* Row 3B: System Role */}
+                  <div className="flex items-center p-0 min-h-[40px] py-0.5">
+                    <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">System Role -</span>
+                    <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                      {isEditing ? (
+                        <select
+                          value={role}
+                          onChange={(e) => handleRoleChange(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none"
+                        >
+                          {SYSTEM_ROLES.map((r) => (
+                            <option key={r.id} value={r.id}>
+                              {r.label}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span className="font-black text-black">{getRoleLabel(role)}</span>
+                      )}
                     </div>
                   </div>
 
                   {/* Row 4: Mobile Number & Alt Contact */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Mobile No -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="tel"
                           required
@@ -1235,9 +1263,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Alt / WhatsApp -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="tel"
                           disabled={!isEditing}
@@ -1252,9 +1280,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
 
                   {/* Row 5: Email ID & State */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Email ID -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="email"
                           disabled={!isEditing}
@@ -1265,9 +1293,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">State -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1281,9 +1309,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                   </div>
 
                   {/* Row 6: Full Address */}
-                  <div className="flex items-center p-0 h-10">
+                  <div className="flex items-center p-0 min-h-[40px] py-0.5">
                     <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Full Address -</span>
-                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                    <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                       <input
                         type="text"
                         disabled={!isEditing}
@@ -1297,9 +1325,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
 
                   {/* Row 7: Village / City & Taluka */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Village / City -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1310,9 +1338,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Taluka / Tehsil -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1327,9 +1355,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
 
                   {/* Row 8: District & Pin Code */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">District -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1340,9 +1368,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Pin Code -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1357,9 +1385,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
 
                   {/* Row 9: Date of Birth & Aadhaar No */}
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Date of Birth -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="date"
                           disabled={!isEditing}
@@ -1369,9 +1397,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Aadhaar No -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="text"
                           disabled={!isEditing}
@@ -1385,9 +1413,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                   </div>
 
                   {/* Row 10: PAN Card No */}
-                  <div className="flex items-center p-0 h-10">
+                  <div className="flex items-center p-0 min-h-[40px] py-0.5">
                     <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">PAN Card No -</span>
-                    <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                    <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                       <input
                         type="text"
                         disabled={!isEditing}
@@ -1400,17 +1428,19 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                   </div>
                 </div>
 
-                {/* 4. Credentials Section Banner */}
-                <div className="bg-slate-900 text-white font-black px-4 py-2 flex items-center justify-center uppercase tracking-widest text-xs border-y-2 border-black">
-                  LOGIN & ACCESS CREDENTIALS
-                </div>
+                {/* 4. Credentials Section Banner - Strictly visible ONLY to Admin/Owner */}
+                {isAdmin(profile) && (
+                  <>
+                    <div className="bg-slate-900 text-white font-black px-4 py-2 flex items-center justify-center uppercase tracking-widest text-xs border-y-2 border-black">
+                      LOGIN & ACCESS CREDENTIALS
+                    </div>
 
-                {/* Credentials & Access Mode Rows */}
-                <div className="divide-y-2 divide-black bg-white text-[11px]">
+                    {/* Credentials & Access Mode Rows */}
+                    <div className="divide-y-2 divide-black bg-white text-[11px]">
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Login ID -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         <input
                           type="text"
                           required
@@ -1422,7 +1452,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                         />
                       </div>
                     </div>
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Password -</span>
                       <div className="flex-1 border-l-2 border-black h-full flex items-center justify-between px-3 gap-2">
                         <input
@@ -1448,9 +1478,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                   </div>
 
                   <div className="grid grid-cols-2 divide-x-2 divide-black">
-                    <div className="flex items-center p-0 h-10">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Account Status -</span>
-                      <div className="flex-1 border-l-2 border-black h-full flex items-center px-3">
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                         {isEditing ? (
                           <select
                             value={status}
@@ -1577,6 +1607,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                     </div>
                   )}
                 </div>
+              </>
+            )}
               </div>
             </form>
           </div>
@@ -1586,7 +1618,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
       {/* ======================= PHOTO SELECTION MODAL ======================= */}
       {showPhotoModal && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 no-print animate-in fade-in duration-150">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-5 space-y-4 border border-slate-200">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-5 space-y-4 border border-slate-200 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between border-b pb-3">
               <div className="flex items-center gap-2">
                 <div className="w-8 h-8 rounded-full bg-emerald-100 flex items-center justify-center text-emerald-700">
