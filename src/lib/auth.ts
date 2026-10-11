@@ -14,6 +14,12 @@ export interface UserProfile {
   password?: string;
   allowedModules?: string[];
   createdAt: string;
+  bankName?: string;
+  bankAddress?: string;
+  accountNumber?: string;
+  ifscCode?: string;
+  hasSecurityCheque?: boolean;
+  securityChequeNumber?: string;
 }
 
 /**

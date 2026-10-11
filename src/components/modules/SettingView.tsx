@@ -5,7 +5,7 @@ import { UserProfile, isAdmin } from '../../lib/auth';
 import { restoreRecord, DeletedRecordItem, AuditLogItem } from '../../lib/dataService';
 import { Language, translations } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
-import { Settings, Trash2, RotateCcw, ShieldAlert, History, Globe, HardDrive, RefreshCw, CheckCircle2 } from 'lucide-react';
+import { Settings, Trash2, RotateCcw, ShieldAlert, History, Globe, HardDrive, RefreshCw } from 'lucide-react';
 
 interface Props {
   profile: UserProfile;
@@ -292,39 +292,19 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
       )}
 
       {activeTab === 'cache' && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-6 text-xs">
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-5 text-xs">
           <div>
             <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
               <RefreshCw className="w-4 h-4 text-rose-600" />
               <span>App Update & Cache</span>
             </h3>
-            <p className="text-[11px] text-slate-500 mt-1">
-              Automatic background updates are enabled. The app keeps all features and data synchronized automatically across web and mobile.
-            </p>
           </div>
 
-          <div className="p-4 bg-slate-50 rounded-2xl border border-slate-200 space-y-3">
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-bold text-slate-600">Current App Build Version:</span>
-              <span className="font-black text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-200 flex items-center gap-1.5">
-                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                <span>v1.0.3 (Latest Production)</span>
-              </span>
-            </div>
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-bold text-slate-600">Auto-Update Status:</span>
-              <span className="font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-lg border border-emerald-200 flex items-center gap-1">
-                <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                <span>Active (Automatic Sync)</span>
-              </span>
-            </div>
-          </div>
-
-          <div className="pt-2">
+          <div>
             <button
               onClick={handleClearCacheAndSync}
               disabled={isClearingCache}
-              className="w-full py-3.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs sm:text-sm font-black shadow-md shadow-rose-200 transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:opacity-50"
+              className="w-full py-3 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs sm:text-sm font-black shadow-md shadow-rose-200 transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:opacity-50"
             >
               <RefreshCw className={`w-4 h-4 ${isClearingCache ? 'animate-spin' : ''}`} />
               <span>{isClearingCache ? 'Refreshing...' : 'Refresh Now'}</span>

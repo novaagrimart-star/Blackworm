@@ -1014,10 +1014,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                             e.stopPropagation();
                             loadDealerToForm(d, true);
                           }}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 bg-red-600 text-white rounded-lg text-[11px] font-black hover:bg-red-700 transition shadow-xs cursor-pointer active:scale-95"
+                          className="inline-flex items-center px-2.5 py-1 bg-red-600 text-white rounded-lg text-[11px] font-black hover:bg-red-700 transition shadow-xs cursor-pointer active:scale-95"
                           title="फॉर्म उघडा"
                         >
-                          <FileText className="w-3 h-3" />
                           <span>उघडा</span>
                         </button>
                       </td>
@@ -1037,55 +1036,25 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
           {/* CARDS DISPLAY MODE */}
           {listDisplayMode === 'cards' && (
-            <div className="space-y-2.5">
+            <div className="space-y-2">
               {filteredDealers.map((d) => (
                 <div
                   key={d.id}
                   onClick={() => loadDealerToForm(d, true)}
-                  className="bg-white rounded-2xl border border-slate-200 hover:border-red-400 hover:shadow-md p-3.5 sm:p-4 transition-all cursor-pointer flex items-center justify-between gap-3 group relative overflow-hidden"
+                  className="bg-white rounded-xl border border-slate-200 hover:border-red-400 hover:shadow-xs px-3 py-2.5 sm:px-3.5 sm:py-3 transition-all cursor-pointer flex items-center gap-2.5 group relative"
                 >
-                  <div className="flex items-center gap-3 flex-1 min-w-0">
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        loadDealerToForm(d, true);
-                      }}
-                      className="text-xs font-black text-red-600 bg-red-50 hover:bg-red-100 border border-red-200 px-2.5 py-1 rounded-lg uppercase tracking-wider shrink-0 font-mono transition cursor-pointer"
-                      title="फॉर्म उघडण्यासाठी क्लिक करा"
+                  <span
+                    className="text-[11px] font-bold text-red-600 bg-red-50 border border-red-200 px-2 py-0.5 rounded-md uppercase tracking-wider shrink-0 font-mono"
+                  >
+                    #{d.dealerCode || 'DEALER'}
+                  </span>
+                  
+                  <div className="flex-1 min-w-0">
+                    <span
+                      className="text-xs sm:text-[13px] font-bold text-slate-900 group-hover:text-red-600 uppercase block truncate leading-tight tracking-tight"
                     >
-                      #{d.dealerCode || 'DEALER'}
-                    </button>
-                    
-                    <div className="flex-1 min-w-0">
-                      {/* Direct Clickable Dealer Firm Name on single line */}
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          loadDealerToForm(d, true);
-                        }}
-                        className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 hover:underline transition-colors uppercase block text-left w-full cursor-pointer break-words leading-snug"
-                        title="डीलरचा संपूर्ण फॉर्म थेट उघडा"
-                      >
-                        {d.firmName || 'Unnamed Dealership'}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        loadDealerToForm(d, true);
-                      }}
-                      className="flex items-center gap-1.5 px-3 py-1.5 bg-red-50 group-hover:bg-red-600 text-red-600 group-hover:text-white rounded-xl text-xs font-black transition border border-red-200 cursor-pointer shadow-xs active:scale-95"
-                      title="फॉर्म उघडा"
-                    >
-                      <FileText className="w-3.5 h-3.5" />
-                      <span className="hidden sm:inline">फॉर्म उघडा</span>
-                    </button>
+                      {d.firmName || 'Unnamed Dealership'}
+                    </span>
                   </div>
                 </div>
               ))}

@@ -217,6 +217,14 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
   const [allowedModules, setAllowedModules] = useState<string[]>(getDefaultModulesForRole('field_officer'));
   const [photoUrl, setPhotoUrl] = useState('');
 
+  // Banking Details & Security Cheque
+  const [bankName, setBankName] = useState('');
+  const [bankAddress, setBankAddress] = useState('');
+  const [accountNumber, setAccountNumber] = useState('');
+  const [ifscCode, setIfscCode] = useState('');
+  const [hasSecurityCheque, setHasSecurityCheque] = useState(false);
+  const [securityChequeNumber, setSecurityChequeNumber] = useState('');
+
   // Branding
   const [logoUrl, setLogoUrl] = useState<string>('');
   const [logoSize, setLogoSize] = useState<number>(80);
@@ -425,6 +433,12 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
     setStatus('Active');
     setAllowedModules(getDefaultModulesForRole(defaultRole));
     setPhotoUrl('');
+    setBankName('');
+    setBankAddress('');
+    setAccountNumber('');
+    setIfscCode('');
+    setHasSecurityCheque(false);
+    setSecurityChequeNumber('');
     setShowAccessList(false);
     setIsEditing(true);
     setViewMode('form');
@@ -455,6 +469,12 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
     setStatus(u.status || 'Active');
     setAllowedModules(u.allowedModules && u.allowedModules.length > 0 ? u.allowedModules : getDefaultModulesForRole(u.role || 'field_officer'));
     setPhotoUrl(u.photoUrl || '');
+    setBankName(u.bankName || '');
+    setBankAddress(u.bankAddress || '');
+    setAccountNumber(u.accountNumber || '');
+    setIfscCode(u.ifscCode || '');
+    setHasSecurityCheque(!!u.hasSecurityCheque || !!u.securityChequeNumber);
+    setSecurityChequeNumber(u.securityChequeNumber || '');
     setShowAccessList(false);
     setIsEditing(editMode);
     setViewMode('form');
@@ -551,6 +571,12 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
       status,
       allowedModules: finalAllowedModules,
       photoUrl,
+      bankName: bankName.trim().toUpperCase(),
+      bankAddress: bankAddress.trim().toUpperCase(),
+      accountNumber: accountNumber.trim(),
+      ifscCode: ifscCode.trim().toUpperCase(),
+      hasSecurityCheque: !!hasSecurityCheque || !!securityChequeNumber.trim(),
+      securityChequeNumber: securityChequeNumber.trim().toUpperCase(),
       updatedAt: new Date().toISOString(),
       createdAt: currentUid ? (formatSafeDateString(users.find(u => u.uid === currentUid)?.createdAt) || new Date().toISOString()) : new Date().toISOString(),
     };
@@ -587,6 +613,12 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
             aadhaarNo: aadhaarNo.trim(),
             panNo: panNo.trim().toUpperCase(),
             photoUrl,
+            bankName: bankName.trim().toUpperCase(),
+            bankAddress: bankAddress.trim().toUpperCase(),
+            accountNumber: accountNumber.trim(),
+            ifscCode: ifscCode.trim().toUpperCase(),
+            hasSecurityCheque: !!hasSecurityCheque || !!securityChequeNumber.trim(),
+            securityChequeNumber: securityChequeNumber.trim().toUpperCase(),
           }
         });
 
@@ -965,9 +997,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
       {viewMode === 'form' && (
         <div className="space-y-4">
           <div className="bg-white rounded-2xl border-2 border-slate-300 shadow-xl overflow-x-auto print:border-none print:shadow-none print:m-0 print:p-0">
-            {/* Top Action Toolbar inside form card */}
-            <div className="bg-slate-50 border-b border-slate-200 p-2.5 sm:px-4 sm:py-2.5 flex flex-wrap items-center justify-between gap-2 no-print sticky left-0 w-full">
-              <div className="flex items-center gap-2 flex-wrap min-w-0">
+            {/* Top Action Toolbar inside form card - Single line compact layout */}
+            <div className="bg-slate-50 border-b border-slate-200 px-2.5 py-2 sm:px-4 sm:py-2.5 flex items-center justify-between gap-2 no-print sticky left-0 w-full z-10">
+              <div className="flex items-center gap-1.5 sm:gap-2 min-w-0 flex-1">
                 <button
                   type="button"
                   onClick={() => {
@@ -977,77 +1009,76 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                       setViewMode('list');
                     }
                   }}
-                  className="p-1.5 px-2.5 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 flex items-center gap-1.5 text-xs font-bold transition shadow-sm active:scale-95 cursor-pointer"
+                  className="p-1.5 px-2 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 flex items-center gap-1 text-[11px] sm:text-xs font-bold transition shadow-xs active:scale-95 cursor-pointer shrink-0"
                   title="Back to User List"
                 >
-                  <ArrowLeft className="w-4 h-4 text-slate-600" />
+                  <ArrowLeft className="w-3.5 h-3.5 text-slate-600" />
                   <span>Back</span>
                 </button>
-                <span className="text-xs font-black text-slate-800 uppercase tracking-wide">
-                  {userCode || fullName || 'EMPLOYEE / USER REGISTRATION FORM'}
+                <span className="text-[11px] sm:text-xs font-black text-slate-800 uppercase tracking-wide truncate">
+                  {userCode ? `#${userCode} - ` : ''}{fullName || 'USER PROFILE'}
                 </span>
-                {isEditing && (
-                  <span className="text-[10px] font-black text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full uppercase">
-                    Editing Mode
-                  </span>
-                )}
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
+                {/* Editing: Icon only */}
                 <button
                   type="button"
                   onClick={() => setIsEditing(!isEditing)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition shadow-sm border flex items-center gap-1.5 ${
+                  className={`p-1.5 sm:p-2 rounded-lg text-xs font-bold transition shadow-xs border ${
                     isEditing 
                       ? 'bg-emerald-600 text-white border-emerald-500' 
                       : 'bg-white border-slate-300 text-slate-700 hover:bg-slate-100 hover:text-red-600'
                   }`}
-                  title={isEditing ? 'Editing Mode Active (Click for View Mode)' : 'Click to Enable Editing'}
+                  title={isEditing ? 'Viewing Mode (Click to View Mode)' : 'Edit Mode (Click to Edit)'}
                 >
-                  <Edit3 className="w-3.5 h-3.5" />
-                  <span>{isEditing ? 'Editing' : 'Edit Form'}</span>
+                  <Edit3 className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                 </button>
 
+                {/* Save / Submit for Approval: Small compact button */}
                 {isEditing && (
                   <button
                     type="submit"
                     form="user-profile-form"
-                    className="text-xs font-bold px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white flex items-center gap-1 shadow-sm transition"
-                    title="Save Form"
+                    className="text-[11px] font-black px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white flex items-center gap-1 shadow-xs transition"
+                    title={isAdmin(profile) ? 'Save Form' : 'Submit for Approval'}
                   >
                     <Save className="w-3.5 h-3.5" />
-                    <span>{isAdmin(profile) ? 'Save' : 'Submit for Approval'}</span>
+                    <span>{isAdmin(profile) ? 'Save' : 'Submit'}</span>
                   </button>
                 )}
 
+                {/* Download: Small compact button */}
                 <button
                   type="button"
                   onClick={handleDownloadPdf}
                   disabled={isGeneratingPdf}
-                  className="text-xs font-bold px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white flex items-center gap-1.5 shadow-sm transition disabled:opacity-50"
+                  className="text-[11px] font-black px-2.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-700 text-white flex items-center gap-1 shadow-xs transition disabled:opacity-50"
                   title="Download A4 PDF Form"
                 >
                   {isGeneratingPdf ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
-                  <span>{isGeneratingPdf ? 'Generating...' : 'Download'}</span>
+                  <span>PDF</span>
                 </button>
 
+                {/* Print button */}
                 <button
                   type="button"
                   onClick={() => window.print()}
-                  className="p-2 rounded-lg bg-red-600 hover:bg-red-700 text-white flex items-center shadow-sm transition"
+                  className="p-1.5 sm:p-2 rounded-lg bg-red-600 hover:bg-red-700 text-white flex items-center shadow-xs transition"
                   title="Print Form"
                 >
-                  <Printer className="w-4 h-4" />
+                  <Printer className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                 </button>
 
+                {/* Delete button (Admin only) */}
                 {isAdmin(profile) && currentUid && (
                   <button
                     type="button"
                     onClick={() => handleDelete(currentUid, fullName)}
-                    className="p-2 rounded-lg bg-white border border-slate-200 text-slate-400 hover:text-red-600 hover:bg-red-50 transition"
+                    className="p-1.5 sm:p-2 rounded-lg bg-white border border-slate-200 text-slate-400 hover:text-red-600 hover:bg-red-50 transition"
                     title="Delete Form"
                   >
-                    <Trash2 className="w-4 h-4" />
+                    <Trash2 className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                   </button>
                 )}
               </div>
@@ -1428,7 +1459,120 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                   </div>
                 </div>
 
-                {/* 4. Credentials Section Banner - Strictly visible ONLY to Admin/Owner */}
+                {/* 4. Banking & Security Cheque Details Banner */}
+                <div className="bg-slate-900 text-white font-black px-4 py-2 flex items-center justify-center uppercase tracking-widest text-xs border-y-2 border-black">
+                  BANKING & SECURITY CHEQUE DETAILS
+                </div>
+
+                {/* Banking & Security Cheque Rows */}
+                <div className="divide-y-2 divide-black bg-white text-[11px]">
+                  {/* Bank Name */}
+                  <div className="flex items-center p-0 min-h-[40px] py-0.5">
+                    <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Bank Name -</span>
+                    <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                      <input
+                        type="text"
+                        disabled={!isEditing}
+                        value={bankName}
+                        onChange={(e) => setBankName(e.target.value)}
+                        placeholder="BANK NAME (E.G. STATE BANK OF INDIA)"
+                        className="w-full bg-transparent font-black text-black uppercase focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Bank Address */}
+                  <div className="flex items-center p-0 min-h-[40px] py-0.5">
+                    <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Bank Address -</span>
+                    <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                      <input
+                        type="text"
+                        disabled={!isEditing}
+                        value={bankAddress}
+                        onChange={(e) => setBankAddress(e.target.value)}
+                        placeholder="BRANCH / BANK ADDRESS"
+                        className="w-full bg-transparent font-black text-black uppercase focus:outline-none"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Account No & IFSC Code */}
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Account No -</span>
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={accountNumber}
+                          onChange={(e) => setAccountNumber(e.target.value)}
+                          placeholder="ACCOUNT NUMBER"
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">IFSC Code -</span>
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={ifscCode}
+                          onChange={(e) => setIfscCode(e.target.value)}
+                          placeholder="SBIN000XXXX"
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono uppercase"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Security Cheque & Cheque Number */}
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Security Cheque -</span>
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                        {isEditing ? (
+                          <select
+                            value={hasSecurityCheque ? 'YES' : 'NO'}
+                            onChange={(e) => {
+                              const val = e.target.value === 'YES';
+                              setHasSecurityCheque(val);
+                              if (!val) setSecurityChequeNumber('');
+                            }}
+                            className="w-full bg-transparent font-black text-black uppercase focus:outline-none"
+                          >
+                            <option value="NO">NO (नाही)</option>
+                            <option value="YES">YES (दिली आहे)</option>
+                          </select>
+                        ) : (
+                          <span className="font-black uppercase text-black">
+                            {hasSecurityCheque || securityChequeNumber ? 'YES' : 'NO'}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Cheque No -</span>
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={securityChequeNumber}
+                          onChange={(e) => {
+                            setSecurityChequeNumber(e.target.value);
+                            if (e.target.value.trim()) {
+                              setHasSecurityCheque(true);
+                            }
+                          }}
+                          placeholder={hasSecurityCheque ? "CHEQUE NUMBER" : "CHEQUE NUMBER"}
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono uppercase"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 5. Credentials Section Banner - Strictly visible ONLY to Admin/Owner */}
                 {isAdmin(profile) && (
                   <>
                     <div className="bg-slate-900 text-white font-black px-4 py-2 flex items-center justify-center uppercase tracking-widest text-xs border-y-2 border-black">
