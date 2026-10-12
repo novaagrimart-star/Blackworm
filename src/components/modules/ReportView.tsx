@@ -1,21 +1,14 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { collection, query, getDocs, where } from 'firebase/firestore';
+import React, { useState, useEffect } from 'react';
+import { collection, query, getDocs, where, doc, getDoc } from 'firebase/firestore';
 import { db } from '../../firebase';
-import { exportAllData } from '../../lib/dataService';
-import { Language, translations } from '../../lib/i18n';
+import { Language } from '../../lib/i18n';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import jsPDF from 'jspdf';
-import html2canvas from 'html2canvas-pro';
 import { 
   BarChart3, 
-  Download, 
-  Printer, 
   Calendar,
   Search,
   Loader2,
-  Table as TableIcon,
-  ChevronLeft,
-  ChevronRight
+  Table as TableIcon
 } from 'lucide-react';
 
 interface Props {
@@ -38,88 +31,117 @@ interface OfficerDailyReport {
   targetBacklog: number;
 }
 
-export const ReportView: React.FC<Props> = ({ profile, lang }) => {
-  const t = translations[lang];
+export const ReportView: React.FC<Props> = ({ profile }) => {
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().slice(0, 10));
   const [reportData, setReportData] = useState<OfficerDailyReport[]>([]);
   const [loading, setLoading] = useState(false);
-  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
-  const reportRef = useRef<HTMLDivElement>(null);
-  const tableScrollRef = useRef<HTMLDivElement>(null);
-
-  const scrollTable = (direction: 'left' | 'right') => {
-    if (tableScrollRef.current) {
-      const scrollAmount = direction === 'left' ? -350 : 350;
-      tableScrollRef.current.scrollBy({ left: scrollAmount, behavior: 'smooth' });
-    }
-  };
 
   const fetchReportData = async () => {
     setLoading(true);
     try {
       const userIsAdmin = isAdmin(profile);
-      // 1. Fetch Users
-      const usersSnap = await getDocs(query(collection(db, 'users'), where('role', 'not-in', ['owner', 'admin'])));
-      let officers = usersSnap.docs.map(d => d.data() as UserProfile);
 
-      // Data Isolation: If not admin, strictly show ONLY this user's row
-      if (!userIsAdmin) {
-        officers = officers.filter(o => o.uid === profile.uid || (o.loginId && profile.loginId && o.loginId.toLowerCase() === profile.loginId.toLowerCase()));
-        if (officers.length === 0) {
-          officers = [profile];
-        }
+      // 1. Fetch Users safely
+      const usersSnap = await getDocs(query(collection(db, 'users')));
+      const allUsers: UserProfile[] = [];
+      usersSnap.forEach((d) => {
+        allUsers.push({ ...d.data(), uid: d.id } as UserProfile);
+      });
+
+      // Filter officers: Admin sees all non-owner staff/officers; standard user sees only themselves
+      let officers = userIsAdmin
+        ? allUsers.filter((u) => u.role !== 'owner')
+        : allUsers.filter((u) => u.uid === profile.uid || (u.loginId && profile.loginId && u.loginId.toLowerCase() === profile.loginId.toLowerCase()));
+
+      if (officers.length === 0) {
+        officers = [profile];
       }
 
-      // Current Month Details for Target retrieval
-      const reportDateObj = new Date(selectedDate);
-      const year = reportDateObj.getFullYear();
-      const monthIndex = reportDateObj.getMonth();
-      const monthNames = ['April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December', 'January', 'February', 'March'];
-      const targetMonthName = reportDateObj.toLocaleString('en-US', { month: 'long' });
-      
-      const dayOfMonth = reportDateObj.getDate();
-      const sheetMonthKey = `${year}_${(monthIndex + 1).toString().padStart(2, '0')}`;
+      // 2. Safe Date Parsing
+      const [yStr, mStr, dStr] = selectedDate.split('-');
+      const year = parseInt(yStr, 10);
+      const monthIndex = parseInt(mStr, 10) - 1;
+      const dayOfMonth = parseInt(dStr, 10);
+      const sheetMonthKey = `${year}_${mStr.padStart(2, '0')}`;
+      const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+      const targetMonthName = monthNames[monthIndex] || 'October';
+
+      // 3. Pre-fetch collections for this specific date
+      let collDocs: any[] = [];
+      try {
+        const collSnap = await getDocs(query(collection(db, 'collection_entries'), where('date', '==', selectedDate)));
+        collDocs = collSnap.docs.map(d => d.data());
+      } catch (e) {
+        console.warn('Collection entries fetch fallback:', e);
+      }
 
       const finalReports = await Promise.all(
         officers.map(async (officer, i) => {
-          // 2. Fetch Travel Data for this officer for this date
-          // Note: Travel sheets are monthly
+          // A. Fetch Travel Data
           const travelSheetId = `travel_${officer.uid}_${sheetMonthKey}`;
-          const travelSnap = await getDocs(query(collection(db, 'travel_sheets'), where('id', '==', travelSheetId)));
-          let route = '-', openingKm = 0, closingKm = 0, dailyExpense = 0;
-          
-          if (!travelSnap.empty) {
-            const travelData = travelSnap.docs[0].data();
-            const dayRow = (travelData.rows || []).find((r: any) => r.dayNumber === dayOfMonth);
-            if (dayRow) {
-              route = dayRow.route || '-';
-              openingKm = dayRow.openingKm || 0;
-              closingKm = dayRow.closingKm || 0;
-              dailyExpense = (dayRow.amount || 0) + (dayRow.otherExpenses || 0);
+          let route = '-', openingKm = 0, closingKm = 0, dailyExpense = 0, recordedKm = 0;
+          try {
+            const travelDocSnap = await getDoc(doc(db, 'travel_sheets', travelSheetId));
+            let travelData = travelDocSnap.exists() ? travelDocSnap.data() : null;
+            if (!travelData) {
+              const travelQuerySnap = await getDocs(query(collection(db, 'travel_sheets'), where('userId', '==', officer.uid)));
+              const match = travelQuerySnap.docs.find(d => d.id === travelSheetId || d.data().monthKey === sheetMonthKey);
+              if (match) travelData = match.data();
             }
+            if (travelData) {
+              const dayRow = (travelData.rows || []).find((r: any) => 
+                Number(r.dayNumber) === dayOfMonth || r.date === selectedDate
+              );
+              if (dayRow) {
+                route = (dayRow.route || '').trim() || '-';
+                openingKm = Number(dayRow.openingKm) || 0;
+                closingKm = Number(dayRow.closingKm) || 0;
+                recordedKm = Number(dayRow.km) || 0;
+                dailyExpense = (Number(dayRow.amount) || 0) + (Number(dayRow.otherExpenses) || 0);
+              }
+            }
+          } catch (e) {
+            console.warn('Travel data fetch err:', e);
           }
 
-          // 3. Fetch Collection Entries for this officer on this date
-          const collSnap = await getDocs(query(
-            collection(db, 'collection_entries'), 
-            where('collectedByUid', '==', officer.uid),
-            where('date', '==', selectedDate)
-          ));
-          const paymentCollection = collSnap.docs.reduce((acc, d) => acc + (d.data().amount || 0), 0);
+          // B. Match Collections for this officer
+          const paymentCollection = collDocs
+            .filter((d: any) => {
+              return (
+                d.collectedByUid === officer.uid ||
+                d.userId === officer.uid ||
+                (d.loginId && officer.loginId && d.loginId.toLowerCase() === officer.loginId.toLowerCase())
+              );
+            })
+            .reduce((acc: number, d: any) => acc + (Number(d.amount) || 0), 0);
 
-          // 4. Fetch Monthly Target & Achievement
-          const targetSheetId = `yearly_${officer.uid}_2026_27`; // Assuming fixed financial year for now or dynamic
-          const targetSnap = await getDocs(query(collection(db, 'yearly_targets'), where('id', '==', targetSheetId)));
+          // C. Fetch Monthly Target & Achievement
           let monthlySalesTarget = 0, monthlyAchievement = 0;
-          
-          if (!targetSnap.empty) {
-            const targetData = targetSnap.docs[0].data();
-            const monthData = (targetData.months || []).find((m: any) => m.month === targetMonthName);
-            if (monthData) {
-              monthlySalesTarget = monthData.target || 0;
-              monthlyAchievement = monthData.achievement || 0;
+          try {
+            const targetSheetId = `yearly_${officer.uid}_2026_27`;
+            const targetDocSnap = await getDoc(doc(db, 'yearly_targets', targetSheetId));
+            if (targetDocSnap.exists()) {
+              const targetData = targetDocSnap.data();
+              const monthData = (targetData.months || []).find((m: any) => (m.month || '').toLowerCase() === targetMonthName.toLowerCase());
+              if (monthData) {
+                monthlySalesTarget = Number(monthData.target) || 0;
+                monthlyAchievement = Number(monthData.achievement) || 0;
+              }
             }
+
+            if (monthlySalesTarget === 0) {
+              const fallbackTargetSnap = await getDocs(query(collection(db, 'targets'), where('userId', '==', officer.uid)));
+              if (!fallbackTargetSnap.empty) {
+                const tData = fallbackTargetSnap.docs[0].data();
+                monthlySalesTarget = (Number(tData.targetSales) || 0) / 100000;
+                monthlyAchievement = (Number(tData.achievedSales) || 0) / 100000;
+              }
+            }
+          } catch (e) {
+            console.warn('Target data fetch err:', e);
           }
+
+          const calculatedKm = closingKm > openingKm ? closingKm - openingKm : recordedKm;
 
           return {
             srNo: i + 1,
@@ -128,12 +150,12 @@ export const ReportView: React.FC<Props> = ({ profile, lang }) => {
             route,
             openingKm,
             closingKm,
-            totalKm: closingKm > openingKm ? closingKm - openingKm : 0,
+            totalKm: calculatedKm,
             paymentCollection,
             dailyExpense,
             monthlySalesTarget,
             monthlyAchievement,
-            targetBacklog: Math.max(0, monthlySalesTarget - monthlyAchievement)
+            targetBacklog: Math.max(0, monthlySalesTarget - monthlyAchievement),
           };
         })
       );
@@ -150,212 +172,199 @@ export const ReportView: React.FC<Props> = ({ profile, lang }) => {
     fetchReportData();
   }, [selectedDate]);
 
-  const handlePrint = async () => {
-    if (!reportRef.current) return;
-    try {
-      setIsGeneratingPdf(true);
-      const canvas = await html2canvas(reportRef.current, {
-        scale: 2,
-        useCORS: true,
-        logging: false,
-        backgroundColor: '#ffffff',
-      });
-
-      const imgData = canvas.toDataURL('image/jpeg', 0.95);
-      const pdf = new jsPDF({
-        orientation: 'landscape',
-        unit: 'mm',
-        format: 'a4'
-      });
-
-      const pdfWidth = pdf.internal.pageSize.getWidth();
-      const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
-      
-      pdf.addImage(imgData, 'JPEG', 0, 0, pdfWidth, Math.min(pdfHeight, 210));
-      pdf.save(`Daily_Track_Report_${selectedDate}.pdf`);
-    } catch (err) {
-      console.error('PDF error:', err);
-      window.print();
-    } finally {
-      setIsGeneratingPdf(false);
-    }
-  };
+  const totalKmSum = reportData.reduce((acc, r) => acc + r.totalKm, 0);
+  const totalCollectionSum = reportData.reduce((acc, r) => acc + r.paymentCollection, 0);
+  const totalExpenseSum = reportData.reduce((acc, r) => acc + r.dailyExpense, 0);
+  const totalTargetSum = reportData.reduce((acc, r) => acc + r.monthlySalesTarget, 0);
+  const totalAchieveSum = reportData.reduce((acc, r) => acc + r.monthlyAchievement, 0);
+  const totalBacklogSum = reportData.reduce((acc, r) => acc + r.targetBacklog, 0);
 
   return (
-    <div className="space-y-6 max-w-6xl mx-auto pb-20">
-      {/* Header & Backup Section */}
-      <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col md:flex-row items-center justify-between gap-4">
-        <div>
-          <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
-            <BarChart3 className="w-6 h-6 text-indigo-600" />
-            {t.report} & डेटा सेंटर
-          </h2>
-          <p className="text-xs text-slate-500 mt-0.5">व्यावसायिक प्रगती आणि डेली ऑफिसर ट्रॅकिंग</p>
-        </div>
+    <div className="space-y-4 w-full pb-20">
+      {/* Header Bar: Report Title with Date Option right in front of it */}
+      <div className="bg-white p-3 sm:p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-2">
+            <BarChart3 className="w-5 h-5 sm:w-6 sm:h-6 text-indigo-600 shrink-0" />
+            <h2 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight">Report</h2>
+          </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            onClick={exportAllData}
-            className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2.5 rounded-xl text-xs font-bold transition shadow-sm"
-          >
-            <Download className="w-4 h-4" />
-            <span>डेटा बॅकअप (JSON)</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Main Action Bar for Report */}
-      <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm flex flex-col md:flex-row items-center justify-between gap-4 no-print">
-        <div className="flex items-center gap-3 w-full md:w-auto">
-          <div className="relative flex-1 md:w-48">
-            <Calendar className="w-4 h-4 absolute left-3 top-3 text-slate-400" />
+          {/* Date Option right in front of Report */}
+          <div className="relative">
+            <Calendar className="w-4 h-4 absolute left-3 top-2.5 text-slate-400 pointer-events-none" />
             <input 
               type="date"
               value={selectedDate}
               onChange={(e) => setSelectedDate(e.target.value)}
-              className="w-full pl-10 pr-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              className="pl-9 pr-3 py-1.5 sm:py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer"
             />
           </div>
+
           <button 
             onClick={fetchReportData}
             disabled={loading}
-            className="p-2.5 bg-indigo-50 text-indigo-600 rounded-xl hover:bg-indigo-100 transition disabled:opacity-50"
+            className="p-2 bg-indigo-50 text-indigo-600 rounded-xl hover:bg-indigo-100 transition disabled:opacity-50 shrink-0 cursor-pointer active:scale-95"
+            title="Refresh"
           >
-            {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Search className="w-5 h-5" />}
-          </button>
-        </div>
-
-        <div className="flex items-center gap-2 w-full md:w-auto justify-end">
-          <button
-            onClick={handlePrint}
-            disabled={isGeneratingPdf || loading}
-            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-xl text-xs font-black shadow-lg transition active:scale-95 disabled:opacity-50"
-          >
-            {isGeneratingPdf ? <Loader2 className="w-4 h-4 animate-spin" /> : <Printer className="w-4 h-4" />}
-            <span>PRINT REPORT</span>
+            {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
           </button>
         </div>
       </div>
 
-      {/* Report Table Section - Fully scrollable horizontally with larger font & scroll helper buttons */}
-      <div className="space-y-2">
-        <div className="text-xs font-bold text-slate-500 flex items-center justify-between px-1 no-print">
-          <span className="font-black text-slate-700">👉 पूर्ण रिपोर्ट पाहण्यासाठी डावीकडून उजवीकडे स्क्रोल करा (Scroll/Swipe)</span>
-          <div className="flex items-center gap-1.5">
-            <button
-              type="button"
-              onClick={() => scrollTable('left')}
-              className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-xs font-black flex items-center gap-1 border border-slate-300 transition active:scale-95 shadow-xs cursor-pointer"
-              title="Scroll Left"
-            >
-              <ChevronLeft className="w-3.5 h-3.5 stroke-[3px]" />
-              <span>डावीकडे</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => scrollTable('right')}
-              className="px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-xs font-black flex items-center gap-1 border border-indigo-200 transition active:scale-95 shadow-xs cursor-pointer"
-              title="Scroll Right"
-            >
-              <span>उजवीकडे</span>
-              <ChevronRight className="w-3.5 h-3.5 stroke-[3px]" />
-            </button>
-          </div>
-        </div>
-
-        <div ref={tableScrollRef} className="bg-white rounded-2xl border-2 border-slate-300 shadow-xl overflow-x-auto touch-pan-x scroll-smooth overscroll-x-contain scrollbar-thin">
-          <div ref={reportRef} className="p-4 sm:p-6 bg-white min-w-[1300px]">
-            {/* Internal Print Header */}
-            <div className="text-center mb-6 space-y-1">
-              <h1 className="text-2xl sm:text-3xl font-black text-slate-900 uppercase tracking-tight">
-                {isAdmin(profile) ? 'ALL OFFICER DAILY TRACK REPORT' : `DAILY TRACK REPORT - ${profile.fullName || 'OFFICER'}`}
-              </h1>
-              <div className="flex items-center justify-center gap-6 text-sm font-bold text-slate-600">
-                <span className="flex items-center gap-1.5">
-                  <Calendar className="w-4 h-4 text-indigo-600" />
-                  <span>Date: {new Date(selectedDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}</span>
-                </span>
-                <span className="flex items-center gap-1.5">
-                  <TableIcon className="w-4 h-4 text-emerald-600" />
-                  <span>Sheet: Daily Summary</span>
-                </span>
-              </div>
+      {/* Sheet Table (Only English, Clean & Professional, Smooth Horizontal Scroll) */}
+      <div 
+        className="bg-white rounded-2xl border border-slate-300 shadow-xs overflow-x-auto w-full scroll-smooth"
+        style={{ WebkitOverflowScrolling: 'touch' }}
+      >
+        <div className="p-3 sm:p-5 bg-white min-w-[880px] w-full">
+          {/* Internal Sheet Header */}
+          <div className="text-center mb-4 space-y-1">
+            <h1 className="text-lg sm:text-xl font-black text-slate-900 uppercase tracking-tight">
+              {isAdmin(profile) ? 'ALL OFFICER DAILY TRACK REPORT' : `DAILY TRACK REPORT - ${profile.fullName || 'OFFICER'}`}
+            </h1>
+            <div className="flex items-center justify-center gap-6 text-xs font-bold text-slate-600">
+              <span className="flex items-center gap-1.5">
+                <Calendar className="w-3.5 h-3.5 text-indigo-600" />
+                <span>Date: {new Date(selectedDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}</span>
+              </span>
+              <span className="flex items-center gap-1.5">
+                <TableIcon className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Sheet: Daily Summary</span>
+              </span>
             </div>
+          </div>
 
-            <table className="w-full border-collapse border-2 border-slate-900 text-xs sm:text-sm">
-              <thead>
-                <tr className="bg-slate-900 text-white font-black uppercase text-center text-xs sm:text-sm">
-                  <th className="p-3 border border-slate-700 w-12">Sr.</th>
-                  <th className="p-3 border border-slate-700 text-left min-w-[190px]">Officer Name</th>
-                  <th className="p-3 border border-slate-700 min-w-[160px]">Today's Route</th>
-                  <th className="p-3 border border-slate-700 min-w-[100px]">Open KM</th>
-                  <th className="p-3 border border-slate-700 min-w-[100px]">Close KM</th>
-                  <th className="p-3 border border-slate-700 min-w-[100px]">Total KM</th>
-                  <th className="p-3 border border-slate-700 min-w-[140px]">Payment Collection</th>
-                  <th className="p-3 border border-slate-700 min-w-[110px]">Daily Exp.</th>
-                  <th className="p-3 border border-slate-700 min-w-[130px]">Mon. Target (Lakh)</th>
-                  <th className="p-3 border border-slate-700 min-w-[130px]">Mon. Achieve (Lakh)</th>
-                  <th className="p-3 border border-slate-700 min-w-[110px]">Backlog</th>
+          <table className="w-full border-collapse border border-slate-900 text-xs">
+            <thead>
+              <tr className="bg-slate-900 text-white font-black uppercase text-center text-xs">
+                <th className="p-2 border border-slate-700 w-10 text-center">
+                  Sr.
+                </th>
+                <th className="p-2 border border-slate-700 text-left min-w-[140px]">
+                  Officer Name
+                </th>
+                <th className="p-2 border border-slate-700 text-left min-w-[140px] max-w-[220px]">
+                  Today's Route
+                </th>
+                <th className="p-2 border border-slate-700 min-w-[65px]">
+                  Open KM
+                </th>
+                <th className="p-2 border border-slate-700 min-w-[65px]">
+                  Close KM
+                </th>
+                <th className="p-2 border border-slate-700 min-w-[65px] bg-indigo-950 text-indigo-200">
+                  Total KM
+                </th>
+                <th className="p-2 border border-slate-700 min-w-[95px] bg-emerald-950 text-emerald-200">
+                  Collection (₹)
+                </th>
+                <th className="p-2 border border-slate-700 min-w-[85px] bg-rose-950 text-rose-200">
+                  Daily Expense (₹)
+                </th>
+                <th className="p-2 border border-slate-700 min-w-[80px]">
+                  Target (Lakh)
+                </th>
+                <th className="p-2 border border-slate-700 min-w-[80px] bg-blue-950 text-blue-200">
+                  Achieve (Lakh)
+                </th>
+                <th className="p-2 border border-slate-700 min-w-[80px] bg-red-950 text-red-200">
+                  Backlog (Lakh)
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-300 border-b border-slate-900">
+              {reportData.map((row) => (
+                <tr key={row.uid} className="hover:bg-slate-50 font-bold text-slate-900 text-center uppercase tracking-tight">
+                  <td className="p-2 border border-slate-300 font-mono font-black bg-slate-50/50">
+                    {row.srNo}
+                  </td>
+                  <td className="p-2 border border-slate-300 text-left font-black text-slate-900 break-words max-w-[170px]">
+                    {row.name}
+                  </td>
+                  <td className="p-2 border border-slate-300 text-slate-800 font-bold text-left break-words max-w-[220px] text-[11px] leading-tight">
+                    {row.route}
+                  </td>
+                  <td className="p-2 border border-slate-300 font-mono font-bold">
+                    {row.openingKm}
+                  </td>
+                  <td className="p-2 border border-slate-300 font-mono font-bold">
+                    {row.closingKm}
+                  </td>
+                  <td className="p-2 border border-slate-300 font-mono font-black text-indigo-700 bg-indigo-50/40">
+                    {row.totalKm}
+                  </td>
+                  <td className="p-2 border border-slate-300 font-mono font-black text-emerald-700 bg-emerald-50/40">
+                    ₹{row.paymentCollection.toLocaleString()}
+                  </td>
+                  <td className="p-2 border border-slate-300 font-mono font-black text-rose-700 bg-rose-50/40">
+                    ₹{row.dailyExpense.toLocaleString()}
+                  </td>
+                  <td className="p-2 border border-slate-300 font-mono font-bold">
+                    {row.monthlySalesTarget.toFixed(2)}
+                  </td>
+                  <td className="p-2 border border-slate-300 font-mono font-black text-blue-700 bg-blue-50/40">
+                    {row.monthlyAchievement.toFixed(2)}
+                  </td>
+                  <td className="p-2 border border-slate-300 font-mono font-black text-red-600 bg-red-50/40">
+                    {row.targetBacklog.toFixed(2)}
+                  </td>
                 </tr>
-              </thead>
-              <tbody className="divide-y-2 divide-slate-300 border-b-2 border-slate-900">
-                {reportData.map((row) => (
-                  <tr key={row.uid} className="hover:bg-slate-50 font-black text-slate-900 text-center uppercase tracking-tight">
-                    <td className="p-3 border border-slate-300 font-mono font-black">{row.srNo}</td>
-                    <td className="p-3 border border-slate-300 text-left whitespace-nowrap font-black text-slate-900">{row.name}</td>
-                    <td className="p-3 border border-slate-300 italic lowercase first-letter:uppercase text-slate-800 font-bold">{row.route}</td>
-                    <td className="p-3 border border-slate-300 font-mono font-bold">{row.openingKm}</td>
-                    <td className="p-3 border border-slate-300 font-mono font-bold">{row.closingKm}</td>
-                    <td className="p-3 border border-slate-300 font-mono font-black text-indigo-700">{row.totalKm}</td>
-                    <td className="p-3 border border-slate-300 font-mono font-black text-emerald-700">₹{row.paymentCollection.toLocaleString()}</td>
-                    <td className="p-3 border border-slate-300 font-mono font-black text-rose-700">₹{row.dailyExpense.toLocaleString()}</td>
-                    <td className="p-3 border border-slate-300 font-mono font-bold">{row.monthlySalesTarget.toFixed(2)}</td>
-                    <td className="p-3 border border-slate-300 font-mono font-black text-blue-700">{row.monthlyAchievement.toFixed(2)}</td>
-                    <td className="p-3 border border-slate-300 font-mono font-black text-red-600">{row.targetBacklog.toFixed(2)}</td>
-                  </tr>
-                ))}
-                {reportData.length === 0 && !loading && (
-                  <tr>
-                    <td colSpan={11} className="p-12 text-center text-slate-400 font-bold uppercase italic text-sm">
-                      No data available for the selected date.
-                    </td>
-                  </tr>
-                )}
-                {loading && (
-                  <tr>
-                    <td colSpan={11} className="p-12 text-center">
-                      <Loader2 className="w-8 h-8 animate-spin mx-auto text-indigo-600" />
-                      <p className="mt-2 text-xs font-bold text-slate-500 uppercase">Fetching latest data...</p>
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-              {reportData.length > 0 && (
-                <tfoot className="bg-slate-100 font-black text-slate-900 uppercase text-center border-t-2 border-slate-900 text-xs sm:text-sm">
-                  <tr>
-                    <td colSpan={3} className="p-3 text-right border-r-2 border-slate-900 font-black">TOTAL SUMMARY</td>
-                    <td className="p-3 border-r border-slate-300">-</td>
-                    <td className="p-3 border-r border-slate-300">-</td>
-                    <td className="p-3 border-r border-slate-300 font-mono font-black text-indigo-700">{reportData.reduce((acc, r) => acc + r.totalKm, 0)}</td>
-                    <td className="p-3 border-r border-slate-300 font-mono font-black text-emerald-700">₹{reportData.reduce((acc, r) => acc + r.paymentCollection, 0).toLocaleString()}</td>
-                    <td className="p-3 border-r border-slate-300 font-mono font-black text-rose-700">₹{reportData.reduce((acc, r) => acc + r.dailyExpense, 0).toLocaleString()}</td>
-                    <td className="p-3 border-r border-slate-300 font-mono font-bold">{reportData.reduce((acc, r) => acc + r.monthlySalesTarget, 0).toFixed(2)}</td>
-                    <td className="p-3 border-r border-slate-300 font-mono font-black text-blue-700">{reportData.reduce((acc, r) => acc + r.monthlyAchievement, 0).toFixed(2)}</td>
-                    <td className="p-3 font-mono font-black text-red-600">{reportData.reduce((acc, r) => acc + r.targetBacklog, 0).toFixed(2)}</td>
-                  </tr>
-                </tfoot>
+              ))}
+              {reportData.length === 0 && !loading && (
+                <tr>
+                  <td colSpan={11} className="p-8 text-center text-slate-400 font-bold uppercase italic text-xs">
+                    No data available for the selected date.
+                  </td>
+                </tr>
               )}
-            </table>
+              {loading && (
+                <tr>
+                  <td colSpan={11} className="p-8 text-center">
+                    <Loader2 className="w-7 h-7 animate-spin mx-auto text-indigo-600" />
+                    <p className="mt-2 text-xs font-bold text-slate-500 uppercase">Loading data...</p>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+            {reportData.length > 0 && (
+              <tfoot className="bg-slate-100 font-black text-slate-900 uppercase text-center border-t-2 border-slate-900 text-xs">
+                <tr>
+                  <td colSpan={3} className="p-2 text-left font-black border-r border-slate-400">
+                    TOTAL SUMMARY
+                  </td>
+                  <td className="p-2 border-r border-slate-300 text-slate-400">-</td>
+                  <td className="p-2 border-r border-slate-300 text-slate-400">-</td>
+                  <td className="p-2 border-r border-slate-300 font-mono font-black text-indigo-700 bg-indigo-100/60">
+                    {totalKmSum}
+                  </td>
+                  <td className="p-2 border-r border-slate-300 font-mono font-black text-emerald-700 bg-emerald-100/60">
+                    ₹{totalCollectionSum.toLocaleString()}
+                  </td>
+                  <td className="p-2 border-r border-slate-300 font-mono font-black text-rose-700 bg-rose-100/60">
+                    ₹{totalExpenseSum.toLocaleString()}
+                  </td>
+                  <td className="p-2 border-r border-slate-300 font-mono font-bold">
+                    {totalTargetSum.toFixed(2)}
+                  </td>
+                  <td className="p-2 border-r border-slate-300 font-mono font-black text-blue-700 bg-blue-100/60">
+                    {totalAchieveSum.toFixed(2)}
+                  </td>
+                  <td className="p-2 font-mono font-black text-red-600 bg-red-100/60">
+                    {totalBacklogSum.toFixed(2)}
+                  </td>
+                </tr>
+              </tfoot>
+            )}
+          </table>
 
-            <div className="mt-12 flex justify-between items-end no-print">
-              <div className="text-center w-48">
-                <div className="h-10 border-b-2 border-slate-400 mb-2"></div>
-                <p className="text-xs font-black uppercase text-slate-500">Admin Signature</p>
-              </div>
-              <div className="text-center w-48">
-                <div className="h-10 border-b-2 border-slate-400 mb-2"></div>
-                <p className="text-xs font-black uppercase text-slate-500">Owner Signature</p>
-              </div>
+          <div className="mt-8 flex justify-between items-end">
+            <div className="text-center w-36 sm:w-44">
+              <div className="h-7 border-b-2 border-slate-400 mb-1"></div>
+              <p className="text-[10px] sm:text-[11px] font-black uppercase text-slate-500">Admin Signature</p>
+            </div>
+            <div className="text-center w-36 sm:w-44">
+              <div className="h-7 border-b-2 border-slate-400 mb-1"></div>
+              <p className="text-[10px] sm:text-[11px] font-black uppercase text-slate-500">Owner Signature</p>
             </div>
           </div>
         </div>
