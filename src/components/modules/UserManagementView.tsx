@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { collection, query, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import { logAudit } from '../../lib/dataService';
+import { logAudit, syncOfficerDetailsEverywhere } from '../../lib/dataService';
 import { Language, translations } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
 import jsPDF from 'jspdf';
@@ -328,6 +328,18 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
         updatedAt: new Date().toISOString(),
       }, { merge: true });
 
+      // Synchronize updated user details everywhere across all linked records
+      try {
+        await syncOfficerDetailsEverywhere(
+          req.targetUserId,
+          req.proposedData.fullName,
+          req.proposedData.designation,
+          req.proposedData.center
+        );
+      } catch (syncErr) {
+        console.warn('Sync error on approval:', syncErr);
+      }
+
       await setDoc(doc(db, 'user_approval_requests', req.id), {
         status: 'approved',
         approvedAt: new Date().toISOString(),
@@ -648,6 +660,13 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
     try {
       await setDoc(doc(db, 'users', uid), payload, { merge: true });
 
+      // Synchronize updated user details everywhere across all linked records
+      try {
+        await syncOfficerDetailsEverywhere(uid, payload.fullName, payload.designation, payload.center);
+      } catch (syncErr) {
+        console.warn('Sync error on direct save:', syncErr);
+      }
+
       // If new user (and not owner), create initial target & travel records
       if (!currentUid && role !== 'owner') {
         const targetId = `target_${uid}_oct26`;
@@ -947,8 +966,13 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
               })}
             </div>
           ) : (
-            <div className="text-xs font-black text-slate-800 uppercase px-1">
-              माझे युझर प्रोफाईल (My User Profile)
+            <div className="px-1 flex items-center gap-2 truncate whitespace-nowrap">
+              <span className="text-sm font-black text-slate-900 uppercase tracking-tight truncate whitespace-nowrap">
+                {profile.fullName || profile.uid}
+              </span>
+              <span className="text-[9.5px] font-bold text-slate-500 uppercase tracking-tight bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded shrink-0">
+                {profile.designation || profile.role}
+              </span>
             </div>
           )}
 
@@ -966,10 +990,10 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                   </span>
                   
                   <div className="flex-1 min-w-0">
-                    <h3 className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 transition-colors uppercase tracking-wide block break-words leading-snug">
+                    <h3 className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 transition-colors uppercase tracking-wide truncate whitespace-nowrap leading-snug">
                       {u.fullName || 'Unnamed User'}
                     </h3>
-                    <span className="text-[10px] font-bold text-slate-500 uppercase block mt-0.5 break-words">
+                    <span className="text-[9.5px] font-bold text-slate-500 uppercase block mt-0.5 truncate whitespace-nowrap">
                       {u.designation || u.role} {u.center && `• ${u.center}`}
                     </span>
                   </div>

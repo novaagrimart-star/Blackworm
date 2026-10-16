@@ -194,3 +194,170 @@ export async function seedInitialDataIfEmpty(user: UserProfile) {
     console.error('Initial seeding notice:', err);
   }
 }
+
+/**
+ * Synchronizes updated user/officer details (name, designation, center) across all linked historical records.
+ * Historical form data, calculations, serial numbers, and relationships remain strictly intact.
+ * Avoids duplicate or broken records by updating documents by exact ID.
+ */
+export async function syncOfficerDetailsEverywhere(
+  userId: string,
+  updatedName: string,
+  updatedDesignation?: string,
+  updatedCenter?: string
+) {
+  if (!userId || !updatedName) return;
+
+  const cleanNameUpper = updatedName.trim().toUpperCase();
+  const cleanDesigUpper = (updatedDesignation || '').trim().toUpperCase();
+  const cleanCenterUpper = (updatedCenter || '').trim().toUpperCase();
+
+  // 1. Sync Dealer Forms (dealers_application)
+  try {
+    const dealerSnap = await getDocs(collection(db, 'dealers_application'));
+    const updates: Promise<any>[] = [];
+    dealerSnap.forEach((d) => {
+      const data = d.data();
+      const isLinked = 
+        data.created_by_user_id === userId ||
+        data.createdByUid === userId ||
+        data.userId === userId ||
+        data.ownerId === userId;
+
+      if (isLinked) {
+        updates.push(
+          updateDoc(doc(db, 'dealers_application', d.id), {
+            officerName: cleanNameUpper,
+            created_by_name: cleanNameUpper,
+            createdByName: cleanNameUpper,
+            ...(cleanDesigUpper ? { designation: cleanDesigUpper } : {}),
+            updatedAt: new Date().toISOString(),
+          }).catch((e) => console.warn(`Sync failed for dealer ${d.id}:`, e))
+        );
+      }
+    });
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+  } catch (err) {
+    console.error('Error syncing officer in dealers_application:', err);
+  }
+
+  // 2. Sync Orders (orders)
+  try {
+    const ordersSnap = await getDocs(collection(db, 'orders'));
+    const updates: Promise<any>[] = [];
+    ordersSnap.forEach((o) => {
+      const data = o.data();
+      const isLinked = data.userId === userId || data.ownerId === userId;
+      if (isLinked) {
+        updates.push(
+          updateDoc(doc(db, 'orders', o.id), {
+            createdByName: updatedName.trim(),
+            updatedAt: new Date().toISOString(),
+          }).catch((e) => console.warn(`Sync failed for order ${o.id}:`, e))
+        );
+      }
+    });
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+  } catch (err) {
+    console.error('Error syncing officer in orders:', err);
+  }
+
+  // 3. Sync Collection Entries (collection_entries)
+  try {
+    const collSnap = await getDocs(collection(db, 'collection_entries'));
+    const updates: Promise<any>[] = [];
+    collSnap.forEach((c) => {
+      const data = c.data();
+      const isLinked = data.userId === userId || data.ownerId === userId;
+      if (isLinked) {
+        updates.push(
+          updateDoc(doc(db, 'collection_entries', c.id), {
+            createdByName: updatedName.trim(),
+            officerName: updatedName.trim(),
+            updatedAt: new Date().toISOString(),
+          }).catch((e) => console.warn(`Sync failed for collection ${c.id}:`, e))
+        );
+      }
+    });
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+  } catch (err) {
+    console.error('Error syncing officer in collection_entries:', err);
+  }
+
+  // 4. Sync Travel Sheets (travel_sheets)
+  try {
+    const travelSnap = await getDocs(collection(db, 'travel_sheets'));
+    const updates: Promise<any>[] = [];
+    travelSnap.forEach((t) => {
+      const data = t.data();
+      const isLinked = data.userId === userId || t.id.startsWith(`travel_${userId}`);
+      if (isLinked) {
+        updates.push(
+          updateDoc(doc(db, 'travel_sheets', t.id), {
+            officerName: cleanNameUpper,
+            ...(cleanDesigUpper ? { designation: cleanDesigUpper } : {}),
+            updatedAt: new Date().toISOString(),
+          }).catch((e) => console.warn(`Sync failed for travel_sheet ${t.id}:`, e))
+        );
+      }
+    });
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+  } catch (err) {
+    console.error('Error syncing officer in travel_sheets:', err);
+  }
+
+  // 5. Sync Yearly Targets (yearly_targets)
+  try {
+    const targetSnap = await getDocs(collection(db, 'yearly_targets'));
+    const updates: Promise<any>[] = [];
+    targetSnap.forEach((tg) => {
+      const data = tg.data();
+      const isLinked = data.userId === userId || tg.id.startsWith(`yearly_${userId}`);
+      if (isLinked) {
+        updates.push(
+          updateDoc(doc(db, 'yearly_targets', tg.id), {
+            fullName: cleanNameUpper,
+            ...(cleanDesigUpper ? { designation: cleanDesigUpper } : {}),
+            ...(cleanCenterUpper ? { center: cleanCenterUpper } : {}),
+            updatedAt: new Date().toISOString(),
+          }).catch((e) => console.warn(`Sync failed for yearly_target ${tg.id}:`, e))
+        );
+      }
+    });
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+  } catch (err) {
+    console.error('Error syncing officer in yearly_targets:', err);
+  }
+
+  // 6. Sync Targets (targets)
+  try {
+    const oldTargetsSnap = await getDocs(collection(db, 'targets'));
+    const updates: Promise<any>[] = [];
+    oldTargetsSnap.forEach((ot) => {
+      const data = ot.data();
+      if (data.userId === userId) {
+        updates.push(
+          updateDoc(doc(db, 'targets', ot.id), {
+            userName: cleanNameUpper,
+            updatedAt: new Date().toISOString(),
+          }).catch((e) => console.warn(`Sync failed for target ${ot.id}:`, e))
+        );
+      }
+    });
+    if (updates.length > 0) {
+      await Promise.all(updates);
+    }
+  } catch (err) {
+    console.error('Error syncing officer in targets:', err);
+  }
+}

@@ -10,6 +10,7 @@ import { db } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { logAudit } from '../../lib/dataService';
 import { Language, translations } from '../../lib/i18n';
+import { cn } from '../../lib/utils';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas-pro';
 import { 
@@ -70,6 +71,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const userIsAdmin = isAdmin(profile);
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [selectedUserId, setSelectedUserId] = useState<string>(userIsAdmin ? (profile.role === 'owner' ? '' : profile.uid) : profile.uid);
+  const [isUserDropdownOpen, setIsUserDropdownOpen] = useState(false);
   
   // Current date by default
   const today = new Date();
@@ -434,24 +436,93 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       const element = printableSheetRef.current;
       
       const canvas = await html2canvas(element, {
-        scale: 2.5,
+        scale: 2,
         useCORS: true,
         logging: false,
         backgroundColor: '#ffffff',
-        windowWidth: 1024,
+        width: 980,
+        windowWidth: 1200,
+        scrollX: 0,
+        scrollY: 0,
+        onclone: (clonedDoc) => {
+          const clonedSheet = clonedDoc.querySelector('[data-printable-sheet="true"]') as HTMLElement;
+          if (clonedSheet) {
+            clonedSheet.style.width = '980px';
+            clonedSheet.style.minWidth = '980px';
+            clonedSheet.style.maxWidth = '980px';
+            clonedSheet.style.overflow = 'visible';
+            clonedSheet.style.margin = '0';
+            clonedSheet.style.boxSizing = 'border-box';
+          }
+
+          // Replace inputs in the clone with styled divs so html2canvas renders complete text without input clipping
+          const inputs = clonedDoc.querySelectorAll('input');
+          inputs.forEach((input) => {
+            const textDiv = clonedDoc.createElement('div');
+            const val = input.value || input.placeholder || '';
+            textDiv.textContent = val;
+            textDiv.style.width = '100%';
+            textDiv.style.textAlign = 'center';
+            textDiv.style.whiteSpace = 'nowrap';
+            textDiv.style.overflow = 'visible';
+            textDiv.style.display = 'block';
+            textDiv.style.fontWeight = '900';
+            textDiv.style.textTransform = 'uppercase';
+            textDiv.style.color = '#000000';
+            textDiv.style.lineHeight = '1.2';
+            textDiv.style.padding = '2px 3px';
+
+            const role = input.getAttribute('data-role');
+            if (role === 'route') {
+              textDiv.style.padding = '2px 3px 2px 6px';
+              textDiv.style.textAlign = 'left';
+              const len = val.length;
+              // Precise font scaling for Route column so even very long village chains fit in a single line!
+              const fontSize = len > 50 ? '7.5px' : len > 38 ? '8.5px' : len > 26 ? '9.5px' : '10.5px';
+              textDiv.style.fontSize = fontSize;
+              textDiv.style.letterSpacing = '-0.02em';
+            } else if (role === 'officerName') {
+              textDiv.style.fontSize = '12px';
+              textDiv.style.textAlign = 'left';
+            } else if (role === 'designation') {
+              textDiv.style.fontSize = '9.5px';
+              textDiv.style.textAlign = 'left';
+            } else {
+              textDiv.style.fontSize = '10px';
+            }
+
+            input.parentNode?.replaceChild(textDiv, input);
+          });
+        }
       });
 
       const imgData = canvas.toDataURL('image/jpeg', 0.98);
       const pdf = new jsPDF({
         orientation: 'portrait',
         unit: 'mm',
-        format: 'a4'
+        format: 'a4',
+        compress: true,
       });
 
-      const pdfWidth = pdf.internal.pageSize.getWidth();
-      const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
-      
-      pdf.addImage(imgData, 'JPEG', 0, 0, pdfWidth, Math.min(pdfHeight, 297));
+      const pageWidth = 210;
+      const pageHeight = 297;
+      const marginX = 5;
+      const marginY = 5;
+      const maxContentWidth = pageWidth - (marginX * 2); // 200 mm
+      const maxContentHeight = pageHeight - (marginY * 2); // 287 mm
+
+      let finalWidth = maxContentWidth;
+      let finalHeight = (canvas.height * finalWidth) / canvas.width;
+
+      if (finalHeight > maxContentHeight) {
+        finalHeight = maxContentHeight;
+        finalWidth = (canvas.width * finalHeight) / canvas.height;
+      }
+
+      const posX = (pageWidth - finalWidth) / 2;
+      const posY = marginY;
+
+      pdf.addImage(imgData, 'JPEG', posX, posY, finalWidth, finalHeight, undefined, 'FAST');
       const sanitizedName = (sheet?.officerName ? `Traveling_Sheet_${sheet.officerName}_${sheet.monthName}` : 'Traveling_Sheet').replace(/[^a-zA-Z0-9_-]/g, '_');
       pdf.save(`${sanitizedName}.pdf`);
     } catch (err: any) {
@@ -480,34 +551,63 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
         <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
           {/* User Selector: Dropdown for Admin, Locked Badge for Non-Admin */}
           {userIsAdmin ? (
-            <div className="relative flex-1 sm:w-60">
-              <UserIcon className="w-4 h-4 absolute left-3 top-3 text-slate-400" />
-              <select 
-                value={selectedUserId}
-                onChange={(e) => setSelectedUserId(e.target.value)}
-                className="w-full pl-9 pr-8 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-black focus:outline-none focus:ring-2 focus:ring-red-500 appearance-none uppercase"
+            <div className="relative flex-1 sm:w-64">
+              <button
+                type="button"
+                onClick={() => setIsUserDropdownOpen(!isUserDropdownOpen)}
+                className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1 px-2.5 rounded-lg text-left flex items-center justify-between gap-1.5 cursor-pointer hover:bg-slate-100 transition shadow-2xs"
               >
-                {users.map(u => (
-                  <option key={u.uid} value={u.uid}>{u.fullName || u.uid} ({u.role})</option>
-                ))}
-              </select>
-              <ChevronDown className="w-4 h-4 absolute right-3 top-3 text-slate-400 pointer-events-none" />
+                <div className="min-w-0 flex-1 flex items-baseline gap-1.5 truncate">
+                  <UserIcon className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                  <span className="text-xs font-black text-slate-900 truncate">
+                    {(users.find(u => u.uid === selectedUserId) || profile).fullName || selectedUserId}
+                  </span>
+                  <span className="text-[9.5px] font-bold text-slate-500 uppercase shrink-0">
+                    {((users.find(u => u.uid === selectedUserId) || profile).designation || (users.find(u => u.uid === selectedUserId) || profile).role)}
+                  </span>
+                </div>
+                <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+              </button>
+
+              {isUserDropdownOpen && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setIsUserDropdownOpen(false)} />
+                  <div className="absolute left-0 mt-1 w-full sm:w-72 bg-white border border-slate-200 rounded-xl shadow-xl z-50 max-h-60 overflow-y-auto p-1 divide-y divide-slate-100">
+                    {users.map((u) => (
+                      <div
+                        key={u.uid}
+                        onClick={() => {
+                          setSelectedUserId(u.uid);
+                          setIsUserDropdownOpen(false);
+                        }}
+                        className={cn(
+                          "p-1.5 px-2 rounded-lg cursor-pointer transition flex flex-col",
+                          selectedUserId === u.uid ? "bg-red-50 text-red-900" : "hover:bg-slate-50 text-slate-800"
+                        )}
+                      >
+                        <span className="text-xs font-black text-slate-900 truncate">{u.fullName || u.uid}</span>
+                        <span className="text-[9.5px] font-bold text-slate-500 uppercase">
+                          {u.designation || u.role}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
           ) : (
-            <div className="flex items-center gap-2 px-3 py-2 bg-slate-100 border border-slate-200 rounded-xl text-xs font-black uppercase text-slate-800">
-              <UserIcon className="w-4 h-4 text-slate-500 shrink-0" />
-              <div className="flex items-baseline gap-1.5 flex-wrap">
-                <span className="font-black text-slate-900">{profile.fullName || 'OFFICER'}</span>
-                <span className="text-[10px] font-bold text-slate-500 bg-white border border-slate-200 px-1 py-0.5 rounded">
-                  ({profile.designation || 'OFFICER'})
-                </span>
-              </div>
+            <div className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-100 border border-slate-200 rounded-lg text-xs font-black uppercase text-slate-800">
+              <UserIcon className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+              <span className="font-black text-slate-900 truncate">{profile.fullName || 'OFFICER'}</span>
+              <span className="text-[9.5px] font-bold text-slate-500 bg-white border border-slate-200 px-1 py-0.2 rounded shrink-0">
+                ({profile.designation || 'OFFICER'})
+              </span>
             </div>
           )}
 
           {/* Date Picker (Changing this immediately reloads that month's days) */}
-          <div className="relative flex items-center gap-1.5 bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-xl">
-            <Calendar className="w-4 h-4 text-red-600 shrink-0" />
+          <div className="relative flex items-center gap-1.5 bg-slate-50 border border-slate-200 px-2.5 py-1 rounded-lg">
+            <Calendar className="w-3.5 h-3.5 text-red-600 shrink-0" />
             <input 
               type="date"
               value={selectedDate}
@@ -517,15 +617,15 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
           </div>
         </div>
 
-        {/* Action Buttons: Save, Download, Print */}
-        <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
+        {/* Action Buttons: Save, Download, Print - Compact matching ASM badge size */}
+        <div className="flex items-center gap-1.5 w-full sm:w-auto justify-end">
           <button 
             onClick={handleSave}
             disabled={saving}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-xl text-xs font-black transition flex items-center gap-1.5 shadow-sm active:scale-95 disabled:opacity-50"
+            className="bg-emerald-600 hover:bg-emerald-700 text-white px-2 py-0.5 rounded text-[10px] font-black transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer"
             title="Save Travelling Sheet"
           >
-            {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+            {saving ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Save className="w-2.5 h-2.5" />}
             <span>Save</span>
           </button>
 
@@ -533,20 +633,21 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             type="button"
             onClick={handleDownloadPdf}
             disabled={isGeneratingPdf}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-xl text-xs font-black transition flex items-center gap-1.5 shadow-sm active:scale-95 disabled:opacity-50"
+            className="bg-blue-600 hover:bg-blue-700 text-white px-2 py-0.5 rounded text-[10px] font-black transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer"
             title="Download PDF"
           >
-            {isGeneratingPdf ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
-            <span>{isGeneratingPdf ? 'Generating...' : 'Download'}</span>
+            {isGeneratingPdf ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Download className="w-2.5 h-2.5" />}
+            <span>PDF</span>
           </button>
 
           <button
             type="button"
             onClick={() => window.print()}
-            className="p-2 rounded-xl bg-red-600 hover:bg-red-700 text-white flex items-center shadow-sm transition active:scale-95"
+            className="px-2 py-0.5 rounded bg-red-600 hover:bg-red-700 text-white flex items-center gap-1 text-[10px] font-black shadow-2xs transition active:scale-95 cursor-pointer"
             title="Print Form"
           >
-            <Printer className="w-4 h-4" />
+            <Printer className="w-2.5 h-2.5" />
+            <span>Print</span>
           </button>
         </div>
       </div>
@@ -565,7 +666,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
 
       {/* ======================= STRICT OFFICIAL TRAVELLING SHEET FORM ======================= */}
       <div className="bg-white rounded-2xl border-2 border-slate-300 shadow-xl overflow-x-auto print:border-none print:shadow-none print:m-0 print:p-0">
-        <div ref={printableSheetRef} className="border-2 border-black bg-white shadow-sm min-w-[850px] sm:min-w-0">
+        <div ref={printableSheetRef} data-printable-sheet="true" className="border-2 border-black bg-white shadow-sm w-[980px] min-w-[980px]">
           
           {/* 1. Header Section - Logo (Left) and Company Details (Center) */}
           <div className="p-3 relative bg-white border-b-2 border-black">
@@ -633,6 +734,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
               <div className="flex-1 border-l-2 border-black min-h-10 flex items-center px-2 min-w-0">
                 <input 
                   type="text" 
+                  data-role="officerName"
                   value={sheet.officerName} 
                   onChange={e => setSheet({ ...sheet, officerName: e.target.value.toUpperCase() })} 
                   placeholder="OFFICER NAME"
@@ -647,6 +749,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
               <div className="flex-1 border-l-2 border-black min-h-10 flex items-center px-2 min-w-0">
                 <input 
                   type="text" 
+                  data-role="designation"
                   value={sheet.designation} 
                   onChange={e => setSheet({ ...sheet, designation: e.target.value.toUpperCase() })} 
                   placeholder="DESIGNATION"
@@ -671,21 +774,21 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             <table className="w-full text-left border-collapse text-[10.5px]">
               <thead>
                 <tr className="bg-slate-900 text-white font-black uppercase text-center border-b-2 border-black">
-                  <th className="p-1.5 border-r-2 border-black w-20 text-center">Date</th>
-                  <th className="p-1.5 border-r-2 border-black w-14 text-center">Days</th>
-                  <th className="p-1.5 border-r-2 border-black min-w-[170px] text-center">Route</th>
-                  <th className="p-1.5 border-r-2 border-black w-20 text-center">Opening KM</th>
-                  <th className="p-1.5 border-r-2 border-black w-20 text-center">Closing KM</th>
-                  <th className="p-1.5 border-r-2 border-black w-16 text-center">KM</th>
-                  <th className="p-1.5 border-r-2 border-black w-20 text-center">Amount</th>
-                  <th className="p-1.5 border-r-2 border-black w-24 text-center">Other Expenses</th>
-                  <th className="p-1.5 text-center w-24 bg-slate-800">Subtotal</th>
+                  <th className="p-1.5 border-r-2 border-black w-16 text-center whitespace-nowrap">Date</th>
+                  <th className="p-1.5 border-r-2 border-black w-12 text-center whitespace-nowrap">Days</th>
+                  <th className="p-1.5 pl-3 border-r-2 border-black w-[410px] min-w-[390px] text-left whitespace-nowrap">Route</th>
+                  <th className="p-1.5 border-r-2 border-black w-16 text-center whitespace-nowrap">Opening KM</th>
+                  <th className="p-1.5 border-r-2 border-black w-16 text-center whitespace-nowrap">Closing KM</th>
+                  <th className="p-1.5 border-r-2 border-black w-14 text-center whitespace-nowrap">KM</th>
+                  <th className="p-1.5 border-r-2 border-black w-16 text-center whitespace-nowrap">Amount</th>
+                  <th className="p-1.5 border-r-2 border-black w-20 text-center whitespace-nowrap">Other Expenses</th>
+                  <th className="p-1.5 text-center w-20 bg-slate-800 whitespace-nowrap">Subtotal</th>
                 </tr>
               </thead>
               <tbody className="divide-y-2 divide-black text-black font-black">
                 {sheet.rows.map((row, idx) => {
                   const isSunday = row.days === 'Sun';
-                  const routeRowCount = Math.max(1, Math.ceil((row.route || '').length / 22));
+                  const routeLen = (row.route || '').length;
                   return (
                     <tr 
                       key={row.dayNumber} 
@@ -705,15 +808,25 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                         </span>
                       </td>
 
-                      {/* Route (Strictly single line, auto comma on space after word unless manually removed) */}
-                      <td className="p-1 border-r-2 border-black align-middle">
+                      {/* Route (Strictly single line, all village names clearly visible without cutting off) */}
+                      <td className="p-0 pl-2 pr-1 border-r-2 border-black align-middle w-[410px] min-w-[390px]">
                         <input 
                           type="text" 
+                          data-role="route"
                           value={row.route} 
+                          title={row.route}
                           onKeyDown={e => handleRouteKeyDown(idx, e)}
                           onChange={e => updateRow(idx, { route: e.target.value.toUpperCase() })}
-                          placeholder={isSunday ? "SUNDAY / OFF" : "ENTER ROUTE"}
-                          className="w-full px-1.5 py-0.5 bg-transparent border-none focus:outline-none font-black uppercase text-center text-[10.5px] truncate block leading-tight whitespace-nowrap" 
+                          placeholder={isSunday ? "SUNDAY / OFF" : "TASGAON, SANGLI, VITA"}
+                          className={`w-full p-0 m-0 pl-1 pr-0.5 py-0.5 bg-transparent border-none focus:outline-none font-black uppercase text-left block leading-tight whitespace-nowrap tracking-tight ${
+                            routeLen > 48
+                              ? 'text-[7.5px]'
+                              : routeLen > 36
+                                ? 'text-[8.5px]'
+                                : routeLen > 24
+                                  ? 'text-[9.5px]'
+                                  : 'text-[10.5px]'
+                          }`}
                         />
                       </td>
 

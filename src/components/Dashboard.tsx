@@ -37,7 +37,7 @@ import { PriceListView } from './modules/PriceListView';
 import { DealerView } from './modules/DealerView';
 import { TravelView } from './modules/TravelView';
 import { SchemeView } from './modules/SchemeView';
-import { ReportView } from './modules/ReportView';
+import { ReportView, preloadReportData } from './modules/ReportView';
 import { SettingView } from './modules/SettingView';
 
 interface DashboardProps {
@@ -114,6 +114,16 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout })
     });
     return () => unsubBranding();
   }, []);
+
+  // Preload and cache report data in background so Report tab opens instantly
+  useEffect(() => {
+    if (currentUserData && currentUserData.uid) {
+      const timer = setTimeout(() => {
+        preloadReportData(currentUserData);
+      }, 350);
+      return () => clearTimeout(timer);
+    }
+  }, [currentUserData?.uid]);
 
   const modules = [
     { id: 'target', label: t.targetSheet, icon: Target, color: 'text-blue-500', bg: 'bg-blue-50' },
@@ -293,9 +303,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout })
             />
           </div>
 
-          {/* Company Title - Updated to full name after login */}
+          {/* Company Title - Updated to full name with increased font size */}
           <div className="flex flex-col justify-center min-w-0">
-            <h1 className="text-xs sm:text-sm md:text-base font-black text-rose-600 tracking-tight leading-tight uppercase break-words sm:whitespace-nowrap">
+            <h1 className="text-sm sm:text-base md:text-lg lg:text-xl font-black text-rose-600 tracking-tight leading-tight uppercase break-words sm:whitespace-nowrap">
               BLACKWORM AGRITECH PVT LTD
             </h1>
           </div>
