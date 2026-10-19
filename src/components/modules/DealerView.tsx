@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   collection, 
   query, 
@@ -40,7 +40,11 @@ import {
   RefreshCw,
   FileText,
   LayoutList,
-  Table as TableIcon
+  Table as TableIcon,
+  User as UserIcon,
+  ChevronDown,
+  ArrowUpDown,
+  UserCheck
 } from 'lucide-react';
 
 export interface DealershipFormItem {
@@ -162,10 +166,17 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const galleryInputRef = useRef<HTMLInputElement>(null);
   const printableFormRef = useRef<HTMLDivElement>(null);
   const [usersMap, setUsersMap] = useState<Record<string, string>>({});
+  const [officers, setOfficers] = useState<{ uid: string; fullName: string; designation?: string; role?: string; loginId?: string }[]>([]);
+  const [selectedOfficerFilter, setSelectedOfficerFilter] = useState<string>('all');
+  const [showUserFilterDropdown, setShowUserFilterDropdown] = useState<boolean>(false);
+  const [sortByUser, setSortByUser] = useState<boolean>(false);
+  const [isSavingDealer, setIsSavingDealer] = useState<boolean>(false);
+  const formSessionIdRef = useRef<string>('');
 
   useEffect(() => {
     const unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
       const map: Record<string, string> = {};
+      const uList: { uid: string; fullName: string; designation?: string; role?: string; loginId?: string }[] = [];
       snap.forEach((d) => {
         const u = d.data();
         if (u.fullName) {
@@ -173,8 +184,19 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           if (u.loginId) map[u.loginId.toLowerCase()] = u.fullName;
           if (u.userCode) map[u.userCode.toLowerCase()] = u.fullName;
         }
+        if (u.role !== 'dealer') {
+          uList.push({
+            uid: d.id,
+            fullName: u.fullName || u.loginId || d.id,
+            designation: u.designation || u.role || 'OFFICER',
+            role: u.role,
+            loginId: u.loginId,
+          });
+        }
       });
+      uList.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
       setUsersMap(map);
+      setOfficers(uList);
     });
     return () => unsubUsers();
   }, []);
@@ -550,6 +572,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     const previewCode = customCode || String(previewNum).padStart(3, '0');
 
     setCurrentId(null);
+    formSessionIdRef.current = '';
     setCenter('');
     setShopOpeningDate(new Date().toISOString().slice(0, 10));
     setDealerCode(previewCode);
@@ -599,6 +622,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   // ============================================================================
   const loadDealerToForm = (item: DealershipFormItem, editMode: boolean = true) => {
     setCurrentId(item.id);
+    formSessionIdRef.current = item.id;
     setCenter(item.center || '');
     setShopOpeningDate(item.shopOpeningDate || '');
     setDealerCode(item.dealerCode || '');
@@ -661,6 +685,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
   const handleSave = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
+    if (isSavingDealer) return;
+
     if (!firmName.trim()) {
       setDialogConfig({
         isOpen: true,
@@ -672,82 +698,89 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       return;
     }
 
-    const id = currentId || `dealer_app_${Date.now()}`;
-
-    // For new forms: allocate Global Auto-Increment Code across ALL users atomically
-    let finalCode = dealerCode.trim();
-    if (!currentId) {
-      try {
-        finalCode = await allocateGlobalDealerCode();
-      } catch (err) {
-        console.warn('Fallback sequence allocation:', err);
-        const nextNum = (globalSequence || 0) + 1;
-        finalCode = String(nextNum).padStart(3, '0');
-      }
-    }
-
-    // Preserve the original officer name and creator UID
-    const finalOfficer = currentId 
-      ? (officerName || createdByName || profile.fullName || '').toUpperCase()
-      : (profile.fullName || profile.loginId || officerName || 'OFFICER').toUpperCase();
-    const finalCreatorId = currentId ? (createdByUserId || profile.uid) : profile.uid;
-    const finalCreatorName = currentId ? (createdByName || finalOfficer) : (profile.fullName || profile.loginId || 'OFFICER');
-
-    const payload: DealershipFormItem = {
-      id,
-      center: center.trim(),
-      shopOpeningDate,
-      dealerCode: finalCode,
-      village: village.trim(),
-      securityDeposit: securityDeposit.trim(),
-      dealershipAddressPhoto,
-      firmName: firmName.trim().toUpperCase(),
-      proprietorName: proprietorName.trim().toUpperCase(),
-      contactNumber: contactNumber.trim(),
-      state: stateName.trim(),
-      emailId: emailId.trim(),
-      responsiblePerson: responsiblePerson.trim().toUpperCase(),
-      responsibleContact: responsibleContact.trim(),
-      aadhaarNo: aadhaarNo.trim(),
-      district: district.trim().toUpperCase(),
-      panNo: panNo.trim().toUpperCase(),
-      dateOfBirth,
-      gstNo: gstNo.trim().toUpperCase(),
-      pinCode: pinCode.trim(),
-      bankName: bankName.trim().toUpperCase(),
-      bankAddress: bankAddress.trim().toUpperCase(),
-      accountNo: accountNo.trim(),
-      ifscCode: ifscCode.trim().toUpperCase(),
-      chequeNos: chequeNos.trim(),
-      place: place.trim(),
-      declarationDate,
-      remarks: remarks.trim(),
-      officeDate,
-      officeTime,
-      officePlace: officePlace.trim().toUpperCase(),
-      officerName: finalOfficer,
-      created_by_user_id: finalCreatorId,
-      created_by_name: finalCreatorName,
-      status,
-      isArchived: false,
-      ownerId: finalCreatorId,
-      userId: finalCreatorId,
-      loginId: profile.loginId || '',
-      createdByUid: finalCreatorId,
-      updatedAt: new Date().toISOString(),
-    };
-
-    if (!currentId) {
-      payload.createdAt = new Date().toISOString();
-    }
+    setIsSavingDealer(true);
 
     try {
+      const isNewRecord = !currentId && !formSessionIdRef.current;
+      const id = currentId || formSessionIdRef.current || `dealer_app_${Date.now()}`;
+      formSessionIdRef.current = id;
+      if (!currentId) {
+        setCurrentId(id);
+      }
+
+      // For new forms: allocate Global Auto-Increment Code across ALL users atomically
+      let finalCode = dealerCode.trim();
+      if (isNewRecord) {
+        try {
+          finalCode = await allocateGlobalDealerCode();
+        } catch (err) {
+          console.warn('Fallback sequence allocation:', err);
+          const nextNum = (globalSequence || 0) + 1;
+          finalCode = String(nextNum).padStart(3, '0');
+        }
+      }
+
+      // Preserve the original officer name and creator UID
+      const finalOfficer = currentId 
+        ? (officerName || createdByName || profile.fullName || '').toUpperCase()
+        : (profile.fullName || profile.loginId || officerName || 'OFFICER').toUpperCase();
+      const finalCreatorId = currentId ? (createdByUserId || profile.uid) : profile.uid;
+      const finalCreatorName = currentId ? (createdByName || finalOfficer) : (profile.fullName || profile.loginId || 'OFFICER');
+
+      const payload: DealershipFormItem = {
+        id,
+        center: center.trim(),
+        shopOpeningDate,
+        dealerCode: finalCode,
+        village: village.trim(),
+        securityDeposit: securityDeposit.trim(),
+        dealershipAddressPhoto,
+        firmName: firmName.trim().toUpperCase(),
+        proprietorName: proprietorName.trim().toUpperCase(),
+        contactNumber: contactNumber.trim(),
+        state: stateName.trim(),
+        emailId: emailId.trim(),
+        responsiblePerson: responsiblePerson.trim().toUpperCase(),
+        responsibleContact: responsibleContact.trim(),
+        aadhaarNo: aadhaarNo.trim(),
+        district: district.trim().toUpperCase(),
+        panNo: panNo.trim().toUpperCase(),
+        dateOfBirth,
+        gstNo: gstNo.trim().toUpperCase(),
+        pinCode: pinCode.trim(),
+        bankName: bankName.trim().toUpperCase(),
+        bankAddress: bankAddress.trim().toUpperCase(),
+        accountNo: accountNo.trim(),
+        ifscCode: ifscCode.trim().toUpperCase(),
+        chequeNos: chequeNos.trim(),
+        place: place.trim(),
+        declarationDate,
+        remarks: remarks.trim(),
+        officeDate,
+        officeTime,
+        officePlace: officePlace.trim().toUpperCase(),
+        officerName: finalOfficer,
+        created_by_user_id: finalCreatorId,
+        created_by_name: finalCreatorName,
+        status,
+        isArchived: false,
+        ownerId: finalCreatorId,
+        userId: finalCreatorId,
+        loginId: profile.loginId || '',
+        createdByUid: finalCreatorId,
+        updatedAt: new Date().toISOString(),
+      };
+
+      if (isNewRecord) {
+        payload.createdAt = new Date().toISOString();
+      }
+
       await setDoc(doc(db, 'dealers_application', id), payload, { merge: true });
       await logAudit(
-        currentId ? 'UPDATE' : 'CREATE',
+        isNewRecord ? 'CREATE' : 'UPDATE',
         'dealers_application',
         id,
-        `${currentId ? 'Updated' : 'Created'} Dealership Form for ${payload.firmName} (${payload.dealerCode}) by ${payload.officerName}`,
+        `${isNewRecord ? 'Created' : 'Updated'} Dealership Form for ${payload.firmName} (${payload.dealerCode}) by ${payload.officerName}`,
         profile
       );
 
@@ -760,7 +793,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
 
-      if (!currentId) {
+      if (isNewRecord) {
         setDialogConfig({
           isOpen: true,
           type: 'success',
@@ -778,6 +811,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         message: `Save error: ${err.message || err}`,
         onConfirm: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
       });
+    } finally {
+      setIsSavingDealer(false);
     }
   };
 
@@ -821,20 +856,88 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     }
   };
 
-  const filteredDealers = dealers.filter((d) => {
-    const q = searchQuery.toLowerCase().trim();
-    const matchQuery =
-      !q ||
-      d.dealerCode.toLowerCase().includes(q) ||
-      d.firmName.toLowerCase().includes(q) ||
-      d.proprietorName.toLowerCase().includes(q) ||
-      d.village.toLowerCase().includes(q);
+  const isCreatedByOfficer = (d: DealershipFormItem, officerUid: string) => {
+    if (officerUid === 'all') return true;
+    const targetOfficer = officers.find(o => o.uid === officerUid);
+    const targetName = (targetOfficer?.fullName || '').trim().toUpperCase();
+    const targetLogin = (targetOfficer?.loginId || '').trim().toLowerCase();
 
-    if (activeFilter === 'active') {
-      return matchQuery && d.status === 'Approved';
+    if (
+      d.created_by_user_id === officerUid ||
+      d.createdByUid === officerUid ||
+      d.userId === officerUid ||
+      d.ownerId === officerUid
+    ) {
+      return true;
     }
-    return matchQuery;
+    if (targetLogin && d.loginId && d.loginId.toLowerCase() === targetLogin) {
+      return true;
+    }
+    if (targetName) {
+      if (d.officerName && d.officerName.trim().toUpperCase() === targetName) return true;
+      if (d.created_by_name && d.created_by_name.trim().toUpperCase() === targetName) return true;
+    }
+    return false;
+  };
+
+  const getDealerSubmittedBy = (d: DealershipFormItem) => {
+    const uid = d.created_by_user_id || d.createdByUid || d.userId || d.ownerId;
+    if (uid && usersMap[uid]) return usersMap[uid];
+    if (d.created_by_name) return d.created_by_name;
+    if (d.officerName) return d.officerName;
+    if (d.loginId && usersMap[d.loginId.toLowerCase()]) return usersMap[d.loginId.toLowerCase()];
+    return 'अधिकारी (Officer)';
+  };
+
+  const usersWithCounts = useMemo(() => {
+    return officers.map(off => {
+      const count = dealers.filter(d => isCreatedByOfficer(d, off.uid)).length;
+      return {
+        ...off,
+        count
+      };
+    }).sort((a, b) => b.count - a.count || a.fullName.localeCompare(b.fullName));
+  }, [officers, dealers]);
+
+  const selectedOfficerObj = officers.find((o) => o.uid === selectedOfficerFilter);
+
+  const officerScopedDealers = dealers.filter((d) => {
+    if ((profile.role === 'owner' || isAdmin(profile)) && selectedOfficerFilter !== 'all') {
+      return isCreatedByOfficer(d, selectedOfficerFilter);
+    }
+    return true;
   });
+
+  const officerDealersCount = officerScopedDealers.length;
+  const officerActiveCount = officerScopedDealers.filter((d) => d.status === 'Approved').length;
+
+  const filteredDealers = useMemo(() => {
+    let list = officerScopedDealers.filter((d) => {
+      const q = searchQuery.toLowerCase().trim();
+      const matchQuery =
+        !q ||
+        d.dealerCode.toLowerCase().includes(q) ||
+        d.firmName.toLowerCase().includes(q) ||
+        d.proprietorName.toLowerCase().includes(q) ||
+        d.village.toLowerCase().includes(q);
+
+      if (activeFilter === 'active') {
+        return matchQuery && d.status === 'Approved';
+      }
+      return matchQuery;
+    });
+
+    if (sortByUser) {
+      list = [...list].sort((a, b) => {
+        const uA = (getDealerSubmittedBy(a) || '').toUpperCase();
+        const uB = (getDealerSubmittedBy(b) || '').toUpperCase();
+        if (uA !== uB) return uA.localeCompare(uB);
+        return (b.createdAt || '').localeCompare(a.createdAt || '');
+      });
+    }
+
+    return list;
+  }, [officerScopedDealers, searchQuery, activeFilter, sortByUser, usersMap]);
 
   return (
     <div className="space-y-4 pb-24">
@@ -932,27 +1035,74 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         <div className="space-y-4 no-print">
 
           {/* Filter Pills matching screenshot */}
-          <div className="flex items-center gap-2 px-1">
+          <div className="flex items-center gap-2 px-1 flex-wrap">
             <button
               onClick={() => setActiveFilter('all')}
-              className={`px-5 py-1.5 rounded-lg text-xs font-black transition cursor-pointer ${
+              className={`px-4 py-1.5 rounded-lg text-xs font-black transition cursor-pointer ${
                 activeFilter === 'all'
                   ? 'bg-slate-900 text-white shadow-md'
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
               }`}
             >
-              All Applications ({dealers.length})
+              All ({dealers.length})
             </button>
             <button
               onClick={() => setActiveFilter('active')}
-              className={`px-5 py-1.5 rounded-lg text-xs font-black transition cursor-pointer ${
+              className={`px-4 py-1.5 rounded-lg text-xs font-black transition cursor-pointer ${
                 activeFilter === 'active'
                   ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-sm'
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
               }`}
             >
-              Active ({dealers.filter((d) => d.status === 'Approved').length})
+              Active ({officerActiveCount})
             </button>
+
+            {/* ऑफिसर सिलेक्ट - Only this clean dropdown with small letters */}
+            {(profile.role === 'owner' || isAdmin(profile)) && (
+              <select
+                value={selectedOfficerFilter}
+                onChange={(e) => setSelectedOfficerFilter(e.target.value)}
+                className="bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-[11px] font-bold text-slate-700 focus:outline-none focus:ring-1 focus:ring-red-500 cursor-pointer"
+                title="ऑफिसर सिलेक्ट"
+              >
+                <option value="all">ऑफिसर सिलेक्ट</option>
+                {officers.map((off) => {
+                  const count = dealers.filter((d) => isCreatedByOfficer(d, off.uid)).length;
+                  return (
+                    <option key={off.uid} value={off.uid} className="text-[11px] font-medium">
+                      {off.fullName} ({count})
+                    </option>
+                  );
+                })}
+              </select>
+            )}
+
+            {/* युजर वाईस सॉर्टिंग */}
+            <button
+              type="button"
+              onClick={() => setSortByUser(!sortByUser)}
+              title="युजर वाईस सॉर्टिंग"
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
+                sortByUser
+                  ? 'bg-indigo-600 text-white shadow-sm'
+                  : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <ArrowUpDown className="w-3 h-3" />
+              <span className="text-[11px]">युजर वाईस सॉर्टिंग</span>
+            </button>
+
+            {selectedOfficerFilter !== 'all' && (
+              <button
+                type="button"
+                onClick={() => setSelectedOfficerFilter('all')}
+                className="bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 px-2 py-1 rounded-lg text-[10.5px] font-black flex items-center gap-1 cursor-pointer transition"
+                title="फिल्टर काढा"
+              >
+                <span>{selectedOfficerObj?.fullName}</span>
+                <X className="w-3 h-3" />
+              </button>
+            )}
           </div>
 
           {/* TABLE DISPLAY MODE */}
@@ -1002,7 +1152,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                         {d.proprietorName || '-'}
                       </td>
                       <td className="p-3 font-bold text-slate-800 uppercase">
-                        {d.officerName || d.created_by_name || 'OFFICER'}
+                        {(d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'OFFICER'}
                       </td>
                       <td className="p-3 text-slate-600 uppercase">
                         {d.village || d.center || '-'}
@@ -1054,6 +1204,12 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                       className="text-xs sm:text-[13px] font-bold text-slate-900 group-hover:text-red-600 uppercase block truncate leading-tight tracking-tight"
                     >
                       {d.firmName || 'Unnamed Dealership'}
+                    </span>
+                    <span className="text-[10px] text-slate-500 font-semibold block truncate">
+                      {d.village || d.center || ''}{d.village && d.center ? ' • ' : ''}
+                      <span className="text-slate-700 font-bold ml-1">
+                        ({(d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'OFFICER'})
+                      </span>
                     </span>
                   </div>
                 </div>
@@ -1111,11 +1267,12 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   <button
                     type="submit"
                     form="dealer-application-form"
-                    className="text-xs font-bold px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white flex items-center gap-1 shadow-sm transition"
+                    disabled={isSavingDealer}
+                    className="text-xs font-bold px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white flex items-center gap-1 shadow-sm transition cursor-pointer"
                     title="Save Form"
                   >
-                    <Save className="w-3.5 h-3.5" />
-                    <span>Save</span>
+                    {isSavingDealer ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                    <span>{isSavingDealer ? 'Saving...' : 'Save'}</span>
                   </button>
                 )}
 

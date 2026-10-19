@@ -132,6 +132,13 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const printableSheetRef = useRef<HTMLDivElement>(null);
   const suppressedCommaMap = useRef<Record<number, boolean>>({});
 
+  // Village name formatter: First letter Capital, rest lowercase (Title Case)
+  const formatRouteVillages = (str: string): string => {
+    return str.replace(/\b[a-zA-Z]+/g, (match) => {
+      return match.charAt(0).toUpperCase() + match.slice(1).toLowerCase();
+    });
+  };
+
   // Route input handler: Auto-inserts comma on space after word, but remembers if comma was deleted
   const handleRouteKeyDown = (idx: number, e: React.KeyboardEvent<HTMLInputElement>) => {
     const input = e.currentTarget;
@@ -158,7 +165,8 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       if (/[A-Za-z0-9]$/.test(textBefore)) {
         e.preventDefault();
         const textAfter = val.slice(cursorPos);
-        const newVal = (textBefore + ', ' + textAfter).toUpperCase();
+        const formattedBefore = formatRouteVillages(textBefore);
+        const newVal = formattedBefore + ', ' + textAfter;
         updateRow(idx, { route: newVal });
         setTimeout(() => {
           input.setSelectionRange(cursorPos + 2, cursorPos + 2);
@@ -816,9 +824,9 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                           value={row.route} 
                           title={row.route}
                           onKeyDown={e => handleRouteKeyDown(idx, e)}
-                          onChange={e => updateRow(idx, { route: e.target.value.toUpperCase() })}
-                          placeholder={isSunday ? "SUNDAY / OFF" : "TASGAON, SANGLI, VITA"}
-                          className={`w-full p-0 m-0 pl-1 pr-0.5 py-0.5 bg-transparent border-none focus:outline-none font-black uppercase text-left block leading-tight whitespace-nowrap tracking-tight ${
+                          onChange={e => updateRow(idx, { route: formatRouteVillages(e.target.value) })}
+                          placeholder={isSunday ? "SUNDAY / OFF" : ""}
+                          className={`w-full p-0 m-0 pl-1 pr-0.5 py-0.5 bg-transparent border-none focus:outline-none font-black text-left block leading-tight whitespace-nowrap tracking-tight ${
                             routeLen > 48
                               ? 'text-[7.5px]'
                               : routeLen > 36

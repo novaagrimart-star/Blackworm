@@ -334,7 +334,12 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
           req.targetUserId,
           req.proposedData.fullName,
           req.proposedData.designation,
-          req.proposedData.center
+          req.proposedData.center,
+          {
+            loginId: req.proposedData.loginId,
+            oldName: req.targetUserName,
+            userCode: req.targetUserCode,
+          }
         );
       } catch (syncErr) {
         console.warn('Sync error on approval:', syncErr);
@@ -662,7 +667,18 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
 
       // Synchronize updated user details everywhere across all linked records
       try {
-        await syncOfficerDetailsEverywhere(uid, payload.fullName, payload.designation, payload.center);
+        const existingUser = users.find(u => u.uid === uid);
+        await syncOfficerDetailsEverywhere(
+          uid,
+          payload.fullName,
+          payload.designation,
+          payload.center,
+          {
+            loginId: payload.loginId,
+            oldName: existingUser?.fullName,
+            userCode: payload.userCode,
+          }
+        );
       } catch (syncErr) {
         console.warn('Sync error on direct save:', syncErr);
       }

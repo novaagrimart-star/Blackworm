@@ -373,6 +373,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
 
   // Generate & Save Order to Firestore
   const handleGenerateOrder = async () => {
+    if (isSubmittingOrder) return;
     setFormError(null);
 
     // 1. Resolve Dealer
@@ -539,11 +540,11 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       itemsListText = order.items
         .map(
           (it, idx) =>
-            `${idx + 1}. *${it.productName}* (${it.packingSize}) - *${it.quantity} Bags/Qty*`
+            `${idx + 1}. *${it.productName}* (${it.packingSize}) - *${it.quantity} Nos.*`
         )
         .join('\n');
     } else {
-      itemsListText = `1. Order Items (Qty: ${order.totalQuantity})`;
+      itemsListText = `1. Order Items (Qty: ${order.totalQuantity} Nos.)`;
     }
 
     const message = `🌿 *BLACKWORM AGRITECH PVT LTD* 🌿
@@ -557,7 +558,7 @@ ${order.farmerName ? `*Proprietor:* ${order.farmerName}\n` : ''}${order.dealerCo
 ${itemsListText}
 
 ━━━━━━━━━━━━━━━━━━━━━
-*TOTAL BAGS / QUANTITY:* *${order.totalQuantity} Units*
+*TOTAL QUANTITY:* *${order.totalQuantity} Nos.*
 *BOOKED BY:* ${order.createdByName || 'Officer'}
 ━━━━━━━━━━━━━━━━━━━━━`;
 
@@ -1043,22 +1044,6 @@ ${itemsListText}
               </div>
             </div>
 
-            {/* PROMINENT ORDER STATUS IN THE PHOTO */}
-            <div
-              className={cn(
-                "py-1.5 px-3 rounded-xl border text-center font-black text-xs uppercase tracking-wider",
-                (capturingOrder.status === 'pending_approval' || capturingOrder.status === 'pending') && "bg-amber-50 text-amber-900 border-amber-300",
-                (capturingOrder.status === 'dispatched' || capturingOrder.status === 'confirmed') && "bg-blue-50 text-blue-900 border-blue-300",
-                capturingOrder.status === 'delivered' && "bg-emerald-50 text-emerald-900 border-emerald-300",
-                capturingOrder.status === 'collected' && "bg-emerald-100 text-emerald-900 border-emerald-400"
-              )}
-            >
-              {(capturingOrder.status === 'pending_approval' || capturingOrder.status === 'pending') && '⏳ ORDER STATUS: PENDING APPROVAL'}
-              {(capturingOrder.status === 'dispatched' || capturingOrder.status === 'confirmed') && '🚚 ORDER STATUS: CONFIRMED / DISPATCHED'}
-              {capturingOrder.status === 'delivered' && '✅ ORDER STATUS: DELIVERED'}
-              {capturingOrder.status === 'collected' && '✅ ORDER STATUS: COMPLETED'}
-            </div>
-
             {/* Complete Dealer & Order Information */}
             <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200 text-[11px] space-y-1">
               <div className="flex justify-between items-start">
@@ -1109,14 +1094,14 @@ ${itemsListText}
                     <tr key={idx} className={idx % 2 === 1 ? "bg-slate-50/70" : ""}>
                       <td className="p-1.5 pl-2 font-bold text-slate-900 text-[11px]">{idx + 1}. {it.productName}</td>
                       <td className="p-1.5 text-center text-slate-600 text-[10px] font-bold">{it.packingSize}</td>
-                      <td className="p-1.5 text-center font-mono font-black text-slate-900 text-xs">{it.quantity} Bags</td>
+                      <td className="p-1.5 text-center font-mono font-black text-slate-900 text-xs">{it.quantity} Nos.</td>
                     </tr>
                   ))}
                 </tbody>
                 <tfoot className="bg-emerald-50 font-black text-emerald-950 text-[11px]">
                   <tr>
-                    <td colSpan={2} className="p-2 pl-2 text-right uppercase">Total Bags / Quantity:</td>
-                    <td className="p-2 text-center font-mono font-black text-sm text-emerald-900">{capturingOrder.totalQuantity} Units</td>
+                    <td colSpan={2} className="p-2 pl-2 text-right uppercase">TOTAL QUANTITY:</td>
+                    <td className="p-2 text-center font-mono font-black text-sm text-emerald-900">{capturingOrder.totalQuantity} Nos.</td>
                   </tr>
                 </tfoot>
               </table>
@@ -1515,7 +1500,7 @@ ${itemsListText}
                     <tfoot className="bg-purple-50 font-black text-purple-900 border-t border-purple-200 text-xs">
                       <tr>
                         <td colSpan={2} className="p-1.5 pl-2.5 text-slate-700">Total:</td>
-                        <td className="p-1.5 text-center font-mono">{totalBagsQuantity} Units</td>
+                        <td className="p-1.5 text-center font-mono">{totalBagsQuantity} Nos.</td>
                         <td colSpan={2} className="p-1.5 text-right text-[10px] text-rose-700">
                           {allDiscountsTotal > 0 ? `Disc: -₹${allDiscountsTotal.toLocaleString()}` : ''}
                         </td>
@@ -1599,7 +1584,7 @@ ${itemsListText}
 
             <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200 text-left text-xs space-y-1">
               <p className="font-black text-slate-900 truncate">Dealer: {successOrder.dealerName}</p>
-              <p className="text-slate-700 font-bold">Total Quantity: <span className="font-mono font-black text-emerald-700">{successOrder.totalQuantity} Bags / Units</span></p>
+              <p className="text-slate-700 font-bold">Total Quantity: <span className="font-mono font-black text-emerald-700">{successOrder.totalQuantity} Nos.</span></p>
               <p className="text-slate-500 text-[10.5px]">Status: ⏳ Pending Approval</p>
             </div>
 

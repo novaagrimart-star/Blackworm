@@ -204,13 +204,17 @@ export async function syncOfficerDetailsEverywhere(
   userId: string,
   updatedName: string,
   updatedDesignation?: string,
-  updatedCenter?: string
+  updatedCenter?: string,
+  extraIdentifiers?: { loginId?: string; oldName?: string; userCode?: string }
 ) {
   if (!userId || !updatedName) return;
 
   const cleanNameUpper = updatedName.trim().toUpperCase();
   const cleanDesigUpper = (updatedDesignation || '').trim().toUpperCase();
   const cleanCenterUpper = (updatedCenter || '').trim().toUpperCase();
+  const extraLogin = (extraIdentifiers?.loginId || '').trim().toLowerCase();
+  const extraOldName = (extraIdentifiers?.oldName || '').trim().toUpperCase();
+  const extraCode = (extraIdentifiers?.userCode || '').trim().toLowerCase();
 
   // 1. Sync Dealer Forms (dealers_application)
   try {
@@ -222,7 +226,11 @@ export async function syncOfficerDetailsEverywhere(
         data.created_by_user_id === userId ||
         data.createdByUid === userId ||
         data.userId === userId ||
-        data.ownerId === userId;
+        data.ownerId === userId ||
+        (extraLogin && data.loginId && data.loginId.toLowerCase() === extraLogin) ||
+        (extraCode && data.userCode && String(data.userCode).toLowerCase() === extraCode) ||
+        (extraOldName && data.officerName && data.officerName.toUpperCase() === extraOldName) ||
+        (extraOldName && data.created_by_name && data.created_by_name.toUpperCase() === extraOldName);
 
       if (isLinked) {
         updates.push(
@@ -249,11 +257,17 @@ export async function syncOfficerDetailsEverywhere(
     const updates: Promise<any>[] = [];
     ordersSnap.forEach((o) => {
       const data = o.data();
-      const isLinked = data.userId === userId || data.ownerId === userId;
+      const isLinked = 
+        data.userId === userId || 
+        data.ownerId === userId ||
+        (extraLogin && data.loginId && data.loginId.toLowerCase() === extraLogin) ||
+        (extraOldName && data.createdByName && data.createdByName.toUpperCase() === extraOldName);
+
       if (isLinked) {
         updates.push(
           updateDoc(doc(db, 'orders', o.id), {
             createdByName: updatedName.trim(),
+            ...(cleanDesigUpper ? { designation: cleanDesigUpper } : {}),
             updatedAt: new Date().toISOString(),
           }).catch((e) => console.warn(`Sync failed for order ${o.id}:`, e))
         );
@@ -272,11 +286,19 @@ export async function syncOfficerDetailsEverywhere(
     const updates: Promise<any>[] = [];
     collSnap.forEach((c) => {
       const data = c.data();
-      const isLinked = data.userId === userId || data.ownerId === userId;
+      const isLinked = 
+        data.userId === userId || 
+        data.ownerId === userId ||
+        data.collectedByUid === userId ||
+        (extraLogin && data.loginId && data.loginId.toLowerCase() === extraLogin) ||
+        (extraOldName && data.collectedByName && data.collectedByName.toUpperCase() === extraOldName) ||
+        (extraOldName && data.createdByName && data.createdByName.toUpperCase() === extraOldName);
+
       if (isLinked) {
         updates.push(
           updateDoc(doc(db, 'collection_entries', c.id), {
             createdByName: updatedName.trim(),
+            collectedByName: updatedName.trim(),
             officerName: updatedName.trim(),
             updatedAt: new Date().toISOString(),
           }).catch((e) => console.warn(`Sync failed for collection ${c.id}:`, e))
@@ -360,4 +382,131 @@ export async function syncOfficerDetailsEverywhere(
   } catch (err) {
     console.error('Error syncing officer in targets:', err);
   }
+}
+
+/**
+ * Creates a comprehensive full backup of the entire application database across all collections.
+ * Generates and downloads a complete JSON file that any developer can run or restore anywhere.
+ */
+export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{ success: boolean; filename: string; stats: Record<string, number> }> {
+  const collectionsToBackup = [
+    'users',
+    'dealers_application',
+    'orders',
+    'collection_entries',
+    'travel_sheets',
+    'yearly_targets',
+    'targets',
+    'travel_records',
+    'products_pricelist_v2',
+    'config',
+    'deleted_records',
+    'audit_logs',
+  ];
+
+  const backupData: Record<string, any[]> = {};
+  const stats: Record<string, number> = {};
+
+  for (const colName of collectionsToBackup) {
+    try {
+      const snap = await getDocs(collection(db, colName));
+      const docsList: any[] = [];
+      snap.forEach((d) => {
+        docsList.push({ _id: d.id, ...d.data() });
+      });
+      backupData[colName] = docsList;
+      stats[colName] = docsList.length;
+    } catch (e) {
+      console.warn(`Could not export collection ${colName}:`, e);
+      backupData[colName] = [];
+      stats[colName] = 0;
+    }
+  }
+
+  const exportPayload = {
+    appName: 'Blackworm Agritech Pvt Ltd - Core Business Data',
+    exportVersion: '2.0',
+    exportedAt: new Date().toISOString(),
+    exportedByUid: profile.uid,
+    exportedByName: profile.fullName || profile.loginId || 'Admin',
+    statistics: stats,
+    collections: backupData,
+  };
+
+  // Local mirror backup in browser storage as additional offline safety net
+  try {
+    localStorage.setItem('BLACKWORM_LOCAL_DATA_MIRROR', JSON.stringify({
+      savedAt: new Date().toISOString(),
+      statistics: stats,
+    }));
+  } catch (e) {
+    console.warn('Local mirror storage failed:', e);
+  }
+
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const timeStr = new Date().toTimeString().slice(0, 8).replace(/:/g, '-');
+  const filename = `Blackworm_Full_Database_Backup_${dateStr}_${timeStr}.json`;
+
+  const blob = new Blob([JSON.stringify(exportPayload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+
+  try {
+    await logAudit(
+      'BACKUP_EXPORT',
+      'system',
+      'full_export',
+      `Full system database backup exported by ${profile.fullName || profile.loginId} (${Object.values(stats).reduce((a, b) => a + b, 0)} total records)`,
+      profile
+    );
+  } catch (e) {
+    console.warn('Audit failed on backup export:', e);
+  }
+
+  return { success: true, filename, stats };
+}
+
+/**
+ * Restores all collections from a JSON backup file.
+ */
+export async function restoreDatabaseFromJson(jsonData: string, profile: UserProfile): Promise<{ success: boolean; restoredCount: number; message: string }> {
+  const parsed = JSON.parse(jsonData);
+  if (!parsed || !parsed.collections) {
+    throw new Error('अवैध बॅकअप फाईल स्वरूप (Invalid backup file structure).');
+  }
+
+  let totalRestored = 0;
+  for (const [colName, docsList] of Object.entries(parsed.collections)) {
+    if (Array.isArray(docsList)) {
+      for (const item of docsList) {
+        const docId = item._id || item.id;
+        if (docId) {
+          const cleanItem = { ...item };
+          delete cleanItem._id;
+          await setDoc(doc(db, colName, docId), cleanItem, { merge: true });
+          totalRestored++;
+        }
+      }
+    }
+  }
+
+  try {
+    await logAudit(
+      'BACKUP_IMPORT',
+      'system',
+      'full_import',
+      `Restored database from JSON backup (${totalRestored} records restored) by ${profile.fullName || profile.loginId}`,
+      profile
+    );
+  } catch (e) {
+    console.warn('Audit failed on backup import:', e);
+  }
+
+  return { success: true, restoredCount: totalRestored, message: `${totalRestored} रेकॉर्ड यशस्वीरित्या रिस्टोर झाले.` };
 }
