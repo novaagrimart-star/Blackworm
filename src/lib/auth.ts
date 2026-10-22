@@ -41,7 +41,7 @@ export function isAdmin(user?: Partial<UserProfile> | null): boolean {
     designation.includes('admin') || 
     designation.includes('administrator') || 
     designation.includes('owner') || 
-    designation.includes('md') || 
+    /\bmd\b/i.test(designation) || 
     designation.includes('managing director')
   ) {
     return true;

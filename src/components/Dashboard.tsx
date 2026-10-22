@@ -21,7 +21,7 @@ import {
   Phone,
   Key
 } from 'lucide-react';
-import { cn } from '../lib/utils';
+import { cn, toTitleCase } from '../lib/utils';
 import { UserProfile, isAdmin, canAccessModule } from '../lib/auth';
 import { Language, translations } from '../lib/i18n';
 import { seedInitialDataIfEmpty } from '../lib/dataService';
@@ -44,14 +44,19 @@ interface DashboardProps {
   profile: UserProfile;
   lang: Language;
   onLogout: () => void;
+  onProfileUpdate?: (profile: UserProfile) => void;
 }
 
-export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout }) => {
+export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, onProfileUpdate }) => {
   const t = translations[lang];
   const [activeTab, setActiveTab] = useState<string>('dashboard');
   const [logoUrl, setLogoUrl] = useState<string>('');
   const [logoSize, setLogoSize] = useState<number>(80);
   const [currentUserData, setCurrentUserData] = useState<any>(profile);
+
+  useEffect(() => {
+    setCurrentUserData(profile);
+  }, [profile]);
   const [dialogConfig, setDialogConfig] = useState<{
     isOpen: boolean;
     type?: 'confirm' | 'alert' | 'success';
@@ -219,7 +224,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout })
 
     switch (activeTab) {
       case 'target': return <TargetSheetView profile={currentUserData} lang={lang} />;
-      case 'user': return <UserManagementView profile={currentUserData} lang={lang} />;
+      case 'user': return <UserManagementView profile={currentUserData} lang={lang} onProfileUpdate={onProfileUpdate} />;
       case 'order': return <OrderView profile={currentUserData} lang={lang} />;
       case 'collection': return <CollectionView profile={currentUserData} lang={lang} />;
       case 'calculator': return <OrderCalculatorView profile={currentUserData} lang={lang} />;
@@ -235,11 +240,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout })
             {/* Logged-In User Profile: Full Officer Name with Compressed Designation */}
             <div className="flex items-center gap-3 mx-auto max-w-2xl px-2">
               <div className="min-w-0 flex-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-                <span className="text-sm sm:text-base font-black text-slate-900 uppercase tracking-tight">
-                  {currentUserData.fullName || 'USER'}
+                <span className="text-sm sm:text-base font-black text-slate-900 tracking-tight">
+                  {toTitleCase(currentUserData.fullName) || 'User'}
                 </span>
-                <span className="text-[10px] sm:text-xs font-bold text-slate-500 uppercase tracking-tight bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded">
-                  {isUserAdmin ? (currentUserData.role === 'owner' ? 'OWNER / MD' : 'ADMIN') : (currentUserData.designation || currentUserData.role)}
+                <span className="text-[10px] sm:text-xs font-bold text-slate-600 tracking-tight bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded">
+                  {isUserAdmin ? (currentUserData.role === 'owner' ? 'Owner (MD)' : 'Admin') : toTitleCase(currentUserData.designation || currentUserData.role)}
                 </span>
               </div>
             </div>
@@ -313,11 +318,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout })
 
         {/* Current Active Logged-In User Badge in Header */}
         <div className="hidden sm:flex items-center gap-1.5 px-3">
-          <span className="text-xs font-black text-slate-900 uppercase leading-none">
-            {currentUserData.fullName || 'OWNER'}
+          <span className="text-xs font-black text-slate-900 leading-none">
+            {toTitleCase(currentUserData.fullName) || 'User'}
           </span>
-          <span className="text-[9.5px] font-bold text-slate-500 uppercase leading-none bg-slate-100 border border-slate-200 px-1 py-0.5 rounded">
-            {currentUserData.role === 'owner' ? 'OWNER / MD' : (currentUserData.designation || currentUserData.role)}
+          <span className="text-[9.5px] font-bold text-slate-600 leading-none bg-slate-100 border border-slate-200 px-1 py-0.5 rounded">
+            {currentUserData.role === 'owner' ? 'Owner (MD)' : toTitleCase(currentUserData.designation || currentUserData.role)}
           </span>
         </div>
       </header>

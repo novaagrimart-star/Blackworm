@@ -16,6 +16,8 @@ import html2canvas from 'html2canvas-pro';
 import { 
   Navigation,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   User as UserIcon,
   Save,
   CheckCircle2,
@@ -70,7 +72,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const t = translations[lang];
   const userIsAdmin = isAdmin(profile);
   const [users, setUsers] = useState<UserProfile[]>([]);
-  const [selectedUserId, setSelectedUserId] = useState<string>(userIsAdmin ? (profile.role === 'owner' ? '' : profile.uid) : profile.uid);
+  const [selectedUserId, setSelectedUserId] = useState<string>(profile.uid);
   const [isUserDropdownOpen, setIsUserDropdownOpen] = useState(false);
   
   // Current date by default
@@ -85,13 +87,6 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       setSelectedUserId(profile.uid);
     }
   }, [userIsAdmin, profile.uid]);
-
-  // Effect to select first user if owner/admin is logged in and no user selected
-  useEffect(() => {
-    if (userIsAdmin && !selectedUserId && users.length > 0) {
-      setSelectedUserId(users[0].uid);
-    }
-  }, [userIsAdmin, selectedUserId, users]);
 
   // Accurate Year and Month parser from YYYY-MM-DD string
   const parseYearMonth = (dateStr: string) => {
@@ -116,6 +111,22 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     'July', 'August', 'September', 'October', 'November', 'December'
   ];
   const selectedMonthName = monthNames[selectedMonthIndex];
+
+  const handlePrevMonth = () => {
+    const d = new Date(selectedYearNumber, selectedMonthIndex, 1);
+    d.setMonth(d.getMonth() - 1);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    setSelectedDate(`${y}-${m}-01`);
+  };
+
+  const handleNextMonth = () => {
+    const d = new Date(selectedYearNumber, selectedMonthIndex, 1);
+    d.setMonth(d.getMonth() + 1);
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    setSelectedDate(`${y}-${m}-01`);
+  };
 
   const [sheet, setSheet] = useState<TravelSheetData | null>(null);
   const [ratePerKm, setRatePerKm] = useState<number>(3.5);
@@ -203,16 +214,14 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     return () => unsubBranding();
   }, []);
 
-  // Fetch users for dropdown (Excluding 'owner' role)
+  // Fetch users for dropdown
   useEffect(() => {
     const q = query(collection(db, 'users'));
     const unsub = onSnapshot(q, (snap) => {
       const list: UserProfile[] = [];
       snap.forEach(d => {
         const userData = d.data() as UserProfile;
-        if (userData.role !== 'owner') {
-          list.push({ ...userData });
-        }
+        list.push({ ...userData, uid: d.id });
       });
       list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
       setUsers(list);
@@ -310,8 +319,8 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
 
         setSheet({
           ...data,
-          officerName: data.officerName || selectedUser.fullName || selectedUser.uid,
-          designation: data.designation || selectedUser.designation || 'FIELD OFFICER',
+          officerName: selectedUser.fullName || data.officerName || selectedUser.uid,
+          designation: selectedUser.designation || data.designation || 'FIELD OFFICER',
           date: selectedDate,
           monthName: selectedMonthName,
           yearNumber: selectedYearNumber,
@@ -553,28 +562,28 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   return (
     <div className="space-y-4 font-sans pb-12">
       {/* Top Action Toolbar */}
-      <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-md flex flex-col sm:flex-row items-center justify-between gap-3 no-print">
+      <div className="bg-white p-2.5 sm:p-3 rounded-2xl border border-slate-200 shadow-md flex flex-wrap items-center justify-between gap-2.5 no-print">
         
         {/* User & Date / Month Selectors */}
-        <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+        <div className="flex flex-wrap items-center gap-2">
           {/* User Selector: Dropdown for Admin, Locked Badge for Non-Admin */}
           {userIsAdmin ? (
-            <div className="relative flex-1 sm:w-64">
+            <div className="relative w-48 sm:w-60">
               <button
                 type="button"
                 onClick={() => setIsUserDropdownOpen(!isUserDropdownOpen)}
                 className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1 px-2.5 rounded-lg text-left flex items-center justify-between gap-1.5 cursor-pointer hover:bg-slate-100 transition shadow-2xs"
               >
                 <div className="min-w-0 flex-1 flex items-baseline gap-1.5 truncate">
-                  <UserIcon className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                  <UserIcon className="w-3 h-3 text-slate-400 shrink-0" />
                   <span className="text-xs font-black text-slate-900 truncate">
                     {(users.find(u => u.uid === selectedUserId) || profile).fullName || selectedUserId}
                   </span>
-                  <span className="text-[9.5px] font-bold text-slate-500 uppercase shrink-0">
+                  <span className="text-[9px] font-bold text-slate-500 uppercase shrink-0">
                     {((users.find(u => u.uid === selectedUserId) || profile).designation || (users.find(u => u.uid === selectedUserId) || profile).role)}
                   </span>
                 </div>
-                <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                <ChevronDown className="w-3 h-3 text-slate-400 shrink-0" />
               </button>
 
               {isUserDropdownOpen && (
@@ -605,17 +614,40 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             </div>
           ) : (
             <div className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-100 border border-slate-200 rounded-lg text-xs font-black uppercase text-slate-800">
-              <UserIcon className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+              <UserIcon className="w-3 h-3 text-slate-500 shrink-0" />
               <span className="font-black text-slate-900 truncate">{profile.fullName || 'OFFICER'}</span>
-              <span className="text-[9.5px] font-bold text-slate-500 bg-white border border-slate-200 px-1 py-0.2 rounded shrink-0">
+              <span className="text-[9px] font-bold text-slate-500 bg-white border border-slate-200 px-1 py-0.2 rounded shrink-0">
                 ({profile.designation || 'OFFICER'})
               </span>
             </div>
           )}
 
-          {/* Date Picker (Changing this immediately reloads that month's days) */}
-          <div className="relative flex items-center gap-1.5 bg-slate-50 border border-slate-200 px-2.5 py-1 rounded-lg">
-            <Calendar className="w-3.5 h-3.5 text-red-600 shrink-0" />
+          {/* Month Switcher with small Left/Right arrows on both sides of Month Name */}
+          <div className="flex items-center gap-1 bg-slate-100 border border-slate-300 px-1.5 py-1 rounded-lg">
+            <button
+              type="button"
+              onClick={handlePrevMonth}
+              className="p-0.5 rounded hover:bg-slate-200 text-slate-700 transition active:scale-95 cursor-pointer"
+              title="Previous Month"
+            >
+              <ChevronLeft className="w-3.5 h-3.5 stroke-[2.5]" />
+            </button>
+            <span className="text-xs font-black text-slate-900 px-1 whitespace-nowrap">
+              {selectedMonthName} {selectedYearNumber}
+            </span>
+            <button
+              type="button"
+              onClick={handleNextMonth}
+              className="p-0.5 rounded hover:bg-slate-200 text-slate-700 transition active:scale-95 cursor-pointer"
+              title="Next Month"
+            >
+              <ChevronRight className="w-3.5 h-3.5 stroke-[2.5]" />
+            </button>
+          </div>
+
+          {/* Date Picker (Small Calendar Icon) */}
+          <div className="relative flex items-center gap-1.5 bg-slate-50 border border-slate-200 px-2 py-1 rounded-lg">
+            <Calendar className="w-3 h-3 text-red-600 shrink-0" />
             <input 
               type="date"
               value={selectedDate}
@@ -625,15 +657,16 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
           </div>
         </div>
 
-        {/* Action Buttons: Save, Download, Print - Compact matching ASM badge size */}
-        <div className="flex items-center gap-1.5 w-full sm:w-auto justify-end">
+        {/* Action Buttons: Save, Save PDF, Print on a Single Compact Line */}
+        <div className="flex items-center gap-1.5 shrink-0 ml-auto">
           <button 
+            type="button"
             onClick={handleSave}
             disabled={saving}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white px-2 py-0.5 rounded text-[10px] font-black transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer"
+            className="bg-emerald-600 hover:bg-emerald-700 text-white px-2.5 py-1 rounded-lg text-xs font-bold transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
             title="Save Travelling Sheet"
           >
-            {saving ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Save className="w-2.5 h-2.5" />}
+            {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
             <span>Save</span>
           </button>
 
@@ -641,20 +674,20 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             type="button"
             onClick={handleDownloadPdf}
             disabled={isGeneratingPdf}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-2 py-0.5 rounded text-[10px] font-black transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer"
-            title="Download PDF"
+            className="bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-1 rounded-lg text-xs font-bold transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+            title="Save PDF"
           >
-            {isGeneratingPdf ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Download className="w-2.5 h-2.5" />}
-            <span>PDF</span>
+            {isGeneratingPdf ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+            <span>Save PDF</span>
           </button>
 
           <button
             type="button"
             onClick={() => window.print()}
-            className="px-2 py-0.5 rounded bg-red-600 hover:bg-red-700 text-white flex items-center gap-1 text-[10px] font-black shadow-2xs transition active:scale-95 cursor-pointer"
+            className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white flex items-center gap-1 text-xs font-bold shadow-2xs transition active:scale-95 cursor-pointer whitespace-nowrap"
             title="Print Form"
           >
-            <Printer className="w-2.5 h-2.5" />
+            <Printer className="w-3 h-3" />
             <span>Print</span>
           </button>
         </div>
@@ -888,8 +921,10 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                       </td>
 
                       {/* Subtotal (Amount + Other Expenses) */}
-                      <td className="p-1 text-center font-mono font-black text-emerald-800 bg-emerald-50/50 align-middle">
-                        ₹ {row.subtotal ? row.subtotal.toFixed(2) : '0.00'}
+                      <td className="p-1 text-center font-mono font-black text-emerald-800 bg-emerald-50/50 align-middle whitespace-nowrap">
+                        <span className="inline-flex items-center justify-center gap-0.5 whitespace-nowrap tabular-nums">
+                          ₹ {row.subtotal ? row.subtotal.toFixed(2) : '0.00'}
+                        </span>
                       </td>
                     </tr>
                   );
@@ -897,16 +932,26 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
 
                 {/* Table Total Summary Row */}
                 <tr className="bg-slate-900 text-white font-black text-xs uppercase border-t-2 border-black">
-                  <td colSpan={3} className="p-2 text-center tracking-tight border-r-2 border-black font-black">
+                  <td colSpan={3} className="p-2 text-center tracking-tight border-r-2 border-black font-black whitespace-nowrap">
                     TOTAL
                   </td>
-                  <td className="p-2 text-center border-r-2 border-black font-mono font-black">-</td>
-                  <td className="p-2 text-center border-r-2 border-black font-mono font-black">-</td>
-                  <td className="p-2 text-center border-r-2 border-black font-mono font-black">{sheet.totalKm}</td>
-                  <td className="p-2 text-center border-r-2 border-black font-mono font-black">₹ {sheet.totalAmount.toFixed(2)}</td>
-                  <td className="p-2 text-center border-r-2 border-black font-mono font-black">₹ {sheet.totalOtherExpenses.toFixed(2)}</td>
-                  <td className="p-2 text-center font-mono font-black bg-red-600 text-white">
-                    ₹ {sheet.subtotalAmount.toFixed(2)}
+                  <td className="p-2 text-center border-r-2 border-black font-mono font-black whitespace-nowrap">-</td>
+                  <td className="p-2 text-center border-r-2 border-black font-mono font-black whitespace-nowrap">-</td>
+                  <td className="p-2 text-center border-r-2 border-black font-mono font-black whitespace-nowrap">{sheet.totalKm}</td>
+                  <td className="p-2 text-center border-r-2 border-black font-mono font-black whitespace-nowrap">
+                    <span className="inline-flex items-center justify-center gap-0.5 whitespace-nowrap tabular-nums">
+                      ₹ {sheet.totalAmount.toFixed(2)}
+                    </span>
+                  </td>
+                  <td className="p-2 text-center border-r-2 border-black font-mono font-black whitespace-nowrap">
+                    <span className="inline-flex items-center justify-center gap-0.5 whitespace-nowrap tabular-nums">
+                      ₹ {sheet.totalOtherExpenses.toFixed(2)}
+                    </span>
+                  </td>
+                  <td className="p-2 text-center font-mono font-black bg-red-600 text-white whitespace-nowrap">
+                    <span className="inline-flex items-center justify-center gap-0.5 whitespace-nowrap tabular-nums">
+                      ₹ {sheet.subtotalAmount.toFixed(2)}
+                    </span>
                   </td>
                 </tr>
               </tbody>
@@ -919,16 +964,18 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             {/* Subtotal */}
             <div className="p-3 bg-slate-50 flex flex-col items-center justify-center text-center">
               <span className="text-[10px] text-slate-700 uppercase tracking-tight">Subtotal</span>
-              <span className="text-base font-mono text-slate-900 font-black mt-0.5">
-                ₹ {sheet.subtotalAmount.toFixed(2)}
+              <span className="text-base font-mono text-slate-900 font-black mt-0.5 whitespace-nowrap inline-flex items-center justify-center gap-1 tabular-nums">
+                <span>₹</span>
+                <span>{sheet.subtotalAmount.toFixed(2)}</span>
               </span>
             </div>
 
             {/* Total Expenses Amount */}
             <div className="p-3 bg-red-50 flex flex-col items-center justify-center text-center">
               <span className="text-[10px] text-red-700 uppercase tracking-tight">Total Expenses Amount</span>
-              <span className="text-lg font-mono text-red-700 font-black mt-0.5">
-                ₹ {sheet.totalExpensesAmount.toFixed(2)}
+              <span className="text-lg font-mono text-red-700 font-black mt-0.5 whitespace-nowrap inline-flex items-center justify-center gap-1 tabular-nums">
+                <span>₹</span>
+                <span>{sheet.totalExpensesAmount.toFixed(2)}</span>
               </span>
             </div>
           </div>

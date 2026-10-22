@@ -10,6 +10,7 @@ import {
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import { UserProfile } from './auth';
+import { toTitleCase } from './utils';
 
 export interface AuditLogItem {
   id: string;
@@ -209,9 +210,9 @@ export async function syncOfficerDetailsEverywhere(
 ) {
   if (!userId || !updatedName) return;
 
-  const cleanNameUpper = updatedName.trim().toUpperCase();
-  const cleanDesigUpper = (updatedDesignation || '').trim().toUpperCase();
-  const cleanCenterUpper = (updatedCenter || '').trim().toUpperCase();
+  const cleanName = toTitleCase(updatedName);
+  const cleanDesig = toTitleCase(updatedDesignation);
+  const cleanCenter = toTitleCase(updatedCenter);
   const extraLogin = (extraIdentifiers?.loginId || '').trim().toLowerCase();
   const extraOldName = (extraIdentifiers?.oldName || '').trim().toUpperCase();
   const extraCode = (extraIdentifiers?.userCode || '').trim().toLowerCase();
@@ -235,10 +236,10 @@ export async function syncOfficerDetailsEverywhere(
       if (isLinked) {
         updates.push(
           updateDoc(doc(db, 'dealers_application', d.id), {
-            officerName: cleanNameUpper,
-            created_by_name: cleanNameUpper,
-            createdByName: cleanNameUpper,
-            ...(cleanDesigUpper ? { designation: cleanDesigUpper } : {}),
+            officerName: cleanName,
+            created_by_name: cleanName,
+            createdByName: cleanName,
+            ...(cleanDesig ? { designation: cleanDesig } : {}),
             updatedAt: new Date().toISOString(),
           }).catch((e) => console.warn(`Sync failed for dealer ${d.id}:`, e))
         );
@@ -266,8 +267,8 @@ export async function syncOfficerDetailsEverywhere(
       if (isLinked) {
         updates.push(
           updateDoc(doc(db, 'orders', o.id), {
-            createdByName: updatedName.trim(),
-            ...(cleanDesigUpper ? { designation: cleanDesigUpper } : {}),
+            createdByName: cleanName,
+            ...(cleanDesig ? { designation: cleanDesig } : {}),
             updatedAt: new Date().toISOString(),
           }).catch((e) => console.warn(`Sync failed for order ${o.id}:`, e))
         );
@@ -297,9 +298,9 @@ export async function syncOfficerDetailsEverywhere(
       if (isLinked) {
         updates.push(
           updateDoc(doc(db, 'collection_entries', c.id), {
-            createdByName: updatedName.trim(),
-            collectedByName: updatedName.trim(),
-            officerName: updatedName.trim(),
+            createdByName: cleanName,
+            collectedByName: cleanName,
+            officerName: cleanName,
             updatedAt: new Date().toISOString(),
           }).catch((e) => console.warn(`Sync failed for collection ${c.id}:`, e))
         );
@@ -322,8 +323,8 @@ export async function syncOfficerDetailsEverywhere(
       if (isLinked) {
         updates.push(
           updateDoc(doc(db, 'travel_sheets', t.id), {
-            officerName: cleanNameUpper,
-            ...(cleanDesigUpper ? { designation: cleanDesigUpper } : {}),
+            officerName: cleanName,
+            ...(cleanDesig ? { designation: cleanDesig } : {}),
             updatedAt: new Date().toISOString(),
           }).catch((e) => console.warn(`Sync failed for travel_sheet ${t.id}:`, e))
         );
@@ -346,9 +347,9 @@ export async function syncOfficerDetailsEverywhere(
       if (isLinked) {
         updates.push(
           updateDoc(doc(db, 'yearly_targets', tg.id), {
-            fullName: cleanNameUpper,
-            ...(cleanDesigUpper ? { designation: cleanDesigUpper } : {}),
-            ...(cleanCenterUpper ? { center: cleanCenterUpper } : {}),
+            fullName: cleanName,
+            ...(cleanDesig ? { designation: cleanDesig } : {}),
+            ...(cleanCenter ? { center: cleanCenter } : {}),
             updatedAt: new Date().toISOString(),
           }).catch((e) => console.warn(`Sync failed for yearly_target ${tg.id}:`, e))
         );
@@ -370,7 +371,7 @@ export async function syncOfficerDetailsEverywhere(
       if (data.userId === userId) {
         updates.push(
           updateDoc(doc(db, 'targets', ot.id), {
-            userName: cleanNameUpper,
+            userName: cleanName,
             updatedAt: new Date().toISOString(),
           }).catch((e) => console.warn(`Sync failed for target ${ot.id}:`, e))
         );

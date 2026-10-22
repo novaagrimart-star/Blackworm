@@ -263,6 +263,10 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
           data.salesTarget = toDecimal2(data.salesTarget);
           data.lastYearOutstanding = toDecimal2(data.lastYearOutstanding);
           data.collectionPercent = Number(data.collectionPercent) || 0;
+          // Synchronize from authoritative users collection
+          data.fullName = selectedUser.fullName || data.fullName || selectedUser.uid;
+          data.designation = selectedUser.designation || data.designation || 'FIELD OFFICER';
+          data.center = selectedUser.center || data.center || '';
           setYearlySheet(data);
         } else {
           const newSheet: YearlySheet = {
@@ -354,6 +358,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
       // Ensure all numbers in sheet are clean decimal 2 numbers before persisting
       const cleanedSheet: YearlySheet = {
         ...sheet,
+        fullName: selectedUser.fullName || sheet.fullName || selectedUser.uid,
+        designation: selectedUser.designation || sheet.designation || 'FIELD OFFICER',
+        center: selectedUser.center || sheet.center || '',
         lastYearSale: toDecimal2(sheet.lastYearSale),
         lastYearCollection: toDecimal2(sheet.lastYearCollection),
         salesTarget: toDecimal2(sheet.salesTarget),
@@ -612,54 +619,27 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
                 <span className="font-black text-black w-24 shrink-0 px-2 uppercase tracking-tighter">Officer -</span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
-                  {isOwnerView || isGeneratingPdf ? (
-                    <span className="w-full font-black text-black uppercase text-center block">
-                      {sheet.fullName}
-                    </span>
-                  ) : (
-                    <input 
-                      type="text" 
-                      value={sheet.fullName} 
-                      onChange={e => updateSheet({ fullName: e.target.value.toUpperCase() })} 
-                      className="w-full bg-transparent font-black text-black uppercase focus:outline-none text-center" 
-                    />
-                  )}
+                  <span className="w-full font-black text-black uppercase text-center block text-xs">
+                    {selectedUser.fullName || sheet.fullName}
+                  </span>
                 </div>
               </div>
 
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
                 <span className="font-black text-black w-24 shrink-0 px-2 uppercase tracking-tighter">Designation -</span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
-                  {isOwnerView || isGeneratingPdf ? (
-                    <span className="w-full font-black text-black uppercase text-center block text-[9px]">
-                      {sheet.designation}
-                    </span>
-                  ) : (
-                    <input 
-                      type="text" 
-                      value={sheet.designation} 
-                      onChange={e => updateSheet({ designation: e.target.value.toUpperCase() })} 
-                      className="w-full bg-transparent font-black text-black uppercase focus:outline-none text-center text-[9px]" 
-                    />
-                  )}
+                  <span className="w-full font-black text-black uppercase text-center block text-[9.5px]">
+                    {selectedUser.designation || sheet.designation}
+                  </span>
                 </div>
               </div>
 
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
                 <span className="font-black text-black w-24 shrink-0 px-2 uppercase tracking-tighter">Center (HQ) -</span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
-                  {isOwnerView || isGeneratingPdf ? (
-                    <span className="w-full font-black text-black uppercase text-center block">
-                      {sheet.center}
-                    </span>
-                  ) : (
-                    <input 
-                      type="text" 
-                      value={sheet.center} 
-                      onChange={e => updateSheet({ center: e.target.value.toUpperCase() })} 
-                      className="w-full bg-transparent font-black text-black uppercase focus:outline-none text-center" 
-                    />
-                  )}
+                  <span className="w-full font-black text-black uppercase text-center block text-xs">
+                    {selectedUser.center || sheet.center || '-'}
+                  </span>
                 </div>
               </div>
             </div>

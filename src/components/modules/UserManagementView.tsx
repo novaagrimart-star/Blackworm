@@ -1,8 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { collection, query, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { logAudit, syncOfficerDetailsEverywhere } from '../../lib/dataService';
+import { toTitleCase } from '../../lib/utils';
+import { compressImageFile } from '../../lib/imageCompression';
 import { Language, translations } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
 import jsPDF from 'jspdf';
@@ -72,21 +74,21 @@ export interface SystemRoleItem {
 }
 
 export const SYSTEM_ROLES: SystemRoleItem[] = [
-  { id: 'owner', label: 'Owner ( MD )', designation: 'OWNER ( MD )' },
+  { id: 'owner', label: 'Owner ( MD )', designation: 'Owner ( MD )' },
   { id: 'asm', label: 'ASM', designation: 'ASM' },
-  { id: 'sr_sales_exec', label: 'Sr. Sales executive', designation: 'SR. SALES EXECUTIVE' },
-  { id: 'sales_exec', label: 'Sales executive', designation: 'SALES EXECUTIVE' },
-  { id: 'sales_officer', label: 'Sales officer', designation: 'SALES OFFICER' },
-  { id: 'dev_officer', label: 'Development officer', designation: 'DEVELOPMENT OFFICER' },
-  { id: 'sr_dev_officer', label: 'Sr. development officer', designation: 'SR. DEVELOPMENT OFFICER' },
-  { id: 'field_officer', label: 'Field officer', designation: 'FIELD OFFICER' },
-  { id: 'admin', label: 'Admin', designation: 'ADMIN OFFICER' },
-  { id: 'dealer', label: 'Dealer', designation: 'AUTHORIZED DEALER' },
+  { id: 'sr_sales_exec', label: 'Sr. Sales executive', designation: 'Sr. Sales Executive' },
+  { id: 'sales_exec', label: 'Sales executive', designation: 'Sales Executive' },
+  { id: 'sales_officer', label: 'Sales officer', designation: 'Sales Officer' },
+  { id: 'dev_officer', label: 'Development officer', designation: 'Development Officer' },
+  { id: 'sr_dev_officer', label: 'Sr. development officer', designation: 'Sr. Development Officer' },
+  { id: 'field_officer', label: 'Field officer', designation: 'Field Officer' },
+  { id: 'admin', label: 'Admin', designation: 'Admin Officer' },
+  { id: 'dealer', label: 'Dealer', designation: 'Authorized Dealer' },
 ];
 
 export const getDefaultDesignationForRole = (r: string): string => {
   const found = SYSTEM_ROLES.find((item) => item.id === r);
-  return found ? found.designation : 'FIELD OFFICER';
+  return found ? found.designation : 'Field Officer';
 };
 
 export const getDefaultModulesForRole = (r: string): string[] => {
@@ -179,9 +181,10 @@ export interface DetailedUserProfile extends UserProfile {
 interface Props {
   profile: UserProfile;
   lang: Language;
+  onProfileUpdate?: (profile: UserProfile) => void;
 }
 
-export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
+export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUpdate }) => {
   const t = translations[lang];
   const [users, setUsers] = useState<DetailedUserProfile[]>([]);
   const [viewMode, setViewMode] = useState<'list' | 'form'>('list');
@@ -278,18 +281,37 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
         return (a.fullName || '').localeCompare(b.fullName || '');
       });
 
-      // Data Isolation: If standard user, strictly show ONLY own profile. Admin sees all users.
-      if (!isAdmin(profile)) {
-        const ownUsers = list.filter((u) => u.uid === profile.uid || (u.loginId && profile.loginId && u.loginId.toLowerCase() === profile.loginId.toLowerCase()));
-        setUsers(ownUsers);
-      } else {
-        setUsers(list);
-      }
+      setUsers(list);
     }, (error) => {
       console.error("Users firestore error:", error);
     });
     return () => unsubscribe();
   }, [profile]);
+
+  // Auto-open own form for non-admin users so they immediately see only their own form
+  useEffect(() => {
+    if (!isAdmin(profile) && viewMode === 'list') {
+      const myUser = users.find((u) => {
+        const uUid = (u.uid || '').trim().toLowerCase();
+        const profUid = (profile.uid || '').trim().toLowerCase();
+        if (profUid && uUid === profUid) return true;
+        const uLogin = (u.loginId || '').trim().toLowerCase();
+        const profLogin = (profile.loginId || '').trim().toLowerCase();
+        if (profLogin && uLogin && uLogin === profLogin) return true;
+        const uCode = (u.userCode || '').trim().toLowerCase();
+        const profCode = (profile.userCode || '').trim().toLowerCase();
+        if (profCode && uCode && uCode === profCode) return true;
+        const uName = (u.fullName || '').trim().toUpperCase();
+        const profName = (profile.fullName || '').trim().toUpperCase();
+        if (profName && uName && uName === profName) return true;
+        return false;
+      }) || (profile as DetailedUserProfile);
+
+      if (myUser) {
+        loadUserToForm(myUser, true);
+      }
+    }
+  }, [profile, users, viewMode]);
 
   // Branding listener
   useEffect(() => {
@@ -424,6 +446,17 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
   };
 
   const resetForm = (customCode?: string) => {
+    if (!isAdmin(profile)) {
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'Action Restricted',
+        message: 'नवीन युजर तयार करण्याची परवानगी फक्त ॲडमिनला आहे. (Only Admin can register new users)',
+        confirmText: 'ठीक आहे',
+        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false }))
+      });
+      return;
+    }
     const defaultRole = 'field_officer';
     const nextCode = customCode || calculateNextUserCode(defaultRole, users);
     setCurrentUid(null);
@@ -462,6 +495,23 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
   };
 
   const loadUserToForm = (u: DetailedUserProfile, editMode: boolean = true) => {
+    if (!isAdmin(profile)) {
+      const isSelf = 
+        u.uid === profile.uid ||
+        (profile.loginId && u.loginId && u.loginId.toLowerCase() === profile.loginId.toLowerCase()) ||
+        (profile.userCode && u.userCode && u.userCode.toLowerCase() === profile.userCode.toLowerCase());
+      if (!isSelf) {
+        setDialogConfig({
+          isOpen: true,
+          type: 'alert',
+          title: 'Access Restricted',
+          message: 'तुम्हाला फक्त स्वतःचे युजर डिटेल्स पाहण्याची परवानगी आहे. (You can only access your own profile)',
+          confirmText: 'ठीक आहे',
+          onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false }))
+        });
+        return;
+      }
+    }
     setCurrentUid(u.uid);
     setUserCode(u.userCode || calculateNextUserCode(u.role || 'field_officer', users));
     setFullName(u.fullName || '');
@@ -497,14 +547,20 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
     setViewMode('form');
   };
 
-  const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setPhotoUrl(reader.result as string);
-      };
-      reader.readAsDataURL(file);
+      try {
+        const compressed = await compressImageFile(file, 1000, 0.7);
+        setPhotoUrl(compressed);
+      } catch (err) {
+        console.warn('User photo compression fallback:', err);
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          setPhotoUrl(reader.result as string);
+        };
+        reader.readAsDataURL(file);
+      }
     }
   };
 
@@ -566,17 +622,17 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
     const payload: DetailedUserProfile = {
       uid,
       userCode: code,
-      fullName: fullName.trim().toUpperCase(),
-      designation: designation.trim().toUpperCase(),
-      center: center.trim().toUpperCase(),
+      fullName: toTitleCase(fullName.trim()),
+      designation: toTitleCase(designation.trim()),
+      center: toTitleCase(center.trim()),
       mobileNumber: trimmedMobile,
       altPhone: altPhone.trim(),
       emailId: emailId.trim() || `${trimmedMobile}@blackwormagri.com`,
       role,
-      address: address.trim().toUpperCase(),
-      village: village.trim().toUpperCase(),
-      taluka: taluka.trim().toUpperCase(),
-      district: district.trim().toUpperCase(),
+      address: toTitleCase(address.trim()),
+      village: toTitleCase(village.trim()),
+      taluka: toTitleCase(taluka.trim()),
+      district: toTitleCase(district.trim()),
       state: stateName.trim(),
       pinCode: pinCode.trim(),
       dateOfBirth,
@@ -588,8 +644,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
       status,
       allowedModules: finalAllowedModules,
       photoUrl,
-      bankName: bankName.trim().toUpperCase(),
-      bankAddress: bankAddress.trim().toUpperCase(),
+      bankName: toTitleCase(bankName.trim()),
+      bankAddress: toTitleCase(bankAddress.trim()),
       accountNumber: accountNumber.trim(),
       ifscCode: ifscCode.trim().toUpperCase(),
       hasSecurityCheque: !!hasSecurityCheque || !!securityChequeNumber.trim(),
@@ -598,74 +654,37 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
       createdAt: currentUid ? (formatSafeDateString(users.find(u => u.uid === currentUid)?.createdAt) || new Date().toISOString()) : new Date().toISOString(),
     };
 
-    // If the user is NOT an Admin/Owner, submit updates for Admin approval
-    if (!isAdmin(profile)) {
-      try {
-        const approvalId = `req_${uid}_${Date.now()}`;
-        await setDoc(doc(db, 'user_approval_requests', approvalId), {
-          id: approvalId,
-          targetUserId: uid,
-          targetUserCode: code,
-          targetUserName: fullName.trim().toUpperCase(),
-          requestedByUid: profile.uid,
-          requestedByName: profile.fullName || profile.loginId || 'User',
-          status: 'pending',
-          createdAt: new Date().toISOString(),
-          proposedData: {
-            fullName: fullName.trim().toUpperCase(),
-            designation: designation.trim().toUpperCase(),
-            center: center.trim().toUpperCase(),
-            mobileNumber: trimmedMobile,
-            altPhone: altPhone.trim(),
-            emailId: emailId.trim() || `${trimmedMobile}@blackwormagri.com`,
-            role,
-            address: address.trim().toUpperCase(),
-            village: village.trim().toUpperCase(),
-            taluka: taluka.trim().toUpperCase(),
-            district: district.trim().toUpperCase(),
-            state: stateName.trim(),
-            pinCode: pinCode.trim(),
-            dateOfBirth,
-            joiningDate,
-            aadhaarNo: aadhaarNo.trim(),
-            panNo: panNo.trim().toUpperCase(),
-            photoUrl,
-            bankName: bankName.trim().toUpperCase(),
-            bankAddress: bankAddress.trim().toUpperCase(),
-            accountNumber: accountNumber.trim(),
-            ifscCode: ifscCode.trim().toUpperCase(),
-            hasSecurityCheque: !!hasSecurityCheque || !!securityChequeNumber.trim(),
-            securityChequeNumber: securityChequeNumber.trim().toUpperCase(),
-          }
-        });
-
-        setIsEditing(false);
-        setDialogConfig({
-          isOpen: true,
-          type: 'success',
-          title: 'बदल मंजुरीसाठी पाठवले',
-          message: 'तुमचे बदल मंजुरीसाठी ॲडमिनकडे पाठवण्यात आले आहेत. ॲडमिनने मंजूर केल्यानंतर माहिती लगेच अपडेट होईल.',
-          confirmText: 'ठीक आहे',
-          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
-        });
-        return;
-      } catch (err: any) {
-        console.error('Approval submission error:', err);
-        setDialogConfig({
-          isOpen: true,
-          type: 'alert',
-          title: 'त्रुटी',
-          message: err.message || 'विनंती पाठवण्यात अडचण आली.',
-          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
-        });
-        return;
-      }
-    }
-
     try {
+      // 1. Direct real-time save to Firestore
       await setDoc(doc(db, 'users', uid), payload, { merge: true });
 
-      // Synchronize updated user details everywhere across all linked records
+      // 2. Immediately update in-memory state in UserManagementView
+      setUsers((prev) => {
+        const idx = prev.findIndex((u) => u.uid === uid);
+        if (idx >= 0) {
+          const updated = [...prev];
+          updated[idx] = payload;
+          return updated;
+        }
+        return [...prev, payload];
+      });
+      setFullName(payload.fullName);
+      setDesignation(payload.designation || '');
+      setCenter(payload.center || '');
+
+      // 3. If updating current logged in user, immediately update local storage & notify parent Dashboard/App
+      if (
+        uid === profile.uid ||
+        (profile.loginId && payload.loginId && profile.loginId.toLowerCase() === payload.loginId.toLowerCase()) ||
+        (profile.mobileNumber && payload.mobileNumber && profile.mobileNumber === payload.mobileNumber)
+      ) {
+        try {
+          localStorage.setItem('blackworm_user_profile', JSON.stringify(payload));
+        } catch (e) {}
+        onProfileUpdate?.(payload);
+      }
+
+      // 4. Synchronize updated user details everywhere across all linked records
       try {
         const existingUser = users.find(u => u.uid === uid);
         await syncOfficerDetailsEverywhere(
@@ -683,7 +702,27 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
         console.warn('Sync error on direct save:', syncErr);
       }
 
-      // If new user (and not owner), create initial target & travel records
+      // 5. If non-admin, log request for audit trail without blocking direct update
+      if (!isAdmin(profile)) {
+        try {
+          const approvalId = `req_${uid}_${Date.now()}`;
+          await setDoc(doc(db, 'user_approval_requests', approvalId), {
+            id: approvalId,
+            targetUserId: uid,
+            targetUserCode: code,
+            targetUserName: payload.fullName,
+            requestedByUid: profile.uid,
+            requestedByName: profile.fullName || profile.loginId || 'User',
+            status: 'approved_direct',
+            createdAt: new Date().toISOString(),
+            proposedData: payload,
+          });
+        } catch (e) {
+          console.warn('Audit request log failed (non-fatal):', e);
+        }
+      }
+
+      // If new user (and not owner), create initial target record
       if (!currentUid && role !== 'owner') {
         const targetId = `target_${uid}_oct26`;
         await setDoc(doc(db, 'targets', targetId), {
@@ -699,29 +738,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
           ownerId: profile.uid,
           isArchived: false,
           createdAt: new Date().toISOString(),
-        });
-
-        const travelId = `travel_${uid}_init`;
-        await setDoc(doc(db, 'travel_records', travelId), {
-          id: travelId,
-          userId: uid,
-          userName: payload.fullName,
-          date: new Date().toISOString().slice(0, 10),
-          startLocation: 'Head Office',
-          endLocation: 'Field Visits',
-          vehicleType: 'Bike',
-          kmTravelled: 0,
-          kmRate: 3.5,
-          fuelExpense: 0,
-          daFoodExpense: 200,
-          lodgingExpense: 0,
-          totalExpense: 200,
-          purpose: 'Initial Field Setup',
-          status: 'submitted',
-          ownerId: uid,
-          isArchived: false,
-          createdAt: new Date().toISOString(),
-        });
+        }, { merge: true }).catch(() => {});
       }
 
       await logAudit(
@@ -736,6 +753,14 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
       setIsEditing(false);
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
+      setDialogConfig({
+        isOpen: true,
+        type: 'success',
+        title: 'माहिती सेव्ह झाली!',
+        message: `${payload.fullName} यांची माहिती यशस्वीरित्या अपडेट करण्यात आली आहे आणि सर्व ठिकाणी लागू झाली आहे.`,
+        confirmText: 'ठीक आहे',
+        onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+      });
     } catch (err: any) {
       setDialogConfig({
         isOpen: true,
@@ -748,6 +773,17 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
   };
 
   const handleDelete = async (uid: string, name: string) => {
+    if (!isAdmin(profile)) {
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'Action Restricted',
+        message: 'युजर डिलीट करण्याची परवानगी फक्त ॲडमिनला आहे. (Only Admin can delete users)',
+        confirmText: 'ठीक आहे',
+        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+      });
+      return;
+    }
     setDialogConfig({
       isOpen: true,
       type: 'confirm',
@@ -816,23 +852,56 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
     return r ? r.label : roleId;
   };
 
-  const filteredUsers = users.filter((u) => {
-    const q = searchQuery.toLowerCase().trim();
-    const matchQuery =
-      !q ||
-      (u.fullName || '').toLowerCase().includes(q) ||
-      (u.center || '').toLowerCase().includes(q) ||
-      (u.mobileNumber || '').toLowerCase().includes(q) ||
-      (u.loginId || '').toLowerCase().includes(q) ||
-      (u.designation || '').toLowerCase().includes(q) ||
-      (u.role || '').toLowerCase().includes(q) ||
-      (u.district || '').toLowerCase().includes(q);
+  const userIsAdmin = isAdmin(profile);
 
-    if (activeFilter !== 'all') {
-      return matchQuery && u.role === activeFilter;
+  const filteredUsers = useMemo(() => {
+    // Non-admin user: strictly return ONLY their own profile (इतर युजर दिसू नयेत)
+    if (!userIsAdmin) {
+      const myUid = (profile.uid || '').trim().toLowerCase();
+      const myLogin = (profile.loginId || '').trim().toLowerCase();
+      const myCode = (profile.userCode || '').trim().toLowerCase();
+      const myName = (profile.fullName || '').trim().toUpperCase();
+
+      const matched = users.filter((u) => {
+        const uUid = (u.uid || '').trim().toLowerCase();
+        if (myUid && uUid === myUid) return true;
+        const uLogin = (u.loginId || '').trim().toLowerCase();
+        if (myLogin && uLogin && uLogin === myLogin) return true;
+        const uCode = (u.userCode || '').trim().toLowerCase();
+        if (myCode && uCode && uCode === myCode) return true;
+        const uName = (u.fullName || '').trim().toUpperCase();
+        if (myName && uName && uName === myName) return true;
+        return false;
+      });
+      if (matched.length > 0) return [matched[0]];
+      return [{
+        ...profile,
+        userCode: profile.userCode || 'EMP-01',
+        designation: profile.designation || 'FIELD OFFICER',
+        center: profile.center || 'Sangli',
+        createdAt: (profile as any).createdAt || new Date().toISOString(),
+      } as DetailedUserProfile];
     }
-    return matchQuery;
-  });
+
+    // Admin / Owner: allow searching and filtering all users
+    return users.filter((u) => {
+      const q = searchQuery.toLowerCase().trim();
+      const matchQuery =
+        !q ||
+        (u.fullName || '').toLowerCase().includes(q) ||
+        (u.center || '').toLowerCase().includes(q) ||
+        (u.mobileNumber || '').toLowerCase().includes(q) ||
+        (u.loginId || '').toLowerCase().includes(q) ||
+        (u.designation || '').toLowerCase().includes(q) ||
+        (u.role || '').toLowerCase().includes(q) ||
+        (u.district || '').toLowerCase().includes(q);
+
+      if (activeFilter !== 'all') {
+        return matchQuery && u.role === activeFilter;
+      }
+      return matchQuery;
+    });
+  }, [users, userIsAdmin, profile, searchQuery, activeFilter]);
 
   // Get module label based on current system language
   const getModuleLabel = (mod: SystemModuleItem) => {
@@ -983,11 +1052,11 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
             </div>
           ) : (
             <div className="px-1 flex items-center gap-2 truncate whitespace-nowrap">
-              <span className="text-sm font-black text-slate-900 uppercase tracking-tight truncate whitespace-nowrap">
-                {profile.fullName || profile.uid}
+              <span className="text-sm font-black text-slate-900 tracking-tight truncate whitespace-nowrap">
+                {toTitleCase(profile.fullName) || profile.uid}
               </span>
-              <span className="text-[9.5px] font-bold text-slate-500 uppercase tracking-tight bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded shrink-0">
-                {profile.designation || profile.role}
+              <span className="text-[9.5px] font-bold text-slate-600 tracking-tight bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded shrink-0">
+                {toTitleCase(profile.designation || profile.role)}
               </span>
             </div>
           )}
@@ -1006,11 +1075,11 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                   </span>
                   
                   <div className="flex-1 min-w-0">
-                    <h3 className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 transition-colors uppercase tracking-wide truncate whitespace-nowrap leading-snug">
-                      {u.fullName || 'Unnamed User'}
+                    <h3 className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 transition-colors tracking-wide truncate whitespace-nowrap leading-snug">
+                      {toTitleCase(u.fullName) || 'Unnamed User'}
                     </h3>
-                    <span className="text-[9.5px] font-bold text-slate-500 uppercase block mt-0.5 truncate whitespace-nowrap">
-                      {u.designation || u.role} {u.center && `• ${u.center}`}
+                    <span className="text-[9.5px] font-bold text-slate-600 block mt-0.5 truncate whitespace-nowrap">
+                      {toTitleCase(u.designation || u.role)} {u.center && `• ${toTitleCase(u.center)}`}
                     </span>
                   </div>
                 </div>
@@ -1055,8 +1124,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang }) => {
                   <ArrowLeft className="w-3.5 h-3.5 text-slate-600" />
                   <span>Back</span>
                 </button>
-                <span className="text-[11px] sm:text-xs font-black text-slate-800 uppercase tracking-wide truncate">
-                  {userCode ? `#${userCode} - ` : ''}{fullName || 'USER PROFILE'}
+                <span className="text-[11px] sm:text-xs font-black text-slate-800 tracking-wide truncate">
+                  {userCode ? `#${userCode} - ` : ''}{toTitleCase(fullName) || 'User Profile'}
                 </span>
               </div>
 

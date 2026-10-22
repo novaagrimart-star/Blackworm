@@ -14,6 +14,8 @@ import {
 import { db } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { logAudit } from '../../lib/dataService';
+import { toTitleCase } from '../../lib/utils';
+import { compressImageFile } from '../../lib/imageCompression';
 import { Language } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
 import jsPDF from 'jspdf';
@@ -97,6 +99,7 @@ export interface DealershipFormItem {
   userId?: string;
   loginId?: string;
   createdByUid?: string;
+  userCode?: string;
 }
 
 interface Props {
@@ -166,7 +169,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const galleryInputRef = useRef<HTMLInputElement>(null);
   const printableFormRef = useRef<HTMLDivElement>(null);
   const [usersMap, setUsersMap] = useState<Record<string, string>>({});
-  const [officers, setOfficers] = useState<{ uid: string; fullName: string; designation?: string; role?: string; loginId?: string }[]>([]);
+  const [officers, setOfficers] = useState<{ uid: string; fullName: string; designation?: string; role?: string; loginId?: string; userCode?: string }[]>([]);
   const [selectedOfficerFilter, setSelectedOfficerFilter] = useState<string>('all');
   const [showUserFilterDropdown, setShowUserFilterDropdown] = useState<boolean>(false);
   const [sortByUser, setSortByUser] = useState<boolean>(false);
@@ -176,7 +179,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   useEffect(() => {
     const unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
       const map: Record<string, string> = {};
-      const uList: { uid: string; fullName: string; designation?: string; role?: string; loginId?: string }[] = [];
+      const uList: { uid: string; fullName: string; designation?: string; role?: string; loginId?: string; userCode?: string }[] = [];
       snap.forEach((d) => {
         const u = d.data();
         if (u.fullName) {
@@ -191,6 +194,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
             designation: u.designation || u.role || 'OFFICER',
             role: u.role,
             loginId: u.loginId,
+            userCode: u.userCode,
           });
         }
       });
@@ -402,46 +406,38 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     }
   };
 
-  useEffect(() => {
-    reindexAllDealersSequence(false);
-  }, []);
-
+  // Real-time synchronization of all dealer applications across ALL devices and users
   useEffect(() => {
     const q = query(collection(db, 'dealers_application'));
-    const unsub = onSnapshot(q, (snap) => {
-      const list: DealershipFormItem[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as DealershipFormItem;
-        if (!data.isArchived) {
-          // Data Isolation: Admin sees all; non-admin strictly sees ONLY their own dealer forms
-          if (isAdmin(profile)) {
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        const list: DealershipFormItem[] = [];
+        snap.forEach((d) => {
+          const data = d.data() as DealershipFormItem;
+          if (!data.isArchived) {
             list.push({ ...data, id: d.id });
-          } else {
-            const isOwner = (data.created_by_user_id && data.created_by_user_id === profile.uid) ||
-                            (data.createdByUid && data.createdByUid === profile.uid) ||
-                            (data.userId && data.userId === profile.uid) ||
-                            (data.ownerId && data.ownerId === profile.uid) ||
-                            (data.loginId && profile.loginId && data.loginId.toLowerCase() === profile.loginId.toLowerCase()) ||
-                            (data.created_by_name && profile.fullName && data.created_by_name.toUpperCase() === profile.fullName.toUpperCase()) ||
-                            (data.officerName && profile.fullName && data.officerName.toUpperCase() === profile.fullName.toUpperCase());
-            if (isOwner) {
-              list.push({ ...data, id: d.id });
-            }
           }
-        }
-      });
+        });
 
-      // Sort by global serial number descending
-      list.sort((a, b) => {
-        const aNum = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
-        const bNum = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
-        if (aNum && bNum && aNum !== bNum) return bNum - aNum;
-        return (b.createdAt || '').localeCompare(a.createdAt || '');
-      });
-      setDealers(list);
-    });
+        // Sort by global serial number descending (latest first)
+        list.sort((a, b) => {
+          const aNum = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
+          const bNum = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
+          if (aNum && bNum && aNum !== bNum) return bNum - aNum;
+          return (b.createdAt || '').localeCompare(a.createdAt || '');
+        });
+        setDealers(list);
+        try {
+          localStorage.setItem('blackworm_all_dealers', JSON.stringify(list));
+        } catch {}
+      },
+      (error) => {
+        console.error('Real-time dealers sync listener error:', error);
+      }
+    );
     return () => unsub();
-  }, [profile]);
+  }, []);
 
   // Real-time listener for individual dealer document updates across all devices in milliseconds
   useEffect(() => {
@@ -621,6 +617,17 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   // Do not revert this behavior under any circumstances!
   // ============================================================================
   const loadDealerToForm = (item: DealershipFormItem, editMode: boolean = true) => {
+    if (!isAdmin(profile) && !isCreatedByOfficer(item, profile.uid)) {
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'Access Restricted',
+        message: 'तुम्हाला फक्त स्वतः भरलेले डीलर फॉर्म पाहण्याची परवानगी आहे. (You can only access dealership forms filled by you)',
+        confirmText: 'ठीक आहे',
+        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+      });
+      return;
+    }
     setCurrentId(item.id);
     formSessionIdRef.current = item.id;
     setCenter(item.center || '');
@@ -817,6 +824,18 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   };
 
   const handleDelete = async (id: string, name: string) => {
+    const itemToDelete = dealers.find(d => d.id === id);
+    if (!isAdmin(profile) && itemToDelete && !isCreatedByOfficer(itemToDelete, profile.uid)) {
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'Action Restricted',
+        message: 'इतर अधिकाऱ्यांचे डीलर फॉर्म डिलीट करण्याची परवानगी नाही. (You can only delete your own dealer forms)',
+        confirmText: 'ठीक आहे',
+        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+      });
+      return;
+    }
     setDialogConfig({
       isOpen: true,
       type: 'confirm',
@@ -845,38 +864,55 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     });
   };
 
-  const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setDealershipAddressPhoto(reader.result as string);
-      };
-      reader.readAsDataURL(file);
+      try {
+        const compressed = await compressImageFile(file, 1200, 0.7);
+        setDealershipAddressPhoto(compressed);
+      } catch (err) {
+        console.warn('Image compression fallback:', err);
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          setDealershipAddressPhoto(reader.result as string);
+        };
+        reader.readAsDataURL(file);
+      }
     }
   };
 
   const isCreatedByOfficer = (d: DealershipFormItem, officerUid: string) => {
     if (officerUid === 'all') return true;
     const targetOfficer = officers.find(o => o.uid === officerUid);
-    const targetName = (targetOfficer?.fullName || '').trim().toUpperCase();
-    const targetLogin = (targetOfficer?.loginId || '').trim().toLowerCase();
+    const targetName = (targetOfficer?.fullName || (officerUid === profile.uid ? profile.fullName : '') || '').trim().toUpperCase();
+    const targetLogin = (targetOfficer?.loginId || (officerUid === profile.uid ? profile.loginId : '') || '').trim().toLowerCase();
+    const targetCode = (targetOfficer?.userCode || (officerUid === profile.uid ? profile.userCode : '') || '').trim().toLowerCase();
 
-    if (
-      d.created_by_user_id === officerUid ||
-      d.createdByUid === officerUid ||
-      d.userId === officerUid ||
-      d.ownerId === officerUid
-    ) {
+    // 1. Direct creator UID match
+    const creatorId = (d.created_by_user_id || d.createdByUid || d.userId || d.ownerId || '').toString().trim().toLowerCase();
+    const targetUidLower = (officerUid || '').trim().toLowerCase();
+    if (targetUidLower && creatorId && creatorId === targetUidLower) {
       return true;
     }
-    if (targetLogin && d.loginId && d.loginId.toLowerCase() === targetLogin) {
+
+    // 2. Exact officer full name match
+    const dOfficerName = (d.officerName || d.created_by_name || '').toString().trim().toUpperCase();
+    if (targetName && dOfficerName && dOfficerName === targetName) {
       return true;
     }
-    if (targetName) {
-      if (d.officerName && d.officerName.trim().toUpperCase() === targetName) return true;
-      if (d.created_by_name && d.created_by_name.trim().toUpperCase() === targetName) return true;
+
+    // 3. Officer Login ID match (only if not generic 'admin')
+    const dLogin = (d.loginId || '').toString().trim().toLowerCase();
+    if (targetLogin && dLogin && dLogin !== 'admin' && dLogin === targetLogin) {
+      return true;
     }
+
+    // 4. Officer User Code match
+    const dCode = (d.userCode || '').toString().trim().toLowerCase();
+    if (targetCode && dCode && dCode === targetCode) {
+      return true;
+    }
+
     return false;
   };
 
@@ -888,6 +924,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     if (d.loginId && usersMap[d.loginId.toLowerCase()]) return usersMap[d.loginId.toLowerCase()];
     return 'अधिकारी (Officer)';
   };
+
+  const userIsAdmin = isAdmin(profile);
 
   const usersWithCounts = useMemo(() => {
     return officers.map(off => {
@@ -901,12 +939,17 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
   const selectedOfficerObj = officers.find((o) => o.uid === selectedOfficerFilter);
 
-  const officerScopedDealers = dealers.filter((d) => {
-    if ((profile.role === 'owner' || isAdmin(profile)) && selectedOfficerFilter !== 'all') {
-      return isCreatedByOfficer(d, selectedOfficerFilter);
+  const officerScopedDealers = useMemo(() => {
+    // Non-admin user/officer: strictly return ONLY the forms filled by this user (इतर युजरचे फॉर्म्स दिसू नयेत)
+    if (!userIsAdmin) {
+      return dealers.filter((d) => isCreatedByOfficer(d, profile.uid));
     }
-    return true;
-  });
+    // Admin / Owner: see all dealers or filter by selected officer
+    if (selectedOfficerFilter !== 'all') {
+      return dealers.filter((d) => isCreatedByOfficer(d, selectedOfficerFilter));
+    }
+    return dealers;
+  }, [dealers, userIsAdmin, profile, selectedOfficerFilter, officers]);
 
   const officerDealersCount = officerScopedDealers.length;
   const officerActiveCount = officerScopedDealers.filter((d) => d.status === 'Approved').length;
@@ -1038,17 +1081,17 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           <div className="flex items-center gap-2 px-1 flex-wrap">
             <button
               onClick={() => setActiveFilter('all')}
-              className={`px-4 py-1.5 rounded-lg text-xs font-black transition cursor-pointer ${
+              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer ${
                 activeFilter === 'all'
                   ? 'bg-slate-900 text-white shadow-md'
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
               }`}
             >
-              All ({dealers.length})
+              {isAdmin(profile) ? `All (${dealers.length})` : `My Forms (${officerDealersCount})`}
             </button>
             <button
               onClick={() => setActiveFilter('active')}
-              className={`px-4 py-1.5 rounded-lg text-xs font-black transition cursor-pointer ${
+              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer ${
                 activeFilter === 'active'
                   ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-sm'
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
@@ -1057,19 +1100,19 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               Active ({officerActiveCount})
             </button>
 
-            {/* ऑफिसर सिलेक्ट - Only this clean dropdown with small letters */}
-            {(profile.role === 'owner' || isAdmin(profile)) && (
+            {/* Officer Select - directly beside All & Active in small font size (Admin only) */}
+            {isAdmin(profile) && (
               <select
                 value={selectedOfficerFilter}
                 onChange={(e) => setSelectedOfficerFilter(e.target.value)}
-                className="bg-white border border-slate-200 rounded-lg px-2.5 py-1.5 text-[11px] font-bold text-slate-700 focus:outline-none focus:ring-1 focus:ring-red-500 cursor-pointer"
-                title="ऑफिसर सिलेक्ट"
+                className="bg-white border border-slate-300 rounded-lg px-2 py-1 text-[10.5px] font-bold text-slate-700 focus:outline-none focus:ring-1 focus:ring-slate-400 cursor-pointer shadow-2xs max-w-[150px] sm:max-w-none"
+                title="Officer Select"
               >
-                <option value="all">ऑफिसर सिलेक्ट</option>
+                <option value="all">Officer Select</option>
                 {officers.map((off) => {
                   const count = dealers.filter((d) => isCreatedByOfficer(d, off.uid)).length;
                   return (
-                    <option key={off.uid} value={off.uid} className="text-[11px] font-medium">
+                    <option key={off.uid} value={off.uid} className="text-[10px]">
                       {off.fullName} ({count})
                     </option>
                   );
@@ -1077,27 +1120,29 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               </select>
             )}
 
-            {/* युजर वाईस सॉर्टिंग */}
-            <button
-              type="button"
-              onClick={() => setSortByUser(!sortByUser)}
-              title="युजर वाईस सॉर्टिंग"
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
-                sortByUser
-                  ? 'bg-indigo-600 text-white shadow-sm'
-                  : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-50'
-              }`}
-            >
-              <ArrowUpDown className="w-3 h-3" />
-              <span className="text-[11px]">युजर वाईस सॉर्टिंग</span>
-            </button>
+            {/* Sort by User - English only, Admin only */}
+            {isAdmin(profile) && (
+              <button
+                type="button"
+                onClick={() => setSortByUser(!sortByUser)}
+                title="Sort by User"
+                className={`px-2.5 py-1 rounded-lg text-xs font-bold transition cursor-pointer flex items-center gap-1.5 ${
+                  sortByUser
+                    ? 'bg-indigo-600 text-white shadow-sm'
+                    : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-50'
+                }`}
+              >
+                <ArrowUpDown className="w-3 h-3" />
+                <span className="text-[10.5px]">Sort by User</span>
+              </button>
+            )}
 
-            {selectedOfficerFilter !== 'all' && (
+            {isAdmin(profile) && selectedOfficerFilter !== 'all' && (
               <button
                 type="button"
                 onClick={() => setSelectedOfficerFilter('all')}
-                className="bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 px-2 py-1 rounded-lg text-[10.5px] font-black flex items-center gap-1 cursor-pointer transition"
-                title="फिल्टर काढा"
+                className="bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 px-2 py-0.5 rounded-lg text-[10px] font-black flex items-center gap-1 cursor-pointer transition"
+                title="Clear filter"
               >
                 <span>{selectedOfficerObj?.fullName}</span>
                 <X className="w-3 h-3" />
@@ -1142,20 +1187,20 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                             e.stopPropagation();
                             loadDealerToForm(d, true);
                           }}
-                          className="font-black text-slate-900 group-hover:text-red-600 hover:underline uppercase text-left transition block cursor-pointer"
+                          className="font-black text-slate-900 group-hover:text-red-600 hover:underline text-left transition block cursor-pointer"
                           title="डीलरचा संपूर्ण फॉर्म उघडा"
                         >
-                          {d.firmName || 'Unnamed Dealership'}
+                          {toTitleCase(d.firmName) || 'Unnamed Dealership'}
                         </button>
                       </td>
-                      <td className="p-3 font-bold text-slate-700 uppercase">
-                        {d.proprietorName || '-'}
+                      <td className="p-3 font-bold text-slate-700">
+                        {toTitleCase(d.proprietorName) || '-'}
                       </td>
-                      <td className="p-3 font-bold text-slate-800 uppercase">
-                        {(d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'OFFICER'}
+                      <td className="p-3 font-bold text-slate-800">
+                        {toTitleCase((d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'Officer')}
                       </td>
-                      <td className="p-3 text-slate-600 uppercase">
-                        {d.village || d.center || '-'}
+                      <td className="p-3 text-slate-600">
+                        {toTitleCase(d.village || d.center || '-')}
                       </td>
                       <td className="p-3 text-center">
                         <button
@@ -1201,14 +1246,14 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   
                   <div className="flex-1 min-w-0">
                     <span
-                      className="text-xs sm:text-[13px] font-bold text-slate-900 group-hover:text-red-600 uppercase block truncate leading-tight tracking-tight"
+                      className="text-xs sm:text-[13px] font-bold text-slate-900 group-hover:text-red-600 block truncate leading-tight tracking-tight"
                     >
-                      {d.firmName || 'Unnamed Dealership'}
+                      {toTitleCase(d.firmName) || 'Unnamed Dealership'}
                     </span>
                     <span className="text-[10px] text-slate-500 font-semibold block truncate">
-                      {d.village || d.center || ''}{d.village && d.center ? ' • ' : ''}
+                      {toTitleCase(d.village || d.center || '')}
                       <span className="text-slate-700 font-bold ml-1">
-                        ({(d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'OFFICER'})
+                        ({toTitleCase((d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'Officer')})
                       </span>
                     </span>
                   </div>

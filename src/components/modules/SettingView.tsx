@@ -41,7 +41,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
   const t = translations[lang];
   const [deletedItems, setDeletedItems] = useState<DeletedRecordItem[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
-  const [activeTab, setActiveTab] = useState<'trash' | 'branding' | 'cache' | 'backup'>('trash');
+  const [activeTab, setActiveTab] = useState<'branding' | 'cache' | 'backup'>('branding');
   const [logoUrl, setLogoUrl] = useState<string>('');
   const [logoSize, setLogoSize] = useState<number>(80);
   const [isSavingLogo, setIsSavingLogo] = useState<boolean>(false);
@@ -60,15 +60,6 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
       }
     });
     const userIsAdmin = isAdmin(profile);
-    const qTrash = query(collection(db, 'deleted_records'), limit(50));
-    const unsubTrash = onSnapshot(qTrash, (snap) => {
-      let list: DeletedRecordItem[] = [];
-      snap.forEach(d => list.push({ id: d.id, ...d.data() } as DeletedRecordItem));
-      if (!userIsAdmin) {
-        list = list.filter(item => item.deletedByUid === profile.uid || item.deletedByName === profile.fullName);
-      }
-      setDeletedItems(list);
-    });
 
     const qAudit = query(collection(db, 'audit_logs'), limit(50));
     const unsubAudit = onSnapshot(qAudit, (snap) => {
@@ -81,7 +72,6 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
     });
 
     return () => {
-      unsubTrash();
       unsubAudit();
       unsubBranding();
     };
@@ -258,81 +248,35 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
         <div>
           <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
             <Settings className="w-6 h-6 text-slate-700" />
-            {t.setting} & Data Recovery
+            {t.setting} & Data Management
           </h2>
-          <p className="text-xs text-slate-500 mt-0.5">Recycle bin, audit logs and system settings</p>
+          <p className="text-xs text-slate-500 mt-0.5">Branding, system update and permanent database backup</p>
         </div>
       </div>
 
       <div className="flex gap-2 border-b border-slate-200 pb-2 overflow-x-auto">
         <button
-          onClick={() => setActiveTab('trash')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition shrink-0 ${activeTab === 'trash' ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 border border-slate-200'}`}
-        >
-          <Trash2 className="w-4 h-4" />
-          <span>Recycle Bin ({deletedItems.length})</span>
-        </button>
-        <button
           onClick={() => setActiveTab('branding')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition shrink-0 ${activeTab === 'branding' ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 border border-slate-200'}`}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'branding' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
         >
-          <Globe className="w-4 h-4" />
+          <Globe className="w-3.5 h-3.5" />
           <span>Branding</span>
         </button>
         <button
           onClick={() => setActiveTab('cache')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition shrink-0 ${activeTab === 'cache' ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 border border-slate-200'}`}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'cache' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
         >
-          <RefreshCw className="w-4 h-4" />
+          <RefreshCw className="w-3.5 h-3.5" />
           <span>App Update & Cache</span>
         </button>
         <button
           onClick={() => setActiveTab('backup')}
-          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition shrink-0 ${activeTab === 'backup' ? 'bg-slate-900 text-white' : 'bg-white text-slate-600 border border-slate-200'}`}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'backup' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
         >
-          <Database className="w-4 h-4 text-emerald-500" />
+          <Database className="w-3.5 h-3.5 text-emerald-500" />
           <span>Permanent Backup</span>
         </button>
       </div>
-
-      {activeTab === 'trash' && (
-        <div className="space-y-4">
-          <div className="p-4 bg-amber-50 border border-amber-200 rounded-2xl flex items-center gap-3 text-xs text-amber-900">
-            <ShieldAlert className="w-5 h-5 text-amber-600 shrink-0" />
-            <span>Any data deleted by mistake is safe here. Click 'Restore' to reactivate it.</span>
-          </div>
-
-          {deletedItems.length === 0 ? (
-            <div className="bg-white rounded-2xl border border-slate-200 p-12 text-center">
-              <Trash2 className="w-12 h-12 text-slate-300 mx-auto mb-3" />
-              <p className="text-sm font-semibold text-slate-700">Recycle Bin is empty</p>
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 gap-3">
-              {deletedItems.map(item => (
-                <div key={item.id} className="bg-white rounded-2xl border border-slate-200 p-4 flex items-center justify-between shadow-sm">
-                  <div>
-                    <span className="text-[10px] font-bold bg-rose-50 text-rose-700 px-2 py-0.5 rounded uppercase">
-                      {item.originalCollection}
-                    </span>
-                    <h4 className="text-sm font-bold text-slate-900 mt-1">
-                      {item.data.name || item.data.shopName || item.data.title || item.originalRecordId}
-                    </h4>
-                    <p className="text-[11px] text-slate-400">Deleted by: {item.deletedByName} ({new Date(item.deletedAt).toLocaleString()})</p>
-                  </div>
-                  <button
-                    onClick={() => handleRestore(item)}
-                    className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition shadow-sm"
-                  >
-                    <RotateCcw className="w-4 h-4" />
-                    <span>Restore</span>
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
 
       {activeTab === 'branding' && (
         <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-6 text-xs">
@@ -382,19 +326,19 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
                 />
                 <label
                   htmlFor="logo-upload"
-                  className={`inline-flex items-center gap-2 px-6 py-2.5 rounded-xl text-xs font-bold transition shadow-sm cursor-pointer w-full justify-center ${isSavingLogo ? 'bg-slate-100 text-slate-400' : 'bg-rose-600 text-white hover:bg-rose-700'}`}
+                  className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition shadow-2xs cursor-pointer w-full justify-center active:scale-95 ${isSavingLogo ? 'bg-slate-100 text-slate-400' : 'bg-rose-600 text-white hover:bg-rose-700'}`}
                 >
                   {isSavingLogo ? 'Uploading...' : logoUrl ? 'Change Company Logo' : 'Upload Company Logo'}
                 </label>
               </div>
-              <p className="text-[10px] text-slate-400 mt-3 uppercase tracking-widest font-bold text-center">Square aspect ratio recommended</p>
+              <p className="text-[10px] text-slate-400 mt-2 uppercase tracking-widest font-bold text-center">Square aspect ratio recommended</p>
             </div>
           </div>
         </div>
       )}
 
       {activeTab === 'cache' && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-5 text-xs">
+        <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-4 text-xs">
           <div>
             <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
               <RefreshCw className="w-4 h-4 text-rose-600" />
@@ -406,9 +350,9 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
             <button
               onClick={handleClearCacheAndSync}
               disabled={isClearingCache}
-              className="w-full py-3 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs sm:text-sm font-black shadow-md shadow-rose-200 transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:opacity-50"
+              className="w-full py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-bold shadow-2xs transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:opacity-50"
             >
-              <RefreshCw className={`w-4 h-4 ${isClearingCache ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`w-3.5 h-3.5 ${isClearingCache ? 'animate-spin' : ''}`} />
               <span>{isClearingCache ? 'Refreshing...' : 'Refresh Now'}</span>
             </button>
           </div>
@@ -416,14 +360,14 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
       )}
 
       {activeTab === 'backup' && (
-        <div className="space-y-5 text-xs">
+        <div className="space-y-4 text-xs">
           {/* Guaranteed Data Safety Banner */}
-          <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-2xl flex items-start gap-3 text-xs text-emerald-950">
-            <ShieldCheck className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+          <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-start gap-2.5 text-xs text-emerald-950">
+            <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
             <div className="space-y-1">
-              <h4 className="font-black text-sm text-emerald-900">डेटा सुरक्षितता व कायमस्वरूपी बॅकअप हमी (Permanent Data Safety)</h4>
-              <p className="text-emerald-800 leading-relaxed font-medium">
-                ॲपमधील कोणताही सिंगल डेटा मॅन्युअल डिलीट केल्याशिवाय कधीही आपोआप डिलीट होत नाही. मॅन्युअल डिलीट केलेले रेकॉर्ड्स रीसायकल बिनमध्ये सुरक्षित राहतात आणि केव्हाही पूर्ववत करता येतात. भविष्यात कोणत्याही परिस्थितीत ॲप इतर साइटवर किंवा नवीन सर्व्हरवर रन करण्यासाठी खालील बटनावर क्लिक करून संपूर्ण डेटाबेस फाईल डाउनलोड करा.
+              <h4 className="font-bold text-xs text-emerald-900">डेटा सुरक्षितता व कायमस्वरूपी बॅकअप हमी (Permanent Data Safety)</h4>
+              <p className="text-emerald-800 text-[11px] leading-relaxed font-medium">
+                ॲपमधील कोणताही सिंगल डेटा मॅन्युअल डिलीट केल्याशिवाय कधीही आपोआप डिलीट होत नाही. भविष्यात कोणत्याही परिस्थितीत ॲप इतर साइटवर किंवा नवीन सर्व्हरवर रन करण्यासाठी खालील बटनावर क्लिक करून संपूर्ण डेटाबेस फाईल डाउनलोड करा.
               </p>
             </div>
           </div>
@@ -443,24 +387,24 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
           )}
 
           {/* 1. Full Database Export Card */}
-          <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-4 shadow-xs">
-            <div className="flex items-center gap-2.5">
-              <div className="w-9 h-9 rounded-xl bg-purple-100 text-purple-700 flex items-center justify-center shrink-0">
-                <FileJson className="w-5 h-5" />
+          <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3 shadow-xs">
+            <div className="flex items-center gap-2">
+              <div className="w-8 h-8 rounded-lg bg-purple-100 text-purple-700 flex items-center justify-center shrink-0">
+                <FileJson className="w-4 h-4" />
               </div>
               <div>
-                <h3 className="text-sm font-black text-slate-900">Download Full Database Backup (.JSON)</h3>
-                <p className="text-[11px] text-slate-500 font-semibold">Dealers, Orders, Collections, Travel, Targets, Users & Products</p>
+                <h3 className="text-xs sm:text-sm font-bold text-slate-900">Download Full Database Backup (.JSON)</h3>
+                <p className="text-[10.5px] text-slate-500 font-medium">Dealers, Orders, Collections, Travel, Targets, Users & Products</p>
               </div>
             </div>
 
-            <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-xs space-y-1 text-slate-700">
-              <p className="font-bold flex items-center gap-1.5 text-slate-800">
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-0.5 text-slate-700">
+              <p className="font-bold flex items-center gap-1.5 text-slate-800 text-[11px]">
                 <HardDrive className="w-3.5 h-3.5 text-slate-600" />
                 <span>Offline Persistence: Active</span>
               </p>
-              <p className="text-[11px] text-slate-500">
-                This JSON backup can be restored on any device, site, or handed over to a developer.
+              <p className="text-[10.5px] text-slate-500">
+                This JSON backup can be restored on any device or site.
               </p>
             </div>
 
@@ -468,16 +412,16 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
               type="button"
               onClick={handleDownloadBackup}
               disabled={isExportingBackup}
-              className="w-full py-3 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-xl text-xs sm:text-sm font-black shadow-md shadow-purple-200 transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer"
+              className="w-full py-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold shadow-xs transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer"
             >
               {isExportingBackup ? (
                 <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
                   <span>Exporting data...</span>
                 </>
               ) : (
                 <>
-                  <Download className="w-4 h-4 stroke-[2.5]" />
+                  <Download className="w-3.5 h-3.5 stroke-[2.5]" />
                   <span>Download Full Backup (.JSON)</span>
                 </>
               )}
@@ -486,14 +430,14 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
 
           {/* 2. Database Restore Card (For Admin/Owner) */}
           {isAdmin(profile) && (
-            <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-4 shadow-xs">
-              <div className="flex items-center gap-2.5">
-                <div className="w-9 h-9 rounded-xl bg-blue-100 text-blue-700 flex items-center justify-center shrink-0">
-                  <Upload className="w-5 h-5" />
+            <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3 shadow-xs">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-lg bg-blue-100 text-blue-700 flex items-center justify-center shrink-0">
+                  <Upload className="w-4 h-4" />
                 </div>
                 <div>
-                  <h3 className="text-sm font-black text-slate-900">Restore / Import Database</h3>
-                  <p className="text-[11px] text-slate-500 font-semibold">Restore all collections from a previously exported .JSON backup file</p>
+                  <h3 className="text-xs sm:text-sm font-bold text-slate-900">Restore / Import Database</h3>
+                  <p className="text-[10.5px] text-slate-500 font-medium">Restore all collections from a previously exported .JSON backup file</p>
                 </div>
               </div>
 
@@ -509,18 +453,18 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
                 <label
                   htmlFor="backup-file-upload"
                   className={cn(
-                    "w-full py-3 border-2 border-dashed border-blue-300 hover:border-blue-500 bg-blue-50/50 hover:bg-blue-50 text-blue-800 rounded-xl text-xs sm:text-sm font-black transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer",
+                    "w-full py-2 border border-dashed border-blue-300 hover:border-blue-500 bg-blue-50/50 hover:bg-blue-50 text-blue-800 rounded-lg text-xs font-bold transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer",
                     isRestoringBackup && "opacity-50 cursor-not-allowed"
                   )}
                 >
                   {isRestoringBackup ? (
                     <>
-                      <Loader2 className="w-4 h-4 animate-spin text-blue-700" />
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-700" />
                       <span>Restoring database...</span>
                     </>
                   ) : (
                     <>
-                      <Upload className="w-4 h-4 text-blue-700 stroke-[2.5]" />
+                      <Upload className="w-3.5 h-3.5 text-blue-700 stroke-[2.5]" />
                       <span>Select JSON Backup & Restore Database</span>
                     </>
                   )}

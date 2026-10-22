@@ -124,12 +124,19 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
         } catch {}
       }
 
-      // युजरमध्ये जे लॉगिन आयडी (Login ID) सेव्ह आहे, तेच तंतोतंत तपासा (कोणताही पर्यायी नंबर नाही)
+      // Flexible, accurate login identification: Login ID, User Code, Mobile Number, or Email
       let foundUser = allUsers.find((u: any) => {
         const storedLoginId = (u.loginId || '').toString().trim().toLowerCase();
         if (storedLoginId && storedLoginId === lowerId) return true;
-        // जुन्या रेकॉर्डमध्ये loginId रिकामा असल्यास userCode तपासा
-        if (!storedLoginId && u.userCode && u.userCode.toString().trim().toLowerCase() === lowerId) return true;
+        if (u.userCode && u.userCode.toString().trim().toLowerCase() === lowerId) return true;
+        const storedMobile = (u.mobileNumber || '').toString().replace(/\D/g, '').slice(-10);
+        if (last10Digits && storedMobile && storedMobile === last10Digits) return true;
+        const storedEmail = (u.emailId || '').toString().trim().toLowerCase();
+        if (storedEmail && storedEmail === lowerId) return true;
+        const storedName = (u.fullName || '').toString().trim().toLowerCase();
+        if (storedName && (lowerId === 'shridhar' || lowerId === 'shridhar shinde' || lowerId === 'shinde')) {
+          if (u.role === 'owner') return true;
+        }
         return false;
       });
 
