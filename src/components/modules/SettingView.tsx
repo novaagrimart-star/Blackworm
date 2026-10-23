@@ -30,6 +30,7 @@ import {
   FileJson
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
+import { useBranding } from '../../lib/branding';
 
 interface Props {
   profile: UserProfile;
@@ -39,11 +40,9 @@ interface Props {
 
 export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
   const t = translations[lang];
-  const [deletedItems, setDeletedItems] = useState<DeletedRecordItem[]>([]);
+  const { logoUrl, logoSize, saveBranding } = useBranding();
   const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
-  const [activeTab, setActiveTab] = useState<'branding' | 'cache' | 'backup'>('branding');
-  const [logoUrl, setLogoUrl] = useState<string>('');
-  const [logoSize, setLogoSize] = useState<number>(80);
+  const [activeTab, setActiveTab] = useState<'branding' | 'cache' | 'backup'>(isAdmin(profile) ? 'branding' : 'cache');
   const [isSavingLogo, setIsSavingLogo] = useState<boolean>(false);
   const [isClearingCache, setIsClearingCache] = useState<boolean>(false);
   const [isExportingBackup, setIsExportingBackup] = useState<boolean>(false);
@@ -51,16 +50,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
   const [backupStatusMessage, setBackupStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   useEffect(() => {
-    // Fetch branding config
-    const unsubBranding = onSnapshot(doc(db, 'config', 'branding'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        setLogoUrl(data.logoUrl || '');
-        setLogoSize(data.logoSize || 80);
-      }
-    });
     const userIsAdmin = isAdmin(profile);
-
     const qAudit = query(collection(db, 'audit_logs'), limit(50));
     const unsubAudit = onSnapshot(qAudit, (snap) => {
       let list: AuditLogItem[] = [];
@@ -73,27 +63,13 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
 
     return () => {
       unsubAudit();
-      unsubBranding();
     };
   }, []);
 
   const saveLogoConfig = async (newUrl: string, newSize: number) => {
     setIsSavingLogo(true);
     try {
-      await updateDoc(doc(db, 'config', 'branding'), {
-        logoUrl: newUrl,
-        logoSize: newSize,
-        updatedAt: new Date().toISOString(),
-        updatedBy: profile.uid
-      }).catch(async () => {
-        const { setDoc } = await import('firebase/firestore');
-        await setDoc(doc(db, 'config', 'branding'), {
-          logoUrl: newUrl,
-          logoSize: newSize,
-          updatedAt: new Date().toISOString(),
-          updatedBy: profile.uid
-        });
-      });
+      await saveBranding(newUrl, newSize, profile.uid);
     } catch (err) {
       console.error('Logo config save failed:', err);
     } finally {
@@ -107,7 +83,6 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
       const reader = new FileReader();
       reader.onloadend = () => {
         const base64 = reader.result as string;
-        setLogoUrl(base64);
         saveLogoConfig(base64, logoSize);
       };
       reader.readAsDataURL(file);
@@ -116,11 +91,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
 
   const handleSizeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newSize = parseInt(e.target.value);
-    setLogoSize(newSize);
-  };
-
-  const handleSizeSave = () => {
-    saveLogoConfig(logoUrl, logoSize);
+    saveLogoConfig(logoUrl, newSize);
   };
 
   const [dialogConfig, setDialogConfig] = useState<{
@@ -255,13 +226,15 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
       </div>
 
       <div className="flex gap-2 border-b border-slate-200 pb-2 overflow-x-auto">
-        <button
-          onClick={() => setActiveTab('branding')}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'branding' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
-        >
-          <Globe className="w-3.5 h-3.5" />
-          <span>Branding</span>
-        </button>
+        {isAdmin(profile) && (
+          <button
+            onClick={() => setActiveTab('branding')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'branding' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
+          >
+            <Globe className="w-3.5 h-3.5" />
+            <span>Branding</span>
+          </button>
+        )}
         <button
           onClick={() => setActiveTab('cache')}
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'cache' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
@@ -278,7 +251,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
         </button>
       </div>
 
-      {activeTab === 'branding' && (
+      {isAdmin(profile) && activeTab === 'branding' && (
         <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-6 text-xs">
           <div>
             <h3 className="text-sm font-bold text-slate-900">Company Branding</h3>
@@ -298,12 +271,6 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
               <div className="space-y-2">
                 <div className="flex justify-between items-center">
                   <span className="font-bold text-slate-700">Logo Size: {logoSize}px</span>
-                  <button 
-                    onClick={handleSizeSave}
-                    className="text-[10px] bg-slate-100 px-2 py-1 rounded font-bold hover:bg-slate-200"
-                  >
-                    Save Size
-                  </button>
                 </div>
                 <input
                   type="range"

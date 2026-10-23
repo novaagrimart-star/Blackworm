@@ -6,7 +6,7 @@ import {
   doc, 
   setDoc
 } from 'firebase/firestore';
-import { db } from '../../firebase';
+import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { logAudit } from '../../lib/dataService';
 import { Language } from '../../lib/i18n';
@@ -176,9 +176,11 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     const q = query(collection(db, 'users'));
     const unsub = onSnapshot(q, (snap) => {
       const list: UserProfile[] = [];
-      snap.forEach(d => list.push({ ...d.data() } as UserProfile));
+      snap.forEach(d => list.push({ ...d.data(), uid: d.id } as UserProfile));
       list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
       setUsers(list);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'users');
     });
     return () => unsub();
   }, []);
@@ -240,6 +242,8 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
         };
         setYearlySheet(consolidatedSheet);
         setLoading(false);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.LIST, 'yearly_targets');
       });
       return () => unsub();
     } else {
@@ -292,6 +296,8 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
           setYearlySheet(newSheet);
         }
         setLoading(false);
+      }, (error) => {
+        handleFirestoreError(error, OperationType.GET, `yearly_targets/${sheetId}`);
       });
       return () => unsub();
     }

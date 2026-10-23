@@ -2,16 +2,20 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   collection, 
   query, 
+  where,
+  orderBy,
+  limit,
   onSnapshot, 
   doc, 
   setDoc,
   updateDoc
 } from 'firebase/firestore';
-import { db } from '../../firebase';
+import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { logAudit } from '../../lib/dataService';
 import { Language, translations } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
+import { useBranding } from '../../lib/branding';
 import { 
   IndianRupee, 
   Search, 
@@ -35,7 +39,8 @@ import {
   Loader2,
   Phone,
   Mail,
-  Receipt
+  Receipt,
+  Pencil
 } from 'lucide-react';
 
 interface OrderItem {
@@ -55,6 +60,7 @@ interface OrderItem {
   loginId?: string;
   createdByName?: string;
   createdAt: string;
+  updatedAt?: string;
   isArchived?: boolean;
 }
 
@@ -94,6 +100,7 @@ interface CollectionRecord {
   collectedByUid?: string;
   collectedByName?: string;
   createdAt: string;
+  updatedAt?: string;
 }
 
 interface DealerStandingItem {
@@ -116,6 +123,7 @@ interface Props {
 }
 
 export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
+  const { logoUrl } = useBranding();
   const [orders, setOrders] = useState<OrderItem[]>([]);
   const [dealers, setDealers] = useState<SavedDealer[]>([]);
   const [collectionEntries, setCollectionEntries] = useState<CollectionRecord[]>([]);
@@ -138,6 +146,16 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
 
   const printableSheetRef = useRef<HTMLDivElement>(null);
 
+  // Edit Receipt Modal States
+  const [showEditReceiptModal, setShowEditReceiptModal] = useState<boolean>(false);
+  const [editingReceipt, setEditingReceipt] = useState<CollectionRecord | null>(null);
+  const [editAmount, setEditAmount] = useState<string>('');
+  const [editPaymentMode, setEditPaymentMode] = useState<string>('Cash');
+  const [editReferenceNo, setEditReferenceNo] = useState<string>('');
+  const [editBankName, setEditBankName] = useState<string>('');
+  const [editDate, setEditDate] = useState<string>('');
+  const [editRemarks, setEditRemarks] = useState<string>('');
+
   // Mobile back button integration
   useEffect(() => {
     if (showReceivePaymentModal) {
@@ -154,7 +172,21 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
 
   // Real-time listener for Orders
   useEffect(() => {
-    const q = query(collection(db, 'orders'));
+    let q = query(
+      collection(db, 'orders'),
+      orderBy('createdAt', 'desc'),
+      limit(300)
+    );
+
+    if (!isAdmin(profile)) {
+      q = query(
+        collection(db, 'orders'),
+        where('userId', '==', profile.uid),
+        orderBy('createdAt', 'desc'),
+        limit(200)
+      );
+    }
+
     const unsub = onSnapshot(q, (snap) => {
       const list: OrderItem[] = [];
       snap.forEach((d) => {
@@ -164,13 +196,29 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         }
       });
       setOrders(list);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'orders');
     });
     return () => unsub();
   }, []);
 
   // Real-time listener for Dealers Application with full ownership metadata
   useEffect(() => {
-    const q = query(collection(db, 'dealers_application'));
+    let q = query(
+      collection(db, 'dealers_application'),
+      orderBy('createdAt', 'desc'),
+      limit(300)
+    );
+
+    if (!isAdmin(profile)) {
+      q = query(
+        collection(db, 'dealers_application'),
+        where('userId', '==', profile.uid),
+        orderBy('createdAt', 'desc'),
+        limit(200)
+      );
+    }
+
     const unsub = onSnapshot(q, (snap) => {
       const list: SavedDealer[] = [];
       snap.forEach((d) => {
@@ -198,21 +246,38 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         }
       });
       setDealers(list);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'dealers_application');
     });
     return () => unsub();
   }, []);
 
   // Real-time listener for Collection Entries
   useEffect(() => {
-    const q = query(collection(db, 'collection_entries'));
+    let q = query(
+      collection(db, 'collection_entries'),
+      orderBy('createdAt', 'desc'),
+      limit(500)
+    );
+
+    if (!isAdmin(profile)) {
+      q = query(
+        collection(db, 'collection_entries'),
+        where('collectedByUid', '==', profile.uid),
+        orderBy('createdAt', 'desc'),
+        limit(300)
+      );
+    }
+
     const unsub = onSnapshot(q, (snap) => {
       const list: CollectionRecord[] = [];
       snap.forEach((d) => {
         const data = d.data() as CollectionRecord;
         list.push({ ...data, id: d.id });
       });
-      list.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
       setCollectionEntries(list);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'collection_entries');
     });
     return () => unsub();
   }, []);
@@ -475,6 +540,174 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
     }
   };
 
+  // Delete Receipt and Revert Balances
+  const handleDeleteReceipt = async (entry: CollectionRecord) => {
+    if (!isAdmin(profile)) return;
+    if (!window.confirm(`Are you sure you want to delete this payment receipt of ₹${entry.amount.toLocaleString()}? This will revert the balance on the associated orders.`)) return;
+
+    try {
+      // 1. Revert balances on orders (LIFO - Newest paid first)
+      let amountToRevert = Number(entry.amount) || 0;
+      
+      const dealerOrders = orders
+        .filter(o => {
+          const match = (o.dealerName || '').trim().toUpperCase() === entry.dealerName.trim().toUpperCase() ||
+                        (o.dealerId && entry.dealerId && o.dealerId === entry.dealerId);
+          return match && o.paidAmount > 0;
+        })
+        .sort((a, b) => (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || ''));
+
+      for (const ord of dealerOrders) {
+        if (amountToRevert <= 0) break;
+
+        const currentPaid = ord.paidAmount || 0;
+        const currentBal = ord.balanceAmount || 0;
+        const revertVal = Math.min(amountToRevert, currentPaid);
+
+        const newPaid = Math.max(0, currentPaid - revertVal);
+        const newBal = currentBal + revertVal;
+        // If it was collected, and now has balance, move back to pending/delivered
+        // Simple logic: if newBal > 0 and status was 'collected', set to 'delivered' (or whatever makes sense)
+        const newStatus = newBal > 0 && ord.status === 'collected' ? 'delivered' : ord.status;
+
+        await updateDoc(doc(db, 'orders', ord.id), {
+          paidAmount: newPaid,
+          balanceAmount: newBal,
+          status: newStatus,
+          updatedAt: new Date().toISOString()
+        });
+
+        amountToRevert -= revertVal;
+      }
+
+      // 2. Delete the record
+      await updateDoc(doc(db, 'collection_entries', entry.id), {
+        isArchived: true, // Prefer soft delete if possible, but let's see if we should deleteDoc
+      });
+      // Actually, since we don't have isArchived filter in the listener, let's delete it
+      // Wait, let's just delete the doc to keep it simple as requested
+      const { deleteDoc } = await import('firebase/firestore');
+      await deleteDoc(doc(db, 'collection_entries', entry.id));
+
+      // 3. Audit Log
+      await logAudit(
+        'DELETE',
+        'collection_entries',
+        entry.id,
+        `Payment receipt deleted: ₹${entry.amount} from ${entry.dealerName}`,
+        profile
+      );
+
+      setSuccessToast(`Receipt for ₹${entry.amount.toLocaleString()} deleted and balances reverted.`);
+      setTimeout(() => setSuccessToast(''), 4000);
+    } catch (err: any) {
+      console.error('Delete error:', err);
+      alert('Error deleting receipt: ' + (err.message || err));
+    }
+  };
+
+  const handleOpenEditReceipt = (entry: CollectionRecord) => {
+    if (!isAdmin(profile)) return;
+    setEditingReceipt(entry);
+    setEditAmount(String(entry.amount));
+    setEditPaymentMode(entry.paymentMode || 'Cash');
+    setEditReferenceNo(entry.referenceNo || '');
+    setEditBankName(entry.bankName || '');
+    setEditDate(entry.date || new Date().toISOString().slice(0, 10));
+    setEditRemarks(entry.notes || '');
+    setShowEditReceiptModal(true);
+  };
+
+  const handleUpdateReceipt = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingReceipt || isSubmitting) return;
+
+    const oldVal = Number(editingReceipt.amount) || 0;
+    const newVal = Number(editAmount) || 0;
+    const diff = newVal - oldVal;
+
+    setIsSubmitting(true);
+    try {
+      if (diff !== 0) {
+        // If amount changed, we need to adjust orders
+        if (diff > 0) {
+          // Additional payment - FIFO
+          let remaining = diff;
+          const dealerOrders = orders
+            .filter(o => {
+              const match = (o.dealerName || '').trim().toUpperCase() === editingReceipt.dealerName.trim().toUpperCase() ||
+                            (o.dealerId && editingReceipt.dealerId && o.dealerId === editingReceipt.dealerId);
+              return match && o.balanceAmount > 0;
+            })
+            .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+
+          for (const ord of dealerOrders) {
+            if (remaining <= 0) break;
+            const deduction = Math.min(remaining, ord.balanceAmount);
+            await updateDoc(doc(db, 'orders', ord.id), {
+              paidAmount: ord.paidAmount + deduction,
+              balanceAmount: ord.balanceAmount - deduction,
+              status: (ord.balanceAmount - deduction) <= 0 ? 'collected' : ord.status,
+              updatedAt: new Date().toISOString()
+            });
+            remaining -= deduction;
+          }
+        } else {
+          // Reduced payment - LIFO
+          let toRevert = Math.abs(diff);
+          const dealerOrders = orders
+            .filter(o => {
+              const match = (o.dealerName || '').trim().toUpperCase() === editingReceipt.dealerName.trim().toUpperCase() ||
+                            (o.dealerId && editingReceipt.dealerId && o.dealerId === editingReceipt.dealerId);
+              return match && o.paidAmount > 0;
+            })
+            .sort((a, b) => (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || ''));
+
+          for (const ord of dealerOrders) {
+            if (toRevert <= 0) break;
+            const revertVal = Math.min(toRevert, ord.paidAmount);
+            const newBal = ord.balanceAmount + revertVal;
+            await updateDoc(doc(db, 'orders', ord.id), {
+              paidAmount: ord.paidAmount - revertVal,
+              balanceAmount: newBal,
+              status: newBal > 0 && ord.status === 'collected' ? 'delivered' : ord.status,
+              updatedAt: new Date().toISOString()
+            });
+            toRevert -= revertVal;
+          }
+        }
+      }
+
+      // Update the receipt record
+      await updateDoc(doc(db, 'collection_entries', editingReceipt.id), {
+        amount: newVal,
+        paymentMode: editPaymentMode,
+        referenceNo: editReferenceNo.trim(),
+        bankName: editBankName.trim(),
+        date: editDate,
+        notes: editRemarks.trim(),
+        updatedAt: new Date().toISOString()
+      });
+
+      await logAudit(
+        'UPDATE',
+        'collection_entries',
+        editingReceipt.id,
+        `Payment receipt updated for ${editingReceipt.dealerName}. Amount: ₹${oldVal} -> ₹${newVal}`,
+        profile
+      );
+
+      setShowEditReceiptModal(false);
+      setSuccessToast(`Receipt for ${editingReceipt.dealerName} updated successfully.`);
+      setTimeout(() => setSuccessToast(''), 4000);
+    } catch (err: any) {
+      console.error('Update error:', err);
+      alert('Error updating receipt: ' + (err.message || err));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
   const handlePrintSheet = () => {
     window.print();
   };
@@ -696,7 +929,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
             <div className="p-3 sm:p-3.5 bg-white border-b-2 border-black">
               <div className="flex items-center justify-between gap-3 sm:gap-4">
                 <div className="w-12 h-12 sm:w-14 sm:h-14 flex items-center justify-center shrink-0">
-                  <img src="/logo.jpg" alt="Logo" className="w-10 h-10 sm:w-12 sm:h-12 object-contain" />
+                  <img src={logoUrl || "/logo.jpg"} alt="Logo" className="w-10 h-10 sm:w-12 sm:h-12 object-contain" />
                 </div>
 
                 <div className="flex-1 text-center space-y-0.5">
@@ -739,7 +972,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
                   <th className="p-2 border-r border-black w-10 text-center whitespace-nowrap">Sr.</th>
                   <th className="p-2 border-r border-black w-24 font-mono whitespace-nowrap">Dealer Code</th>
                   <th className="p-2 border-r border-black min-w-[220px] sm:min-w-[280px] whitespace-nowrap">Dealer / Firm Name</th>
-                  <th className="p-2 border-r border-black min-w-[120px] whitespace-nowrap">Village / Center</th>
+                  <th className="p-2 border-r border-black min-w-[120px] whitespace-nowrap">Contact Number</th>
                   <th className="p-2 border-r border-black text-right min-w-[130px] sm:min-w-[140px] bg-rose-50/70 font-mono whitespace-nowrap">
                     Standing Due (₹)
                   </th>
@@ -766,16 +999,20 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
                     <td className="p-2 border-r border-black font-bold text-slate-900 uppercase whitespace-nowrap">
                       <div className="flex items-center gap-1.5 truncate">
                         <span className="truncate">{item.firmName}</span>
-                        {item.proprietorName && (
-                          <span className="text-[10px] text-slate-400 font-normal shrink-0">
-                            ({item.proprietorName})
-                          </span>
-                        )}
                       </div>
                     </td>
 
                     <td className="p-2 border-r border-black uppercase text-slate-700 whitespace-nowrap">
-                      {item.village || '-'}
+                      {item.contactNumber ? (
+                        <a 
+                          href={`tel:${item.contactNumber}`} 
+                          className="text-blue-600 font-bold hover:underline flex items-center gap-1"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <Phone className="w-3 h-3" />
+                          {item.contactNumber}
+                        </a>
+                      ) : '-'}
                     </td>
 
                     <td className="p-2 border-r border-black text-right font-mono font-bold text-xs bg-rose-50/40 whitespace-nowrap">
@@ -859,6 +1096,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
                   <th className="p-2.5">Ref / Cheque No.</th>
                   <th className="p-2.5 text-right w-28 bg-emerald-50/50 font-mono">Amount (₹)</th>
                   <th className="p-2.5 min-w-[120px]">Collected By</th>
+                  {isAdmin(profile) && <th className="p-2.5 w-20 text-center no-print">Actions</th>}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 font-medium">
@@ -894,6 +1132,26 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
                     <td className="p-2.5 text-slate-700 font-medium uppercase text-[11px]">
                       {entry.collectedByName || 'Officer'}
                     </td>
+                    {isAdmin(profile) && (
+                      <td className="p-2.5 no-print">
+                        <div className="flex items-center justify-center gap-2">
+                          <button
+                            onClick={() => handleOpenEditReceipt(entry)}
+                            className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition"
+                            title="Edit Receipt"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => handleDeleteReceipt(entry)}
+                            className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition"
+                            title="Delete Receipt"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </td>
+                    )}
                   </tr>
                 ))}
 
@@ -1181,6 +1439,130 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
                       <span>Save Payment</span>
                     </>
                   )}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ======================= EDIT RECEIPT MODAL (ADMIN ONLY) ======================= */}
+      {showEditReceiptModal && editingReceipt && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-3 sm:p-4 backdrop-blur-xs animate-in fade-in">
+          <div className="bg-white rounded-2xl max-w-md w-full p-5 shadow-2xl border border-slate-200 max-h-[92vh] overflow-y-auto space-y-4">
+            <div className="flex justify-between items-center pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-blue-50 text-blue-700 flex items-center justify-center shrink-0 border border-blue-200">
+                  <Pencil className="w-4 h-4 stroke-[2.5]" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900 leading-tight">Edit Payment Receipt</h3>
+                  <span className="text-[11px] text-slate-500 font-medium">Update receipt details for {editingReceipt.dealerName}</span>
+                </div>
+              </div>
+              <button type="button" onClick={() => setShowEditReceiptModal(false)} className="text-slate-400 hover:text-slate-600 p-1 rounded-lg hover:bg-slate-100 transition">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleUpdateReceipt} className="space-y-3.5">
+              <div className="bg-slate-50 p-2.5 rounded-lg border border-slate-200">
+                <div className="text-[10px] font-bold text-slate-400 uppercase">Party Name</div>
+                <div className="text-sm font-black text-slate-900 uppercase">{editingReceipt.dealerName}</div>
+              </div>
+
+              <div>
+                <label className="text-xs font-bold text-slate-700 block mb-1">Payment Amount (₹) *</label>
+                <div className="relative">
+                  <IndianRupee className="w-3.5 h-3.5 absolute left-3 top-2.5 text-slate-400" />
+                  <input
+                    type="number"
+                    required
+                    step="any"
+                    value={editAmount}
+                    onChange={(e) => setEditAmount(e.target.value)}
+                    placeholder="0.00"
+                    className="w-full pl-8 pr-3 py-2 border border-slate-300 rounded-lg text-sm font-black text-slate-900 focus:border-blue-500 focus:outline-none transition-colors"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs font-bold text-slate-700 block mb-1">Payment Mode *</label>
+                  <select
+                    value={editPaymentMode}
+                    onChange={(e) => setEditPaymentMode(e.target.value)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-bold text-slate-900 focus:border-blue-500 focus:outline-none"
+                  >
+                    <option value="Cash">Cash</option>
+                    <option value="Cheque">Cheque</option>
+                    <option value="RTGS/NEFT">RTGS/NEFT</option>
+                    <option value="UPI / GPay">UPI / GPay</option>
+                    <option value="Online Transfer">Online Transfer</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-slate-700 block mb-1">Payment Date *</label>
+                  <input
+                    type="date"
+                    required
+                    value={editDate}
+                    onChange={(e) => setEditDate(e.target.value)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-bold text-slate-900 focus:border-blue-500 focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              {(editPaymentMode !== 'Cash' && editPaymentMode !== 'UPI / GPay') && (
+                <div className="grid grid-cols-2 gap-3 animate-in slide-in-from-top-1">
+                  <div>
+                    <label className="text-xs font-bold text-slate-700 block mb-1">Ref / Cheque No.</label>
+                    <input
+                      type="text"
+                      value={editReferenceNo}
+                      onChange={(e) => setEditReferenceNo(e.target.value)}
+                      placeholder="Enter Number"
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-bold text-slate-900 focus:border-blue-500 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-bold text-slate-700 block mb-1">Bank Name</label>
+                    <input
+                      type="text"
+                      value={editBankName}
+                      onChange={(e) => setEditBankName(e.target.value)}
+                      placeholder="Enter Bank"
+                      className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-bold text-slate-900 focus:border-blue-500 focus:outline-none"
+                    />
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label className="text-xs font-bold text-slate-700 block mb-1">Remarks (Optional)</label>
+                <textarea
+                  value={editRemarks}
+                  onChange={(e) => setEditRemarks(e.target.value)}
+                  placeholder="Any internal notes..."
+                  className="w-full px-3 py-2 border border-slate-300 rounded-lg text-xs font-medium text-slate-900 focus:border-blue-500 focus:outline-none h-16 resize-none"
+                />
+              </div>
+
+              <div className="pt-2 flex gap-3">
+                <button
+                  type="button"
+                  onClick={() => setShowEditReceiptModal(false)}
+                  className="flex-1 px-4 py-2.5 border border-slate-200 text-slate-600 rounded-xl text-xs font-bold hover:bg-slate-50 transition active:scale-95"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white px-4 py-2.5 rounded-xl text-xs font-bold shadow-lg shadow-blue-200 transition active:scale-95 flex items-center justify-center gap-2"
+                >
+                  {isSubmitting ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Update Receipt'}
                 </button>
               </div>
             </form>

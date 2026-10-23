@@ -4,6 +4,8 @@ import { db } from '../firebase';
 import { UserProfile } from '../lib/auth';
 import { User, Lock, ArrowRight, AlertCircle, ShieldCheck, Eye, EyeOff, Loader2 } from 'lucide-react';
 
+import { useBranding } from '../lib/branding';
+
 interface LoginProps {
   onLoginSuccess: (profile: UserProfile) => void;
 }
@@ -15,32 +17,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   
-  // Branding state with local fallback
-  const [logoUrl, setLogoUrl] = useState<string>(() => {
-    return localStorage.getItem('blackworm_cached_logo') || '';
-  });
-  const [logoSize, setLogoSize] = useState<number>(100);
-
-  useEffect(() => {
-    // Fetch branding config
-    try {
-      const unsubBranding = onSnapshot(doc(db, 'config', 'branding'), (snap) => {
-        if (snap.exists()) {
-          const data = snap.data();
-          if (data.logoUrl) {
-            setLogoUrl(data.logoUrl);
-            localStorage.setItem('blackworm_cached_logo', data.logoUrl);
-          }
-          if (data.logoSize) setLogoSize(data.logoSize);
-        }
-      }, (err) => {
-        console.warn('Branding listener error (non-fatal):', err);
-      });
-      return () => unsubBranding();
-    } catch (e) {
-      console.warn('Failed to attach branding listener:', e);
-    }
-  }, []);
+  const { logoUrl, logoSize } = useBranding();
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();

@@ -13,34 +13,38 @@
         "designation": { "type": "string" },
         "loginId": { "type": "string" },
         "password": { "type": "string" },
-        "role": { "type": "string", "enum": ["admin", "owner", "staff", "dealer", "farmer"] },
-        "territory": { "type": "string" },
+        "role": { "type": "string" },
+        "center": { "type": "string" },
+        "userCode": { "type": "string" },
+        "allowedModules": { "type": "array" },
+        "status": { "type": "string", "enum": ["Active", "Inactive"] },
         "isArchived": { "type": "boolean" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["uid", "fullName", "role", "loginId", "password"]
     },
-    "farmer": {
-      "title": "Farmer",
-      "description": "Farmer records managed by field executives",
+    "dealerApplication": {
+      "title": "Dealer Application",
+      "description": "Detailed dealership registration forms",
       "type": "object",
       "properties": {
         "id": { "type": "string" },
-        "name": { "type": "string" },
-        "mobile": { "type": "string" },
+        "firmName": { "type": "string" },
+        "proprietorName": { "type": "string" },
+        "dealerCode": { "type": "string" },
         "village": { "type": "string" },
-        "taluka": { "type": "string" },
         "district": { "type": "string" },
-        "acres": { "type": "number" },
-        "crops": { "type": "string" },
+        "contactNumber": { "type": "string" },
+        "officerName": { "type": "string" },
+        "status": { "type": "string" },
+        "userId": { "type": "string" },
         "ownerId": { "type": "string" },
-        "createdBy": { "type": "string" },
         "isArchived": { "type": "boolean" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["id", "name", "ownerId"]
+      "required": ["id", "firmName", "userId"]
     },
     "order": {
       "title": "Order",
@@ -51,23 +55,38 @@
         "orderNumber": { "type": "string" },
         "dealerId": { "type": "string" },
         "dealerName": { "type": "string" },
-        "farmerName": { "type": "string" },
         "items": { "type": "array" },
         "totalAmount": { "type": "number" },
         "paidAmount": { "type": "number" },
         "balanceAmount": { "type": "number" },
-        "paymentMode": { "type": "string" },
-        "status": { "type": "string", "enum": ["pending", "confirmed", "delivered", "collected"] },
+        "status": { "type": "string" },
+        "userId": { "type": "string" },
         "ownerId": { "type": "string" },
-        "createdByName": { "type": "string" },
         "isArchived": { "type": "boolean" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["id", "ownerId", "totalAmount"]
+      "required": ["id", "userId", "totalAmount"]
+    },
+    "collectionEntry": {
+      "title": "Collection Entry",
+      "description": "Payment collection records linked to orders or dealers",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "amount": { "type": "number" },
+        "date": { "type": "string" },
+        "paymentMode": { "type": "string" },
+        "dealerId": { "type": "string" },
+        "orderId": { "type": "string" },
+        "collectedByUid": { "type": "string" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "amount", "collectedByUid"]
     },
     "target": {
-      "title": "Target Sheet",
+      "title": "Monthly Target",
       "description": "Monthly performance targets for sales staff",
       "type": "object",
       "properties": {
@@ -82,119 +101,29 @@
         "achievedCollection": { "type": "number" },
         "ownerId": { "type": "string" },
         "isArchived": { "type": "boolean" },
-        "createdAt": { "type": "string", "format": "date-time" },
-        "updatedAt": { "type": "string", "format": "date-time" }
+        "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "userId", "month", "year"]
     },
-    "yearlyTarget": {
-      "title": "Yearly Target Sheet",
-      "description": "Comprehensive yearly sales and collection targets with metadata",
+    "travelSheet": {
+      "title": "Travel Sheet",
+      "description": "Monthly or daily travel expense summary",
       "type": "object",
       "properties": {
         "id": { "type": "string" },
         "userId": { "type": "string" },
-        "fullName": { "type": "string" },
-        "designation": { "type": "string" },
-        "center": { "type": "string" },
-        "year": { "type": "string" },
-        "lastYearSale": { "type": "number" },
-        "lastYearCollection": { "type": "number" },
-        "salesTarget": { "type": "number" },
-        "lastYearOutstanding": { "type": "number" },
-        "outstandingPercent": { "type": "number" },
-        "months": { "type": "array" },
-        "updatedAt": { "type": "string", "format": "date-time" }
-      },
-      "required": ["id", "userId", "year"]
-    },
-    "travel": {
-      "title": "Travel Record",
-      "description": "Daily travel logs, kilometers, and daily allowances",
-      "type": "object",
-      "properties": {
-        "id": { "type": "string" },
-        "userId": { "type": "string" },
-        "userName": { "type": "string" },
-        "date": { "type": "string", "format": "date" },
-        "startLocation": { "type": "string" },
-        "endLocation": { "type": "string" },
-        "vehicleType": { "type": "string" },
-        "kmTravelled": { "type": "number" },
-        "kmRate": { "type": "number" },
-        "fuelExpense": { "type": "number" },
-        "daFoodExpense": { "type": "number" },
-        "lodgingExpense": { "type": "number" },
-        "totalExpense": { "type": "number" },
-        "purpose": { "type": "string" },
-        "status": { "type": "string", "enum": ["submitted", "approved", "reimbursed"] },
-        "ownerId": { "type": "string" },
-        "isArchived": { "type": "boolean" },
-        "createdAt": { "type": "string", "format": "date-time" },
-        "updatedAt": { "type": "string", "format": "date-time" }
-      },
-      "required": ["id", "userId", "date"]
-    },
-    "dealer": {
-      "title": "Dealer",
-      "description": "Agricultural input dealers and distributors",
-      "type": "object",
-      "properties": {
-        "id": { "type": "string" },
-        "shopName": { "type": "string" },
-        "proprietorName": { "type": "string" },
-        "mobile": { "type": "string" },
-        "village": { "type": "string" },
-        "district": { "type": "string" },
-        "gstNo": { "type": "string" },
-        "creditLimit": { "type": "number" },
-        "outstandingBalance": { "type": "number" },
-        "ownerId": { "type": "string" },
-        "isArchived": { "type": "boolean" },
-        "createdAt": { "type": "string", "format": "date-time" },
-        "updatedAt": { "type": "string", "format": "date-time" }
-      },
-      "required": ["id", "shopName"]
-    },
-    "product": {
-      "title": "Product",
-      "description": "Inventory products, package sizes, and price tiers",
-      "type": "object",
-      "properties": {
-        "id": { "type": "string" },
-        "name": { "type": "string" },
-        "category": { "type": "string" },
-        "packSize": { "type": "string" },
-        "mrp": { "type": "number" },
-        "dealerPrice": { "type": "number" },
-        "farmerPrice": { "type": "number" },
-        "inStock": { "type": "boolean" },
+        "officerName": { "type": "string" },
+        "monthYear": { "type": "string" },
+        "totalKm": { "type": "number" },
+        "totalAmount": { "type": "number" },
         "isArchived": { "type": "boolean" },
         "createdAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["id", "name", "dealerPrice"]
-    },
-    "scheme": {
-      "title": "Scheme",
-      "description": "Seasonal promotional schemes and target bonuses",
-      "type": "object",
-      "properties": {
-        "id": { "type": "string" },
-        "title": { "type": "string" },
-        "description": { "type": "string" },
-        "validFrom": { "type": "string" },
-        "validTo": { "type": "string" },
-        "eligibility": { "type": "string" },
-        "bonusOffer": { "type": "string" },
-        "isActive": { "type": "boolean" },
-        "isArchived": { "type": "boolean" },
-        "createdAt": { "type": "string", "format": "date-time" }
-      },
-      "required": ["id", "title"]
+      "required": ["id", "userId"]
     },
     "auditLog": {
       "title": "Audit Log",
-      "description": "Permanent trace of data creation, modifications, deletions, and recoveries",
+      "description": "Permanent trace of data creation, modifications, and deletions",
       "type": "object",
       "properties": {
         "id": { "type": "string" },
@@ -212,43 +141,39 @@
   "firestore": {
     "users/{userId}": {
       "schema": "user",
-      "description": "User profiles with role-based access"
+      "description": "User profiles"
     },
-    "farmers/{farmerId}": {
-      "schema": "farmer",
-      "description": "Farmers database"
+    "dealers_application/{docId}": {
+      "schema": "dealerApplication",
+      "description": "Dealership registration forms"
     },
     "orders/{orderId}": {
       "schema": "order",
-      "description": "Orders and collection payments"
+      "description": "Sales orders"
+    },
+    "collection_entries/{docId}": {
+      "schema": "collectionEntry",
+      "description": "Payment collections"
     },
     "targets/{targetId}": {
       "schema": "target",
-      "description": "Monthly sales & collection targets"
+      "description": "Monthly targets"
     },
-    "travel_records/{travelId}": {
-      "schema": "travel",
-      "description": "Staff travel sheets and KM expense logs"
-    },
-    "dealers/{dealerId}": {
-      "schema": "dealer",
-      "description": "Dealer profiles and credit balances"
-    },
-    "products/{productId}": {
-      "schema": "product",
-      "description": "Price list and catalog"
-    },
-    "schemes/{schemeId}": {
-      "schema": "scheme",
-      "description": "Promotional offers and seasonal schemes"
+    "travel_sheets/{sheetId}": {
+      "schema": "travelSheet",
+      "description": "Travel expense summaries"
     },
     "audit_logs/{logId}": {
       "schema": "auditLog",
-      "description": "Immutable audit trails for compliance and data recovery"
+      "description": "Immutable audit trails"
+    },
+    "config/branding": {
+      "schema": "object",
+      "description": "Global company branding configuration"
     },
     "deleted_records/{docId}": {
-      "schema": "user",
-      "description": "Soft-deleted documents saved in Recycle Bin for accident recovery"
+      "schema": "object",
+      "description": "Recycle bin for soft-deleted records"
     }
   }
 }

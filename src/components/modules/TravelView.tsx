@@ -11,6 +11,7 @@ import { UserProfile, isAdmin } from '../../lib/auth';
 import { logAudit } from '../../lib/dataService';
 import { Language, translations } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
+import { useBranding } from '../../lib/branding';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas-pro';
 import { 
@@ -135,9 +136,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const [showSuccess, setShowSuccess] = useState(false);
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
 
-  // Branding
-  const [logoUrl, setLogoUrl] = useState<string>('');
-  const [logoSize, setLogoSize] = useState<number>(80);
+  // Selected user photo
   const [selectedUserPhoto, setSelectedUserPhoto] = useState<string>('');
 
   const printableSheetRef = useRef<HTMLDivElement>(null);
@@ -202,17 +201,8 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     }
   }, [selectedUserId, users, profile]);
 
-  // Branding listener
-  useEffect(() => {
-    const unsubBranding = onSnapshot(doc(db, 'config', 'branding'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        setLogoUrl(data.logoUrl || '');
-        setLogoSize(data.logoSize || 80);
-      }
-    });
-    return () => unsubBranding();
-  }, []);
+  // Branding
+  const { logoUrl, logoSize } = useBranding();
 
   // Fetch users for dropdown
   useEffect(() => {
@@ -622,8 +612,9 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             </div>
           )}
 
-          {/* Month Switcher with small Left/Right arrows on both sides of Month Name */}
-          <div className="flex items-center gap-1 bg-slate-100 border border-slate-300 px-1.5 py-1 rounded-lg">
+          {/* Unified Month / Date Box with Calendar Icon & Arrows */}
+          <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-300 px-2 py-1 rounded-lg">
+            <Calendar className="w-3.5 h-3.5 text-red-600 shrink-0" />
             <button
               type="button"
               onClick={handlePrevMonth}
@@ -643,17 +634,6 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             >
               <ChevronRight className="w-3.5 h-3.5 stroke-[2.5]" />
             </button>
-          </div>
-
-          {/* Date Picker (Small Calendar Icon) */}
-          <div className="relative flex items-center gap-1.5 bg-slate-50 border border-slate-200 px-2 py-1 rounded-lg">
-            <Calendar className="w-3 h-3 text-red-600 shrink-0" />
-            <input 
-              type="date"
-              value={selectedDate}
-              onChange={(e) => e.target.value && setSelectedDate(e.target.value)}
-              className="bg-transparent font-black text-xs text-slate-900 focus:outline-none cursor-pointer"
-            />
           </div>
         </div>
 

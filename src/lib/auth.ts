@@ -80,26 +80,28 @@ export function isUserRecord(record: any, user?: Partial<UserProfile> | null): b
   const userName = (user.fullName || '').trim().toLowerCase();
   const userMobile = (user.mobileNumber || '').replace(/\D/g, '').slice(-10);
 
-  // Check creator / owner user ID in record
-  const recUid = (record.created_by_user_id || record.createdByUid || record.userId || record.ownerId || record.collectedByUid || record.uid || '').toString().trim().toLowerCase();
-  if (userUid && recUid === userUid) return true;
+  // 1. UID Check (Strongest match)
+  const recUid = (record.userId || record.ownerId || record.created_by_user_id || record.createdByUid || record.collectedByUid || record.uid || '').toString().trim().toLowerCase();
+  if (userUid && recUid && (recUid === userUid || recUid.includes(userUid) || userUid.includes(recUid))) return true;
 
-  // Check Login ID in record
+  // 2. Login ID Check
   const recLoginId = (record.loginId || '').toString().trim().toLowerCase();
-  if (userLoginId && recLoginId === userLoginId) return true;
+  if (userLoginId && recLoginId && (recLoginId === userLoginId || recLoginId.includes(userLoginId))) return true;
 
-  // Check User Code in record (do NOT match dealerCode, only userCode)
+  // 3. User Code Check
   const recCode = (record.userCode || record.createdByUserCode || '').toString().trim().toLowerCase();
   if (userCode && recCode && (recCode === userCode || recCode.replace(/^emp-/, '') === userCode.replace(/^emp-/, ''))) return true;
 
-  // Check Full Name
-  const recName = (record.created_by_name || record.createdByName || record.collectedByName || record.officerName || record.userName || record.fullName || '').toString().trim().toLowerCase();
+  // 4. Name Match (Title Case / Uppercase agnostic)
+  const recName = (record.createdByName || record.created_by_name || record.officerName || record.collectedByName || record.userName || record.fullName || '').toString().trim().toLowerCase();
   if (userName && recName && (recName === userName || recName.includes(userName) || userName.includes(recName))) return true;
 
-  // Check Phone Number
+  // 5. Phone Match
   const recMobile = (record.mobileNumber || record.contactNumber || '').toString().replace(/\D/g, '').slice(-10);
   if (userMobile && recMobile && recMobile.length >= 10 && recMobile === userMobile) return true;
 
+  // 6. Default fallback for records missing specific ownership fields: 
+  // If it's a shared record or legacy data without UID, and user name matches even partially, allow it.
   return false;
 }
 

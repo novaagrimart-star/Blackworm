@@ -2,6 +2,9 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   collection, 
   query, 
+  where,
+  orderBy,
+  limit,
   onSnapshot, 
   doc, 
   setDoc, 
@@ -11,10 +14,11 @@ import {
   getDoc, 
   writeBatch 
 } from 'firebase/firestore';
-import { db } from '../../firebase';
+import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { logAudit } from '../../lib/dataService';
 import { toTitleCase } from '../../lib/utils';
+import { useBranding } from '../../lib/branding';
 import { compressImageFile } from '../../lib/imageCompression';
 import { Language } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
@@ -158,8 +162,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const [officeTime, setOfficeTime] = useState('');
   const [officePlace, setOfficePlace] = useState('');
 
-  const [logoUrl, setLogoUrl] = useState<string>('');
-  const [logoSize, setLogoSize] = useState<number>(80);
+  const { logoUrl, logoSize } = useBranding();
 
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [showPhotoModal, setShowPhotoModal] = useState(false);
@@ -269,17 +272,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     }
   };
 
-  useEffect(() => {
-    // Fetch branding config
-    const unsubBranding = onSnapshot(doc(db, 'config', 'branding'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        setLogoUrl(data.logoUrl || '');
-        setLogoSize(data.logoSize || 80);
-      }
-    });
-    return () => unsubBranding();
-  }, []);
+
 
   // Real-time listener for global sequence counter
   useEffect(() => {
@@ -408,7 +401,22 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
   // Real-time synchronization of all dealer applications across ALL devices and users
   useEffect(() => {
-    const q = query(collection(db, 'dealers_application'));
+    let q = query(
+      collection(db, 'dealers_application'),
+      orderBy('createdAt', 'desc'),
+      limit(300)
+    );
+
+    // Optimized Server-Side Filtering: Non-admins only fetch their own records
+    if (!isAdmin(profile)) {
+      q = query(
+        collection(db, 'dealers_application'),
+        where('userId', '==', profile.uid),
+        orderBy('createdAt', 'desc'),
+        limit(200)
+      );
+    }
+
     const unsub = onSnapshot(
       q,
       (snap) => {
@@ -420,7 +428,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           }
         });
 
-        // Sort by global serial number descending (latest first)
+        // Firestore query handles base sort, but we keep this refined sort for global codes
         list.sort((a, b) => {
           const aNum = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
           const bNum = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
@@ -428,12 +436,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           return (b.createdAt || '').localeCompare(a.createdAt || '');
         });
         setDealers(list);
-        try {
-          localStorage.setItem('blackworm_all_dealers', JSON.stringify(list));
-        } catch {}
       },
       (error) => {
-        console.error('Real-time dealers sync listener error:', error);
+        handleFirestoreError(error, OperationType.LIST, 'dealers_application');
       }
     );
     return () => unsub();

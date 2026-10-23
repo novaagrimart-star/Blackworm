@@ -14,12 +14,14 @@ const app = initializeApp(firebaseConfig);
 
 let firestoreDb;
 try {
+  // Robust persistence with multi-tab support for seamless data sync across devices
   firestoreDb = initializeFirestore(app, {
     localCache: persistentLocalCache({
       tabManager: persistentMultipleTabManager()
     })
   }, firebaseConfig.firestoreDatabaseId);
-} catch {
+} catch (e) {
+  console.warn('Firestore persistence init failed, falling back to basic init:', e);
   firestoreDb = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 }
 

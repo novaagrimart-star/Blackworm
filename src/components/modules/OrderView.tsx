@@ -2,13 +2,16 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   collection, 
   query, 
+  where,
+  orderBy,
+  limit,
   onSnapshot, 
   doc, 
   setDoc,
   updateDoc,
   deleteDoc 
 } from 'firebase/firestore';
-import { db } from '../../firebase';
+import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { softDeleteRecord, logAudit } from '../../lib/dataService';
 import { Language } from '../../lib/i18n';
@@ -228,19 +231,25 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     }
   }, [showNewOrderModal, selectedOrderDetails, successOrder]);
 
-  // Load Orders from Firestore with local cache preload
+  // Load Orders from Firestore (using built-in persistent cache for speed)
   useEffect(() => {
-    try {
-      const cached = localStorage.getItem('blackworm_cached_orders');
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setOrders(parsed);
-        }
-      }
-    } catch {}
 
-    const q = query(collection(db, 'orders'));
+    let q = query(
+      collection(db, 'orders'),
+      orderBy('createdAt', 'desc'),
+      limit(300)
+    );
+
+    // Optimized Server-Side Filtering: Non-admins only fetch their own records to save data and time
+    if (!isAdmin(profile)) {
+      q = query(
+        collection(db, 'orders'),
+        where('userId', '==', profile.uid),
+        orderBy('createdAt', 'desc'),
+        limit(200)
+      );
+    }
+
     const unsub = onSnapshot(q, (snap) => {
       const list: OrderItem[] = [];
       snap.forEach((d) => {
@@ -281,12 +290,10 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           });
         }
       });
-      // Sort latest first
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      // Firestore query already sorts by createdAt desc, but we keep this as safety
       setOrders(list);
-      try {
-        localStorage.setItem('blackworm_cached_orders', JSON.stringify(list));
-      } catch {}
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'orders');
     });
     return () => unsub();
   }, []);

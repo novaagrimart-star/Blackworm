@@ -27,6 +27,7 @@ import { Language, translations } from '../lib/i18n';
 import { seedInitialDataIfEmpty } from '../lib/dataService';
 import { OfflineIndicator } from './OfflineIndicator';
 import { CustomDialogModal } from './CustomDialogModal';
+import { useBranding } from '../lib/branding';
 
 import { TargetSheetView } from './modules/TargetSheetView';
 import { UserManagementView } from './modules/UserManagementView';
@@ -50,13 +51,13 @@ interface DashboardProps {
 export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, onProfileUpdate }) => {
   const t = translations[lang];
   const [activeTab, setActiveTab] = useState<string>('dashboard');
-  const [logoUrl, setLogoUrl] = useState<string>('');
-  const [logoSize, setLogoSize] = useState<number>(80);
+  const { logoUrl, logoSize } = useBranding();
   const [currentUserData, setCurrentUserData] = useState<any>(profile);
 
   useEffect(() => {
     setCurrentUserData(profile);
   }, [profile]);
+
   const [dialogConfig, setDialogConfig] = useState<{
     isOpen: boolean;
     type?: 'confirm' | 'alert' | 'success';
@@ -108,24 +109,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     }
   }, [profile.uid]);
 
-  // Branding listener from Settings
-  useEffect(() => {
-    const unsubBranding = onSnapshot(doc(db, 'config', 'branding'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        setLogoUrl(data.logoUrl || '');
-        setLogoSize(data.logoSize || 80);
-      }
-    });
-    return () => unsubBranding();
-  }, []);
-
   // Preload and cache report data in background so Report tab opens instantly
   useEffect(() => {
     if (currentUserData && currentUserData.uid) {
       const timer = setTimeout(() => {
         preloadReportData(currentUserData);
-      }, 350);
+      }, 5000); // Increased delay to prioritize main UI and sync
       return () => clearTimeout(timer);
     }
   }, [currentUserData?.uid]);
