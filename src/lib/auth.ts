@@ -80,28 +80,75 @@ export function isUserRecord(record: any, user?: Partial<UserProfile> | null): b
   const userName = (user.fullName || '').trim().toLowerCase();
   const userMobile = (user.mobileNumber || '').replace(/\D/g, '').slice(-10);
 
-  // 1. UID Check (Strongest match)
-  const recUid = (record.userId || record.ownerId || record.created_by_user_id || record.createdByUid || record.collectedByUid || record.uid || '').toString().trim().toLowerCase();
-  if (userUid && recUid && (recUid === userUid || recUid.includes(userUid) || userUid.includes(recUid))) return true;
+  // 1. UID Check (userId, ownerId, createdByUid, created_by_user_id, collectedByUid, dealerOfficerId, assignedToUid, officerUid)
+  const recUids = [
+    record.userId,
+    record.ownerId,
+    record.created_by_user_id,
+    record.createdByUid,
+    record.collectedByUid,
+    record.dealerOfficerId,
+    record.assignedToUid,
+    record.officerUid,
+    record.uid
+  ].filter(Boolean).map(x => String(x).trim().toLowerCase());
+
+  if (userUid && recUids.some(id => id === userUid || id.includes(userUid) || userUid.includes(id))) {
+    return true;
+  }
 
   // 2. Login ID Check
-  const recLoginId = (record.loginId || '').toString().trim().toLowerCase();
-  if (userLoginId && recLoginId && (recLoginId === userLoginId || recLoginId.includes(userLoginId))) return true;
+  const recLoginIds = [
+    record.loginId,
+    record.officerLoginId,
+    record.userLoginId,
+    record.assignedToLoginId
+  ].filter(Boolean).map(x => String(x).trim().toLowerCase());
 
-  // 3. User Code Check
-  const recCode = (record.userCode || record.createdByUserCode || '').toString().trim().toLowerCase();
-  if (userCode && recCode && (recCode === userCode || recCode.replace(/^emp-/, '') === userCode.replace(/^emp-/, ''))) return true;
+  if (userLoginId && recLoginIds.some(id => id === userLoginId || id.includes(userLoginId))) {
+    return true;
+  }
 
-  // 4. Name Match (Title Case / Uppercase agnostic)
-  const recName = (record.createdByName || record.created_by_name || record.officerName || record.collectedByName || record.userName || record.fullName || '').toString().trim().toLowerCase();
-  if (userName && recName && (recName === userName || recName.includes(userName) || userName.includes(recName))) return true;
+  // 3. User Code Check (EMP-XX or XX)
+  const recCodes = [
+    record.userCode,
+    record.createdByUserCode,
+    record.officerCode,
+    record.dealerOfficerCode
+  ].filter(Boolean).map(x => String(x).trim().toLowerCase());
+
+  if (userCode && recCodes.some(c => c === userCode || c.replace(/^emp-/, '') === userCode.replace(/^emp-/, ''))) {
+    return true;
+  }
+
+  // 4. Officer / Creator Name Match (Title Case / Uppercase agnostic)
+  const recNames = [
+    record.createdByName,
+    record.created_by_name,
+    record.officerName,
+    record.collectedByName,
+    record.dealerOfficerName,
+    record.assignedToName,
+    record.userName,
+    record.fullName
+  ].filter(Boolean).map(x => String(x).trim().toLowerCase());
+
+  if (userName && recNames.some(n => n === userName || n.includes(userName) || userName.includes(n))) {
+    return true;
+  }
 
   // 5. Phone Match
-  const recMobile = (record.mobileNumber || record.contactNumber || '').toString().replace(/\D/g, '').slice(-10);
-  if (userMobile && recMobile && recMobile.length >= 10 && recMobile === userMobile) return true;
+  const recMobiles = [
+    record.mobileNumber,
+    record.contactNumber,
+    record.officerMobile,
+    record.creatorMobile
+  ].filter(Boolean).map(x => String(x).replace(/\D/g, '').slice(-10));
 
-  // 6. Default fallback for records missing specific ownership fields: 
-  // If it's a shared record or legacy data without UID, and user name matches even partially, allow it.
+  if (userMobile && userMobile.length >= 10 && recMobiles.includes(userMobile)) {
+    return true;
+  }
+
   return false;
 }
 

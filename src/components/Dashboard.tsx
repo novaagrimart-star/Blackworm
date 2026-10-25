@@ -38,7 +38,7 @@ import { PriceListView } from './modules/PriceListView';
 import { DealerView } from './modules/DealerView';
 import { TravelView } from './modules/TravelView';
 import { SchemeView } from './modules/SchemeView';
-import { ReportView, preloadReportData } from './modules/ReportView';
+import { ReportView } from './modules/ReportView';
 import { SettingView } from './modules/SettingView';
 
 interface DashboardProps {
@@ -109,15 +109,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     }
   }, [profile.uid]);
 
-  // Preload and cache report data in background so Report tab opens instantly
-  useEffect(() => {
-    if (currentUserData && currentUserData.uid) {
-      const timer = setTimeout(() => {
-        preloadReportData(currentUserData);
-      }, 5000); // Increased delay to prioritize main UI and sync
-      return () => clearTimeout(timer);
-    }
-  }, [currentUserData?.uid]);
+  // Note: Background preloading removed to optimize Firestore read quota.
+  // ReportView handles its own optimized data loading when the tab is opened.
 
   const modules = [
     { id: 'target', label: t.targetSheet, icon: Target, color: 'text-blue-500', bg: 'bg-blue-50' },

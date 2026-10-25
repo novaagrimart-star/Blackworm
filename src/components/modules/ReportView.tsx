@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { collection, query, getDocs, where, doc, getDoc } from 'firebase/firestore';
+import { collection, query, getDocs, where, doc, getDoc, onSnapshot } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { Language } from '../../lib/i18n';
 import { UserProfile, isAdmin } from '../../lib/auth';
@@ -10,9 +10,11 @@ import {
   Loader2,
   Table as TableIcon,
   CheckCircle2,
-  RefreshCw
+  RefreshCw,
+  AlertCircle
 } from 'lucide-react';
 import { toDecimal2, addDecimal2, subtractDecimal2, formatAmount } from '../../lib/decimal';
+import { useUsers } from '../../lib/UsersContext';
 
 interface Props {
   profile: UserProfile;
@@ -86,20 +88,36 @@ export function buildReportRows(
   const { dayOfMonth, sheetMonthKey, targetMonthName } = parseDateKeys(selectedDate);
 
   let officers = userIsAdmin
-    ? allUsers.filter((u) => u.role !== 'owner')
+    ? allUsers.filter((u) => u.role !== 'owner' && u.role !== 'dealer')
     : allUsers.filter((u) => u.uid === profile.uid || (u.loginId && profile.loginId && u.loginId.toLowerCase() === profile.loginId.toLowerCase()));
 
   if (officers.length === 0) {
     officers = [profile];
   }
 
-  // Build high-performance lookup maps
+  // Build high-performance multi-tier lookup maps for all travel sheets
   const travelMap = new Map<string, any>();
   allTravelSheets.forEach((s) => {
-    if (s._id) travelMap.set(s._id, s);
-    if (s.id) travelMap.set(s.id, s);
-    if (s.userId && s.monthKey) travelMap.set(`${s.userId}_${s.monthKey}`, s);
-    if (s.userId) travelMap.set(s.userId, s);
+    const docId = s.id || s._id || '';
+    if (docId) travelMap.set(docId, s);
+
+    // Compute month key from sheet (Case-insensitive to handle legacy data)
+    const sMonthIdx = monthNames.findIndex(m => m.toLowerCase() === String(s.monthName || '').toLowerCase());
+    const sMonthKey = s.sheetMonthKey || 
+      (s.yearNumber && sMonthIdx !== -1 ? `${s.yearNumber}_${String(sMonthIdx + 1).padStart(2, '0')}` : sheetMonthKey);
+
+    if (s.userId) {
+      travelMap.set(`${s.userId}_${sMonthKey}`, s);
+      travelMap.set(s.userId, s);
+    }
+    if (s.userCode) {
+      const code = String(s.userCode).trim().toLowerCase();
+      travelMap.set(`code_${code}_${sMonthKey}`, s);
+      travelMap.set(`code_${code.replace(/^emp-/, '')}_${sMonthKey}`, s);
+    }
+    if (s.loginId) {
+      travelMap.set(`login_${String(s.loginId).trim().toLowerCase()}_${sMonthKey}`, s);
+    }
   });
 
   const yearlyTargetMap = new Map<string, any>();
@@ -110,21 +128,41 @@ export function buildReportRows(
   });
 
   const targetFallbackMap = new Map<string, any>();
-  allTargets.forEach((t) => {
+  // allTargets is kept for internal fallback if yearly_targets is missing
+  (allTargets || []).forEach((t) => {
     if (t.userId) targetFallbackMap.set(t.userId, t);
   });
 
   return officers.map((officer, i) => {
+    const officerUid = String(officer.uid || '').trim();
+    const officerCode = String(officer.userCode || '').trim().toLowerCase();
+    const officerLogin = String(officer.loginId || '').trim().toLowerCase();
+
     const travelSheetId = `travel_${officer.uid}_${sheetMonthKey}`;
-    const travelData = travelMap.get(travelSheetId) || travelMap.get(`${officer.uid}_${sheetMonthKey}`) || travelMap.get(officer.uid);
+
+    // Lookup across robust unique matching tiers (UID, Code, Login)
+    // Removed name-based fallback to prevent cross-user data leakage if names are identical
+    const travelData = 
+      travelMap.get(travelSheetId) ||
+      travelMap.get(`${officerUid}_${sheetMonthKey}`) ||
+      (officerCode ? (travelMap.get(`code_${officerCode}_${sheetMonthKey}`) || travelMap.get(`code_${officerCode.replace(/^emp-/, '')}_${sheetMonthKey}`)) : null) ||
+      (officerLogin ? travelMap.get(`login_${officerLogin}_${sheetMonthKey}`) : null) ||
+      travelMap.get(officerUid);
     
     let route = '-', openingKm = 0, closingKm = 0, dailyExpense = 0, recordedKm = 0;
-    if (travelData && travelData.rows) {
-      const dayRow = travelData.rows.find((r: any) => 
-        Number(r.dayNumber) === dayOfMonth || r.date === selectedDate
-      );
+    if (travelData && travelData.rows && Array.isArray(travelData.rows)) {
+      // Find row for selectedDate:
+      // Primary: exact date match (e.g. "2026-10-24")
+      let dayRow = travelData.rows.find((r: any) => r.date === selectedDate);
+      
+      // Secondary: dayNumber match (e.g. 24)
+      if (!dayRow) {
+        dayRow = travelData.rows.find((r: any) => Number(r.dayNumber) === dayOfMonth);
+      }
+      
       if (dayRow) {
-        route = (dayRow.route || '').trim() || '-';
+        const rawRoute = (dayRow.route || '').trim();
+        route = rawRoute.length > 0 ? rawRoute : '-';
         openingKm = Number(dayRow.openingKm) || 0;
         closingKm = Number(dayRow.closingKm) || 0;
         recordedKm = Number(dayRow.km) || 0;
@@ -137,7 +175,8 @@ export function buildReportRows(
         return (
           d.collectedByUid === officer.uid ||
           d.userId === officer.uid ||
-          (d.loginId && officer.loginId && d.loginId.toLowerCase() === officer.loginId.toLowerCase())
+          d.dealerOfficerId === officer.uid ||
+          (d.loginId && officer.loginId && String(d.loginId).toLowerCase() === officer.loginId.toLowerCase())
         );
       })
       .reduce((acc: number, d: any) => acc + (Number(d.amount) || 0), 0);
@@ -159,7 +198,7 @@ export function buildReportRows(
       monthlyAchievement = toDecimal2((Number(tData.achievedSales) || 0) / 100000);
     }
 
-    const calculatedKm = closingKm > openingKm ? closingKm - openingKm : recordedKm;
+    const calculatedKm = (closingKm >= openingKm && openingKm > 0) ? (closingKm - openingKm) : recordedKm;
 
     return {
       srNo: i + 1,
@@ -179,85 +218,14 @@ export function buildReportRows(
 }
 
 // Background prefetch function called from Dashboard to warm cache ahead of time
-export async function preloadReportData(profile: UserProfile): Promise<void> {
-  if (typeof window === 'undefined') return;
-
-  const userIsAdmin = isAdmin(profile);
-  const todayStr = new Date().toISOString().slice(0, 10);
-
-  // If memory cache is fresh (< 3 mins), skip heavy fetch
-  if (reportStaticCache && Date.now() - reportStaticCache.timestamp < 180000) {
-    return;
-  }
-
-  try {
-    const collPromise = getDocs(query(collection(db, 'collection_entries'), where('date', '==', todayStr)))
-      .catch(() => ({ docs: [] } as any));
-
-    if (!userIsAdmin) {
-      // Non-admin fast single-user read
-      const { sheetMonthKey } = parseDateKeys(todayStr);
-      const [travelDocSnap, yearlyDocSnap, collSnap] = await Promise.all([
-        getDoc(doc(db, 'travel_sheets', `travel_${profile.uid}_${sheetMonthKey}`)).catch(() => null),
-        getDoc(doc(db, 'yearly_targets', `yearly_${profile.uid}_2026_27`)).catch(() => null),
-        collPromise,
-      ]);
-
-      const travelData = travelDocSnap && travelDocSnap.exists() ? [{ id: travelDocSnap.id, ...travelDocSnap.data() }] : [];
-      const yearlyData = yearlyDocSnap && yearlyDocSnap.exists() ? [{ id: yearlyDocSnap.id, ...yearlyDocSnap.data() }] : [];
-      const collDocs = (collSnap?.docs || []).map((d: any) => d.data());
-
-      reportStaticCache = {
-        timestamp: Date.now(),
-        users: [profile],
-        travelSheets: travelData,
-        yearlyTargets: yearlyData,
-        targets: [],
-      };
-      localStorage.setItem(LOCAL_STORAGE_STATIC_KEY, JSON.stringify(reportStaticCache));
-
-      const dailyRows = buildReportRows([profile], travelData, yearlyData, [], collDocs, todayStr, profile);
-      localStorage.setItem(`${LOCAL_STORAGE_DAILY_PREFIX}${todayStr}`, JSON.stringify(dailyRows));
-      return;
-    }
-
-    // Admin batch read
-    const [usersSnap, travelSnap, yearlyTargetsSnap, targetsSnap, collSnap] = await Promise.all([
-      getDocs(collection(db, 'users')),
-      getDocs(collection(db, 'travel_sheets')),
-      getDocs(collection(db, 'yearly_targets')),
-      getDocs(collection(db, 'targets')).catch(() => ({ docs: [] } as any)),
-      collPromise,
-    ]);
-
-    const allUsers = usersSnap.docs.map((d: any) => ({ ...d.data(), uid: d.id } as UserProfile));
-    const allTravelSheets = travelSnap.docs.map((d: any) => ({ ...d.data(), _id: d.id }));
-    const allYearlyTargets = yearlyTargetsSnap.docs.map((d: any) => ({ ...d.data(), _id: d.id }));
-    const allTargets = (targetsSnap?.docs || []).map((d: any) => ({ ...d.data(), _id: d.id }));
-    const collDocs = (collSnap?.docs || []).map((d: any) => d.data());
-
-    reportStaticCache = {
-      timestamp: Date.now(),
-      users: allUsers,
-      travelSheets: allTravelSheets,
-      yearlyTargets: allYearlyTargets,
-      targets: allTargets,
-    };
-    try {
-      localStorage.setItem(LOCAL_STORAGE_STATIC_KEY, JSON.stringify(reportStaticCache));
-      const dailyRows = buildReportRows(allUsers, allTravelSheets, allYearlyTargets, allTargets, collDocs, todayStr, profile);
-      localStorage.setItem(`${LOCAL_STORAGE_DAILY_PREFIX}${todayStr}`, JSON.stringify(dailyRows));
-    } catch (e) {}
-  } catch (err) {
-    console.warn('Preload report error (non-fatal):', err);
-  }
-}
+// ... removed preloadReportData as it's redundant with optimized listeners
 
 export const ReportView: React.FC<Props> = ({ profile }) => {
+  const { users: allUsersFromContext, loading: usersLoading } = useUsers();
   const todayDate = new Date().toISOString().slice(0, 10);
   const [selectedDate, setSelectedDate] = useState(todayDate);
   
-  // Instant Initial State: Read immediately from localStorage or static cache (0ms latency!)
+  // Instant Initial State: Read immediately from localStorage (0ms latency!)
   const [reportData, setReportData] = useState<OfficerDailyReport[]>(() => {
     if (typeof window !== 'undefined') {
       try {
@@ -268,17 +236,6 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
             return parsed;
           }
         }
-        if (reportStaticCache && reportStaticCache.users.length > 0) {
-          return buildReportRows(
-            reportStaticCache.users,
-            reportStaticCache.travelSheets,
-            reportStaticCache.yearlyTargets,
-            reportStaticCache.targets,
-            [],
-            todayDate,
-            profile
-          );
-        }
       } catch (e) {}
     }
     return [];
@@ -286,156 +243,140 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
 
   const [loading, setLoading] = useState(() => reportData.length === 0);
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const hasMountedRef = useRef(false);
 
-  const fetchReportData = async (forceRefresh = false) => {
-    const userIsAdmin = isAdmin(profile);
+  // References to hold live data components
+  const liveUsersRef = useRef<UserProfile[]>([]);
+  const liveTravelRef = useRef<any[]>([]);
+  const liveTargetsRef = useRef<any[]>([]);
+  const liveCollRef = useRef<any[]>([]);
 
-    // 1. Instant optimistic lookup for selectedDate from localStorage or existing memory cache
+  // Function to re-aggregate live report rows from current in-memory snapshots
+  const updateReport = (targetDate: string) => {
+    const freshRows = buildReportRows(
+      liveUsersRef.current,
+      liveTravelRef.current,
+      liveTargetsRef.current,
+      [],
+      liveCollRef.current,
+      targetDate,
+      profile
+    );
+    setReportData(freshRows);
     try {
-      const cachedDaily = localStorage.getItem(`${LOCAL_STORAGE_DAILY_PREFIX}${selectedDate}`);
-      if (cachedDaily) {
-        const parsed = JSON.parse(cachedDaily);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setReportData(parsed);
-          setLoading(false);
-        }
-      } else if (reportStaticCache && reportStaticCache.users.length > 0) {
-        const rows = buildReportRows(
-          reportStaticCache.users,
-          reportStaticCache.travelSheets,
-          reportStaticCache.yearlyTargets,
-          reportStaticCache.targets,
-          [],
-          selectedDate,
-          profile
-        );
-        if (rows.length > 0) {
-          setReportData(rows);
-          setLoading(false);
-        }
-      }
+      localStorage.setItem(`${LOCAL_STORAGE_DAILY_PREFIX}${targetDate}`, JSON.stringify(freshRows));
     } catch (e) {}
-
-    // 2. Background Revalidation (Stale-While-Revalidate)
-    setIsRefreshing(true);
-    if (reportData.length === 0) {
-      setLoading(true);
-    }
-
-    try {
-      // Fast collection entries query with 3.5s timeout safeguard
-      const collPromise = Promise.race([
-        getDocs(query(collection(db, 'collection_entries'), where('date', '==', selectedDate)))
-          .catch(() => ({ docs: [] } as any)),
-        new Promise<any>((resolve) => setTimeout(() => resolve({ docs: [] }), 3500))
-      ]);
-
-      const isCacheRecent = !forceRefresh && reportStaticCache && (Date.now() - reportStaticCache.timestamp < 180000);
-
-      if (isCacheRecent && reportStaticCache) {
-        const collSnap = await collPromise;
-        const collDocs = (collSnap?.docs || []).map((d: any) => d.data());
-        const freshRows = buildReportRows(
-          reportStaticCache.users,
-          reportStaticCache.travelSheets,
-          reportStaticCache.yearlyTargets,
-          reportStaticCache.targets,
-          collDocs,
-          selectedDate,
-          profile
-        );
-        setReportData(freshRows);
-        try {
-          localStorage.setItem(`${LOCAL_STORAGE_DAILY_PREFIX}${selectedDate}`, JSON.stringify(freshRows));
-        } catch (e) {}
-        setLoading(false);
-        setIsRefreshing(false);
-        return;
-      }
-
-      if (!userIsAdmin) {
-        // Fast individual query for non-admin
-        const { sheetMonthKey } = parseDateKeys(selectedDate);
-        const [travelDocSnap, yearlyDocSnap, collSnap] = await Promise.all([
-          getDoc(doc(db, 'travel_sheets', `travel_${profile.uid}_${sheetMonthKey}`)).catch(() => null),
-          getDoc(doc(db, 'yearly_targets', `yearly_${profile.uid}_2026_27`)).catch(() => null),
-          collPromise,
-        ]);
-
-        const travelData = travelDocSnap && travelDocSnap.exists() ? [{ id: travelDocSnap.id, ...travelDocSnap.data() }] : [];
-        const yearlyData = yearlyDocSnap && yearlyDocSnap.exists() ? [{ id: yearlyDocSnap.id, ...yearlyDocSnap.data() }] : [];
-        const collDocs = (collSnap?.docs || []).map((d: any) => d.data());
-
-        reportStaticCache = {
-          timestamp: Date.now(),
-          users: [profile],
-          travelSheets: travelData,
-          yearlyTargets: yearlyData,
-          targets: [],
-        };
-        try {
-          localStorage.setItem(LOCAL_STORAGE_STATIC_KEY, JSON.stringify(reportStaticCache));
-        } catch (e) {}
-
-        const freshRows = buildReportRows([profile], travelData, yearlyData, [], collDocs, selectedDate, profile);
-        setReportData(freshRows);
-        try {
-          localStorage.setItem(`${LOCAL_STORAGE_DAILY_PREFIX}${selectedDate}`, JSON.stringify(freshRows));
-        } catch (e) {}
-      } else {
-        // Admin full fetch
-        const [usersSnap, travelSnap, yearlyTargetsSnap, targetsSnap, collSnap] = await Promise.all([
-          getDocs(collection(db, 'users')),
-          getDocs(collection(db, 'travel_sheets')),
-          getDocs(collection(db, 'yearly_targets')),
-          getDocs(collection(db, 'targets')).catch(() => ({ docs: [] } as any)),
-          collPromise,
-        ]);
-
-        const allUsers = usersSnap.docs.map((d: any) => ({ ...d.data(), uid: d.id } as UserProfile));
-        const allTravelSheets = travelSnap.docs.map((d: any) => ({ ...d.data(), _id: d.id }));
-        const allYearlyTargets = yearlyTargetsSnap.docs.map((d: any) => ({ ...d.data(), _id: d.id }));
-        const allTargets = (targetsSnap?.docs || []).map((d: any) => ({ ...d.data(), _id: d.id }));
-        const collDocs = (collSnap?.docs || []).map((d: any) => d.data());
-
-        reportStaticCache = {
-          timestamp: Date.now(),
-          users: allUsers,
-          travelSheets: allTravelSheets,
-          yearlyTargets: allYearlyTargets,
-          targets: allTargets,
-        };
-        try {
-          localStorage.setItem(LOCAL_STORAGE_STATIC_KEY, JSON.stringify(reportStaticCache));
-        } catch (e) {}
-
-        const freshRows = buildReportRows(
-          allUsers,
-          allTravelSheets,
-          allYearlyTargets,
-          allTargets,
-          collDocs,
-          selectedDate,
-          profile
-        );
-        setReportData(freshRows);
-        try {
-          localStorage.setItem(`${LOCAL_STORAGE_DAILY_PREFIX}${selectedDate}`, JSON.stringify(freshRows));
-        } catch (e) {}
-      }
-    } catch (err) {
-      console.error('Error fetching report data:', err);
-    } finally {
-      setLoading(false);
-      setIsRefreshing(false);
-    }
   };
 
+  // Track connection status and quota errors
+  const [syncStatus, setSyncStatus] = useState<'online' | 'offline' | 'quota_hit'>('online');
+
+  // Real-time synchronization across Admin and Users for the selected date and month
   useEffect(() => {
-    fetchReportData(false);
-    hasMountedRef.current = true;
+    let active = true;
+    const { year, targetMonthName } = parseDateKeys(selectedDate);
+    const monthKey = `${year}_${targetMonthName}`;
+
+    // Month-level subscription: only resubscribe if year or month changes
+    const unsubMonth = onSnapshot(
+      query(
+        collection(db, 'travel_sheets'),
+        where('monthName', '==', targetMonthName),
+        where('yearNumber', '==', year)
+      ),
+      (snap) => {
+        if (!active) return;
+        const list: any[] = [];
+        snap.forEach((d) => {
+          list.push({ ...d.data(), id: d.id, _id: d.id });
+        });
+        liveTravelRef.current = list;
+        updateReport(selectedDate);
+        setLoading(false);
+        setIsRefreshing(false);
+        setSyncStatus('online');
+      },
+      (err: any) => {
+        console.warn('Travel sheets listener error:', err);
+        if (active) {
+          if (err.code === 'resource-exhausted') setSyncStatus('quota_hit');
+          else setSyncStatus('offline');
+          setLoading(false);
+          setIsRefreshing(false);
+        }
+      }
+    );
+
+    // Initial load for static-ish data (Users, Targets)
+    const loadStaticData = async () => {
+      try {
+        const [targetsSnap] = await Promise.all([
+          getDocs(collection(db, 'yearly_targets'))
+        ]);
+        
+        if (!active) return;
+        
+        liveUsersRef.current = allUsersFromContext;
+
+        const targetsList: any[] = [];
+        targetsSnap.forEach((d) => {
+          targetsList.push({ ...d.data(), id: d.id, _id: d.id });
+        });
+        liveTargetsRef.current = targetsList;
+        
+        updateReport(selectedDate);
+      } catch (err: any) {
+        console.warn('Error loading static report data:', err);
+        if (err.code === 'resource-exhausted') setSyncStatus('quota_hit');
+      }
+    };
+
+    loadStaticData();
+
+    return () => {
+      active = false;
+      unsubMonth();
+    };
+  }, [selectedDate.split('-').slice(0, 2).join('-'), profile.uid]); // Depends only on YYYY-MM
+
+  // Date-level subscription: resubscribe on every date change
+  useEffect(() => {
+    let active = true;
+    setIsRefreshing(true);
+
+    const unsubColl = onSnapshot(
+      query(
+        collection(db, 'collection_entries'),
+        where('date', '==', selectedDate)
+      ),
+      (snap) => {
+        if (!active) return;
+        const list: any[] = [];
+        snap.forEach((d) => {
+          list.push({ ...d.data(), id: d.id });
+        });
+        liveCollRef.current = list;
+        updateReport(selectedDate);
+        setIsRefreshing(false);
+      },
+      (err: any) => {
+        console.warn('Collection entries listener error:', err);
+        if (active) {
+          setIsRefreshing(false);
+        }
+      }
+    );
+
+    return () => {
+      active = false;
+      unsubColl();
+    };
   }, [selectedDate]);
+
+  const handleManualRefresh = () => {
+    setIsRefreshing(true);
+    updateReport(selectedDate);
+    setTimeout(() => setIsRefreshing(false), 500);
+  };
 
   const totalKmSum = reportData.reduce((acc, r) => acc + r.totalKm, 0);
   const totalCollectionSum = reportData.reduce((acc, r) => acc + r.paymentCollection, 0);
@@ -466,7 +407,7 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
           </div>
 
           <button 
-            onClick={() => fetchReportData(true)}
+            onClick={handleManualRefresh}
             disabled={isRefreshing}
             className="flex items-center gap-1.5 px-3 py-1.5 sm:py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-xl text-xs font-bold transition disabled:opacity-50 shrink-0 cursor-pointer active:scale-95"
             title="Refresh Data"
@@ -487,7 +428,17 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
 
         {/* Live fast status indicator */}
         <div className="flex items-center gap-2">
-          {isRefreshing ? (
+          {syncStatus === 'quota_hit' ? (
+            <span className="flex items-center gap-1 text-[11px] font-bold text-red-700 bg-red-50 px-2.5 py-1 rounded-full border border-red-200">
+              <AlertCircle className="w-3 h-3 text-red-600" />
+              <span>Quota Exceeded</span>
+            </span>
+          ) : syncStatus === 'offline' ? (
+            <span className="flex items-center gap-1 text-[11px] font-bold text-amber-700 bg-amber-50 px-2.5 py-1 rounded-full border border-amber-200">
+              <RefreshCw className="w-3 h-3 text-amber-600 animate-spin" />
+              <span>Offline/Connecting...</span>
+            </span>
+          ) : isRefreshing ? (
             <span className="flex items-center gap-1 text-[11px] font-bold text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-full border border-indigo-200">
               <Loader2 className="w-3 h-3 animate-spin" />
               <span>Updating live...</span>
@@ -495,7 +446,7 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
           ) : (
             <span className="flex items-center gap-1 text-[11px] font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
               <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-              <span>Instant Loaded</span>
+              <span>Live Synced</span>
             </span>
           )}
         </div>

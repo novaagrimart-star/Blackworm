@@ -45,4 +45,10 @@ if ('serviceWorker' in navigator) {
   });
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+import { UsersProvider } from './lib/UsersContext.tsx';
+
+createRoot(document.getElementById('root')!).render(
+  <UsersProvider>
+    <App />
+  </UsersProvider>
+);

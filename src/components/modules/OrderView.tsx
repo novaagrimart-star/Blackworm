@@ -8,6 +8,7 @@ import {
   onSnapshot, 
   doc, 
   setDoc,
+  getDocs,
   updateDoc,
   deleteDoc 
 } from 'firebase/firestore';
@@ -43,7 +44,8 @@ import {
   AlertCircle,
   Edit3,
   Lock,
-  Sprout
+  Sprout,
+  RefreshCw
 } from 'lucide-react';
 
 export const COMMON_CROPS = [
@@ -104,6 +106,9 @@ export interface OrderItem {
   loginId?: string;
   userCode?: string;
   createdByName: string;
+  dealerOfficerId?: string;
+  dealerOfficerName?: string;
+  createdByUid?: string;
   createdAt: string;
   updatedAt?: string;
   updatedByName?: string;
@@ -118,6 +123,14 @@ interface SavedDealer {
   dealerCode: string;
   village: string;
   district: string;
+  userId?: string;
+  ownerId?: string;
+  dealerOfficerId?: string;
+  dealerOfficerName?: string;
+  createdByUid?: string;
+  createdByName?: string;
+  userCode?: string;
+  loginId?: string;
 }
 
 interface Props {
@@ -131,6 +144,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   const [products, setProducts] = useState<DynamicPriceProduct[]>([]);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
+  const [syncStatus, setSyncStatus] = useState<'online' | 'offline' | 'quota_hit'>('online');
   
   // Modals state
   const [showNewOrderModal, setShowNewOrderModal] = useState(false);
@@ -231,30 +245,19 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     }
   }, [showNewOrderModal, selectedOrderDetails, successOrder]);
 
-  // Load Orders from Firestore (using built-in persistent cache for speed)
+  // Load Orders from Firestore (Centralized Sync: Admin sees all, Officers see their authorized orders)
   useEffect(() => {
-
-    let q = query(
+    const q = query(
       collection(db, 'orders'),
       orderBy('createdAt', 'desc'),
-      limit(300)
+      limit(isAdmin(profile) ? 500 : 300)
     );
-
-    // Optimized Server-Side Filtering: Non-admins only fetch their own records to save data and time
-    if (!isAdmin(profile)) {
-      q = query(
-        collection(db, 'orders'),
-        where('userId', '==', profile.uid),
-        orderBy('createdAt', 'desc'),
-        limit(200)
-      );
-    }
 
     const unsub = onSnapshot(q, (snap) => {
       const list: OrderItem[] = [];
       snap.forEach((d) => {
         const data = d.data() as any;
-        if (!data.isArchived) {
+        if (!data.isArchived && (isAdmin(profile) || isUserRecord(data, profile))) {
           list.push({
             id: d.id,
             orderNumber: data.orderNumber || `BW-${d.id.slice(-6)}`,
@@ -282,6 +285,9 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
             deliveredAt: data.deliveredAt,
             ownerId: data.ownerId || '',
             userId: data.userId,
+            dealerOfficerId: data.dealerOfficerId,
+            dealerOfficerName: data.dealerOfficerName,
+            createdByUid: data.createdByUid,
             loginId: data.loginId,
             userCode: data.userCode,
             createdByName: data.createdByName || 'User',
@@ -290,85 +296,116 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           });
         }
       });
-      // Firestore query already sorts by createdAt desc, but we keep this as safety
       setOrders(list);
-    }, (error) => {
+      setSyncStatus('online');
+    }, (error: any) => {
+      if (error.code === 'resource-exhausted') setSyncStatus('quota_hit');
+      else setSyncStatus('offline');
       handleFirestoreError(error, OperationType.LIST, 'orders');
     });
     return () => unsub();
-  }, []);
+  }, [profile]);
 
   // Load Saved Dealers from Firestore (and cache in localStorage for fast offline access)
   useEffect(() => {
-    try {
-      const cached = localStorage.getItem('blackworm_all_dealers');
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          const list: SavedDealer[] = parsed.map((data: any) => ({
-            id: data.id,
-            firmName: data.firmName || 'Unnamed Firm',
-            proprietorName: data.proprietorName || '',
-            contactNumber: data.contactNumber || '',
-            dealerCode: data.dealerCode || '',
-            village: data.village || '',
-            district: data.district || '',
-          }));
-          list.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
-          setDealers(list);
-        }
-      }
-    } catch {}
-
-    const q = query(collection(db, 'dealers_application'));
-    const unsub = onSnapshot(q, (snap) => {
-      const list: SavedDealer[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as any;
-        list.push({
-          id: d.id,
-          firmName: data.firmName || 'Unnamed Firm',
-          proprietorName: data.proprietorName || '',
-          contactNumber: data.contactNumber || '',
-          dealerCode: data.dealerCode || '',
-          village: data.village || '',
-          district: data.district || '',
-        });
-      });
-      // Sort alphabetically by firm name
-      list.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
-      setDealers(list);
+    const fetchDealers = async () => {
       try {
-        localStorage.setItem('blackworm_all_dealers', JSON.stringify(list));
-      } catch {}
-    });
-    return () => unsub();
-  }, []);
+        const cached = localStorage.getItem('blackworm_all_dealers');
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const list: SavedDealer[] = parsed.map((data: any) => ({
+              id: data.id,
+              firmName: data.firmName || 'Unnamed Firm',
+              proprietorName: data.proprietorName || '',
+              contactNumber: data.contactNumber || '',
+              dealerCode: data.dealerCode || '',
+              village: data.village || '',
+              district: data.district || '',
+              userId: data.userId,
+              ownerId: data.ownerId,
+              dealerOfficerId: data.dealerOfficerId,
+              dealerOfficerName: data.dealerOfficerName,
+              createdByUid: data.createdByUid,
+              createdByName: data.createdByName,
+              userCode: data.userCode,
+              loginId: data.loginId,
+            }));
+            list.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
+            setDealers(list);
+          }
+        }
+
+        const q = query(
+          collection(db, 'dealers_application'),
+          orderBy('createdAt', 'desc'),
+          limit(isAdmin(profile) ? 500 : 300)
+        );
+        const snap = await getDocs(q);
+        const list: SavedDealer[] = [];
+        snap.forEach((d) => {
+          const data = d.data() as any;
+          if (!data.isArchived && (isAdmin(profile) || isUserRecord(data, profile))) {
+            list.push({
+              id: d.id,
+              firmName: data.firmName || 'Unnamed Firm',
+              proprietorName: data.proprietorName || '',
+              contactNumber: data.contactNumber || '',
+              dealerCode: data.dealerCode || '',
+              village: data.village || '',
+              district: data.district || '',
+              userId: data.userId || data.ownerId || '',
+              ownerId: data.ownerId || '',
+              dealerOfficerId: data.dealerOfficerId || data.userId || '',
+              dealerOfficerName: data.dealerOfficerName || data.officerName || data.createdByName || '',
+              createdByUid: data.createdByUid || data.createdByUserId || '',
+              createdByName: data.createdByName || '',
+              userCode: data.userCode || '',
+              loginId: data.loginId || '',
+            });
+          }
+        });
+        list.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
+        setDealers(list);
+        try {
+          localStorage.setItem('blackworm_all_dealers', JSON.stringify(list));
+        } catch {}
+      } catch (error: any) {
+        if (error.code === 'resource-exhausted') setSyncStatus('quota_hit');
+        handleFirestoreError(error, OperationType.LIST, 'dealers_application');
+      }
+    };
+    fetchDealers();
+  }, [profile]);
 
   // Load Products from Price List (with fallback to OFFICIAL_REFERENCE_DATA)
   useEffect(() => {
-    const q = query(collection(db, 'products_pricelist_v2'));
-    const unsub = onSnapshot(q, (snap) => {
-      if (!snap.empty) {
-        const list: DynamicPriceProduct[] = [];
-        snap.forEach((d) => {
-          const data = d.data() as any;
-          if (!data.isArchived) {
-            list.push({ ...data, id: d.id });
-          }
-        });
-        list.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
-        setProducts(list);
-      } else {
-        // Fallback to official reference data
-        const fallback = OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
-          ...p,
-          id: `ref_${idx}`,
-        }));
-        setProducts(fallback);
+    const fetchProducts = async () => {
+      const q = query(collection(db, 'products_pricelist_v2'));
+      try {
+        const snap = await getDocs(q);
+        if (!snap.empty) {
+          const list: DynamicPriceProduct[] = [];
+          snap.forEach((d) => {
+            const data = d.data() as any;
+            if (!data.isArchived) {
+              list.push({ ...data, id: d.id });
+            }
+          });
+          list.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
+          setProducts(list);
+        } else {
+          const fallback = OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
+            ...p,
+            id: `ref_${idx}`,
+          }));
+          setProducts(fallback);
+        }
+      } catch (error: any) {
+        if (error.code === 'resource-exhausted') setSyncStatus('quota_hit');
       }
-    });
-    return () => unsub();
+    };
+    fetchProducts();
   }, []);
 
   // Filter Dealers in New Order Dropdown
@@ -655,8 +692,11 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         balanceAmount: totalBill,
         paymentMode: 'Pending / Credit',
         status: 'pending_approval',
-        ownerId: profile.uid || '',
-        userId: profile.uid || '',
+        ownerId: dealerToUse.userId || dealerToUse.ownerId || dealerToUse.dealerOfficerId || profile.uid || '',
+        userId: dealerToUse.userId || dealerToUse.ownerId || dealerToUse.dealerOfficerId || profile.uid || '',
+        dealerOfficerId: dealerToUse.dealerOfficerId || dealerToUse.userId || profile.uid || '',
+        dealerOfficerName: dealerToUse.dealerOfficerName || dealerToUse.createdByName || profile.fullName || '',
+        createdByUid: profile.uid || '',
         loginId: profile.loginId || '',
         userCode: profile.userCode || '',
         createdByName: profile.fullName || 'Officer',
@@ -971,6 +1011,35 @@ ${itemsListText}
           <Plus className="w-3.5 h-3.5 stroke-[3]" />
           <span>New Order</span>
         </button>
+      </div>
+
+      {/* Sync Status Banner */}
+      <div className={cn(
+        "p-2.5 rounded-xl border text-[11px] flex items-center justify-between gap-2 no-print",
+        syncStatus === 'quota_hit' ? "bg-red-50 border-red-200 text-red-900" :
+        syncStatus === 'offline' ? "bg-amber-50 border-amber-200 text-amber-900" :
+        "bg-purple-50 border-purple-200 text-purple-900"
+      )}>
+        <div className="flex items-center gap-2">
+          <div className={cn(
+            "w-1.5 h-1.5 rounded-full",
+            syncStatus === 'quota_hit' ? "bg-red-600 animate-pulse" :
+            syncStatus === 'offline' ? "bg-amber-500 animate-pulse" :
+            "bg-purple-500"
+          )} />
+          <span className="font-bold">
+            {syncStatus === 'quota_hit' ? (
+              <span className="flex items-center gap-1.5"><AlertCircle className="w-3.5 h-3.5" /> Firestore Read Quota Exceeded. Some data may be missing until tomorrow.</span>
+            ) : syncStatus === 'offline' ? (
+              <span className="flex items-center gap-1.5"><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Connection Lost. Working offline.</span>
+            ) : (
+              <span className="flex items-center gap-1.5"><CheckCircle2 className="w-3.5 h-3.5 text-purple-600" /> All data is synced and up to date.</span>
+            )}
+          </span>
+        </div>
+        <div className="text-[10px] font-black uppercase tracking-tighter opacity-50">
+          {syncStatus === 'online' ? '● Connected' : '○ Disconnected'}
+        </div>
       </div>
 
       {/* Search & Filter Bar - Ultra Compact Small Buttons */}
