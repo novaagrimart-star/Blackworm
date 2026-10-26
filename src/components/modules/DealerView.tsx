@@ -1069,11 +1069,11 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       {viewMode === 'list' && (
         <div className="space-y-4 no-print">
 
-          {/* Filter Pills matching screenshot */}
-          <div className="flex items-center gap-2 px-1 flex-wrap">
+          {/* Filter Pills in a Single Inline Row on Mobile & Desktop */}
+          <div className="flex items-center gap-1.5 px-1 overflow-x-auto whitespace-nowrap py-1 scrollbar-none">
             <button
               onClick={() => setActiveFilter('all')}
-              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer ${
+              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer shrink-0 ${
                 activeFilter === 'all'
                   ? 'bg-slate-900 text-white shadow-md'
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
@@ -1083,7 +1083,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
             </button>
             <button
               onClick={() => setActiveFilter('active')}
-              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer ${
+              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer shrink-0 ${
                 activeFilter === 'active'
                   ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-sm'
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
@@ -1092,12 +1092,12 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               Active ({officerActiveCount})
             </button>
 
-            {/* Officer Select - Dark, bold, high-contrast, crystal clear (Admin only) */}
+            {/* Officer Select - Directly beside Active in the same row on mobile and desktop */}
             {isAdmin(profile) && (
               <select
                 value={selectedOfficerFilter}
                 onChange={(e) => setSelectedOfficerFilter(e.target.value)}
-                className="bg-slate-900 text-white hover:bg-slate-800 border-2 border-slate-900 rounded-lg px-2.5 py-1 text-xs font-black focus:outline-none focus:ring-2 focus:ring-slate-900 cursor-pointer shadow-xs tracking-tight"
+                className="bg-slate-900 text-white hover:bg-slate-800 border-2 border-slate-900 rounded-lg px-2.5 py-1 text-xs font-black focus:outline-none focus:ring-2 focus:ring-slate-900 cursor-pointer shadow-xs tracking-tight shrink-0"
                 title="Officer Select"
               >
                 <option value="all" className="bg-white text-slate-900 font-black py-1">
@@ -1118,7 +1118,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               <button
                 type="button"
                 onClick={() => setSelectedOfficerFilter('all')}
-                className="bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 px-2 py-0.5 rounded-lg text-[10px] font-black flex items-center gap-1 cursor-pointer transition"
+                className="bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 px-2 py-0.5 rounded-lg text-[10px] font-black flex items-center gap-1 cursor-pointer transition shrink-0"
                 title="Clear filter"
               >
                 <span>{selectedOfficerObj?.fullName}</span>
@@ -1154,7 +1154,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                       </td>
                       <td className="p-3 font-mono font-black text-red-600">
                         <span className="bg-red-50 border border-red-200 px-2 py-0.5 rounded text-[11px]">
-                          #{d.dealerCode || 'DEALER'}
+                          {d.dealerCode ? d.dealerCode.replace(/^#/, '') : 'DEALER'}
                         </span>
                       </td>
                       <td className="p-3">
@@ -1218,7 +1218,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   <span
                     className="text-[11px] font-bold text-red-600 bg-red-50 border border-red-200 px-2 py-0.5 rounded-md uppercase tracking-wider shrink-0 font-mono"
                   >
-                    #{d.dealerCode || 'DEALER'}
+                    {d.dealerCode ? d.dealerCode.replace(/^#/, '') : 'DEALER'}
                   </span>
                   
                   <div className="flex-1 min-w-0">
@@ -1267,7 +1267,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   Back
                 </button>
                 <span className="text-xs font-black text-slate-800 uppercase tracking-wide break-words">
-                  {dealerCode ? `#${dealerCode} - ` : ''}{firmName || 'DEALERSHIP APPLICATION FORM'}
+                  {dealerCode ? `${dealerCode.replace(/^#/, '')} - ` : ''}{firmName || 'DEALERSHIP APPLICATION FORM'}
                 </span>
               </div>
 

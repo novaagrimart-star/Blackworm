@@ -54,9 +54,36 @@ export interface FirestoreErrorInfo {
   };
 }
 
+export function isQuotaExceededError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return (
+    msg.toLowerCase().includes('quota') ||
+    msg.toLowerCase().includes('resource-exhausted') ||
+    msg.toLowerCase().includes('daily read units') ||
+    msg.toLowerCase().includes('free tier database')
+  );
+}
+
+export function getFriendlyErrorMessage(error: unknown, fallbackMessage = 'डेटा सध्या उपलब्ध नाही. कृपया काही वेळाने पुन्हा प्रयत्न करा.'): string {
+  if (isQuotaExceededError(error)) {
+    return 'डेटा सध्या उपलब्ध नाही. कृपया काही वेळाने पुन्हा प्रयत्न करा.';
+  }
+  const msg = error instanceof Error ? error.message : String(error);
+  if (msg.includes('offline') || msg.includes('network') || msg.includes('unavailable')) {
+    return 'इंटरनेट कनेक्शन उपलब्ध नाही. ऑफलाइन कॅश डेटा दर्शवला जात आहे.';
+  }
+  if (msg.includes('permission') || msg.includes('PERMISSION_DENIED')) {
+    return 'या माहितीसाठी आवश्यक परवानगी उपलब्ध नाही.';
+  }
+  return fallbackMessage;
+}
+
 export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const rawMsg = error instanceof Error ? error.message : String(error);
+  const isQuota = isQuotaExceededError(error);
+
   const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
+    error: rawMsg,
     authInfo: {
       userId: auth.currentUser?.uid,
       email: auth.currentUser?.email,
@@ -71,8 +98,19 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
     operationType,
     path
   };
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  return errInfo;
+
+  // Safe developer-only console warning without exposing raw stack to UI
+  if (isQuota) {
+    console.warn('Firestore notice: daily free quota threshold active. Offline cache is serving data.');
+  } else {
+    console.warn('Firestore notice [safe]:', rawMsg);
+  }
+
+  return {
+    ...errInfo,
+    userMessage: getFriendlyErrorMessage(error),
+    isQuota
+  };
 }
 
 export async function testFirestoreConnection(): Promise<boolean> {

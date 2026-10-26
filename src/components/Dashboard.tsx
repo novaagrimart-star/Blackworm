@@ -24,7 +24,6 @@ import {
 import { cn, toTitleCase } from '../lib/utils';
 import { UserProfile, isAdmin, canAccessModule } from '../lib/auth';
 import { Language, translations } from '../lib/i18n';
-import { seedInitialDataIfEmpty } from '../lib/dataService';
 import { OfflineIndicator } from './OfflineIndicator';
 import { CustomDialogModal } from './CustomDialogModal';
 import { useBranding } from '../lib/branding';
@@ -88,10 +87,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
       onCancel: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
     });
   };
-
-  useEffect(() => {
-    seedInitialDataIfEmpty(profile);
-  }, [profile]);
 
   // Live listener for current logged-in user profile
   useEffect(() => {
