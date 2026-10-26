@@ -8,7 +8,6 @@ import {
   onSnapshot, 
   doc, 
   setDoc,
-  getDocs,
   updateDoc,
   deleteDoc 
 } from 'firebase/firestore';
@@ -44,8 +43,7 @@ import {
   AlertCircle,
   Edit3,
   Lock,
-  Sprout,
-  RefreshCw
+  Sprout
 } from 'lucide-react';
 
 export const COMMON_CROPS = [
@@ -63,11 +61,78 @@ export const COMMON_CROPS = [
   { id: 'all_crops', name: 'सर्व पिके (General / All Crops)', icon: '🌾' },
 ];
 
+export const getCleanGradeName = (prod?: { 
+  groupName?: string; 
+  brandName?: string; 
+  gradeName?: string; 
+  productName?: string; 
+} | null): string => {
+  if (!prod) return '';
+
+  const g = (prod.groupName || '').toLowerCase().trim();
+  const brand = (prod.brandName || '').trim();
+  const grade = (prod.gradeName || '').trim();
+  const name = (prod.productName || '').trim();
+
+  // Identify Group B and Group C products (or known Group B/C commercial names)
+  const isGroupB = g.includes('group b') || g.includes('micronutrient') || g.includes('micro');
+  const isGroupC = g.includes('group c') || g.includes('growth regulator') || g.includes('pgr') || g.includes('stimulant');
+  const isKnownBCName = 
+    /microgrip/i.test(brand) || 
+    /bw\s*combi/i.test(brand) || 
+    /nutrijet/i.test(brand) ||
+    /microgrip/i.test(grade) || 
+    /bw\s*combi/i.test(grade) || 
+    /nutrijet/i.test(grade) ||
+    /microgrip/i.test(name) || 
+    /bw\s*combi/i.test(name) || 
+    /nutrijet/i.test(name);
+
+  // RULE 3: ONLY FOR B GROUP AND C GROUP:
+  if (isGroupB || isGroupC || isKnownBCName) {
+    // Return only the colored product name (e.g. Microgrip®, Microgrip DF®, BW Combi®, Nutrijet)
+    // Do NOT include the following blue Grade/Description or extra information!
+    if (/microgrip\s*df/i.test(brand) || /microgrip\s*df/i.test(grade) || /microgrip\s*df/i.test(name)) {
+      return 'Microgrip DF®';
+    }
+    if (/microgrip/i.test(brand) || /microgrip/i.test(grade) || /microgrip/i.test(name)) {
+      return 'Microgrip®';
+    }
+    if (/bw\s*combi/i.test(brand) || /bw\s*combi/i.test(grade) || /bw\s*combi/i.test(name)) {
+      return 'BW Combi®';
+    }
+    if (/nutrijet/i.test(brand) || /nutrijet/i.test(grade) || /nutrijet/i.test(name)) {
+      return 'Nutrijet';
+    }
+
+    if (brand && !/^Airawat[®\s-]*$/i.test(brand) && !/^Blackworm[\s-]*$/i.test(brand)) {
+      return brand;
+    }
+    if (brand) {
+      return brand;
+    }
+  }
+
+  // RULE 4: FOR GROUP A AND SPECIALITY GRADE: NO CHANGE!
+  let raw = (grade || name || '').trim();
+  if (!raw) return (brand || '').trim();
+
+  if (brand && raw.toLowerCase().startsWith(brand.toLowerCase())) {
+    raw = raw.slice(brand.length).trim();
+  }
+
+  raw = raw.replace(/^Airawat[®\s-]*/i, '').trim();
+  raw = raw.replace(/^Blackworm[\s-]*/i, '').trim();
+
+  return raw || (grade || name || brand || '').trim();
+};
+
 export interface OrderProductLine {
   productId: string;
   productName: string;
   brandName?: string;
   gradeName?: string;
+  groupName?: string;
   packingSize: string;
   rate: number;
   quantity: number;
@@ -106,9 +171,6 @@ export interface OrderItem {
   loginId?: string;
   userCode?: string;
   createdByName: string;
-  dealerOfficerId?: string;
-  dealerOfficerName?: string;
-  createdByUid?: string;
   createdAt: string;
   updatedAt?: string;
   updatedByName?: string;
@@ -123,14 +185,6 @@ interface SavedDealer {
   dealerCode: string;
   village: string;
   district: string;
-  userId?: string;
-  ownerId?: string;
-  dealerOfficerId?: string;
-  dealerOfficerName?: string;
-  createdByUid?: string;
-  createdByName?: string;
-  userCode?: string;
-  loginId?: string;
 }
 
 interface Props {
@@ -144,7 +198,6 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   const [products, setProducts] = useState<DynamicPriceProduct[]>([]);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
-  const [syncStatus, setSyncStatus] = useState<'online' | 'offline' | 'quota_hit'>('online');
   
   // Modals state
   const [showNewOrderModal, setShowNewOrderModal] = useState(false);
@@ -245,19 +298,48 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     }
   }, [showNewOrderModal, selectedOrderDetails, successOrder]);
 
-  // Load Orders from Firestore (Centralized Sync: Admin sees all, Officers see their authorized orders)
+  // Load Orders from Firestore (using built-in persistent cache for speed)
   useEffect(() => {
-    const q = query(
+
+    let q = query(
       collection(db, 'orders'),
       orderBy('createdAt', 'desc'),
-      limit(isAdmin(profile) ? 500 : 300)
+      limit(300)
     );
+
+    // Optimized Server-Side Filtering: Non-admins only fetch their own records to save data and time
+    if (!isAdmin(profile)) {
+      q = query(
+        collection(db, 'orders'),
+        where('userId', '==', profile.uid),
+        orderBy('createdAt', 'desc'),
+        limit(200)
+      );
+    }
 
     const unsub = onSnapshot(q, (snap) => {
       const list: OrderItem[] = [];
       snap.forEach((d) => {
         const data = d.data() as any;
-        if (!data.isArchived && (isAdmin(profile) || isUserRecord(data, profile))) {
+        if (!data.isArchived) {
+          let orderItemsChanged = false;
+          const cleanedItems = (data.items || []).map((it: any) => {
+            const cleanName = getCleanGradeName(it);
+            if (it.productName !== cleanName || it.gradeName !== cleanName) {
+              orderItemsChanged = true;
+            }
+            return {
+              ...it,
+              productName: cleanName,
+              gradeName: cleanName,
+            };
+          });
+
+          // Asynchronously update in Firestore if names were outdated
+          if (orderItemsChanged) {
+            updateDoc(doc(db, 'orders', d.id), { items: cleanedItems }).catch(() => {});
+          }
+
           list.push({
             id: d.id,
             orderNumber: data.orderNumber || `BW-${d.id.slice(-6)}`,
@@ -269,7 +351,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
             dealerVillage: data.dealerVillage || '',
             dealerDistrict: data.dealerDistrict || '',
             farmerName: data.farmerName || '',
-            items: data.items || [],
+            items: cleanedItems,
             totalQuantity: data.totalQuantity || (data.items?.reduce((a: number, b: any) => a + (b.quantity || 0), 0) || 0),
             grossAmount: Number(data.grossAmount) || 0,
             discountAmount: Number(data.discountAmount) || 0,
@@ -285,9 +367,6 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
             deliveredAt: data.deliveredAt,
             ownerId: data.ownerId || '',
             userId: data.userId,
-            dealerOfficerId: data.dealerOfficerId,
-            dealerOfficerName: data.dealerOfficerName,
-            createdByUid: data.createdByUid,
             loginId: data.loginId,
             userCode: data.userCode,
             createdByName: data.createdByName || 'User',
@@ -296,116 +375,85 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           });
         }
       });
+      // Firestore query already sorts by createdAt desc, but we keep this as safety
       setOrders(list);
-      setSyncStatus('online');
-    }, (error: any) => {
-      if (error.code === 'resource-exhausted') setSyncStatus('quota_hit');
-      else setSyncStatus('offline');
+    }, (error) => {
       handleFirestoreError(error, OperationType.LIST, 'orders');
     });
     return () => unsub();
-  }, [profile]);
+  }, []);
 
   // Load Saved Dealers from Firestore (and cache in localStorage for fast offline access)
   useEffect(() => {
-    const fetchDealers = async () => {
-      try {
-        const cached = localStorage.getItem('blackworm_all_dealers');
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            const list: SavedDealer[] = parsed.map((data: any) => ({
-              id: data.id,
-              firmName: data.firmName || 'Unnamed Firm',
-              proprietorName: data.proprietorName || '',
-              contactNumber: data.contactNumber || '',
-              dealerCode: data.dealerCode || '',
-              village: data.village || '',
-              district: data.district || '',
-              userId: data.userId,
-              ownerId: data.ownerId,
-              dealerOfficerId: data.dealerOfficerId,
-              dealerOfficerName: data.dealerOfficerName,
-              createdByUid: data.createdByUid,
-              createdByName: data.createdByName,
-              userCode: data.userCode,
-              loginId: data.loginId,
-            }));
-            list.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
-            setDealers(list);
-          }
+    try {
+      const cached = localStorage.getItem('blackworm_all_dealers');
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const list: SavedDealer[] = parsed.map((data: any) => ({
+            id: data.id,
+            firmName: data.firmName || 'Unnamed Firm',
+            proprietorName: data.proprietorName || '',
+            contactNumber: data.contactNumber || '',
+            dealerCode: data.dealerCode || '',
+            village: data.village || '',
+            district: data.district || '',
+          }));
+          list.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
+          setDealers(list);
         }
-
-        const q = query(
-          collection(db, 'dealers_application'),
-          orderBy('createdAt', 'desc'),
-          limit(isAdmin(profile) ? 500 : 300)
-        );
-        const snap = await getDocs(q);
-        const list: SavedDealer[] = [];
-        snap.forEach((d) => {
-          const data = d.data() as any;
-          if (!data.isArchived && (isAdmin(profile) || isUserRecord(data, profile))) {
-            list.push({
-              id: d.id,
-              firmName: data.firmName || 'Unnamed Firm',
-              proprietorName: data.proprietorName || '',
-              contactNumber: data.contactNumber || '',
-              dealerCode: data.dealerCode || '',
-              village: data.village || '',
-              district: data.district || '',
-              userId: data.userId || data.ownerId || '',
-              ownerId: data.ownerId || '',
-              dealerOfficerId: data.dealerOfficerId || data.userId || '',
-              dealerOfficerName: data.dealerOfficerName || data.officerName || data.createdByName || '',
-              createdByUid: data.createdByUid || data.createdByUserId || '',
-              createdByName: data.createdByName || '',
-              userCode: data.userCode || '',
-              loginId: data.loginId || '',
-            });
-          }
-        });
-        list.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
-        setDealers(list);
-        try {
-          localStorage.setItem('blackworm_all_dealers', JSON.stringify(list));
-        } catch {}
-      } catch (error: any) {
-        if (error.code === 'resource-exhausted') setSyncStatus('quota_hit');
-        handleFirestoreError(error, OperationType.LIST, 'dealers_application');
       }
-    };
-    fetchDealers();
-  }, [profile]);
+    } catch {}
+
+    const q = query(collection(db, 'dealers_application'));
+    const unsub = onSnapshot(q, (snap) => {
+      const list: SavedDealer[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as any;
+        list.push({
+          id: d.id,
+          firmName: data.firmName || 'Unnamed Firm',
+          proprietorName: data.proprietorName || '',
+          contactNumber: data.contactNumber || '',
+          dealerCode: data.dealerCode || '',
+          village: data.village || '',
+          district: data.district || '',
+        });
+      });
+      // Sort alphabetically by firm name
+      list.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
+      setDealers(list);
+      try {
+        localStorage.setItem('blackworm_all_dealers', JSON.stringify(list));
+      } catch {}
+    });
+    return () => unsub();
+  }, []);
 
   // Load Products from Price List (with fallback to OFFICIAL_REFERENCE_DATA)
   useEffect(() => {
-    const fetchProducts = async () => {
-      const q = query(collection(db, 'products_pricelist_v2'));
-      try {
-        const snap = await getDocs(q);
-        if (!snap.empty) {
-          const list: DynamicPriceProduct[] = [];
-          snap.forEach((d) => {
-            const data = d.data() as any;
-            if (!data.isArchived) {
-              list.push({ ...data, id: d.id });
-            }
-          });
-          list.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
-          setProducts(list);
-        } else {
-          const fallback = OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
-            ...p,
-            id: `ref_${idx}`,
-          }));
-          setProducts(fallback);
-        }
-      } catch (error: any) {
-        if (error.code === 'resource-exhausted') setSyncStatus('quota_hit');
+    const q = query(collection(db, 'products_pricelist_v2'));
+    const unsub = onSnapshot(q, (snap) => {
+      if (!snap.empty) {
+        const list: DynamicPriceProduct[] = [];
+        snap.forEach((d) => {
+          const data = d.data() as any;
+          if (!data.isArchived) {
+            list.push({ ...data, id: d.id });
+          }
+        });
+        list.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
+        setProducts(list);
+      } else {
+        // Fallback to official reference data
+        const fallback = OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
+          ...p,
+          id: `ref_${idx}`,
+        }));
+        setProducts(fallback);
       }
-    };
-    fetchProducts();
+    });
+    return () => unsub();
   }, []);
 
   // Filter Dealers in New Order Dropdown
@@ -459,7 +507,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   const handleSelectProduct = (prod: DynamicPriceProduct) => {
     setSelectedProduct(prod);
     setFormError(null);
-    setProductSearchQuery(`${prod.brandName} ${prod.gradeName}`);
+    setProductSearchQuery(getCleanGradeName(prod));
     if (prod.packings && prod.packings.length > 0) {
       const first = prod.packings[0];
       setSelectedPacking(first.packingSize);
@@ -491,12 +539,14 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     const disc = Number(itemDiscount) || 0;
     const discountAmt = discountType === 'percent' ? Math.round((baseTotal * disc) / 100) : disc;
     const subtotal = Math.max(0, baseTotal - discountAmt);
+    const cleanName = getCleanGradeName(selectedProduct);
 
     const newLine: OrderProductLine = {
       productId: selectedProduct.id || `prod_${Date.now()}`,
-      productName: `${selectedProduct.brandName} ${selectedProduct.gradeName}`.trim(),
+      productName: cleanName,
       brandName: selectedProduct.brandName || '',
-      gradeName: selectedProduct.gradeName || '',
+      gradeName: cleanName,
+      groupName: selectedProduct.groupName || '',
       packingSize: packing,
       rate,
       quantity: qty,
@@ -572,12 +622,14 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       const disc = Number(itemDiscount) || 0;
       const discountAmt = discountType === 'percent' ? Math.round((baseTotal * disc) / 100) : disc;
       const subtotal = Math.max(0, baseTotal - discountAmt);
+      const cleanName = getCleanGradeName(selectedProduct);
 
       const newLine: OrderProductLine = {
         productId: selectedProduct.id || `prod_${Date.now()}`,
-        productName: `${selectedProduct.brandName} ${selectedProduct.gradeName}`.trim(),
+        productName: cleanName,
         brandName: selectedProduct.brandName || '',
-        gradeName: selectedProduct.gradeName || '',
+        gradeName: cleanName,
+        groupName: selectedProduct.groupName || '',
         packingSize: packing,
         rate,
         quantity: qty,
@@ -611,6 +663,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         productName: it.productName || '',
         brandName: it.brandName || '',
         gradeName: it.gradeName || '',
+        groupName: it.groupName || '',
         packingSize: it.packingSize || 'Standard',
         rate: Number(it.rate) || 0,
         quantity: Number(it.quantity) || 1,
@@ -692,11 +745,8 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         balanceAmount: totalBill,
         paymentMode: 'Pending / Credit',
         status: 'pending_approval',
-        ownerId: dealerToUse.userId || dealerToUse.ownerId || dealerToUse.dealerOfficerId || profile.uid || '',
-        userId: dealerToUse.userId || dealerToUse.ownerId || dealerToUse.dealerOfficerId || profile.uid || '',
-        dealerOfficerId: dealerToUse.dealerOfficerId || dealerToUse.userId || profile.uid || '',
-        dealerOfficerName: dealerToUse.dealerOfficerName || dealerToUse.createdByName || profile.fullName || '',
-        createdByUid: profile.uid || '',
+        ownerId: profile.uid || '',
+        userId: profile.uid || '',
         loginId: profile.loginId || '',
         userCode: profile.userCode || '',
         createdByName: profile.fullName || 'Officer',
@@ -1013,35 +1063,6 @@ ${itemsListText}
         </button>
       </div>
 
-      {/* Sync Status Banner */}
-      <div className={cn(
-        "p-2.5 rounded-xl border text-[11px] flex items-center justify-between gap-2 no-print",
-        syncStatus === 'quota_hit' ? "bg-red-50 border-red-200 text-red-900" :
-        syncStatus === 'offline' ? "bg-amber-50 border-amber-200 text-amber-900" :
-        "bg-purple-50 border-purple-200 text-purple-900"
-      )}>
-        <div className="flex items-center gap-2">
-          <div className={cn(
-            "w-1.5 h-1.5 rounded-full",
-            syncStatus === 'quota_hit' ? "bg-red-600 animate-pulse" :
-            syncStatus === 'offline' ? "bg-amber-500 animate-pulse" :
-            "bg-purple-500"
-          )} />
-          <span className="font-bold">
-            {syncStatus === 'quota_hit' ? (
-              <span className="flex items-center gap-1.5"><AlertCircle className="w-3.5 h-3.5" /> Firestore Read Quota Exceeded. Some data may be missing until tomorrow.</span>
-            ) : syncStatus === 'offline' ? (
-              <span className="flex items-center gap-1.5"><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Connection Lost. Working offline.</span>
-            ) : (
-              <span className="flex items-center gap-1.5"><CheckCircle2 className="w-3.5 h-3.5 text-purple-600" /> All data is synced and up to date.</span>
-            )}
-          </span>
-        </div>
-        <div className="text-[10px] font-black uppercase tracking-tighter opacity-50">
-          {syncStatus === 'online' ? '● Connected' : '○ Disconnected'}
-        </div>
-      </div>
-
       {/* Search & Filter Bar - Ultra Compact Small Buttons */}
       <div className="flex flex-col sm:flex-row gap-2">
         <div className="relative flex-1">
@@ -1183,7 +1204,7 @@ ${itemsListText}
                     <div className="space-y-0.5 pt-0.5">
                       {o.items.slice(0, 2).map((it, idx) => (
                         <div key={idx} className="flex justify-between items-center text-[10.5px] font-semibold text-slate-700">
-                          <span className="truncate pr-2">• {it.productName} ({it.packingSize})</span>
+                          <span className="truncate pr-2 font-bold text-sky-700">• {it.gradeName || it.productName} ({it.packingSize})</span>
                           <span className="shrink-0 font-mono text-slate-900 font-bold">
                             {it.quantity} x ₹{it.rate} = ₹{it.subtotal.toLocaleString()}
                           </span>
@@ -1403,7 +1424,7 @@ ${itemsListText}
                 <tbody className="divide-y divide-slate-200 border-b border-slate-200 font-semibold">
                   {capturingOrder.items?.map((it, idx) => (
                     <tr key={idx} className={idx % 2 === 1 ? "bg-slate-50/70" : ""}>
-                      <td className="p-1.5 pl-2 font-bold text-slate-900 text-[11px]">{idx + 1}. {it.productName}</td>
+                      <td className="p-1.5 pl-2 font-bold text-sky-700 text-[11px]">{idx + 1}. {it.gradeName || it.productName}</td>
                       <td className="p-1.5 text-center text-slate-600 text-[10px] font-bold">{it.packingSize}</td>
                       <td className="p-1.5 text-center font-mono font-black text-slate-900 text-xs">{it.quantity} Nos.</td>
                     </tr>
@@ -1570,24 +1591,37 @@ ${itemsListText}
                         {filteredProducts.length === 0 ? (
                           <p className="text-xs text-slate-400 text-center py-2.5">No products found.</p>
                         ) : (
-                          filteredProducts.map((p) => (
-                            <div
-                              key={p.id}
-                              onClick={() => handleSelectProduct(p)}
-                              className="p-1.5 px-2 rounded-lg hover:bg-purple-100/60 cursor-pointer transition flex justify-between items-center text-[11px]"
-                            >
-                              <div className="min-w-0 pr-2">
-                                <span className="font-bold text-slate-900">{p.brandName} </span>
-                                <span className="font-extrabold text-purple-700">{p.gradeName}</span>
-                                {p.groupName && (
-                                  <span className="text-[9.5px] text-slate-400 block truncate">{p.groupName}</span>
-                                )}
+                          filteredProducts.map((p) => {
+                            const cleanName = getCleanGradeName(p);
+                            const g = (p.groupName || '').toLowerCase();
+                            const isBC = g.includes('group b') || g.includes('group c') || g.includes('micronutrient') || g.includes('growth regulator') || g.includes('pgr') || /microgrip|bw\s*combi|nutrijet/i.test(p.brandName || '') || /microgrip|bw\s*combi|nutrijet/i.test(p.gradeName || '');
+                            return (
+                              <div
+                                key={p.id}
+                                onClick={() => handleSelectProduct(p)}
+                                className="p-1.5 px-2 rounded-lg hover:bg-sky-50 cursor-pointer transition flex justify-between items-center text-[11px]"
+                              >
+                                <div className="min-w-0 pr-2">
+                                  {isBC ? (
+                                    <span className="font-black text-amber-800 text-xs">{cleanName}</span>
+                                  ) : (
+                                    <>
+                                      {p.brandName && (
+                                        <span className="font-bold text-amber-700 text-[10.5px] mr-1">{p.brandName}</span>
+                                      )}
+                                      <span className="font-black text-sky-700">{cleanName}</span>
+                                    </>
+                                  )}
+                                  {p.groupName && (
+                                    <span className="text-[9.5px] text-slate-400 block truncate">{p.groupName}</span>
+                                  )}
+                                </div>
+                                <span className="text-[9.5px] font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded shrink-0">
+                                  {p.packings?.length || 0} Packings
+                                </span>
                               </div>
-                              <span className="text-[9.5px] font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded shrink-0">
-                                {p.packings?.length || 0} Packings
-                              </span>
-                            </div>
-                          ))
+                            );
+                          })
                         )}
                       </div>
                     )}
@@ -1598,8 +1632,8 @@ ${itemsListText}
                     <div className="bg-white p-2.5 rounded-xl border border-purple-200 space-y-2">
                       <div className="flex justify-between items-center border-b border-slate-100 pb-1.5">
                         <div>
-                          <span className="text-xs font-black text-slate-900">
-                            {selectedProduct.brandName} {selectedProduct.gradeName}
+                          <span className="text-xs font-black text-sky-700">
+                            {getCleanGradeName(selectedProduct)}
                           </span>
                           {selectedProduct.groupName && (
                             <span className="text-[9.5px] text-slate-400 ml-1.5">({selectedProduct.groupName})</span>
@@ -1788,8 +1822,8 @@ ${itemsListText}
                     <tbody className="divide-y divide-slate-100 text-[11px]">
                       {orderItems.map((item, idx) => (
                         <tr key={idx} className="hover:bg-slate-50">
-                          <td className="p-1.5 pl-2.5 font-bold text-slate-900 truncate max-w-[130px]">
-                            {idx + 1}. {item.productName}
+                          <td className="p-1.5 pl-2.5 font-bold text-sky-700 truncate max-w-[150px]">
+                            {idx + 1}. {item.gradeName || item.productName}
                           </td>
                           <td className="p-1.5 text-center text-slate-500 font-medium">{item.packingSize}</td>
                           <td className="p-1.5 text-center font-mono font-bold text-slate-800">{item.quantity}</td>
@@ -1995,7 +2029,7 @@ ${itemsListText}
                     {selectedOrderDetails.items?.map((it, idx) => (
                       <tr key={idx} className="font-semibold text-slate-800">
                         <td className="p-1.5 pl-2">
-                          <p className="font-bold">{it.productName}</p>
+                          <p className="font-bold text-sky-700">{it.gradeName || it.productName}</p>
                           <span className="text-[9.5px] text-slate-400">{it.packingSize}</span>
                         </td>
                         <td className="p-1.5 text-center font-mono">{it.quantity}</td>

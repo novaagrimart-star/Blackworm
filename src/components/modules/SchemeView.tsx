@@ -501,7 +501,7 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
                         <th className="border-r border-black py-2.5 px-2 text-center w-14 whitespace-nowrap bg-slate-50">
                           Sr. No.
                         </th>
-                        <th className="border-r border-black py-2.5 px-3 text-left w-64 bg-slate-50">
+                        <th className="border-r border-black py-2.5 px-3 text-center w-64 bg-slate-50">
                           Product Name & Grade
                         </th>
                         <th className="border-r border-black py-2.5 px-2 text-center w-28 whitespace-nowrap bg-amber-50/50">
@@ -550,20 +550,21 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
                                 </td>
                               )}
 
-                              {/* 2. Product Name & Grade (Span across all packing sub-rows, compact balanced width) */}
+                              {/* 2. Product Name & Grade (Spans across all packings - exactly matches Price List) */}
                               {pkIdx === 0 && (
                                 <td 
                                   rowSpan={rowCount}
-                                  className="border-r border-black p-2.5 text-left align-middle"
+                                  className="border-r border-black py-2 px-3 text-center align-middle bg-white"
                                 >
-                                  <div className="flex flex-col">
-                                    <span className="font-black text-slate-900 text-[12px] leading-tight">
-                                      {prod.brandName} {prod.gradeName}
+                                  <div className="flex flex-col items-center justify-center leading-tight">
+                                    {prod.brandName && (
+                                      <span className="text-[11px] font-bold text-amber-700 font-sans tracking-tight">
+                                        {prod.brandName}
+                                      </span>
+                                    )}
+                                    <span className="text-xs sm:text-[13px] font-black text-sky-700 font-sans tracking-tight">
+                                      {prod.gradeName}
                                     </span>
-                                    <div className="flex items-center gap-2 mt-0.5 text-[10px] text-slate-500 font-bold">
-                                      <span>GST: {prod.gstRate || 5}%</span>
-                                      {prod.hsn && <span>HSN: {prod.hsn}</span>}
-                                    </div>
                                   </div>
                                 </td>
                               )}

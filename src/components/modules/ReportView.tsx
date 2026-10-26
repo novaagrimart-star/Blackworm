@@ -1,20 +1,22 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { collection, query, getDocs, where, doc, getDoc, onSnapshot } from 'firebase/firestore';
+import { collection, query, where, onSnapshot } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { Language } from '../../lib/i18n';
 import { UserProfile, isAdmin } from '../../lib/auth';
+import { toTitleCase } from '../../lib/utils';
+import html2canvas from 'html2canvas-pro';
 import { 
   BarChart3, 
-  Calendar,
-  Search,
-  Loader2,
-  Table as TableIcon,
-  CheckCircle2,
+  Calendar, 
+  Search, 
+  Loader2, 
+  Table as TableIcon, 
+  CheckCircle2, 
   RefreshCw,
-  AlertCircle
+  Camera,
+  Check
 } from 'lucide-react';
 import { toDecimal2, addDecimal2, subtractDecimal2, formatAmount } from '../../lib/decimal';
-import { useUsers } from '../../lib/UsersContext';
 
 interface Props {
   profile: UserProfile;
@@ -44,10 +46,9 @@ interface StaticCacheData {
   targets: any[];
 }
 
-const LOCAL_STORAGE_STATIC_KEY = 'blackworm_report_static_cache_v3';
-const LOCAL_STORAGE_DAILY_PREFIX = 'blackworm_report_daily_v3_';
+const LOCAL_STORAGE_STATIC_KEY = 'blackworm_report_static_cache_v4';
+const LOCAL_STORAGE_DAILY_PREFIX = 'blackworm_report_daily_v4_';
 
-// In-memory cache for instant zero-latency access across tab switches
 let reportStaticCache: StaticCacheData | null = (() => {
   try {
     if (typeof window !== 'undefined') {
@@ -75,6 +76,10 @@ export function parseDateKeys(dateStr: string) {
   return { year, monthIndex, dayOfMonth, sheetMonthKey, targetMonthName };
 }
 
+export async function preloadReportData(_profile?: any): Promise<void> {
+  // Live onSnapshot listeners now handle instantaneous background updates
+}
+
 export function buildReportRows(
   allUsers: UserProfile[],
   allTravelSheets: any[],
@@ -88,36 +93,20 @@ export function buildReportRows(
   const { dayOfMonth, sheetMonthKey, targetMonthName } = parseDateKeys(selectedDate);
 
   let officers = userIsAdmin
-    ? allUsers.filter((u) => u.role !== 'owner' && u.role !== 'dealer')
+    ? allUsers.filter((u) => u.role !== 'owner')
     : allUsers.filter((u) => u.uid === profile.uid || (u.loginId && profile.loginId && u.loginId.toLowerCase() === profile.loginId.toLowerCase()));
 
   if (officers.length === 0) {
     officers = [profile];
   }
 
-  // Build high-performance multi-tier lookup maps for all travel sheets
+  // Build high-performance lookup maps
   const travelMap = new Map<string, any>();
   allTravelSheets.forEach((s) => {
-    const docId = s.id || s._id || '';
-    if (docId) travelMap.set(docId, s);
-
-    // Compute month key from sheet (Case-insensitive to handle legacy data)
-    const sMonthIdx = monthNames.findIndex(m => m.toLowerCase() === String(s.monthName || '').toLowerCase());
-    const sMonthKey = s.sheetMonthKey || 
-      (s.yearNumber && sMonthIdx !== -1 ? `${s.yearNumber}_${String(sMonthIdx + 1).padStart(2, '0')}` : sheetMonthKey);
-
-    if (s.userId) {
-      travelMap.set(`${s.userId}_${sMonthKey}`, s);
-      travelMap.set(s.userId, s);
-    }
-    if (s.userCode) {
-      const code = String(s.userCode).trim().toLowerCase();
-      travelMap.set(`code_${code}_${sMonthKey}`, s);
-      travelMap.set(`code_${code.replace(/^emp-/, '')}_${sMonthKey}`, s);
-    }
-    if (s.loginId) {
-      travelMap.set(`login_${String(s.loginId).trim().toLowerCase()}_${sMonthKey}`, s);
-    }
+    if (s._id) travelMap.set(s._id, s);
+    if (s.id) travelMap.set(s.id, s);
+    if (s.userId && s.monthKey) travelMap.set(`${s.userId}_${s.monthKey}`, s);
+    if (s.userId) travelMap.set(s.userId, s);
   });
 
   const yearlyTargetMap = new Map<string, any>();
@@ -128,41 +117,21 @@ export function buildReportRows(
   });
 
   const targetFallbackMap = new Map<string, any>();
-  // allTargets is kept for internal fallback if yearly_targets is missing
-  (allTargets || []).forEach((t) => {
+  allTargets.forEach((t) => {
     if (t.userId) targetFallbackMap.set(t.userId, t);
   });
 
   return officers.map((officer, i) => {
-    const officerUid = String(officer.uid || '').trim();
-    const officerCode = String(officer.userCode || '').trim().toLowerCase();
-    const officerLogin = String(officer.loginId || '').trim().toLowerCase();
-
     const travelSheetId = `travel_${officer.uid}_${sheetMonthKey}`;
-
-    // Lookup across robust unique matching tiers (UID, Code, Login)
-    // Removed name-based fallback to prevent cross-user data leakage if names are identical
-    const travelData = 
-      travelMap.get(travelSheetId) ||
-      travelMap.get(`${officerUid}_${sheetMonthKey}`) ||
-      (officerCode ? (travelMap.get(`code_${officerCode}_${sheetMonthKey}`) || travelMap.get(`code_${officerCode.replace(/^emp-/, '')}_${sheetMonthKey}`)) : null) ||
-      (officerLogin ? travelMap.get(`login_${officerLogin}_${sheetMonthKey}`) : null) ||
-      travelMap.get(officerUid);
+    const travelData = travelMap.get(travelSheetId) || travelMap.get(`${officer.uid}_${sheetMonthKey}`) || travelMap.get(officer.uid);
     
     let route = '-', openingKm = 0, closingKm = 0, dailyExpense = 0, recordedKm = 0;
-    if (travelData && travelData.rows && Array.isArray(travelData.rows)) {
-      // Find row for selectedDate:
-      // Primary: exact date match (e.g. "2026-10-24")
-      let dayRow = travelData.rows.find((r: any) => r.date === selectedDate);
-      
-      // Secondary: dayNumber match (e.g. 24)
-      if (!dayRow) {
-        dayRow = travelData.rows.find((r: any) => Number(r.dayNumber) === dayOfMonth);
-      }
-      
+    if (travelData && travelData.rows) {
+      const dayRow = travelData.rows.find((r: any) => 
+        Number(r.dayNumber) === dayOfMonth || r.date === selectedDate
+      );
       if (dayRow) {
-        const rawRoute = (dayRow.route || '').trim();
-        route = rawRoute.length > 0 ? rawRoute : '-';
+        route = (dayRow.route || '').trim() || '-';
         openingKm = Number(dayRow.openingKm) || 0;
         closingKm = Number(dayRow.closingKm) || 0;
         recordedKm = Number(dayRow.km) || 0;
@@ -175,8 +144,7 @@ export function buildReportRows(
         return (
           d.collectedByUid === officer.uid ||
           d.userId === officer.uid ||
-          d.dealerOfficerId === officer.uid ||
-          (d.loginId && officer.loginId && String(d.loginId).toLowerCase() === officer.loginId.toLowerCase())
+          (d.loginId && officer.loginId && d.loginId.toLowerCase() === officer.loginId.toLowerCase())
         );
       })
       .reduce((acc: number, d: any) => acc + (Number(d.amount) || 0), 0);
@@ -198,12 +166,12 @@ export function buildReportRows(
       monthlyAchievement = toDecimal2((Number(tData.achievedSales) || 0) / 100000);
     }
 
-    const calculatedKm = (closingKm >= openingKm && openingKm > 0) ? (closingKm - openingKm) : recordedKm;
+    const calculatedKm = closingKm > openingKm ? closingKm - openingKm : recordedKm;
 
     return {
       srNo: i + 1,
       uid: officer.uid,
-      name: officer.fullName || 'Officer',
+      name: toTitleCase(officer.fullName) || 'Officer',
       route,
       openingKm,
       closingKm,
@@ -217,15 +185,19 @@ export function buildReportRows(
   });
 }
 
-// Background prefetch function called from Dashboard to warm cache ahead of time
-// ... removed preloadReportData as it's redundant with optimized listeners
-
 export const ReportView: React.FC<Props> = ({ profile }) => {
-  const { users: allUsersFromContext, loading: usersLoading } = useUsers();
   const todayDate = new Date().toISOString().slice(0, 10);
   const [selectedDate, setSelectedDate] = useState(todayDate);
-  
-  // Instant Initial State: Read immediately from localStorage (0ms latency!)
+  const printableSheetRef = useRef<HTMLDivElement>(null);
+
+  // In-memory collections state for live reactive updates
+  const usersRef = useRef<UserProfile[]>([]);
+  const travelRef = useRef<any[]>([]);
+  const targetsRef = useRef<any[]>([]);
+  const oldTargetsRef = useRef<any[]>([]);
+  const collDocsRef = useRef<any[]>([]);
+
+  // Instant Initial State: Read immediately from localStorage or memory cache (0ms latency!)
   const [reportData, setReportData] = useState<OfficerDailyReport[]>(() => {
     if (typeof window !== 'undefined') {
       try {
@@ -236,6 +208,17 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
             return parsed;
           }
         }
+        if (reportStaticCache && reportStaticCache.users.length > 0) {
+          return buildReportRows(
+            reportStaticCache.users,
+            reportStaticCache.travelSheets,
+            reportStaticCache.yearlyTargets,
+            reportStaticCache.targets,
+            [],
+            todayDate,
+            profile
+          );
+        }
       } catch (e) {}
     }
     return [];
@@ -243,139 +226,122 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
 
   const [loading, setLoading] = useState(() => reportData.length === 0);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isCapturingPhoto, setIsCapturingPhoto] = useState(false);
+  const [photoSavedToast, setPhotoSavedToast] = useState(false);
 
-  // References to hold live data components
-  const liveUsersRef = useRef<UserProfile[]>([]);
-  const liveTravelRef = useRef<any[]>([]);
-  const liveTargetsRef = useRef<any[]>([]);
-  const liveCollRef = useRef<any[]>([]);
-
-  // Function to re-aggregate live report rows from current in-memory snapshots
-  const updateReport = (targetDate: string) => {
-    const freshRows = buildReportRows(
-      liveUsersRef.current,
-      liveTravelRef.current,
-      liveTargetsRef.current,
-      [],
-      liveCollRef.current,
-      targetDate,
+  // Helper to re-compute rows live whenever any collection fires an update
+  const recomputeLiveReport = () => {
+    const rows = buildReportRows(
+      usersRef.current,
+      travelRef.current,
+      targetsRef.current,
+      oldTargetsRef.current,
+      collDocsRef.current,
+      selectedDate,
       profile
     );
-    setReportData(freshRows);
+    setReportData(rows);
+    setLoading(false);
     try {
-      localStorage.setItem(`${LOCAL_STORAGE_DAILY_PREFIX}${targetDate}`, JSON.stringify(freshRows));
+      localStorage.setItem(`${LOCAL_STORAGE_DAILY_PREFIX}${selectedDate}`, JSON.stringify(rows));
     } catch (e) {}
   };
 
-  // Track connection status and quota errors
-  const [syncStatus, setSyncStatus] = useState<'online' | 'offline' | 'quota_hit'>('online');
-
-  // Real-time synchronization across Admin and Users for the selected date and month
+  // Real-Time Live Sync Listeners across devices (zero manual refresh required!)
   useEffect(() => {
-    let active = true;
-    const { year, targetMonthName } = parseDateKeys(selectedDate);
-    const monthKey = `${year}_${targetMonthName}`;
+    const userIsAdmin = isAdmin(profile);
 
-    // Month-level subscription: only resubscribe if year or month changes
-    const unsubMonth = onSnapshot(
-      query(
-        collection(db, 'travel_sheets'),
-        where('monthName', '==', targetMonthName),
-        where('yearNumber', '==', year)
-      ),
-      (snap) => {
-        if (!active) return;
-        const list: any[] = [];
-        snap.forEach((d) => {
-          list.push({ ...d.data(), id: d.id, _id: d.id });
-        });
-        liveTravelRef.current = list;
-        updateReport(selectedDate);
-        setLoading(false);
-        setIsRefreshing(false);
-        setSyncStatus('online');
-      },
-      (err: any) => {
-        console.warn('Travel sheets listener error:', err);
-        if (active) {
-          if (err.code === 'resource-exhausted') setSyncStatus('quota_hit');
-          else setSyncStatus('offline');
-          setLoading(false);
-          setIsRefreshing(false);
-        }
-      }
-    );
+    // 1. Live Users Listener
+    const qUsers = query(collection(db, 'users'));
+    const unsubUsers = onSnapshot(qUsers, (snap) => {
+      usersRef.current = snap.docs.map(d => ({ ...d.data(), uid: d.id } as UserProfile));
+      recomputeLiveReport();
+    }, (err) => console.warn('Users live sync error:', err));
 
-    // Initial load for static-ish data (Users, Targets)
-    const loadStaticData = async () => {
-      try {
-        const [targetsSnap] = await Promise.all([
-          getDocs(collection(db, 'yearly_targets'))
-        ]);
-        
-        if (!active) return;
-        
-        liveUsersRef.current = allUsersFromContext;
+    // 2. Live Travel Sheets Listener
+    const qTravel = userIsAdmin
+      ? query(collection(db, 'travel_sheets'))
+      : query(collection(db, 'travel_sheets'), where('userId', '==', profile.uid));
+    const unsubTravel = onSnapshot(qTravel, (snap) => {
+      travelRef.current = snap.docs.map(d => ({ ...d.data(), _id: d.id }));
+      recomputeLiveReport();
+    }, (err) => console.warn('Travel live sync error:', err));
 
-        const targetsList: any[] = [];
-        targetsSnap.forEach((d) => {
-          targetsList.push({ ...d.data(), id: d.id, _id: d.id });
-        });
-        liveTargetsRef.current = targetsList;
-        
-        updateReport(selectedDate);
-      } catch (err: any) {
-        console.warn('Error loading static report data:', err);
-        if (err.code === 'resource-exhausted') setSyncStatus('quota_hit');
-      }
-    };
+    // 3. Live Yearly Targets Listener
+    const qTargets = userIsAdmin
+      ? query(collection(db, 'yearly_targets'))
+      : query(collection(db, 'yearly_targets'), where('userId', '==', profile.uid));
+    const unsubTargets = onSnapshot(qTargets, (snap) => {
+      targetsRef.current = snap.docs.map(d => ({ ...d.data(), _id: d.id }));
+      recomputeLiveReport();
+    }, (err) => console.warn('Targets live sync error:', err));
 
-    loadStaticData();
+    // 4. Live Collection Entries Listener for selectedDate
+    const qColl = query(collection(db, 'collection_entries'), where('date', '==', selectedDate));
+    const unsubColl = onSnapshot(qColl, (snap) => {
+      collDocsRef.current = snap.docs.map(d => d.data());
+      recomputeLiveReport();
+    }, (err) => console.warn('Collections live sync error:', err));
 
     return () => {
-      active = false;
-      unsubMonth();
-    };
-  }, [selectedDate.split('-').slice(0, 2).join('-'), profile.uid]); // Depends only on YYYY-MM
-
-  // Date-level subscription: resubscribe on every date change
-  useEffect(() => {
-    let active = true;
-    setIsRefreshing(true);
-
-    const unsubColl = onSnapshot(
-      query(
-        collection(db, 'collection_entries'),
-        where('date', '==', selectedDate)
-      ),
-      (snap) => {
-        if (!active) return;
-        const list: any[] = [];
-        snap.forEach((d) => {
-          list.push({ ...d.data(), id: d.id });
-        });
-        liveCollRef.current = list;
-        updateReport(selectedDate);
-        setIsRefreshing(false);
-      },
-      (err: any) => {
-        console.warn('Collection entries listener error:', err);
-        if (active) {
-          setIsRefreshing(false);
-        }
-      }
-    );
-
-    return () => {
-      active = false;
+      unsubUsers();
+      unsubTravel();
+      unsubTargets();
       unsubColl();
     };
-  }, [selectedDate]);
+  }, [selectedDate, profile.uid]);
 
-  const handleManualRefresh = () => {
-    setIsRefreshing(true);
-    updateReport(selectedDate);
-    setTimeout(() => setIsRefreshing(false), 500);
+  // Capture Report Photo directly to device gallery / download
+  const handleCaptureReportPhoto = async () => {
+    if (!printableSheetRef.current || isCapturingPhoto) return;
+    setIsCapturingPhoto(true);
+    try {
+      const element = printableSheetRef.current;
+      const canvas = await html2canvas(element, {
+        scale: 2.5,
+        useCORS: true,
+        logging: false,
+        backgroundColor: '#ffffff',
+      });
+      const blob = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob((b) => resolve(b), 'image/png')
+      );
+      if (blob) {
+        const fileName = `Daily_Report_${selectedDate}.png`;
+        const file = new File([blob], fileName, { type: 'image/png' });
+
+        // Mobile Web Share API support
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          try {
+            await navigator.share({
+              files: [file],
+              title: `Daily Report - ${selectedDate}`,
+            });
+            setIsCapturingPhoto(false);
+            setPhotoSavedToast(true);
+            setTimeout(() => setPhotoSavedToast(false), 3000);
+            return;
+          } catch (shareErr) {
+            // User cancelled share dialog or native fallback
+          }
+        }
+
+        // Direct browser file download straight to Gallery / Downloads
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = fileName;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(link.href);
+        setPhotoSavedToast(true);
+        setTimeout(() => setPhotoSavedToast(false), 3000);
+      }
+    } catch (err) {
+      console.error('Failed to capture report photo:', err);
+    } finally {
+      setIsCapturingPhoto(false);
+    }
   };
 
   const totalKmSum = reportData.reduce((acc, r) => acc + r.totalKm, 0);
@@ -386,9 +352,9 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
   const totalBacklogSum = addDecimal2(...reportData.map(r => r.targetBacklog));
 
   return (
-    <div className="space-y-4 w-full pb-20">
-      {/* Header Bar: Report Title with Date Option right in front of it */}
-      <div className="bg-white p-3 sm:p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-wrap items-center justify-between gap-3">
+    <div className="space-y-4 w-full pb-20 font-sans">
+      {/* Header Bar: Report Title with Date Option and Actions */}
+      <div className="bg-white p-3 sm:p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-wrap items-center justify-between gap-3 no-print">
         <div className="flex items-center gap-3 flex-wrap">
           <div className="flex items-center gap-2">
             <BarChart3 className="w-5 h-5 sm:w-6 sm:h-6 text-indigo-600 shrink-0" />
@@ -406,62 +372,47 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
             />
           </div>
 
+          {/* Camera Button: Save Photo to Gallery */}
           <button 
-            onClick={handleManualRefresh}
-            disabled={isRefreshing}
-            className="flex items-center gap-1.5 px-3 py-1.5 sm:py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-xl text-xs font-bold transition disabled:opacity-50 shrink-0 cursor-pointer active:scale-95"
-            title="Refresh Data"
+            type="button"
+            onClick={handleCaptureReportPhoto}
+            disabled={isCapturingPhoto}
+            className="flex items-center gap-1.5 px-3 py-1.5 sm:py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition shadow-xs disabled:opacity-50 shrink-0 cursor-pointer active:scale-95"
+            title="Save Report Photo directly to Mobile Gallery"
           >
-            {isRefreshing ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                <span className="hidden sm:inline">Syncing...</span>
-              </>
+            {isCapturingPhoto ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
             ) : (
-              <>
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Refresh</span>
-              </>
+              <Camera className="w-3.5 h-3.5" />
             )}
+            <span>Photo</span>
           </button>
-        </div>
 
-        {/* Live fast status indicator */}
-        <div className="flex items-center gap-2">
-          {syncStatus === 'quota_hit' ? (
-            <span className="flex items-center gap-1 text-[11px] font-bold text-red-700 bg-red-50 px-2.5 py-1 rounded-full border border-red-200">
-              <AlertCircle className="w-3 h-3 text-red-600" />
-              <span>Quota Exceeded</span>
-            </span>
-          ) : syncStatus === 'offline' ? (
-            <span className="flex items-center gap-1 text-[11px] font-bold text-amber-700 bg-amber-50 px-2.5 py-1 rounded-full border border-amber-200">
-              <RefreshCw className="w-3 h-3 text-amber-600 animate-spin" />
-              <span>Offline/Connecting...</span>
-            </span>
-          ) : isRefreshing ? (
-            <span className="flex items-center gap-1 text-[11px] font-bold text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-full border border-indigo-200">
-              <Loader2 className="w-3 h-3 animate-spin" />
-              <span>Updating live...</span>
-            </span>
-          ) : (
-            <span className="flex items-center gap-1 text-[11px] font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-full border border-emerald-200">
-              <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-              <span>Live Synced</span>
-            </span>
-          )}
+          {/* Instant Live Sync indicator */}
+          <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-bold">
+            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+            <span>Live Sync Active</span>
+          </div>
         </div>
       </div>
 
-      {/* Sheet Table (Only English, Clean & Professional, Smooth Horizontal Scroll) */}
+      {photoSavedToast && (
+        <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-bold rounded-xl flex items-center gap-2 animate-in fade-in no-print shadow-xs">
+          <Check className="w-4 h-4 text-emerald-600" />
+          <span>Report photo saved to Gallery / Downloads!</span>
+        </div>
+      )}
+
+      {/* Sheet Table with Soft Colors, Bold Crisp Text & Single-Line Names/Routes */}
       <div 
         className="bg-white rounded-2xl border border-slate-300 shadow-xs overflow-x-auto w-full scroll-smooth"
         style={{ WebkitOverflowScrolling: 'touch' }}
       >
-        <div className="p-3 sm:p-5 bg-white min-w-[880px] w-full">
+        <div ref={printableSheetRef} className="p-3 sm:p-5 bg-white min-w-[880px] w-full">
           {/* Internal Sheet Header */}
           <div className="text-center mb-4 space-y-1">
             <h1 className="text-lg sm:text-xl font-black text-slate-900 uppercase tracking-tight">
-              {isAdmin(profile) ? 'ALL OFFICER DAILY TRACK REPORT' : `DAILY TRACK REPORT - ${profile.fullName || 'OFFICER'}`}
+              {isAdmin(profile) ? 'ALL OFFICER DAILY TRACK REPORT' : `DAILY TRACK REPORT - ${toTitleCase(profile.fullName) || 'OFFICER'}`}
             </h1>
             <div className="flex items-center justify-center gap-6 text-xs font-bold text-slate-600">
               <span className="flex items-center gap-1.5">
@@ -475,103 +426,85 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
             </div>
           </div>
 
-          <table className="w-full border-collapse border border-slate-900 text-xs">
+          <table className="w-full border-collapse border border-slate-400 text-xs">
             <thead>
-              <tr className="bg-slate-900 text-white font-black uppercase text-center text-xs">
-                <th className="p-2 border border-slate-700 w-10 text-center">
+              {/* Soft table header with crisp dark text instead of pitch black */}
+              <tr className="bg-slate-100 text-slate-900 font-extrabold uppercase text-center text-xs border-b-2 border-slate-400">
+                <th className="p-2 border border-slate-300 w-10 text-center">
                   Sr.
                 </th>
-                <th className="p-2 border border-slate-700 text-left min-w-[140px]">
+                <th className="p-2 border border-slate-300 text-left min-w-[140px] whitespace-nowrap">
                   Officer Name
                 </th>
-                <th className="p-2 border border-slate-700 text-left min-w-[140px] max-w-[220px]">
+                <th className="p-2 border border-slate-300 text-left min-w-[150px] whitespace-nowrap">
                   Today's Route
                 </th>
-                <th className="p-2 border border-slate-700 min-w-[65px]">
+                <th className="p-2 border border-slate-300 min-w-[65px] whitespace-nowrap">
                   Open KM
                 </th>
-                <th className="p-2 border border-slate-700 min-w-[65px]">
+                <th className="p-2 border border-slate-300 min-w-[65px] whitespace-nowrap">
                   Close KM
                 </th>
-                <th className="p-2 border border-slate-700 min-w-[65px] bg-indigo-950 text-indigo-200">
+                <th className="p-2 border border-slate-300 min-w-[65px] bg-indigo-50/70 text-indigo-950 whitespace-nowrap">
                   Total KM
                 </th>
-                <th className="p-2 border border-slate-700 min-w-[95px] bg-emerald-950 text-emerald-200">
+                <th className="p-2 border border-slate-300 min-w-[95px] bg-emerald-50/70 text-emerald-950 whitespace-nowrap">
                   Collection (₹)
                 </th>
-                <th className="p-2 border border-slate-700 min-w-[85px] bg-rose-950 text-rose-200">
+                <th className="p-2 border border-slate-300 min-w-[85px] bg-rose-50/70 text-rose-950 whitespace-nowrap">
                   Daily Expense (₹)
                 </th>
-                <th className="p-2 border border-slate-700 min-w-[80px]">
+                <th className="p-2 border border-slate-300 min-w-[80px] whitespace-nowrap">
                   Target (Lakh)
                 </th>
-                <th className="p-2 border border-slate-700 min-w-[80px] bg-blue-950 text-blue-200">
+                <th className="p-2 border border-slate-300 min-w-[80px] bg-sky-50/70 text-sky-950 whitespace-nowrap">
                   Achieve (Lakh)
                 </th>
-                <th className="p-2 border border-slate-700 min-w-[80px] bg-red-950 text-red-200">
+                <th className="p-2 border border-slate-300 min-w-[80px] bg-amber-50/70 text-amber-950 whitespace-nowrap">
                   Backlog (Lakh)
                 </th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-300 border-b border-slate-900">
+            <tbody className="divide-y divide-slate-300 border-b border-slate-400">
               {reportData.map((row) => (
-                <tr key={row.uid} className="hover:bg-slate-50 font-bold text-slate-900 text-center uppercase tracking-tight transition-colors">
-                  <td className="p-2 border border-slate-300 font-mono font-black bg-slate-50/50">
+                <tr key={row.uid} className="hover:bg-slate-50 font-bold text-slate-900 text-center transition-colors">
+                  <td className="p-2 border border-slate-300 font-mono font-black bg-slate-50/60">
                     {row.srNo}
                   </td>
-                  <td className="p-2 border border-slate-300 text-left font-black text-slate-900 break-words max-w-[170px]">
+                  {/* Officer Name: Title Case (First letter capital, rest small), Bold, Single Line */}
+                  <td className="p-2 border border-slate-300 text-left font-black text-slate-900 whitespace-nowrap">
                     {row.name}
                   </td>
-                  <td className="p-2 border border-slate-300 text-slate-800 font-bold text-left break-words max-w-[220px] text-[11px] leading-tight">
+                  {/* Today's Route: Single line, crisp and readable */}
+                  <td className="p-2 border border-slate-300 text-left font-bold text-slate-800 whitespace-nowrap text-[11.5px]">
                     {row.route}
                   </td>
-                  <td className="p-2 border border-slate-300 font-mono font-bold">
+                  <td className="p-2 border border-slate-300 font-mono font-bold text-slate-800">
                     {row.openingKm}
                   </td>
-                  <td className="p-2 border border-slate-300 font-mono font-bold">
+                  <td className="p-2 border border-slate-300 font-mono font-bold text-slate-800">
                     {row.closingKm}
                   </td>
-                  <td className="p-2 border border-slate-300 font-mono font-black text-indigo-700 bg-indigo-50/40">
+                  <td className="p-2 border border-slate-300 font-mono font-black text-indigo-900 bg-indigo-50/40">
                     {row.totalKm}
                   </td>
-                  <td className="p-2 border border-slate-300 font-mono font-black text-emerald-700 bg-emerald-50/40">
+                  <td className="p-2 border border-slate-300 font-mono font-black text-emerald-900 bg-emerald-50/40">
                     ₹{row.paymentCollection.toLocaleString()}
                   </td>
-                  <td className="p-2 border border-slate-300 font-mono font-black text-rose-700 bg-rose-50/40">
+                  <td className="p-2 border border-slate-300 font-mono font-black text-rose-900 bg-rose-50/40">
                     ₹{row.dailyExpense.toLocaleString()}
                   </td>
-                  <td className="p-2 border border-slate-300 font-mono font-bold">
+                  <td className="p-2 border border-slate-300 font-mono font-bold text-slate-800">
                     {formatAmount(row.monthlySalesTarget)}
                   </td>
-                  <td className="p-2 border border-slate-300 font-mono font-black text-blue-700 bg-blue-50/40">
+                  <td className="p-2 border border-slate-300 font-mono font-black text-sky-900 bg-sky-50/40">
                     {formatAmount(row.monthlyAchievement)}
                   </td>
-                  <td className="p-2 border border-slate-300 font-mono font-black text-red-600 bg-red-50/40">
+                  <td className="p-2 border border-slate-300 font-mono font-black text-amber-900 bg-amber-50/40">
                     {formatAmount(row.targetBacklog)}
                   </td>
                 </tr>
               ))}
-
-              {/* Skeleton placeholder ONLY if completely empty and loading first time */}
-              {reportData.length === 0 && loading && (
-                <>
-                  {[1, 2, 3].map((idx) => (
-                    <tr key={`skeleton-${idx}`} className="animate-pulse">
-                      <td className="p-3 border border-slate-200 text-center"><div className="h-4 bg-slate-200 rounded w-5 mx-auto"></div></td>
-                      <td className="p-3 border border-slate-200"><div className="h-4 bg-slate-200 rounded w-28"></div></td>
-                      <td className="p-3 border border-slate-200"><div className="h-4 bg-slate-200 rounded w-36"></div></td>
-                      <td className="p-3 border border-slate-200"><div className="h-4 bg-slate-200 rounded w-12 mx-auto"></div></td>
-                      <td className="p-3 border border-slate-200"><div className="h-4 bg-slate-200 rounded w-12 mx-auto"></div></td>
-                      <td className="p-3 border border-slate-200 bg-indigo-50/30"><div className="h-4 bg-indigo-200 rounded w-12 mx-auto"></div></td>
-                      <td className="p-3 border border-slate-200 bg-emerald-50/30"><div className="h-4 bg-emerald-200 rounded w-16 mx-auto"></div></td>
-                      <td className="p-3 border border-slate-200 bg-rose-50/30"><div className="h-4 bg-rose-200 rounded w-16 mx-auto"></div></td>
-                      <td className="p-3 border border-slate-200"><div className="h-4 bg-slate-200 rounded w-12 mx-auto"></div></td>
-                      <td className="p-3 border border-slate-200 bg-blue-50/30"><div className="h-4 bg-blue-200 rounded w-12 mx-auto"></div></td>
-                      <td className="p-3 border border-slate-200 bg-red-50/30"><div className="h-4 bg-red-200 rounded w-12 mx-auto"></div></td>
-                    </tr>
-                  ))}
-                </>
-              )}
 
               {reportData.length === 0 && !loading && (
                 <tr>
@@ -582,29 +515,29 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
               )}
             </tbody>
             {reportData.length > 0 && (
-              <tfoot className="bg-slate-100 font-black text-slate-900 uppercase text-center border-t-2 border-slate-900 text-xs">
+              <tfoot className="bg-slate-100 font-black text-slate-900 uppercase text-center border-t-2 border-slate-400 text-xs">
                 <tr>
-                  <td colSpan={3} className="p-2 text-left font-black border-r border-slate-400">
+                  <td colSpan={3} className="p-2 text-left font-black border-r border-slate-300">
                     TOTAL SUMMARY
                   </td>
                   <td className="p-2 border-r border-slate-300 text-slate-400">-</td>
                   <td className="p-2 border-r border-slate-300 text-slate-400">-</td>
-                  <td className="p-2 border-r border-slate-300 font-mono font-black text-indigo-700 bg-indigo-100/60">
+                  <td className="p-2 border-r border-slate-300 font-mono font-black text-indigo-900 bg-indigo-100/60">
                     {totalKmSum}
                   </td>
-                  <td className="p-2 border-r border-slate-300 font-mono font-black text-emerald-700 bg-emerald-100/60">
+                  <td className="p-2 border-r border-slate-300 font-mono font-black text-emerald-900 bg-emerald-100/60">
                     ₹{totalCollectionSum.toLocaleString()}
                   </td>
-                  <td className="p-2 border-r border-slate-300 font-mono font-black text-rose-700 bg-rose-100/60">
+                  <td className="p-2 border-r border-slate-300 font-mono font-black text-rose-900 bg-rose-100/60">
                     ₹{totalExpenseSum.toLocaleString()}
                   </td>
-                  <td className="p-2 border-r border-slate-300 font-mono font-bold">
+                  <td className="p-2 border-r border-slate-300 font-mono font-bold text-slate-900">
                     {formatAmount(totalTargetSum)}
                   </td>
-                  <td className="p-2 border-r border-slate-300 font-mono font-black text-blue-700 bg-blue-100/60">
+                  <td className="p-2 border-r border-slate-300 font-mono font-black text-sky-900 bg-sky-100/60">
                     {formatAmount(totalAchieveSum)}
                   </td>
-                  <td className="p-2 font-mono font-black text-red-600 bg-red-100/60">
+                  <td className="p-2 font-mono font-black text-amber-900 bg-amber-100/60">
                     {formatAmount(totalBacklogSum)}
                   </td>
                 </tr>
@@ -615,11 +548,11 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
           <div className="mt-8 flex justify-between items-end">
             <div className="text-center w-36 sm:w-44">
               <div className="h-7 border-b-2 border-slate-400 mb-1"></div>
-              <p className="text-[10px] sm:text-[11px] font-black uppercase text-slate-500">Admin Signature</p>
+              <p className="text-[10px] sm:text-[11px] font-black uppercase text-slate-600">Admin Signature</p>
             </div>
             <div className="text-center w-36 sm:w-44">
               <div className="h-7 border-b-2 border-slate-400 mb-1"></div>
-              <p className="text-[10px] sm:text-[11px] font-black uppercase text-slate-500">Owner Signature</p>
+              <p className="text-[10px] sm:text-[11px] font-black uppercase text-slate-600">Owner Signature</p>
             </div>
           </div>
         </div>

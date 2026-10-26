@@ -8,14 +8,13 @@ import {
   onSnapshot, 
   doc, 
   setDoc,
-  getDocs,
   updateDoc
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { logAudit } from '../../lib/dataService';
 import { Language, translations } from '../../lib/i18n';
-import { cn } from '../../lib/utils';
+import { cn, toTitleCase } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
 import { 
   IndianRupee, 
@@ -41,8 +40,7 @@ import {
   Phone,
   Mail,
   Receipt,
-  Pencil,
-  RefreshCw
+  Pencil
 } from 'lucide-react';
 
 interface OrderItem {
@@ -80,8 +78,6 @@ interface SavedDealer {
   createdByName?: string;
   created_by_name?: string;
   officerName?: string;
-  dealerOfficerId?: string;
-  dealerOfficerName?: string;
   loginId?: string;
   userCode?: string;
   userId?: string;
@@ -103,10 +99,6 @@ interface CollectionRecord {
   notes?: string;
   collectedByUid?: string;
   collectedByName?: string;
-  userId?: string;
-  ownerId?: string;
-  dealerOfficerId?: string;
-  dealerOfficerName?: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -123,10 +115,6 @@ interface DealerStandingItem {
   standingAmount: number;
   ordersCount: number;
   orders: OrderItem[];
-  userId?: string;
-  ownerId?: string;
-  dealerOfficerId?: string;
-  dealerOfficerName?: string;
 }
 
 interface Props {
@@ -155,7 +143,6 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
   const [remarks, setRemarks] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [successToast, setSuccessToast] = useState<string>('');
-  const [syncStatus, setSyncStatus] = useState<'online' | 'offline' | 'quota_hit'>('online');
 
   const printableSheetRef = useRef<HTMLDivElement>(null);
 
@@ -185,11 +172,20 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
 
   // Real-time listener for Orders
   useEffect(() => {
-    const q = query(
+    let q = query(
       collection(db, 'orders'),
       orderBy('createdAt', 'desc'),
-      limit(isAdmin(profile) ? 500 : 300)
+      limit(300)
     );
+
+    if (!isAdmin(profile)) {
+      q = query(
+        collection(db, 'orders'),
+        where('userId', '==', profile.uid),
+        orderBy('createdAt', 'desc'),
+        limit(200)
+      );
+    }
 
     const unsub = onSnapshot(q, (snap) => {
       const list: OrderItem[] = [];
@@ -200,69 +196,78 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         }
       });
       setOrders(list);
-      setSyncStatus('online');
-    }, (error: any) => {
-      if (error.code === 'resource-exhausted') setSyncStatus('quota_hit');
-      else setSyncStatus('offline');
+    }, (error) => {
       handleFirestoreError(error, OperationType.LIST, 'orders');
     });
     return () => unsub();
-  }, [profile]);
+  }, []);
 
   // Real-time listener for Dealers Application with full ownership metadata
   useEffect(() => {
-    const fetchDealers = async () => {
-      const q = query(
-        collection(db, 'dealers_application'),
-        orderBy('createdAt', 'desc'),
-        limit(isAdmin(profile) ? 500 : 300)
-      );
+    let q = query(
+      collection(db, 'dealers_application'),
+      orderBy('createdAt', 'desc'),
+      limit(300)
+    );
 
-      try {
-        const snap = await getDocs(q);
-        const list: SavedDealer[] = [];
-        snap.forEach((d) => {
-          const data = d.data() as any;
-          if (!data.isArchived) {
-            list.push({
-              id: d.id,
-              firmName: data.firmName || 'Unnamed Firm',
-              proprietorName: data.proprietorName || '',
-              dealerCode: data.dealerCode || '',
-              contactNumber: data.contactNumber || '',
-              village: data.village || data.center || '',
-              district: data.district || '',
-              isArchived: data.isArchived || false,
-              createdByUid: data.createdByUid || data.created_by_user_id,
-              created_by_user_id: data.created_by_user_id,
-              createdByName: data.createdByName || data.created_by_name,
-              created_by_name: data.created_by_name,
-              officerName: data.officerName,
-              dealerOfficerId: data.dealerOfficerId || data.userId,
-              dealerOfficerName: data.dealerOfficerName || data.officerName || data.createdByName,
-              loginId: data.loginId,
-              userCode: data.userCode,
-              userId: data.userId,
-              ownerId: data.ownerId
-            });
-          }
-        });
-        setDealers(list);
-      } catch (error: any) {
-        if (error.code === 'resource-exhausted') setSyncStatus('quota_hit');
-        handleFirestoreError(error, OperationType.LIST, 'dealers_application');
-      }
-    };
-    fetchDealers();
-  }, [profile]);
+    if (!isAdmin(profile)) {
+      q = query(
+        collection(db, 'dealers_application'),
+        where('userId', '==', profile.uid),
+        orderBy('createdAt', 'desc'),
+        limit(200)
+      );
+    }
+
+    const unsub = onSnapshot(q, (snap) => {
+      const list: SavedDealer[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as any;
+        if (!data.isArchived) {
+          list.push({
+            id: d.id,
+            firmName: data.firmName || 'Unnamed Firm',
+            proprietorName: data.proprietorName || '',
+            dealerCode: data.dealerCode || '',
+            contactNumber: data.contactNumber || '',
+            village: data.village || data.center || '',
+            district: data.district || '',
+            isArchived: data.isArchived || false,
+            createdByUid: data.createdByUid || data.created_by_user_id,
+            created_by_user_id: data.created_by_user_id,
+            createdByName: data.createdByName || data.created_by_name,
+            created_by_name: data.created_by_name,
+            officerName: data.officerName,
+            loginId: data.loginId,
+            userCode: data.userCode,
+            userId: data.userId,
+            ownerId: data.ownerId
+          });
+        }
+      });
+      setDealers(list);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'dealers_application');
+    });
+    return () => unsub();
+  }, []);
 
   // Real-time listener for Collection Entries
   useEffect(() => {
-    const q = query(
+    let q = query(
       collection(db, 'collection_entries'),
       orderBy('createdAt', 'desc'),
-      limit(isAdmin(profile) ? 500 : 300)
+      limit(500)
     );
+
+    if (!isAdmin(profile)) {
+      q = query(
+        collection(db, 'collection_entries'),
+        where('collectedByUid', '==', profile.uid),
+        orderBy('createdAt', 'desc'),
+        limit(300)
+      );
+    }
 
     const unsub = onSnapshot(q, (snap) => {
       const list: CollectionRecord[] = [];
@@ -271,14 +276,11 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         list.push({ ...data, id: d.id });
       });
       setCollectionEntries(list);
-      setSyncStatus('online');
-    }, (error: any) => {
-      if (error.code === 'resource-exhausted') setSyncStatus('quota_hit');
-      else setSyncStatus('offline');
+    }, (error) => {
       handleFirestoreError(error, OperationType.LIST, 'collection_entries');
     });
     return () => unsub();
-  }, [profile]);
+  }, []);
 
   // User-wise Data Security: isolate officers while preserving Admin/Owner full visibility
   const accessibleDealers = useMemo(() => {
@@ -288,27 +290,13 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
 
   const accessibleOrders = useMemo(() => {
     if (isAdmin(profile)) return orders;
-    const accessibleDealerIds = new Set(accessibleDealers.map(d => d.id));
-    const accessibleDealerNames = new Set(accessibleDealers.map(d => (d.firmName || '').trim().toUpperCase()));
-    return orders.filter(o => {
-      if (isUserRecord(o, profile)) return true;
-      if (o.dealerId && accessibleDealerIds.has(o.dealerId)) return true;
-      if (o.dealerName && accessibleDealerNames.has((o.dealerName || '').trim().toUpperCase())) return true;
-      return false;
-    });
-  }, [orders, accessibleDealers, profile]);
+    return orders.filter(o => isUserRecord(o, profile));
+  }, [orders, profile]);
 
   const accessibleCollectionEntries = useMemo(() => {
     if (isAdmin(profile)) return collectionEntries;
-    const accessibleDealerIds = new Set(accessibleDealers.map(d => d.id));
-    const accessibleDealerNames = new Set(accessibleDealers.map(d => (d.firmName || '').trim().toUpperCase()));
-    return collectionEntries.filter(e => {
-      if (isUserRecord(e, profile)) return true;
-      if (e.dealerId && accessibleDealerIds.has(e.dealerId)) return true;
-      if (e.dealerName && accessibleDealerNames.has((e.dealerName || '').trim().toUpperCase())) return true;
-      return false;
-    });
-  }, [collectionEntries, accessibleDealers, profile]);
+    return collectionEntries.filter(e => isUserRecord(e, profile));
+  }, [collectionEntries, profile]);
 
   // Calculate Standing Amounts per Dealer strictly within authorized scope
   const dealersStandingList: DealerStandingItem[] = useMemo(() => {
@@ -325,10 +313,6 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         village: dlr.village || '',
         proprietorName: dlr.proprietorName || '',
         contactNumber: dlr.contactNumber || '',
-        userId: dlr.userId || dlr.ownerId || '',
-        ownerId: dlr.ownerId || dlr.userId || '',
-        dealerOfficerId: dlr.dealerOfficerId || dlr.userId || '',
-        dealerOfficerName: dlr.dealerOfficerName || dlr.officerName || dlr.createdByName || '',
         totalBilled: 0,
         totalPaid: 0,
         standingAmount: 0,
@@ -352,10 +336,6 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
           village: (ord as any).dealerVillage || '',
           proprietorName: ord.farmerName || '',
           contactNumber: (ord as any).dealerContact || '',
-          userId: ord.userId || ord.ownerId || '',
-          ownerId: ord.ownerId || ord.userId || '',
-          dealerOfficerId: (ord as any).dealerOfficerId || ord.userId || '',
-          dealerOfficerName: (ord as any).dealerOfficerName || (ord as any).createdByName || '',
           totalBilled: 0,
           totalPaid: 0,
           standingAmount: 0,
@@ -535,10 +515,6 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         notes: remarks.trim(),
         collectedByUid: profile.uid,
         collectedByName: profile.fullName || 'Officer',
-        userId: dealerObj?.userId || dealerObj?.ownerId || profile.uid,
-        ownerId: dealerObj?.ownerId || dealerObj?.userId || profile.uid,
-        dealerOfficerId: dealerObj?.dealerOfficerId || dealerObj?.userId || profile.uid,
-        dealerOfficerName: dealerObj?.dealerOfficerName || profile.fullName || '',
         createdAt: new Date().toISOString()
       };
 
@@ -732,6 +708,20 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
     }
   };
 
+  const handleSendPaymentReminder = (dealer: DealerStandingItem) => {
+    const cleanPhone = (dealer.contactNumber || '').replace(/\D/g, '').slice(-10);
+    const formattedAmount = `${dealer.standingAmount.toLocaleString('en-IN')}`;
+    const message = `Blackworm Agritech Pvt Ltd\n\nRajarambapu Sahakari Bank\nBranch - Miraj\nAcc No. 035330268109560\nIFSC - RRBP0000035\n\nNEFT Total Amount - ${formattedAmount}/-`;
+    
+    if (cleanPhone && cleanPhone.length === 10) {
+      const waUrl = `https://wa.me/91${cleanPhone}?text=${encodeURIComponent(message)}`;
+      window.open(waUrl, '_blank');
+    } else {
+      const waUrl = `https://wa.me/?text=${encodeURIComponent(message)}`;
+      window.open(waUrl, '_blank');
+    }
+  };
+
   const handlePrintSheet = () => {
     window.print();
   };
@@ -769,67 +759,32 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
             <IndianRupee className="w-4 h-4 sm:w-5 sm:h-5 stroke-[2.5]" />
           </div>
           <div className="min-w-0">
-            <div className="flex items-center gap-1.5 sm:gap-2">
-              <h2 className="text-base sm:text-lg font-black text-slate-900 tracking-tight">
-                Collections
-              </h2>
-              <span className="bg-emerald-100 text-emerald-800 text-[10px] sm:text-[11px] font-mono font-bold px-1.5 py-0.5 rounded-full shrink-0">
-                ₹{totalStanding.toLocaleString()}
-              </span>
-            </div>
+            <h2 className="text-base sm:text-lg font-black text-slate-900 tracking-tight">
+              Collections
+            </h2>
           </div>
         </div>
 
-        {/* Action Buttons: Compact '+ Receive Payment' and 'Print Sheet' */}
+        {/* Action Buttons: Compact 'Receive Payment' and 'Print Sheet' */}
         <div className="flex items-center gap-1.5 shrink-0 ml-auto">
           <button
             type="button"
             onClick={() => handleOpenReceivePayment()}
-            className="flex items-center justify-center gap-1 bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white font-bold text-[11px] px-2 py-1 rounded-md shadow-2xs transition active:scale-95 cursor-pointer whitespace-nowrap"
+            className="flex items-center justify-center bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white font-bold text-[11px] px-2 py-1 rounded-md shadow-2xs transition active:scale-95 cursor-pointer whitespace-nowrap"
             title="Receive Payment"
           >
-            <Plus className="w-3 h-3 stroke-[3]" />
             <span>Receive Payment</span>
           </button>
 
           <button
             type="button"
             onClick={handlePrintSheet}
-            className="flex items-center justify-center gap-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[11px] px-2 py-1 rounded-md border border-slate-200 shadow-2xs transition active:scale-95 cursor-pointer whitespace-nowrap"
+            className="flex items-center justify-center gap-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-2.5 py-1.5 rounded-lg border border-slate-200 shadow-2xs transition active:scale-95 cursor-pointer whitespace-nowrap"
             title="Print Sheet"
           >
-            <Printer className="w-3 h-3 text-slate-600" />
+            <Printer className="w-3.5 h-3.5 text-slate-600" />
             <span className="hidden sm:inline">Print Sheet</span>
           </button>
-        </div>
-      </div>
-
-      {/* Sync Status Banner */}
-      <div className={cn(
-        "p-2.5 rounded-xl border text-[11px] flex items-center justify-between gap-2 no-print",
-        syncStatus === 'quota_hit' ? "bg-red-50 border-red-200 text-red-900" :
-        syncStatus === 'offline' ? "bg-amber-50 border-amber-200 text-amber-900" :
-        "bg-emerald-50 border-emerald-200 text-emerald-900"
-      )}>
-        <div className="flex items-center gap-2">
-          <div className={cn(
-            "w-1.5 h-1.5 rounded-full",
-            syncStatus === 'quota_hit' ? "bg-red-600 animate-pulse" :
-            syncStatus === 'offline' ? "bg-amber-500 animate-pulse" :
-            "bg-emerald-500"
-          )} />
-          <span className="font-bold">
-            {syncStatus === 'quota_hit' ? (
-              <span className="flex items-center gap-1.5"><AlertCircle className="w-3.5 h-3.5" /> Firestore Read Quota Exceeded. Some data may be missing until tomorrow.</span>
-            ) : syncStatus === 'offline' ? (
-              <span className="flex items-center gap-1.5"><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Connection Lost. Working offline.</span>
-            ) : (
-              <span className="flex items-center gap-1.5"><CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> All data is synced and up to date.</span>
-            )}
-          </span>
-        </div>
-        <div className="text-[10px] font-black uppercase tracking-tighter opacity-50">
-          {syncStatus === 'online' ? '● Connected' : '○ Disconnected'}
         </div>
       </div>
 
@@ -1046,25 +1001,29 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
                     </td>
 
                     <td className="p-2 border-r border-black font-mono font-bold text-red-600 whitespace-nowrap">
-                      {item.dealerCode ? `#${item.dealerCode}` : '-'}
+                      {item.dealerCode ? item.dealerCode.replace(/^#/, '') : '-'}
                     </td>
 
-                    <td className="p-2 border-r border-black font-bold text-slate-900 uppercase whitespace-nowrap">
+                    <td className="p-2 border-r border-black font-bold text-slate-900 whitespace-nowrap">
                       <div className="flex items-center gap-1.5 truncate">
-                        <span className="truncate">{item.firmName}</span>
+                        <span className="truncate">{toTitleCase(item.firmName)}</span>
                       </div>
                     </td>
 
-                    <td className="p-2 border-r border-black uppercase text-slate-700 whitespace-nowrap">
+                    <td className="p-2 pl-3 border-r border-black text-slate-800 whitespace-nowrap">
                       {item.contactNumber ? (
-                        <a 
-                          href={`tel:${item.contactNumber}`} 
-                          className="text-blue-600 font-bold hover:underline flex items-center gap-1"
-                          onClick={(e) => e.stopPropagation()}
+                        <button 
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleSendPaymentReminder(item);
+                          }}
+                          className="text-blue-700 font-bold hover:underline inline-flex items-center gap-1.5 cursor-pointer ml-1 text-left"
+                          title="Click to send Outstanding Payment reminder"
                         >
-                          <Phone className="w-3 h-3" />
-                          {item.contactNumber}
-                        </a>
+                          <Phone className="w-3 h-3 text-emerald-600 shrink-0" />
+                          <span className="font-mono tracking-wide">{item.contactNumber}</span>
+                        </button>
                       ) : '-'}
                     </td>
 
@@ -1085,10 +1044,9 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
                         <button
                           type="button"
                           onClick={() => handleOpenReceivePayment(item.id)}
-                          className="px-2 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-md text-[10px] font-bold uppercase transition shadow-2xs active:scale-95 cursor-pointer inline-flex items-center gap-1 whitespace-nowrap"
+                          className="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-[9.5px] font-bold uppercase transition shadow-2xs active:scale-95 cursor-pointer whitespace-nowrap"
                           title={`Receive payment from ${item.firmName}`}
                         >
-                          <Plus className="w-3 h-3 stroke-[3]" />
                           <span>Receive</span>
                         </button>
                       ) : (

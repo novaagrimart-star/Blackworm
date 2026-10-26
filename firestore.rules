@@ -25,10 +25,6 @@ service cloud.firestore {
       allow delete: if false; // Use Soft Delete (isArchived)
     }
 
-    match /dealer_unique_registry/{docId} {
-      allow read, write: if true;
-    }
-
     match /orders/{docId} {
       allow read, write: if true;
       allow delete: if false; // Use Soft Delete (isArchived)

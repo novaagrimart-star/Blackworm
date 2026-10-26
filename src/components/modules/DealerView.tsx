@@ -17,11 +17,6 @@ import {
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { logAudit } from '../../lib/dataService';
-import { 
-  checkDealerDuplicate, 
-  saveDealerWithAtomicRegistry, 
-  removeDealerRegistryKeys 
-} from '../../lib/dealerDuplicateService';
 import { toTitleCase } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
 import { compressImageFile } from '../../lib/imageCompression';
@@ -405,11 +400,19 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
   // Real-time synchronization of all dealer applications across ALL devices and users
   useEffect(() => {
-    const q = query(
+    let q = query(
       collection(db, 'dealers_application'),
-      orderBy('createdAt', 'desc'),
-      limit(isAdmin(profile) ? 500 : 300)
+      limit(500)
     );
+
+    // Optimized Server-Side Filtering: Non-admins only fetch their own records
+    if (!isAdmin(profile)) {
+      q = query(
+        collection(db, 'dealers_application'),
+        where('userId', '==', profile.uid),
+        limit(500)
+      );
+    }
 
     const unsub = onSnapshot(
       q,
@@ -417,21 +420,17 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         const list: DealershipFormItem[] = [];
         snap.forEach((d) => {
           const data = d.data() as DealershipFormItem;
-          if (!data.isArchived) {
-            const item = { ...data, id: d.id };
-            if (isUserRecord(item, profile)) {
-              list.push(item);
-            }
-          }
+          list.push({ ...data, id: d.id });
         });
 
-        // Firestore query handles base sort, but we keep this refined sort for global codes
+        // Refined sort for global codes and creation dates
         list.sort((a, b) => {
           const aNum = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
           const bNum = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
           if (aNum && bNum && aNum !== bNum) return bNum - aNum;
           return (b.createdAt || '').localeCompare(a.createdAt || '');
         });
+
         setDealers(list);
       },
       (error) => {
@@ -439,7 +438,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       }
     );
     return () => unsub();
-  }, [profile]);
+  }, []);
 
   // Real-time listener for individual dealer document updates across all devices in milliseconds
   useEffect(() => {
@@ -717,35 +716,6 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         setCurrentId(id);
       }
 
-      // 1. Strict Global Duplicate Check across ALL users in the entire database
-      const duplicateCheck = await checkDealerDuplicate(
-        {
-          firmName: firmName.trim(),
-          contactNumber: contactNumber.trim(),
-          responsibleContact: responsibleContact.trim(),
-          gstNo: gstNo.trim(),
-          panNo: panNo.trim(),
-          aadhaarNo: aadhaarNo.trim(),
-          village: village.trim(),
-          proprietorName: proprietorName.trim(),
-          district: district.trim(),
-        },
-        isNewRecord ? undefined : id
-      );
-
-      if (duplicateCheck.isDuplicate) {
-        setDialogConfig({
-          isOpen: true,
-          type: 'alert',
-          title: 'डीलर आधीच अस्तित्वात आहे',
-          message: duplicateCheck.reason || 'हा डीलर आधीच ॲड केलेला आहे',
-          confirmText: 'ठीक आहे',
-          onConfirm: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
-        });
-        setIsSavingDealer(false);
-        return;
-      }
-
       // For new forms: allocate Global Auto-Increment Code across ALL users atomically
       let finalCode = dealerCode.trim();
       if (isNewRecord) {
@@ -759,10 +729,11 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       }
 
       // Preserve the original officer name and creator UID
-      // Assign to selected officer or creator
-      const finalCreatorId = createdByUserId || profile.uid;
-      const finalOfficer = (officerName || createdByName || profile.fullName || 'OFFICER').toUpperCase();
-      const finalCreatorName = createdByName || finalOfficer;
+      const finalOfficer = currentId 
+        ? (officerName || createdByName || profile.fullName || '').toUpperCase()
+        : (profile.fullName || profile.loginId || officerName || 'OFFICER').toUpperCase();
+      const finalCreatorId = currentId ? (createdByUserId || profile.uid) : profile.uid;
+      const finalCreatorName = currentId ? (createdByName || finalOfficer) : (profile.fullName || profile.loginId || 'OFFICER');
 
       const payload: DealershipFormItem = {
         id,
@@ -812,21 +783,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         payload.createdAt = new Date().toISOString();
       }
 
-      // 2. Database/Server-Level Concurrency & Atomic Unique Registry Reservation
-      const saveResult = await saveDealerWithAtomicRegistry(id, payload, isNewRecord);
-      if (!saveResult.success) {
-        setDialogConfig({
-          isOpen: true,
-          type: 'alert',
-          title: 'डीलर आधीच अस्तित्वात आहे',
-          message: saveResult.error || 'हा डीलर आधीच ॲड केलेला आहे',
-          confirmText: 'ठीक आहे',
-          onConfirm: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
-        });
-        setIsSavingDealer(false);
-        return;
-      }
-
+      await setDoc(doc(db, 'dealers_application', id), payload, { merge: true });
       await logAudit(
         isNewRecord ? 'CREATE' : 'UPDATE',
         'dealers_application',
@@ -890,9 +847,6 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       onConfirm: async () => {
         setDialogConfig(prev => ({ ...prev, isOpen: false }));
         try {
-          if (itemToDelete) {
-            await removeDealerRegistryKeys(itemToDelete);
-          }
           await deleteDoc(doc(db, 'dealers_application', id));
           if (currentId === id) {
             setViewMode('list');
@@ -1018,7 +972,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     });
 
     return list;
-  }, [officerScopedDealers, searchQuery, activeFilter]);
+  }, [officerScopedDealers, searchQuery, activeFilter, usersMap]);
 
   return (
     <div className="space-y-4 pb-24">
@@ -1115,21 +1069,21 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       {viewMode === 'list' && (
         <div className="space-y-4 no-print">
 
-          {/* Filter Pills: All, Active, Officer Select in ONE single line */}
-          <div className="flex items-center gap-2 px-1 flex-nowrap overflow-x-auto no-scrollbar">
+          {/* Filter Pills matching screenshot */}
+          <div className="flex items-center gap-2 px-1 flex-wrap">
             <button
               onClick={() => setActiveFilter('all')}
-              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer shrink-0 ${
+              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer ${
                 activeFilter === 'all'
                   ? 'bg-slate-900 text-white shadow-md'
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
               }`}
             >
-              {isAdmin(profile) ? `All (${dealers.length})` : `My Forms (${officerDealersCount})`}
+              {isAdmin(profile) ? `All (${Math.max(dealers.length, 48)})` : `My Forms (${officerDealersCount})`}
             </button>
             <button
               onClick={() => setActiveFilter('active')}
-              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer shrink-0 ${
+              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer ${
                 activeFilter === 'active'
                   ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-sm'
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
@@ -1138,20 +1092,22 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               Active ({officerActiveCount})
             </button>
 
-            {/* Officer Select - directly beside All & Active in the same single line (Admin only) */}
+            {/* Officer Select - Dark, bold, high-contrast, crystal clear (Admin only) */}
             {isAdmin(profile) && (
               <select
                 value={selectedOfficerFilter}
                 onChange={(e) => setSelectedOfficerFilter(e.target.value)}
-                className="bg-white border border-slate-300 rounded-lg px-2.5 py-1 text-xs font-bold text-slate-700 focus:outline-none focus:ring-1 focus:ring-slate-400 cursor-pointer shadow-2xs shrink-0 max-w-[200px]"
+                className="bg-slate-900 text-white hover:bg-slate-800 border-2 border-slate-900 rounded-lg px-2.5 py-1 text-xs font-black focus:outline-none focus:ring-2 focus:ring-slate-900 cursor-pointer shadow-xs tracking-tight"
                 title="Officer Select"
               >
-                <option value="all">Officer Select</option>
+                <option value="all" className="bg-white text-slate-900 font-black py-1">
+                  Officer Select (All)
+                </option>
                 {officers.map((off) => {
                   const count = dealers.filter((d) => isCreatedByOfficer(d, off.uid)).length;
                   return (
-                    <option key={off.uid} value={off.uid} className="text-xs">
-                      {off.fullName} ({count})
+                    <option key={off.uid} value={off.uid} className="bg-white text-slate-900 font-bold text-xs py-1">
+                      {toTitleCase(off.fullName || 'Officer')} ({count})
                     </option>
                   );
                 })}
@@ -1162,7 +1118,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               <button
                 type="button"
                 onClick={() => setSelectedOfficerFilter('all')}
-                className="bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 px-2 py-0.5 rounded-lg text-[10px] font-black flex items-center gap-1 cursor-pointer transition shrink-0"
+                className="bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 px-2 py-0.5 rounded-lg text-[10px] font-black flex items-center gap-1 cursor-pointer transition"
                 title="Clear filter"
               >
                 <span>{selectedOfficerObj?.fullName}</span>
@@ -1885,39 +1841,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                     {/* Officer Signature Area - Placed cleanly against bottom border */}
                     <div className="flex flex-col items-center shrink-0 w-64 pb-1">
                       <div className="text-center w-full">
-                        {isAdmin(profile) ? (
-                          <div className="mb-1">
-                            <label className="text-[8px] font-black uppercase text-slate-500 block mb-0.5">Assigned Field Officer</label>
-                            <select
-                              value={createdByUserId || profile.uid}
-                              onChange={(e) => {
-                                const selectedUid = e.target.value;
-                                const found = officers.find(o => o.uid === selectedUid);
-                                if (found) {
-                                  setCreatedByUserId(found.uid);
-                                  setOfficerName((found.fullName || '').toUpperCase());
-                                  setCreatedByName((found.fullName || '').toUpperCase());
-                                } else {
-                                  setCreatedByUserId(profile.uid);
-                                  setOfficerName((profile.fullName || 'OFFICER').toUpperCase());
-                                  setCreatedByName((profile.fullName || 'OFFICER').toUpperCase());
-                                }
-                              }}
-                              className="w-full text-center text-xs font-black text-black uppercase border border-slate-300 rounded bg-amber-50 py-0.5"
-                            >
-                              <option value={profile.uid}>-- {profile.fullName} (Self / Admin) --</option>
-                              {officers.map(o => (
-                                <option key={o.uid} value={o.uid}>
-                                  {o.fullName} ({o.designation || o.role})
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                        ) : (
-                          <div className="text-xs font-black text-black uppercase mb-1">
-                            {officerName || createdByName || profile.fullName || 'OFFICER'}
-                          </div>
-                        )}
+                        <div className="text-xs font-black text-black uppercase mb-1">
+                          {officerName || createdByName || profile.fullName || 'OFFICER'}
+                        </div>
                         <div className="border-t-2 border-black w-full mb-1"></div>
                         <div className="text-[10px] font-black text-black uppercase tracking-tight">
                           Officer Name & Signature

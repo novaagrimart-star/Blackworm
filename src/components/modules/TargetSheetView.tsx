@@ -11,7 +11,6 @@ import { UserProfile, isAdmin } from '../../lib/auth';
 import { logAudit } from '../../lib/dataService';
 import { Language } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
-import { useUsers } from '../../lib/UsersContext';
 import { 
   toDecimal2, 
   addDecimal2, 
@@ -87,7 +86,7 @@ const CellInput: React.FC<{
 
   if (disabled || isPdfOrPrint) {
     return (
-      <span className={cn("inline-block w-full text-center font-black font-mono select-none", colorClass)}>
+      <span className={cn("inline-block w-full text-center font-black font-mono text-xs sm:text-[13px] select-text tracking-tight", colorClass)}>
         {formatAmount(value)}
       </span>
     );
@@ -121,7 +120,7 @@ const CellInput: React.FC<{
       }}
       placeholder={placeholder}
       className={cn(
-        "w-full px-1.5 py-1 bg-transparent border-none focus:outline-none focus:bg-amber-100/60 rounded text-center font-black font-mono transition-colors",
+        "w-full px-1 py-1 bg-transparent border-none focus:outline-none focus:bg-amber-100/70 rounded text-center font-black font-mono text-xs sm:text-[13px] tracking-tight transition-colors",
         colorClass,
         className
       )}
@@ -131,7 +130,7 @@ const CellInput: React.FC<{
 
 export const TargetSheetView: React.FC<Props> = ({ profile }) => {
   const userIsAdmin = isAdmin(profile);
-  const { users } = useUsers();
+  const [users, setUsers] = useState<UserProfile[]>([]);
   const [selectedUserId, setSelectedUserId] = useState<string>(profile.uid);
   const [sheet, setYearlySheet] = useState<YearlySheet | null>(null);
   const [loading, setLoading] = useState(true);
@@ -172,7 +171,19 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     return () => unsubBranding();
   }, []);
 
-
+  // Fetch users for dropdown
+  useEffect(() => {
+    const q = query(collection(db, 'users'));
+    const unsub = onSnapshot(q, (snap) => {
+      const list: UserProfile[] = [];
+      snap.forEach(d => list.push({ ...d.data(), uid: d.id } as UserProfile));
+      list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
+      setUsers(list);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'users');
+    });
+    return () => unsub();
+  }, []);
 
   // Fetch or init sheet for selected user
   useEffect(() => {
@@ -740,9 +751,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
 
           {/* 4. Target Data Table */}
           <div className="overflow-x-auto bg-white">
-            <table className="w-full text-left border-collapse text-[11px]">
+            <table className="w-full text-left border-collapse text-xs sm:text-[13px]">
               <thead>
-                <tr className="bg-slate-900 text-white font-black uppercase text-center border-b-2 border-black">
+                <tr className="bg-slate-900 text-white font-black uppercase text-center border-b-2 border-black text-xs sm:text-[12.5px]">
                   <th className="p-2 border-r-2 border-black whitespace-nowrap w-12 text-center">Sr.</th>
                   <th className="p-2 border-r-2 border-black w-28 text-center">Month</th>
                   <th className="p-2 border-r-2 border-black text-center">Target (Lakh)</th>
@@ -757,12 +768,11 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                 {sheet.months.map((m, idx) => {
                   const achPercentStr = calcPercent(m.achievement, m.target);
                   const collPercentStr = calcPercent(m.actualCollection, m.collection);
-
                   return (
                     <React.Fragment key={m.month}>
                       <tr className="hover:bg-slate-50 transition-colors">
-                        <td className="p-1.5 border-r-2 border-black text-center font-black text-black">{idx + 1}</td>
-                        <td className="p-1.5 border-r-2 border-black font-black uppercase text-center">{m.month}</td>
+                        <td className="p-1.5 border-r-2 border-black text-center font-black text-black text-xs sm:text-[13px]">{idx + 1}</td>
+                        <td className="p-1.5 border-r-2 border-black font-black uppercase text-center text-xs sm:text-[13px]">{m.month}</td>
                         <td className="p-1 border-r-2 border-black">
                           <CellInput
                             value={m.target}
@@ -781,7 +791,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                             colorClass="text-blue-700"
                           />
                         </td>
-                        <td className="p-1.5 border-r-2 border-black text-center font-black font-mono">{achPercentStr}</td>
+                        <td className="p-1.5 border-r-2 border-black text-center font-black font-mono text-xs sm:text-[13px] text-slate-900">{achPercentStr}</td>
                         <td className="p-1 border-r-2 border-black">
                           <CellInput
                             value={m.collection}
@@ -800,12 +810,11 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                             colorClass="text-emerald-700"
                           />
                         </td>
-                        <td className="p-1.5 text-center font-black font-mono">{collPercentStr}</td>
+                        <td className="p-1.5 text-center font-black font-mono text-xs sm:text-[13px] text-slate-900">{collPercentStr}</td>
                       </tr>
-
                       {/* Render Quarter Subtotal Row */}
                       {(idx === 2 || idx === 5 || idx === 8 || idx === 11) && (
-                        <tr className="bg-amber-200/90 font-black text-black border-y-2 border-black">
+                        <tr className="bg-amber-200/90 font-black text-black border-y-2 border-black text-xs sm:text-[13px]">
                           <td colSpan={2} className="p-2 border-r-2 border-black text-center uppercase tracking-wider font-black">
                             {idx === 2 ? 'Q1' : idx === 5 ? 'Q2' : idx === 8 ? 'Q3' : 'Q4'} TOTAL
                           </td>
@@ -813,12 +822,12 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                             const q = idx === 2 ? Q1 : idx === 5 ? Q2 : idx === 8 ? Q3 : Q4;
                             return (
                               <>
-                                <td className="p-2 border-r-2 border-black text-center font-mono font-black">{formatAmount(q.target)}</td>
-                                <td className="p-2 border-r-2 border-black text-center font-mono text-blue-900 font-black">{formatAmount(q.achievement)}</td>
-                                <td className="p-2 border-r-2 border-black text-center font-mono font-black">{calcPercent(q.achievement, q.target)}</td>
-                                <td className="p-2 border-r-2 border-black text-center font-mono font-black">{formatAmount(q.collection)}</td>
-                                <td className="p-2 border-r-2 border-black text-center font-mono text-emerald-900 font-black">{formatAmount(q.actual)}</td>
-                                <td className="p-2 text-center font-mono font-black">{calcPercent(q.actual, q.collection)}</td>
+                                <td className="p-2 border-r-2 border-black text-center font-mono font-black text-xs sm:text-[13px]">{formatAmount(q.target)}</td>
+                                <td className="p-2 border-r-2 border-black text-center font-mono text-blue-900 font-black text-xs sm:text-[13px]">{formatAmount(q.achievement)}</td>
+                                <td className="p-2 border-r-2 border-black text-center font-mono font-black text-xs sm:text-[13px]">{calcPercent(q.achievement, q.target)}</td>
+                                <td className="p-2 border-r-2 border-black text-center font-mono font-black text-xs sm:text-[13px]">{formatAmount(q.collection)}</td>
+                                <td className="p-2 border-r-2 border-black text-center font-mono text-emerald-900 font-black text-xs sm:text-[13px]">{formatAmount(q.actual)}</td>
+                                <td className="p-2 text-center font-mono font-black text-xs sm:text-[13px]">{calcPercent(q.actual, q.collection)}</td>
                               </>
                             );
                           })()}
@@ -827,18 +836,17 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                     </React.Fragment>
                   );
                 })}
-
                 {/* Annual Grand Total Row */}
-                <tr className="bg-red-600 text-white font-black text-xs uppercase border-t-2 border-black">
+                <tr className="bg-red-600 text-white font-black text-xs sm:text-sm uppercase border-t-2 border-black">
                   <td colSpan={2} className="p-2.5 text-center tracking-tight border-r-2 border-black font-black">
                     Grand Total 2026-27
                   </td>
-                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black">{formatAmount(Total.target)}</td>
-                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black">{formatAmount(Total.achievement)}</td>
-                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black">{calcPercent(Total.achievement, Total.target)}</td>
-                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black">{formatAmount(Total.collection)}</td>
-                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black">{formatAmount(Total.actual)}</td>
-                  <td className="p-2.5 text-center font-mono font-black">{calcPercent(Total.actual, Total.collection)}</td>
+                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black text-xs sm:text-sm">{formatAmount(Total.target)}</td>
+                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black text-xs sm:text-sm">{formatAmount(Total.achievement)}</td>
+                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black text-xs sm:text-sm">{calcPercent(Total.achievement, Total.target)}</td>
+                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black text-xs sm:text-sm">{formatAmount(Total.collection)}</td>
+                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black text-xs sm:text-sm">{formatAmount(Total.actual)}</td>
+                  <td className="p-2.5 text-center font-mono font-black text-xs sm:text-sm">{calcPercent(Total.actual, Total.collection)}</td>
                 </tr>
               </tbody>
             </table>

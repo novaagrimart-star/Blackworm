@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { collection, query, onSnapshot, doc, setDoc, deleteDoc, getDocs, where } from 'firebase/firestore';
+import { collection, query, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { logAudit, syncOfficerDetailsEverywhere } from '../../lib/dataService';
-import { toTitleCase, cn } from '../../lib/utils';
+import { toTitleCase } from '../../lib/utils';
 import { compressImageFile } from '../../lib/imageCompression';
 import { Language, translations } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
@@ -43,9 +43,7 @@ import {
   Settings,
   ShieldCheck,
   ArrowLeft,
-  Clock,
-  AlertCircle,
-  RefreshCw
+  Clock
 } from 'lucide-react';
 
 export interface SystemModuleItem {
@@ -195,7 +193,6 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const [isEditing, setIsEditing] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showAccessList, setShowAccessList] = useState(false);
-  const [syncStatus, setSyncStatus] = useState<'online' | 'offline' | 'quota_hit'>('online');
 
   // Form State
   const [currentUid, setCurrentUid] = useState<string | null>(null);
@@ -261,57 +258,35 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
     }
   }, [viewMode]);
 
-  // Optimized User Data Fetching to save quota
+  // Real-time listener for all users
   useEffect(() => {
-    let active = true;
-
-    const fetchUsers = async () => {
-      try {
-        if (!isAdmin(profile)) {
-          // Non-admin: strictly fetch ONLY their own profile to save quota
-          const docSnap = await getDocs(query(collection(db, 'users'), where('uid', '==', profile.uid)));
-          if (!active) return;
-          const list: DetailedUserProfile[] = [];
-          docSnap.forEach((d: any) => {
-            list.push({ ...d.data() as DetailedUserProfile, uid: d.id });
-          });
-          if (list.length > 0) setUsers(list);
-          return;
+    const q = query(collection(db, 'users'));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const list: DetailedUserProfile[] = [];
+      snapshot.forEach((docSnap) => {
+        const u = docSnap.data() as DetailedUserProfile;
+        list.push({ ...u, uid: docSnap.id });
+      });
+      // Sort users: Owner (#1) first, followed by ascending user code number, then by full name
+      list.sort((a, b) => {
+        const aCode = (a.userCode ? String(a.userCode) : '').replace(/\D/g, '');
+        const bCode = (b.userCode ? String(b.userCode) : '').replace(/\D/g, '');
+        const aNum = parseInt(aCode, 10);
+        const bNum = parseInt(bCode, 10);
+        if (!isNaN(aNum) && !isNaN(bNum) && aNum !== bNum) {
+          return aNum - bNum;
         }
+        if (a.role === 'owner' && b.role !== 'owner') return -1;
+        if (b.role === 'owner' && a.role !== 'owner') return 1;
+        return (a.fullName || '').localeCompare(b.fullName || '');
+      });
 
-        // Admin: Fetch all users once (using getDocs instead of onSnapshot to save quota)
-        const snapshot = await getDocs(collection(db, 'users'));
-        if (!active) return;
-        const list: DetailedUserProfile[] = [];
-        snapshot.forEach((docSnap: any) => {
-          const u = docSnap.data() as DetailedUserProfile;
-          list.push({ ...u, uid: docSnap.id });
-        });
-        // Sort users: Owner (#1) first, followed by ascending user code number, then by full name
-        list.sort((a, b) => {
-          const aCode = (a.userCode ? String(a.userCode) : '').replace(/\D/g, '');
-          const bCode = (b.userCode ? String(b.userCode) : '').replace(/\D/g, '');
-          const aNum = parseInt(aCode, 10);
-          const bNum = parseInt(bCode, 10);
-          if (!isNaN(aNum) && !isNaN(bNum) && aNum !== bNum) {
-            return aNum - bNum;
-          }
-          if (a.role === 'owner' && b.role !== 'owner') return -1;
-          if (b.role === 'owner' && a.role !== 'owner') return 1;
-          return (a.fullName || '').localeCompare(b.fullName || '');
-        });
-        setUsers(list);
-        setSyncStatus('online');
-      } catch (error: any) {
-        console.error("Users fetch error:", error);
-        if (error.code === 'resource-exhausted') setSyncStatus('quota_hit');
-        else setSyncStatus('offline');
-      }
-    };
-
-    fetchUsers();
-    return () => { active = false; };
-  }, [profile.uid, profile.role]);
+      setUsers(list);
+    }, (error) => {
+      console.error("Users firestore error:", error);
+    });
+    return () => unsubscribe();
+  }, [profile]);
 
   // Auto-open own form for non-admin users so they immediately see only their own form
   useEffect(() => {
@@ -1027,35 +1002,6 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
           </div>
         </div>
       )}
-
-      {/* Sync Status Banner */}
-      <div className={cn(
-        "p-2.5 rounded-xl border text-[11px] flex items-center justify-between gap-2 no-print",
-        syncStatus === 'quota_hit' ? "bg-red-50 border-red-200 text-red-900" :
-        syncStatus === 'offline' ? "bg-amber-50 border-amber-200 text-amber-900" :
-        "bg-blue-50 border-blue-200 text-blue-900"
-      )}>
-        <div className="flex items-center gap-2">
-          <div className={cn(
-            "w-1.5 h-1.5 rounded-full",
-            syncStatus === 'quota_hit' ? "bg-red-600 animate-pulse" :
-            syncStatus === 'offline' ? "bg-amber-500 animate-pulse" :
-            "bg-blue-500"
-          )} />
-          <span className="font-bold">
-            {syncStatus === 'quota_hit' ? (
-              <span className="flex items-center gap-1.5"><AlertCircle className="w-3.5 h-3.5" /> Firestore Read Quota Exceeded. Some users may be missing until tomorrow.</span>
-            ) : syncStatus === 'offline' ? (
-              <span className="flex items-center gap-1.5"><RefreshCw className="w-3.5 h-3.5 animate-spin" /> Connection Lost. Working offline.</span>
-            ) : (
-              <span className="flex items-center gap-1.5"><CheckCircle2 className="w-3.5 h-3.5 text-blue-600" /> User database is synced.</span>
-            )}
-          </span>
-        </div>
-        <div className="text-[10px] font-black uppercase tracking-tighter opacity-50">
-          {syncStatus === 'online' ? '● Connected' : '○ Disconnected'}
-        </div>
-      </div>
 
       {/* Success notification */}
       {saveSuccess && (
