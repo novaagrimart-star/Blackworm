@@ -167,6 +167,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
   const [saving, setSaving] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+  const [downloadTimestamp, setDownloadTimestamp] = useState<string>('');
   const [isUserDropdownOpen, setIsUserDropdownOpen] = useState(false);
 
   // If not admin, lock selectedUserId to logged-in user profile
@@ -416,6 +417,11 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
 
       try {
         localStorage.setItem(`yearly_target_sheet_${cleanedSheet.userId}`, JSON.stringify(cleanedSheet));
+        // Permanent automated local backup before Firestore update
+        localStorage.setItem(`backup_yearly_target_${cleanedSheet.userId}`, JSON.stringify({
+          backupTimestamp: new Date().toISOString(),
+          sheet: cleanedSheet
+        }));
       } catch {}
       await setDoc(doc(db, 'yearly_targets', sheet.id), {
         ...cleanedSheet,
@@ -436,8 +442,13 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     if (!printableSheetRef.current) return;
     try {
       setIsGeneratingPdf(true);
-      // Wait a moment for React to render clean static spans instead of inputs
-      await new Promise(r => setTimeout(r, 120));
+      const now = new Date();
+      const dateStr = now.toLocaleDateString('en-GB'); // DD/MM/YYYY
+      const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+      setDownloadTimestamp(`${dateStr} ${timeStr}`);
+
+      // Wait a moment for React to render clean static spans and the timestamp footnote
+      await new Promise(r => setTimeout(r, 130));
 
       const element = printableSheetRef.current;
       
@@ -457,10 +468,25 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
         format: 'a4'
       });
 
-      const pdfWidth = pdf.internal.pageSize.getWidth();
-      const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
-      
-      pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, Math.min(pdfHeight, 297), undefined, 'FAST');
+      const pageWidth = 210;
+      const pageHeight = 297;
+      const marginX = 5; // 5mm balanced margin ensures right side is never cut off!
+      const marginY = 5;
+      const maxContentWidth = pageWidth - (marginX * 2); // 200 mm
+      const maxContentHeight = pageHeight - (marginY * 2); // 287 mm
+
+      let finalWidth = maxContentWidth;
+      let finalHeight = (canvas.height * finalWidth) / canvas.width;
+
+      if (finalHeight > maxContentHeight) {
+        finalHeight = maxContentHeight;
+        finalWidth = (canvas.width * finalHeight) / canvas.height;
+      }
+
+      const posX = (pageWidth - finalWidth) / 2;
+      const posY = marginY;
+
+      pdf.addImage(imgData, 'PNG', posX, posY, finalWidth, finalHeight, undefined, 'FAST');
       const sanitizedName = (sheet?.fullName ? `Target_Sheet_${sheet.fullName}` : 'Target_Sheet_2026_27').replace(/[^a-zA-Z0-9_-]/g, '_');
       pdf.save(`${sanitizedName}.pdf`);
     } catch (err: any) {
@@ -521,13 +547,13 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
         {/* User Selection & Actions: In a single line (flex-nowrap) on mobile, tablet, laptop, and monitor! */}
         <div className="flex items-center gap-1.5 sm:gap-2 flex-nowrap w-full sm:w-auto shrink-0">
           {userIsAdmin ? (
-            <div className="relative flex-1 sm:w-56 md:w-64 min-w-0">
+            <div className="relative flex-1 sm:w-60 md:w-72 min-w-0">
               <button
                 type="button"
                 onClick={() => setIsUserDropdownOpen(!isUserDropdownOpen)}
-                className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1.5 px-2 sm:px-2.5 rounded-lg text-left flex items-center justify-between gap-1 cursor-pointer hover:bg-slate-100 transition shadow-2xs min-w-0"
+                className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1.5 px-2.5 rounded-lg text-left flex items-center justify-between gap-1.5 cursor-pointer hover:bg-slate-100 transition shadow-2xs min-w-0"
               >
-                <div className="min-w-0 flex-1 flex items-center gap-1 truncate">
+                <div className="min-w-0 flex-1 flex items-center gap-1.5">
                   <span className="text-[10px] font-bold text-slate-500 uppercase shrink-0">
                     {selectedUser.role === 'owner' ? 'Owner:' : 'Officer:'}
                   </span>
@@ -546,7 +572,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               {isUserDropdownOpen && (
                 <>
                   <div className="fixed inset-0 z-40" onClick={() => setIsUserDropdownOpen(false)} />
-                  <div className="absolute right-0 sm:left-0 mt-1 w-64 sm:w-80 bg-white border border-slate-200 rounded-xl shadow-xl z-50 max-h-60 overflow-y-auto p-1 divide-y divide-slate-100">
+                  <div className="absolute right-0 sm:left-0 mt-1 w-max min-w-[280px] sm:min-w-[340px] max-w-[92vw] bg-white border border-slate-300 rounded-xl shadow-2xl z-50 max-h-72 overflow-y-auto p-1.5 divide-y divide-slate-100">
                     {users.map((u) => (
                       <div
                         key={u.uid}
@@ -555,11 +581,11 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                           setIsUserDropdownOpen(false);
                         }}
                         className={cn(
-                          "p-2 px-2.5 rounded-lg cursor-pointer transition flex items-center justify-between gap-2 whitespace-nowrap text-xs",
+                          "p-2 px-3 rounded-lg cursor-pointer transition flex items-center justify-between gap-3 text-xs sm:text-sm",
                           selectedUserId === u.uid ? "bg-blue-50 text-blue-900 font-bold" : "hover:bg-slate-50 text-slate-800 font-medium"
                         )}
                       >
-                        <span className="truncate">
+                        <span className="whitespace-normal break-words font-semibold">
                           {formatTitleCase(u.fullName || u.uid)}
                         </span>
                         {u.role === 'owner' && (
@@ -615,30 +641,35 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
       )}
 
       {/* Main Printable Document Layout */}
-      <div className="overflow-x-auto p-1.5 sm:p-3 bg-slate-100/70 rounded-2xl border border-slate-200">
-        <div 
-          ref={printableSheetRef}
-          className="w-[880px] min-w-[880px] mx-auto bg-white p-5 sm:p-6 shadow-sm border border-slate-300 rounded-xl font-sans text-slate-800 relative"
-          style={{ minHeight: '1080px' }}
-        >
-          {/* 1. Header with Company Logo & Details centered & balanced */}
-          <div className="border-b-2 border-slate-400 pb-3 pt-1">
-            <div className="flex items-center justify-center gap-4 sm:gap-6 max-w-[820px] mx-auto">
-              {/* Left Logo */}
-              <div className="w-20 h-20 shrink-0 flex items-center justify-center p-1 bg-white border border-slate-300 rounded-lg shadow-2xs">
-                {logoUrl ? (
-                  <img 
-                    src={logoUrl} 
-                    alt="Company Logo" 
-                    style={{ width: `${logoSize}px`, height: 'auto' }}
-                    className="object-contain max-h-20 max-w-full" 
-                  />
-                ) : (
-                  <div className="w-16 h-16 bg-slate-800 text-white flex items-center justify-center font-black text-xl rounded-lg shadow-sm">
-                    BW
-                  </div>
-                )}
-              </div>
+      <div className="overflow-x-auto p-2 sm:p-4 bg-slate-100/70 rounded-2xl border border-slate-200">
+        <div className="min-w-fit px-2 sm:px-4 py-2 inline-block">
+          <div 
+            ref={printableSheetRef}
+            className="w-[880px] min-w-[880px] bg-white p-5 sm:p-6 shadow-sm border-2 border-slate-300 rounded-xl font-sans text-slate-900 relative"
+            style={{ minHeight: '1080px' }}
+          >
+            {/* 1. Header with Company Logo & Details centered & balanced */}
+            <div className="border-b-2 border-slate-400 pb-3 pt-1">
+              <div className="flex items-center justify-center gap-5 sm:gap-7 max-w-[820px] mx-auto">
+                {/* Left Logo - NO BOX, NO BORDER, CLEAN SEAMLESS INTEGRATION */}
+                <div className="shrink-0 flex items-center justify-center p-0 bg-transparent border-0 shadow-none">
+                  {logoUrl ? (
+                    <img 
+                      src={logoUrl} 
+                      alt="Company Logo" 
+                      style={{ 
+                        width: `${logoSize || 85}px`, 
+                        height: 'auto',
+                        imageRendering: '-webkit-optimize-contrast'
+                      }}
+                      className="object-contain max-h-24 max-w-full drop-shadow-none" 
+                    />
+                  ) : (
+                    <div className="w-16 h-16 bg-slate-800 text-white flex items-center justify-center font-black text-xl rounded-lg shadow-sm">
+                      BW
+                    </div>
+                  )}
+                </div>
 
               {/* Company Info centered right next to the logo */}
               <div className="text-center space-y-1">
@@ -814,17 +845,17 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
 
           {/* 4. Target Data Table */}
           <div className="overflow-x-auto bg-white border-2 border-slate-400 rounded-lg shadow-2xs">
-            <table className="w-full text-left border-collapse text-xs sm:text-[13px]">
+            <table className="w-full text-left border-collapse text-xs sm:text-[13px] table-fixed min-w-[820px]">
               <thead>
                 <tr className="bg-slate-800 text-white font-bold uppercase text-center border-b-2 border-slate-400 text-xs sm:text-[12.5px]">
-                  <th className="p-2 border-r border-slate-400 whitespace-nowrap w-12 text-center">Sr.</th>
-                  <th className="p-2 border-r border-slate-400 whitespace-nowrap w-28 text-center">Month</th>
-                  <th className="p-2 border-r border-slate-400 whitespace-nowrap text-center">Target (Lakh)</th>
-                  <th className="p-2 border-r border-slate-400 whitespace-nowrap text-center">Achieve (Lakh)</th>
-                  <th className="p-2 border-r border-slate-400 whitespace-nowrap text-center">% Ach.</th>
-                  <th className="p-2 border-r border-slate-400 whitespace-nowrap text-center">Collection (Lakh)</th>
-                  <th className="p-2 border-r border-slate-400 whitespace-nowrap text-center">Actual Coll.</th>
-                  <th className="p-2 whitespace-nowrap text-center">% Coll.</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap w-[5%] text-center">Sr.</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap w-[15%] text-center">Month</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap w-[13%] text-center">Target (Lakh)</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap w-[13%] text-center">Achieve (Lakh)</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap w-[10%] text-center">% Ach.</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap w-[16%] text-center">Collection (Lakh)</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap w-[14%] text-center">Actual Coll.</th>
+                  <th className="p-2 whitespace-nowrap w-[14%] text-center">% Coll.</th>
                 </tr>
               </thead>
               <tbody className="text-slate-900 font-medium">
@@ -869,7 +900,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                             colorClass="text-emerald-900 font-bold"
                           />
                         </td>
-                        <td className="p-1.5 border-b border-slate-300 text-center font-bold font-mono text-xs sm:text-[13px] text-slate-900">{collPercentStr}</td>
+                        <td className="p-1.5 border-b border-slate-300 text-center font-bold font-mono text-xs sm:text-[13px] text-slate-900 px-2">{collPercentStr}</td>
                       </tr>
                       {/* Render Quarter Subtotal Row */}
                       {(idx === 2 || idx === 5 || idx === 8 || idx === 11) && (
@@ -886,7 +917,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                                 <td className="p-2 border-r border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{calcPercent(q.achievement, q.target)}</td>
                                 <td className="p-2 border-r border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{formatAmount(q.collection)}</td>
                                 <td className="p-2 border-r border-b border-slate-400 text-center font-mono text-emerald-900 font-extrabold text-xs sm:text-[13px]">{formatAmount(q.actual)}</td>
-                                <td className="p-2 border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{calcPercent(q.actual, q.collection)}</td>
+                                <td className="p-2 border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px] px-2">{calcPercent(q.actual, q.collection)}</td>
                               </>
                             );
                           })()}
@@ -905,7 +936,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                   <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{calcPercent(Total.achievement, Total.target)}</td>
                   <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.collection)}</td>
                   <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.actual)}</td>
-                  <td className="p-2.5 text-center font-mono font-extrabold text-xs sm:text-sm">{calcPercent(Total.actual, Total.collection)}</td>
+                  <td className="p-2.5 text-center font-mono font-extrabold text-xs sm:text-sm px-2">{calcPercent(Total.actual, Total.collection)}</td>
                 </tr>
               </tbody>
             </table>
@@ -922,8 +953,15 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               <div className="border-t-2 border-dashed border-slate-400 w-52 mx-auto" />
             </div>
           </div>
+
+          {/* Direct Timestamp Footnote - Printed cleanly without any placeholder box or border */}
+          <div className="mt-8 pt-3 border-t border-slate-300 flex items-center justify-between text-[10.5px] font-mono font-bold text-slate-600 select-text">
+            <span>OFFICIAL RECORD &bull; BLACKWORM AGRITECH PVT LTD</span>
+            <span>Generated on: {downloadTimestamp || (new Date().toLocaleDateString('en-GB') + ' ' + new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }))}</span>
+          </div>
         </div>
       </div>
     </div>
-  );
+  </div>
+);
 };

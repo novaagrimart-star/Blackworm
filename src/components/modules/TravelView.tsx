@@ -704,7 +704,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
               {isUserDropdownOpen && (
                 <>
                   <div className="fixed inset-0 z-40" onClick={() => setIsUserDropdownOpen(false)} />
-                  <div className="absolute left-0 mt-1 w-full sm:w-72 bg-white border border-slate-200 rounded-xl shadow-xl z-50 max-h-60 overflow-y-auto p-1 divide-y divide-slate-100">
+                  <div className="absolute left-0 mt-1 w-max min-w-[260px] sm:min-w-[320px] max-w-[90vw] bg-white border border-slate-300 rounded-xl shadow-2xl z-50 max-h-72 overflow-y-auto p-1.5 divide-y divide-slate-100">
                     {users.map((u) => (
                       <div
                         key={u.uid}
@@ -713,12 +713,12 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                           setIsUserDropdownOpen(false);
                         }}
                         className={cn(
-                          "p-1.5 px-2 rounded-lg cursor-pointer transition flex flex-col",
-                          selectedUserId === u.uid ? "bg-red-50 text-red-900" : "hover:bg-slate-50 text-slate-800"
+                          "p-2 px-2.5 rounded-lg cursor-pointer transition flex flex-col gap-0.5",
+                          selectedUserId === u.uid ? "bg-blue-50 text-blue-900" : "hover:bg-slate-50 text-slate-800"
                         )}
                       >
-                        <span className="text-xs font-black text-slate-900 truncate">{u.fullName || u.uid}</span>
-                        <span className="text-[9.5px] font-bold text-slate-500 uppercase">
+                        <span className="text-xs font-bold text-slate-900 whitespace-normal break-words">{u.fullName || u.uid}</span>
+                        <span className="text-[9.5px] font-semibold text-slate-500 uppercase">
                           {u.designation || u.role}
                         </span>
                       </div>
