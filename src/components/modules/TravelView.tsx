@@ -129,7 +129,18 @@ export const generateMonthRows = (
 export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const t = translations[lang];
   const userIsAdmin = isAdmin(profile);
-  const [users, setUsers] = useState<UserProfile[]>([]);
+  const [users, setUsers] = useState<UserProfile[]>(() => {
+    try {
+      const cached = localStorage.getItem('blackworm_cached_users');
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed)) {
+          return parsed.filter((u: any) => u.role !== 'owner');
+        }
+      }
+    } catch {}
+    return [];
+  });
   const [selectedUserId, setSelectedUserId] = useState<string>(() => {
     if (profile.role === 'owner') {
       try {
@@ -683,46 +694,69 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
         <div className="flex flex-wrap items-center gap-2">
           {/* User Selector: Dropdown for Admin, Locked Badge for Non-Admin */}
           {userIsAdmin ? (
-            <div className="relative w-48 sm:w-60">
+            <div className="relative flex-1 min-w-[130px] sm:w-60">
               <button
                 type="button"
                 onClick={() => setIsUserDropdownOpen(!isUserDropdownOpen)}
-                className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1 px-2.5 rounded-lg text-left flex items-center justify-between gap-1.5 cursor-pointer hover:bg-slate-100 transition shadow-2xs"
+                className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1.5 px-2 xs:px-2.5 rounded-lg text-left flex items-center justify-between gap-1.5 cursor-pointer hover:bg-slate-100 transition shadow-2xs min-w-0"
               >
-                <div className="min-w-0 flex-1 flex items-baseline gap-1.5 truncate">
-                  <UserIcon className="w-3 h-3 text-slate-400 shrink-0" />
-                  <span className="text-xs font-black text-slate-900 truncate">
+                <div className="min-w-0 flex-1 flex items-center gap-1.5">
+                  <UserIcon className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                  <span className="text-[11px] xs:text-xs font-bold text-slate-900 leading-tight break-words line-clamp-1 flex-1">
                     {users.find(u => u.uid === selectedUserId)?.fullName || (profile.role !== 'owner' ? profile.fullName : 'अधिकारी निवडा')}
                   </span>
-                  <span className="text-[9px] font-bold text-slate-500 uppercase shrink-0">
-                    {users.find(u => u.uid === selectedUserId)?.designation || users.find(u => u.uid === selectedUserId)?.role || (profile.role !== 'owner' ? profile.designation : 'FIELD OFFICER')}
-                  </span>
                 </div>
-                <ChevronDown className="w-3 h-3 text-slate-400 shrink-0" />
+                <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
               </button>
 
               {isUserDropdownOpen && (
                 <>
-                  <div className="fixed inset-0 z-40" onClick={() => setIsUserDropdownOpen(false)} />
-                  <div className="absolute left-0 mt-1 w-max min-w-[260px] sm:min-w-[320px] max-w-[90vw] bg-white border border-slate-300 rounded-xl shadow-2xl z-50 max-h-72 overflow-y-auto p-1.5 divide-y divide-slate-100">
-                    {users.map((u) => (
-                      <div
-                        key={u.uid}
-                        onClick={() => {
-                          setSelectedUserId(u.uid);
-                          setIsUserDropdownOpen(false);
-                        }}
-                        className={cn(
-                          "p-2 px-2.5 rounded-lg cursor-pointer transition flex flex-col gap-0.5",
-                          selectedUserId === u.uid ? "bg-blue-50 text-blue-900" : "hover:bg-slate-50 text-slate-800"
-                        )}
-                      >
-                        <span className="text-xs font-bold text-slate-900 whitespace-normal break-words">{u.fullName || u.uid}</span>
-                        <span className="text-[9.5px] font-semibold text-slate-500 uppercase">
-                          {u.designation || u.role}
+                  <div 
+                    className="fixed inset-0 z-[90] bg-black/40 backdrop-blur-xs transition-opacity" 
+                    onClick={() => setIsUserDropdownOpen(false)} 
+                  />
+                  <div className="fixed left-3 right-3 top-28 sm:top-auto sm:left-0 sm:right-auto sm:absolute sm:mt-1 sm:w-80 md:w-96 z-[100] bg-white border border-slate-300 rounded-2xl shadow-2xl overflow-hidden ring-1 ring-black/10">
+                    <div className="p-3 bg-slate-100 border-b border-slate-200 flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <UserIcon className="w-4 h-4 text-slate-700" />
+                        <span className="text-xs font-bold text-slate-800 uppercase tracking-wide">
+                          अधिकारी निवडा ({users.length})
                         </span>
                       </div>
-                    ))}
+                      <button 
+                        type="button" 
+                        onClick={() => setIsUserDropdownOpen(false)} 
+                        className="p-1 rounded-lg text-slate-500 hover:text-slate-800 hover:bg-slate-200 cursor-pointer"
+                        title="Close"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+
+                    <div className="max-h-64 sm:max-h-80 overflow-y-auto p-1.5 divide-y divide-slate-100">
+                      {users.map((u) => (
+                        <div
+                          key={u.uid}
+                          onClick={() => {
+                            setSelectedUserId(u.uid);
+                            setIsUserDropdownOpen(false);
+                          }}
+                          className={cn(
+                            "p-2.5 px-3 rounded-xl cursor-pointer transition flex items-center justify-between gap-3 text-xs sm:text-sm",
+                            selectedUserId === u.uid 
+                              ? "bg-blue-50 text-blue-900 font-bold border border-blue-200" 
+                              : "hover:bg-slate-50 text-slate-800 font-medium"
+                          )}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <p className="font-bold text-slate-900 whitespace-normal break-words">{u.fullName || u.uid}</p>
+                            <p className="text-[10px] text-slate-500 uppercase mt-0.5">
+                              {u.designation || u.role || 'FIELD OFFICER'}
+                            </p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </>
               )}

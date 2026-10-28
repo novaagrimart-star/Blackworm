@@ -4,7 +4,8 @@ import {
   query, 
   onSnapshot, 
   doc, 
-  setDoc
+  setDoc,
+  getDoc
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
@@ -30,7 +31,10 @@ import {
   Download,
   Loader2,
   Phone,
-  Mail
+  Mail,
+  RefreshCw,
+  X,
+  User as UserIcon
 } from 'lucide-react';
 
 export const formatTitleCase = (str: string | undefined | null): string => {
@@ -169,6 +173,53 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
   const [downloadTimestamp, setDownloadTimestamp] = useState<string>('');
   const [isUserDropdownOpen, setIsUserDropdownOpen] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [syncKey, setSyncKey] = useState(0);
+  const lastSyncRef = useRef<number>(Date.now());
+
+  // Failsafe: Never allow full-page loading spinner to stay stuck indefinitely
+  useEffect(() => {
+    if (loading) {
+      const timer = setTimeout(() => {
+        setLoading(false);
+      }, 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [loading]);
+
+  // Manual refresh that forces instant server pull without wiping UI data
+  const handleManualRefresh = async () => {
+    try {
+      setRefreshing(true);
+      lastSyncRef.current = Date.now();
+      // Increment syncKey to trigger clean re-fetch from Firestore server
+      setSyncKey(prev => prev + 1);
+    } catch {
+      // ignore
+    } finally {
+      setTimeout(() => setRefreshing(false), 700);
+    }
+  };
+
+  // Auto-refresh when app comes to foreground or window gains focus (debounced to avoid loop)
+  useEffect(() => {
+    const handleFocus = () => {
+      if (document.visibilityState === 'visible') {
+        const now = Date.now();
+        // Only re-sync if at least 15 seconds have passed since last sync to prevent infinite loops
+        if (now - lastSyncRef.current > 15000) {
+          lastSyncRef.current = now;
+          setSyncKey(prev => prev + 1);
+        }
+      }
+    };
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleFocus);
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleFocus);
+    };
+  }, []);
 
   // If not admin, lock selectedUserId to logged-in user profile
   useEffect(() => {
@@ -192,7 +243,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
   // Fetch users for dropdown with cache synchronization
   useEffect(() => {
     const q = query(collection(db, 'users'));
-    const unsub = onSnapshot(q, (snap) => {
+    const unsub = onSnapshot(q, { includeMetadataChanges: true }, (snap) => {
       const list: UserProfile[] = [];
       snap.forEach(d => list.push({ ...d.data(), uid: d.id } as UserProfile));
       list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
@@ -204,18 +255,44 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
       handleFirestoreError(error, OperationType.LIST, 'users');
     });
     return () => unsub();
-  }, []);
+  }, [syncKey]);
 
-  // Fetch or init sheet for selected user
+  // Fetch or init sheet for selected user with 0ms instant cache resolution & live real-time sync
   useEffect(() => {
-    setLoading(true);
     const selectedUser = users.find(u => u.uid === selectedUserId) || profile;
     const isOwner = selectedUser.role === 'owner';
+
+    // 1. Instant 0ms read from cache for this specific selected user (eliminates loading wait)
+    if (!sheet || sheet.userId !== selectedUserId) {
+      if (!isOwner) {
+        try {
+          const cached = localStorage.getItem(`yearly_target_sheet_${selectedUserId}`);
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (parsed && Array.isArray(parsed.months) && parsed.months.length > 0) {
+              setYearlySheet(parsed);
+              setLoading(false);
+            } else {
+              setLoading(true);
+            }
+          } else {
+            setLoading(true);
+          }
+        } catch {
+          setLoading(true);
+        }
+      } else {
+        setLoading(true);
+      }
+    } else {
+      // Sheet already in state for selected user - keep it visible without full-screen loading flash
+      setLoading(false);
+    }
 
     if (isOwner) {
       // Aggregation logic for owner - strictly decimal/cents precision
       const q = query(collection(db, 'yearly_targets'));
-      const unsub = onSnapshot(q, (snap) => {
+      const unsub = onSnapshot(q, { includeMetadataChanges: true }, (snap) => {
         const allSheets: YearlySheet[] = [];
         snap.forEach(d => {
           const data = d.data() as YearlySheet;
@@ -265,12 +342,14 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
         setLoading(false);
       }, (error) => {
         handleFirestoreError(error, OperationType.LIST, 'yearly_targets');
+        setLoading(false);
+        setRefreshing(false);
       });
       return () => unsub();
     } else {
-      // Regular fetching for individual users
+      // Regular fetching for individual users with real-time metadata changes
       const sheetId = `yearly_${selectedUserId}_2026_27`;
-      const unsub = onSnapshot(doc(db, 'yearly_targets', sheetId), (docSnap) => {
+      const unsub = onSnapshot(doc(db, 'yearly_targets', sheetId), { includeMetadataChanges: true }, (docSnap) => {
         if (docSnap.exists()) {
           const data = docSnap.data() as YearlySheet;
           // Normalize and clean all numbers to 2 decimal places using toDecimal2
@@ -326,12 +405,15 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
           setYearlySheet(newSheet);
         }
         setLoading(false);
+        setRefreshing(false);
       }, (error) => {
         handleFirestoreError(error, OperationType.GET, `yearly_targets/${sheetId}`);
+        setLoading(false);
+        setRefreshing(false);
       });
       return () => unsub();
     }
-  }, [selectedUserId, users, profile]);
+  }, [selectedUserId, users, profile, syncKey]);
 
   const updateSheet = (updates: Partial<YearlySheet>) => {
     if (!sheet) return;
@@ -497,14 +579,22 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     }
   };
 
-  if (loading) {
+  if (loading && !sheet) {
     return (
-      <div className="flex justify-center p-12">
-        <div className="w-8 h-8 border-4 border-slate-700 border-t-transparent rounded-full animate-spin" />
+      <div className="flex flex-col items-center justify-center p-12 bg-white rounded-2xl border border-slate-200 shadow-xs">
+        <div className="w-8 h-8 border-4 border-slate-700 border-t-transparent rounded-full animate-spin mb-3" />
+        <p className="text-slate-600 font-bold text-xs sm:text-sm">टार्गेट शीट डेटा लोड होत आहे...</p>
       </div>
     );
   }
-  if (!sheet) return null;
+  if (!sheet) {
+    return (
+      <div className="flex flex-col items-center justify-center p-12 bg-white rounded-2xl border border-slate-200 shadow-xs">
+        <div className="w-8 h-8 border-4 border-slate-700 border-t-transparent rounded-full animate-spin mb-3" />
+        <p className="text-slate-600 font-bold text-xs sm:text-sm">टार्गेट शीट तयार होत आहे...</p>
+      </div>
+    );
+  }
 
   const calculateQuarter = (mIndexes: number[]) => {
     const qMonths = mIndexes.map(i => sheet.months[i] || { target: 0, achievement: 0, collection: 0, actualCollection: 0 });
@@ -532,9 +622,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
   return (
     <div className="space-y-4 font-sans pb-12">
       {/* Top Action Toolbar */}
-      <div className="bg-white p-2.5 sm:p-4 rounded-xl border border-slate-200 shadow-xs print:hidden space-y-2.5 sm:space-y-0 sm:flex sm:items-center sm:justify-between sm:gap-3">
+      <div className="bg-white p-2 xs:p-2.5 sm:p-4 rounded-xl border border-slate-200 shadow-xs print:hidden space-y-2.5 sm:space-y-0 sm:flex sm:items-center sm:justify-between sm:gap-3">
         {/* Title area */}
-        <div className="flex items-center gap-2.5 min-w-0">
+        <div className="flex items-center gap-2 xs:gap-2.5 min-w-0">
           <div className="p-1.5 sm:p-2 bg-slate-100 text-slate-700 border border-slate-200 rounded-lg shrink-0">
             <Target className="w-4 h-4 sm:w-5 sm:h-5 text-slate-700" />
           </div>
@@ -545,19 +635,19 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
         </div>
 
         {/* User Selection & Actions: In a single line (flex-nowrap) on mobile, tablet, laptop, and monitor! */}
-        <div className="flex items-center gap-1.5 sm:gap-2 flex-nowrap w-full sm:w-auto shrink-0">
+        <div className="flex items-center gap-1 xs:gap-1.5 sm:gap-2 flex-nowrap w-full sm:w-auto shrink-0">
           {userIsAdmin ? (
-            <div className="relative flex-1 sm:w-60 md:w-72 min-w-0">
+            <div className="relative flex-1 min-w-[120px] xs:min-w-[140px] sm:w-60 md:w-72">
               <button
                 type="button"
                 onClick={() => setIsUserDropdownOpen(!isUserDropdownOpen)}
-                className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1.5 px-2.5 rounded-lg text-left flex items-center justify-between gap-1.5 cursor-pointer hover:bg-slate-100 transition shadow-2xs min-w-0"
+                className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1.5 px-2 xs:px-2.5 rounded-lg text-left flex items-center justify-between gap-1 xs:gap-1.5 cursor-pointer hover:bg-slate-100 transition shadow-2xs min-w-0"
               >
-                <div className="min-w-0 flex-1 flex items-center gap-1.5">
+                <div className="min-w-0 flex-1 flex items-center gap-1 xs:gap-1.5">
                   <span className="text-[10px] font-bold text-slate-500 uppercase shrink-0">
                     {selectedUser.role === 'owner' ? 'Owner:' : 'Officer:'}
                   </span>
-                  <span className="text-xs font-bold text-slate-900 truncate">
+                  <span className="text-[11px] xs:text-xs sm:text-sm font-bold text-slate-900 leading-tight text-left break-words line-clamp-1 flex-1">
                     {formatTitleCase(selectedUser.fullName || selectedUser.uid)}
                   </span>
                   {selectedUser.role === 'owner' && (
@@ -571,48 +661,92 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
 
               {isUserDropdownOpen && (
                 <>
-                  <div className="fixed inset-0 z-40" onClick={() => setIsUserDropdownOpen(false)} />
-                  <div className="absolute right-0 sm:left-0 mt-1 w-max min-w-[280px] sm:min-w-[340px] max-w-[92vw] bg-white border border-slate-300 rounded-xl shadow-2xl z-50 max-h-72 overflow-y-auto p-1.5 divide-y divide-slate-100">
-                    {users.map((u) => (
-                      <div
-                        key={u.uid}
-                        onClick={() => {
-                          setSelectedUserId(u.uid);
-                          setIsUserDropdownOpen(false);
-                        }}
-                        className={cn(
-                          "p-2 px-3 rounded-lg cursor-pointer transition flex items-center justify-between gap-3 text-xs sm:text-sm",
-                          selectedUserId === u.uid ? "bg-blue-50 text-blue-900 font-bold" : "hover:bg-slate-50 text-slate-800 font-medium"
-                        )}
-                      >
-                        <span className="whitespace-normal break-words font-semibold">
-                          {formatTitleCase(u.fullName || u.uid)}
+                  {/* Backdrop with dark blur overlay to completely prevent overlap with background data table */}
+                  <div 
+                    className="fixed inset-0 z-[90] bg-black/40 backdrop-blur-xs transition-opacity" 
+                    onClick={() => setIsUserDropdownOpen(false)} 
+                  />
+                  {/* Responsive Dropdown: on mobile fixed with side margins (left-3 right-3), on desktop absolute under button */}
+                  <div className="fixed left-3 right-3 top-28 sm:top-auto sm:left-0 sm:right-auto sm:absolute sm:mt-1 sm:w-80 md:w-96 z-[100] bg-white border border-slate-300 rounded-2xl shadow-2xl overflow-hidden ring-1 ring-black/10">
+                    {/* Header */}
+                    <div className="p-3 bg-slate-100 border-b border-slate-200 flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <UserIcon className="w-4 h-4 text-slate-700" />
+                        <span className="text-xs font-bold text-slate-800 uppercase tracking-wide">
+                          अधिकारी / Owner निवडा ({users.length})
                         </span>
-                        {u.role === 'owner' && (
-                          <span className="text-[10px] font-bold text-slate-600 uppercase shrink-0 bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded">
-                            Owner (Total)
-                          </span>
-                        )}
                       </div>
-                    ))}
+                      <button 
+                        type="button" 
+                        onClick={() => setIsUserDropdownOpen(false)} 
+                        className="p-1 rounded-lg text-slate-500 hover:text-slate-800 hover:bg-slate-200 cursor-pointer"
+                        title="Close"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+
+                    {/* Officer list */}
+                    <div className="max-h-64 sm:max-h-80 overflow-y-auto p-1.5 divide-y divide-slate-100">
+                      {users.map((u) => (
+                        <div
+                          key={u.uid}
+                          onClick={() => {
+                            setSelectedUserId(u.uid);
+                            setIsUserDropdownOpen(false);
+                          }}
+                          className={cn(
+                            "p-2.5 px-3 rounded-xl cursor-pointer transition flex items-center justify-between gap-3 text-xs sm:text-sm",
+                            selectedUserId === u.uid 
+                              ? "bg-blue-50 text-blue-900 font-bold border border-blue-200" 
+                              : "hover:bg-slate-50 text-slate-800 font-medium"
+                          )}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <p className="font-bold text-slate-900 whitespace-normal break-words leading-snug">
+                              {formatTitleCase(u.fullName || u.uid)}
+                            </p>
+                            <p className="text-[10px] text-slate-500 uppercase mt-0.5">
+                              {u.designation || u.role || 'FIELD OFFICER'}
+                            </p>
+                          </div>
+                          {u.role === 'owner' && (
+                            <span className="text-[10px] font-bold text-slate-700 uppercase shrink-0 bg-slate-200 px-2 py-0.5 rounded-md">
+                              Owner (Total)
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </>
               )}
             </div>
           ) : (
-            <div className="flex-1 sm:w-auto min-w-0 bg-slate-50 border border-slate-300 py-1.5 px-2.5 rounded-lg flex items-center gap-1.5 truncate">
+            <div className="flex-1 min-w-[120px] xs:min-w-[140px] sm:w-auto bg-slate-50 border border-slate-300 py-1.5 px-2 xs:px-2.5 rounded-lg flex items-center gap-1.5">
               <span className="text-[10px] font-bold text-slate-500 uppercase shrink-0">Officer:</span>
-              <span className="text-xs font-bold text-slate-900 truncate">
+              <span className="text-[11px] xs:text-xs sm:text-sm font-bold text-slate-900 leading-tight break-words line-clamp-1">
                 {formatTitleCase(selectedUser.fullName || selectedUser.uid)}
               </span>
             </div>
           )}
 
+          {/* Live Sync / Refresh Live Data Button */}
+          <button
+            onClick={handleManualRefresh}
+            disabled={refreshing}
+            className="shrink-0 flex items-center justify-center gap-1 p-1.5 xs:px-2.5 sm:px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-300 rounded-lg text-xs font-bold transition shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer"
+            title="Refresh latest live data from server"
+          >
+            <RefreshCw className={cn("w-3.5 h-3.5 text-slate-700", refreshing && "animate-spin text-blue-600")} />
+            <span className="hidden xs:inline">{refreshing ? 'Syncing...' : 'Refresh'}</span>
+          </button>
+
           {!isOwnerView && (
             <button
               onClick={handleSave}
               disabled={saving}
-              className="shrink-0 flex items-center gap-1 px-2.5 sm:px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition shadow-2xs disabled:opacity-50 cursor-pointer active:scale-95 whitespace-nowrap"
+              className="shrink-0 flex items-center justify-center gap-1 p-1.5 xs:px-2.5 sm:px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition shadow-2xs disabled:opacity-50 cursor-pointer active:scale-95 whitespace-nowrap"
               title="Save Changes"
             >
               {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
@@ -624,7 +758,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
           <button
             onClick={handleDownloadPdf}
             disabled={isGeneratingPdf}
-            className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold transition shadow-2xs disabled:opacity-50 cursor-pointer active:scale-95 whitespace-nowrap"
+            className="shrink-0 flex items-center justify-center gap-1 px-2.5 xs:px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold transition shadow-2xs disabled:opacity-50 cursor-pointer active:scale-95 whitespace-nowrap"
             title="Download PDF"
           >
             {isGeneratingPdf ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
@@ -718,8 +852,8 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                 <span className="font-extrabold text-slate-800 w-24 shrink-0 px-2.5 tracking-tight whitespace-nowrap">
                   {isOwnerView ? 'Owner -' : 'Officer -'}
                 </span>
-                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center px-1">
-                  <span className="w-full font-extrabold text-slate-950 text-center block text-xs sm:text-[13px] whitespace-nowrap overflow-hidden text-ellipsis">
+                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center justify-center px-1.5 py-1">
+                  <span className="w-full font-extrabold text-slate-950 text-center block text-[11px] sm:text-[13px] leading-tight break-words">
                     {formatTitleCase(selectedUser.fullName || sheet.fullName)}
                   </span>
                 </div>
@@ -727,8 +861,8 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
 
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
                 <span className="font-extrabold text-slate-800 w-24 shrink-0 px-2.5 tracking-tight whitespace-nowrap">Center (HQ) -</span>
-                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center px-1">
-                  <span className="w-full font-bold text-slate-900 text-center block text-xs sm:text-[13px] whitespace-nowrap overflow-hidden text-ellipsis">
+                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center justify-center px-1.5 py-1">
+                  <span className="w-full font-bold text-slate-900 text-center block text-[11px] sm:text-[13px] leading-tight break-words">
                     {isOwnerView ? 'All Centers' : (selectedUser.center || sheet.center || '-')}
                   </span>
                 </div>
