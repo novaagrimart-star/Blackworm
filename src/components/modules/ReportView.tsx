@@ -106,7 +106,14 @@ export function buildReportRows(
     if (s._id) travelMap.set(s._id, s);
     if (s.id) travelMap.set(s.id, s);
     if (s.userId && s.monthKey) travelMap.set(`${s.userId}_${s.monthKey}`, s);
-    if (s.userId) travelMap.set(s.userId, s);
+    if (s.userId && s.yearNumber && s.monthName) {
+      travelMap.set(`${s.userId}_${s.yearNumber}_${s.monthName.toLowerCase()}`, s);
+    }
+    const isCurrentMonth = (s.monthName && s.monthName.toLowerCase() === targetMonthName.toLowerCase()) ||
+                           (s.id && s.id.includes(sheetMonthKey));
+    if (s.userId && (isCurrentMonth || !travelMap.has(s.userId))) {
+      travelMap.set(s.userId, s);
+    }
   });
 
   const yearlyTargetMap = new Map<string, any>();
@@ -123,12 +130,36 @@ export function buildReportRows(
 
   return officers.map((officer, i) => {
     const travelSheetId = `travel_${officer.uid}_${sheetMonthKey}`;
-    const travelData = travelMap.get(travelSheetId) || travelMap.get(`${officer.uid}_${sheetMonthKey}`) || travelMap.get(officer.uid);
+    let travelData = travelMap.get(travelSheetId) || 
+                     travelMap.get(`${officer.uid}_${sheetMonthKey}`) ||
+                     travelMap.get(`${officer.uid}_${parseDateKeys(selectedDate).year}_${targetMonthName.toLowerCase()}`);
+
+    if (!travelData && officer.loginId) {
+      travelData = travelMap.get(`travel_${officer.loginId}_${sheetMonthKey}`) || 
+                   travelMap.get(`${officer.loginId}_${sheetMonthKey}`);
+    }
+
+    if (!travelData) {
+      try {
+        const cachedLocal = localStorage.getItem(`travel_sheet_${officer.uid}_${sheetMonthKey}`) ||
+                            (officer.loginId ? localStorage.getItem(`travel_sheet_${officer.loginId}_${sheetMonthKey}`) : null) ||
+                            localStorage.getItem(`travel_sheet_${officer.uid}`);
+        if (cachedLocal) {
+          travelData = JSON.parse(cachedLocal);
+        }
+      } catch (e) {}
+    }
+
+    if (!travelData) {
+      travelData = travelMap.get(officer.uid);
+    }
     
     let route = '-', openingKm = 0, closingKm = 0, dailyExpense = 0, recordedKm = 0;
-    if (travelData && travelData.rows) {
+    if (travelData && Array.isArray(travelData.rows)) {
       const dayRow = travelData.rows.find((r: any) => 
-        Number(r.dayNumber) === dayOfMonth || r.date === selectedDate
+        Number(r.dayNumber) === dayOfMonth || 
+        r.date === selectedDate ||
+        (r.date && r.date.startsWith(selectedDate))
       );
       if (dayRow) {
         route = (dayRow.route || '').trim() || '-';
@@ -144,7 +175,8 @@ export function buildReportRows(
         return (
           d.collectedByUid === officer.uid ||
           d.userId === officer.uid ||
-          (d.loginId && officer.loginId && d.loginId.toLowerCase() === officer.loginId.toLowerCase())
+          (d.loginId && officer.loginId && d.loginId.toLowerCase() === officer.loginId.toLowerCase()) ||
+          (d.collectedByName && officer.fullName && d.collectedByName.trim().toLowerCase() === officer.fullName.trim().toLowerCase())
         );
       })
       .reduce((acc: number, d: any) => acc + (Number(d.amount) || 0), 0);
@@ -185,16 +217,44 @@ export function buildReportRows(
   });
 }
 
+function getInitialCachedUsers(): UserProfile[] {
+  try {
+    const raw = localStorage.getItem('blackworm_cached_users');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+    if (reportStaticCache && reportStaticCache.users && reportStaticCache.users.length > 0) {
+      return reportStaticCache.users;
+    }
+  } catch (e) {}
+  return [];
+}
+
+function getInitialCachedTravel(): any[] {
+  try {
+    const raw = localStorage.getItem('blackworm_cached_travel_sheets');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+    if (reportStaticCache && reportStaticCache.travelSheets) {
+      return reportStaticCache.travelSheets;
+    }
+  } catch (e) {}
+  return [];
+}
+
 export const ReportView: React.FC<Props> = ({ profile }) => {
   const todayDate = new Date().toISOString().slice(0, 10);
   const [selectedDate, setSelectedDate] = useState(todayDate);
   const printableSheetRef = useRef<HTMLDivElement>(null);
 
-  // In-memory collections state for live reactive updates
-  const usersRef = useRef<UserProfile[]>([]);
-  const travelRef = useRef<any[]>([]);
-  const targetsRef = useRef<any[]>([]);
-  const oldTargetsRef = useRef<any[]>([]);
+  // In-memory collections state for live reactive updates with immediate cache pre-fill
+  const usersRef = useRef<UserProfile[]>(getInitialCachedUsers());
+  const travelRef = useRef<any[]>(getInitialCachedTravel());
+  const targetsRef = useRef<any[]>(reportStaticCache?.yearlyTargets || []);
+  const oldTargetsRef = useRef<any[]>(reportStaticCache?.targets || []);
   const collDocsRef = useRef<any[]>([]);
 
   // Instant Initial State: Read immediately from localStorage or memory cache (0ms latency!)
@@ -208,12 +268,13 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
             return parsed;
           }
         }
-        if (reportStaticCache && reportStaticCache.users.length > 0) {
+        const cachedUsers = getInitialCachedUsers();
+        if (cachedUsers.length > 0) {
           return buildReportRows(
-            reportStaticCache.users,
-            reportStaticCache.travelSheets,
-            reportStaticCache.yearlyTargets,
-            reportStaticCache.targets,
+            cachedUsers,
+            getInitialCachedTravel(),
+            reportStaticCache?.yearlyTargets || [],
+            reportStaticCache?.targets || [],
             [],
             todayDate,
             profile
@@ -247,25 +308,44 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
     } catch (e) {}
   };
 
-  // Real-Time Live Sync Listeners across devices (zero manual refresh required!)
+  // Recompute rows whenever selectedDate changes
+  useEffect(() => {
+    recomputeLiveReport();
+  }, [selectedDate]);
+
+  // Master Background Sync: Users, Travel Sheets, Yearly Targets (Only mounted once, zero duplicate reads on date switch!)
   useEffect(() => {
     const userIsAdmin = isAdmin(profile);
 
-    // 1. Live Users Listener
+    // 1. Live Users Listener (Cached immediately)
     const qUsers = query(collection(db, 'users'));
     const unsubUsers = onSnapshot(qUsers, (snap) => {
-      usersRef.current = snap.docs.map(d => ({ ...d.data(), uid: d.id } as UserProfile));
+      const uList = snap.docs.map(d => ({ ...d.data(), uid: d.id } as UserProfile));
+      usersRef.current = uList;
+      try {
+        localStorage.setItem('blackworm_cached_users', JSON.stringify(uList));
+      } catch (e) {}
       recomputeLiveReport();
-    }, (err) => console.warn('Users live sync error:', err));
+    }, (err) => {
+      console.warn('Users live sync notice:', err);
+      setLoading(false);
+    });
 
     // 2. Live Travel Sheets Listener
     const qTravel = userIsAdmin
       ? query(collection(db, 'travel_sheets'))
       : query(collection(db, 'travel_sheets'), where('userId', '==', profile.uid));
     const unsubTravel = onSnapshot(qTravel, (snap) => {
-      travelRef.current = snap.docs.map(d => ({ ...d.data(), _id: d.id }));
+      const tList = snap.docs.map(d => ({ ...d.data(), _id: d.id }));
+      travelRef.current = tList;
+      try {
+        localStorage.setItem('blackworm_cached_travel_sheets', JSON.stringify(tList));
+      } catch (e) {}
       recomputeLiveReport();
-    }, (err) => console.warn('Travel live sync error:', err));
+    }, (err) => {
+      console.warn('Travel live sync notice:', err);
+      setLoading(false);
+    });
 
     // 3. Live Yearly Targets Listener
     const qTargets = userIsAdmin
@@ -274,22 +354,38 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
     const unsubTargets = onSnapshot(qTargets, (snap) => {
       targetsRef.current = snap.docs.map(d => ({ ...d.data(), _id: d.id }));
       recomputeLiveReport();
-    }, (err) => console.warn('Targets live sync error:', err));
+    }, (err) => {
+      console.warn('Targets live sync notice:', err);
+      setLoading(false);
+    });
 
-    // 4. Live Collection Entries Listener for selectedDate
+    // Safety timeout: ensure loading turns off within 1.2s even on slow connection or quota exhaustion
+    const safetyTimer = setTimeout(() => {
+      recomputeLiveReport();
+      setLoading(false);
+    }, 1200);
+
+    return () => {
+      clearTimeout(safetyTimer);
+      unsubUsers();
+      unsubTravel();
+      unsubTargets();
+    };
+  }, [profile.uid]);
+
+  // Targeted Daily Collection Entries (Only queries records for the specific date selected)
+  useEffect(() => {
     const qColl = query(collection(db, 'collection_entries'), where('date', '==', selectedDate));
     const unsubColl = onSnapshot(qColl, (snap) => {
       collDocsRef.current = snap.docs.map(d => d.data());
       recomputeLiveReport();
-    }, (err) => console.warn('Collections live sync error:', err));
+    }, (err) => {
+      console.warn('Collections live sync notice:', err);
+      setLoading(false);
+    });
 
-    return () => {
-      unsubUsers();
-      unsubTravel();
-      unsubTargets();
-      unsubColl();
-    };
-  }, [selectedDate, profile.uid]);
+    return () => unsubColl();
+  }, [selectedDate]);
 
   // Capture Report Photo directly to device gallery / download
   const handleCaptureReportPhoto = async () => {
@@ -506,10 +602,21 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
                 </tr>
               ))}
 
+              {reportData.length === 0 && loading && (
+                <tr>
+                  <td colSpan={11} className="p-8 text-center text-indigo-600 font-bold text-xs">
+                    <div className="flex items-center justify-center gap-2">
+                      <div className="w-5 h-5 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
+                      <span>डेटा लोड होत आहे...</span>
+                    </div>
+                  </td>
+                </tr>
+              )}
+
               {reportData.length === 0 && !loading && (
                 <tr>
-                  <td colSpan={11} className="p-8 text-center text-slate-400 font-bold uppercase italic text-xs">
-                    No data available for the selected date.
+                  <td colSpan={11} className="p-8 text-center text-slate-500 font-bold text-xs">
+                    निवडलेल्या तारखेसाठी कोणताही डेटा उपलब्ध नाही.
                   </td>
                 </tr>
               )}

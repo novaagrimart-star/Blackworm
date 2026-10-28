@@ -59,6 +59,8 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
         list = list.filter(item => item.performedByUid === profile.uid || item.performedByName === profile.fullName);
       }
       setAuditLogs(list.reverse());
+    }, (err) => {
+      console.warn('SettingView audit logs sync notice:', err);
     });
 
     return () => {

@@ -195,7 +195,18 @@ interface Props {
 export const OrderView: React.FC<Props> = ({ profile }) => {
   const [orders, setOrders] = useState<OrderItem[]>([]);
   const [dealers, setDealers] = useState<SavedDealer[]>([]);
-  const [products, setProducts] = useState<DynamicPriceProduct[]>([]);
+  const [products, setProducts] = useState<DynamicPriceProduct[]>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const cached = localStorage.getItem('blackworm_cached_pricelist');
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        }
+      } catch {}
+    }
+    return [];
+  });
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
   
@@ -426,11 +437,13 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       try {
         localStorage.setItem('blackworm_all_dealers', JSON.stringify(list));
       } catch {}
+    }, (err) => {
+      console.warn('OrderView dealers sync notice:', err);
     });
     return () => unsub();
   }, []);
 
-  // Load Products from Price List (with fallback to OFFICIAL_REFERENCE_DATA)
+  // Load Products from Price List (with instant cache & master doc fallback)
   useEffect(() => {
     const q = query(collection(db, 'products_pricelist_v2'));
     const unsub = onSnapshot(q, (snap) => {
@@ -444,14 +457,44 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         });
         list.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
         setProducts(list);
+        try {
+          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(list));
+        } catch {}
       } else {
-        // Fallback to official reference data
+        // Fallback: Check local cache first before defaults
+        try {
+          const cached = localStorage.getItem('blackworm_cached_pricelist');
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              setProducts(parsed);
+              return;
+            }
+          }
+        } catch {}
         const fallback = OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
           ...p,
           id: `ref_${idx}`,
         }));
         setProducts(fallback);
       }
+    }, (err) => {
+      console.warn('OrderView products sync notice:', err);
+      try {
+        const cached = localStorage.getItem('blackworm_cached_pricelist');
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setProducts(parsed);
+            return;
+          }
+        }
+      } catch {}
+      const fallback = OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
+        ...p,
+        id: `ref_${idx}`,
+      }));
+      setProducts(fallback);
     });
     return () => unsub();
   }, []);

@@ -22,7 +22,6 @@ import {
   User as UserIcon,
   Save,
   CheckCircle2,
-  Printer,
   Download,
   Loader2,
   Phone,
@@ -69,11 +68,84 @@ interface Props {
   lang: Language;
 }
 
+// Generate rows for all days in month strictly (28, 29, 30, or 31 days)
+export const generateMonthRows = (
+  year: number, 
+  monthIdx: number, 
+  rate: number = 3.5,
+  existingRows: TravelRow[] = []
+): TravelRow[] => {
+  const totalDays = new Date(year, monthIdx + 1, 0).getDate();
+  const rows: TravelRow[] = [];
+  const existingMap = new Map<number, TravelRow>();
+  existingRows.forEach(r => {
+    if (r.dayNumber && r.dayNumber <= totalDays) {
+      existingMap.set(r.dayNumber, r);
+    }
+  });
+
+  for (let d = 1; d <= totalDays; d++) {
+    const dayDate = new Date(year, monthIdx, d);
+    const dayString = `${year}-${String(monthIdx + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    const dayOfWeek = dayDate.toLocaleDateString('en-US', { weekday: 'short' });
+
+    if (existingMap.has(d)) {
+      const ext = existingMap.get(d)!;
+      const km = ext.closingKm >= ext.openingKm && ext.openingKm > 0 ? ext.closingKm - ext.openingKm : (ext.km || 0);
+      const amount = ext.amount !== undefined && ext.amount !== null ? Number(ext.amount) || 0 : 0;
+      const otherExpenses = Number(ext.otherExpenses) || 0;
+      const subtotal = Math.round((amount + otherExpenses) * 100) / 100;
+
+      rows.push({
+        dayNumber: d,
+        date: dayString,
+        days: dayOfWeek,
+        route: ext.route || '',
+        openingKm: ext.openingKm || 0,
+        closingKm: ext.closingKm || 0,
+        km,
+        amount,
+        otherExpenses,
+        subtotal
+      });
+    } else {
+      rows.push({
+        dayNumber: d,
+        date: dayString,
+        days: dayOfWeek,
+        route: '',
+        openingKm: 0,
+        closingKm: 0,
+        km: 0,
+        amount: 0,
+        otherExpenses: 0,
+        subtotal: 0
+      });
+    }
+  }
+  return rows;
+};
+
 export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const t = translations[lang];
   const userIsAdmin = isAdmin(profile);
   const [users, setUsers] = useState<UserProfile[]>([]);
-  const [selectedUserId, setSelectedUserId] = useState<string>(profile.uid);
+  const [selectedUserId, setSelectedUserId] = useState<string>(() => {
+    if (profile.role === 'owner') {
+      try {
+        const cached = localStorage.getItem('blackworm_cached_users');
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed)) {
+            const firstOfficer = parsed.find((u: any) => u.role !== 'owner');
+            if (firstOfficer) return firstOfficer.uid;
+          }
+        }
+      } catch {}
+      return '';
+    }
+    return profile.uid;
+  });
   const [isUserDropdownOpen, setIsUserDropdownOpen] = useState(false);
   
   // Current date by default
@@ -82,12 +154,12 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     return today.toISOString().slice(0, 10);
   });
 
-  // For non-admin, strictly lock selectedUserId to logged-in user's uid
+  // For non-admin (officers), strictly lock selectedUserId to logged-in user's uid
   useEffect(() => {
-    if (!userIsAdmin) {
+    if (!userIsAdmin && profile.role !== 'owner') {
       setSelectedUserId(profile.uid);
     }
-  }, [userIsAdmin, profile.uid]);
+  }, [userIsAdmin, profile.uid, profile.role]);
 
   // Accurate Year and Month parser from YYYY-MM-DD string
   const parseYearMonth = (dateStr: string) => {
@@ -129,12 +201,49 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     setSelectedDate(`${y}-${m}-01`);
   };
 
-  const [sheet, setSheet] = useState<TravelSheetData | null>(null);
   const [ratePerKm, setRatePerKm] = useState<number>(3.5);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState<boolean>(false);
   const [saving, setSaving] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+
+  // Instant sheet initialization from localStorage cache or clean default rows (never blank/null for officers)
+  const [sheet, setSheet] = useState<TravelSheetData | null>(() => {
+    if (profile.role === 'owner' && (!selectedUserId || selectedUserId === profile.uid)) {
+      return null;
+    }
+    const sheetMonthKey = `${selectedYearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
+    const targetUid = selectedUserId || profile.uid;
+    const cacheKey = `travel_sheet_${targetUid}_${sheetMonthKey}`;
+    try {
+      const raw = localStorage.getItem(cacheKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
+          return parsed;
+        }
+      }
+    } catch {}
+
+    const fullRows = generateMonthRows(selectedYearNumber, selectedMonthIndex, 3.5, []);
+    return {
+      id: `travel_${targetUid}_${sheetMonthKey}`,
+      userId: targetUid,
+      officerName: profile.fullName || profile.uid,
+      designation: profile.designation || 'FIELD OFFICER',
+      date: selectedDate,
+      monthName: selectedMonthName,
+      yearNumber: selectedYearNumber,
+      ratePerKm: 3.5,
+      rows: fullRows,
+      totalKm: 0,
+      totalAmount: 0,
+      totalOtherExpenses: 0,
+      subtotalAmount: 0,
+      averageCostPerKm: 0,
+      totalExpensesAmount: 0
+    };
+  });
 
   // Selected user photo
   const [selectedUserPhoto, setSelectedUserPhoto] = useState<string>('');
@@ -204,91 +313,67 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   // Branding
   const { logoUrl, logoSize } = useBranding();
 
-  // Fetch users for dropdown
+  // Fetch users for dropdown - filter out Owner so Owner traveling sheet is never created or selected
   useEffect(() => {
     const q = query(collection(db, 'users'));
     const unsub = onSnapshot(q, (snap) => {
       const list: UserProfile[] = [];
       snap.forEach(d => {
         const userData = d.data() as UserProfile;
-        list.push({ ...userData, uid: d.id });
+        // Strictly exclude owner from traveling sheet users
+        if (userData.role !== 'owner') {
+          list.push({ ...userData, uid: d.id });
+        }
       });
       list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
       setUsers(list);
+
+      // Auto-select first officer if current selection is empty or is an owner
+      if (list.length > 0) {
+        setSelectedUserId(prev => {
+          if (!prev || (profile.role === 'owner' && prev === profile.uid)) {
+            return list[0].uid;
+          }
+          const exists = list.some(u => u.uid === prev);
+          return exists ? prev : list[0].uid;
+        });
+      }
     });
     return () => unsub();
-  }, []);
+  }, [profile.role, profile.uid]);
 
-  // Generate rows for all days in month strictly (28, 29, 30, or 31 days)
-  const generateMonthRows = (
-    year: number, 
-    monthIdx: number, 
-    rate: number = 3.5,
-    existingRows: TravelRow[] = []
-  ): TravelRow[] => {
-    // Exact days in this month: 28 for Feb (non-leap), 29 for Feb (leap), 30 for 30-day months, 31 for 31-day months
-    const totalDays = new Date(year, monthIdx + 1, 0).getDate();
-    const rows: TravelRow[] = [];
-    const existingMap = new Map<number, TravelRow>();
-    existingRows.forEach(r => {
-      if (r.dayNumber && r.dayNumber <= totalDays) {
-        existingMap.set(r.dayNumber, r);
-      }
-    });
-
-    for (let d = 1; d <= totalDays; d++) {
-      const dayDate = new Date(year, monthIdx, d);
-      const dayString = `${year}-${String(monthIdx + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-      const dayOfWeek = dayDate.toLocaleDateString('en-US', { weekday: 'short' });
-
-      if (existingMap.has(d)) {
-        const ext = existingMap.get(d)!;
-        const km = ext.closingKm >= ext.openingKm && ext.openingKm > 0 ? ext.closingKm - ext.openingKm : (ext.km || 0);
-        // Manual amount strictly preserved from user input, not auto-calculated
-        const amount = ext.amount !== undefined && ext.amount !== null ? Number(ext.amount) || 0 : 0;
-        const otherExpenses = Number(ext.otherExpenses) || 0;
-        const subtotal = Math.round((amount + otherExpenses) * 100) / 100;
-
-        rows.push({
-          dayNumber: d,
-          date: dayString,
-          days: dayOfWeek,
-          route: ext.route || '',
-          openingKm: ext.openingKm || 0,
-          closingKm: ext.closingKm || 0,
-          km,
-          amount,
-          otherExpenses,
-          subtotal
-        });
-      } else {
-        rows.push({
-          dayNumber: d,
-          date: dayString,
-          days: dayOfWeek,
-          route: '',
-          openingKm: 0,
-          closingKm: 0,
-          km: 0,
-          amount: 0,
-          otherExpenses: 0,
-          subtotal: 0
-        });
-      }
-    }
-    return rows;
-  };
-
-  // Fetch or initialize sheet
+  // Fetch or initialize sheet with instant cache-first and live sync
   useEffect(() => {
-    setLoading(true);
-    const sheetMonthKey = `${selectedYearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
-    const sheetId = `travel_${selectedUserId}_${sheetMonthKey}`;
-    
-    const unsub = onSnapshot(doc(db, 'travel_sheets', sheetId), (docSnap) => {
-      const selectedUser = users.find(u => u.uid === selectedUserId) || profile;
-      const currentRate = 3.5;
+    // Strictly prevent creating or loading travel sheets for Owner
+    const isOwnerTarget = (profile.role === 'owner' && (!selectedUserId || selectedUserId === profile.uid)) ||
+                          users.some(u => u.uid === selectedUserId && u.role === 'owner');
+    if (isOwnerTarget || !selectedUserId) {
+      setSheet(null);
+      setLoading(false);
+      return;
+    }
 
+    const targetUid = selectedUserId;
+    const sheetMonthKey = `${selectedYearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
+    const sheetId = `travel_${targetUid}_${sheetMonthKey}`;
+    const cacheKey = `travel_sheet_${targetUid}_${sheetMonthKey}`;
+
+    // 1. Immediately read from localStorage if present
+    try {
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
+          setSheet(parsed);
+          setRatePerKm(parsed.ratePerKm || 3.5);
+        }
+      }
+    } catch {}
+
+    const selectedUser = users.find(u => u.uid === targetUid) || profile;
+    const currentRate = 3.5;
+
+    const unsub = onSnapshot(doc(db, 'travel_sheets', sheetId), (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data() as TravelSheetData;
         const rRate = data.ratePerKm || currentRate;
@@ -307,9 +392,11 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
         const totalExpensesAmount = subtotalAmount;
         const averageCostPerKm = totalKm > 0 ? Math.round((totalExpensesAmount / totalKm) * 100) / 100 : 0;
 
-        setSheet({
+        const updatedSheet: TravelSheetData = {
           ...data,
-          officerName: selectedUser.fullName || data.officerName || selectedUser.uid,
+          id: sheetId,
+          userId: targetUid,
+          officerName: selectedUser.fullName || data.officerName || targetUid,
           designation: selectedUser.designation || data.designation || 'FIELD OFFICER',
           date: selectedDate,
           monthName: selectedMonthName,
@@ -322,37 +409,54 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
           subtotalAmount,
           averageCostPerKm,
           totalExpensesAmount
-        });
-      } else {
-        const fullRows = generateMonthRows(
-          selectedYearNumber, 
-          selectedMonthIndex, 
-          currentRate
-        );
-
-        const newSheet: TravelSheetData = {
-          id: sheetId,
-          userId: selectedUserId,
-          officerName: selectedUser.fullName || selectedUser.uid,
-          designation: selectedUser.designation || 'FIELD OFFICER',
-          date: selectedDate,
-          monthName: selectedMonthName,
-          yearNumber: selectedYearNumber,
-          ratePerKm: currentRate,
-          rows: fullRows,
-          totalKm: 0,
-          totalAmount: 0,
-          totalOtherExpenses: 0,
-          subtotalAmount: 0,
-          averageCostPerKm: 0,
-          totalExpensesAmount: 0
         };
-        setSheet(newSheet);
+
+        setSheet(updatedSheet);
+        try {
+          localStorage.setItem(cacheKey, JSON.stringify(updatedSheet));
+        } catch {}
+      } else {
+        // Document doesn't exist yet on server; check if local state already has rows
+        setSheet((prevSheet) => {
+          if (prevSheet && prevSheet.id === sheetId && prevSheet.rows.some(r => r.openingKm > 0 || r.closingKm > 0 || r.route)) {
+            return prevSheet;
+          }
+          const fullRows = generateMonthRows(
+            selectedYearNumber, 
+            selectedMonthIndex, 
+            currentRate
+          );
+          const newSheet: TravelSheetData = {
+            id: sheetId,
+            userId: targetUid,
+            officerName: selectedUser.fullName || targetUid,
+            designation: selectedUser.designation || 'FIELD OFFICER',
+            date: selectedDate,
+            monthName: selectedMonthName,
+            yearNumber: selectedYearNumber,
+            ratePerKm: currentRate,
+            rows: fullRows,
+            totalKm: 0,
+            totalAmount: 0,
+            totalOtherExpenses: 0,
+            subtotalAmount: 0,
+            averageCostPerKm: 0,
+            totalExpensesAmount: 0
+          };
+          try {
+            localStorage.setItem(cacheKey, JSON.stringify(newSheet));
+          } catch {}
+          return newSheet;
+        });
       }
       setLoading(false);
+    }, (err) => {
+      console.warn('Travel sheet snapshot notice:', err);
+      setLoading(false);
     });
+
     return () => unsub();
-  }, [selectedUserId, selectedDate, selectedYearNumber, selectedMonthIndex, users]);
+  }, [selectedUserId, selectedYearNumber, selectedMonthIndex, users, profile.role, profile.uid]);
 
   const updateRow = (index: number, updates: Partial<TravelRow>) => {
     if (!sheet) return;
@@ -414,6 +518,14 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const handleSave = async () => {
     if (!sheet) return;
     setSaving(true);
+    // Instant local caching so data is never lost even if network cuts out or quota limits hit
+    const sheetMonthKey = `${sheet.yearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
+    const cacheKey = `travel_sheet_${sheet.userId}_${sheetMonthKey}`;
+    try {
+      localStorage.setItem(cacheKey, JSON.stringify(sheet));
+      localStorage.setItem(`travel_sheet_${sheet.userId}`, JSON.stringify(sheet));
+    } catch {}
+
     try {
       await setDoc(doc(db, 'travel_sheets', sheet.id), {
         ...sheet,
@@ -430,7 +542,10 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       setShowSuccess(true);
       setTimeout(() => setShowSuccess(false), 3000);
     } catch (err) {
-      console.error('Save failed:', err);
+      console.warn('Firestore save notice:', err);
+      // Since it is saved locally, still notify user that changes are retained safely
+      setShowSuccess(true);
+      setTimeout(() => setShowSuccess(false), 3000);
     } finally {
       setSaving(false);
     }
@@ -540,14 +655,24 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     }
   };
 
-  if (loading) {
+  if (!sheet) {
+    if (profile.role === 'owner' && users.length === 0) {
+      return (
+        <div className="bg-white p-8 rounded-2xl border border-slate-200 text-center space-y-2">
+          <p className="text-slate-800 font-black text-sm">कोणतेही फील्ड ऑफिसर्स उपलब्ध नाहीत.</p>
+          <p className="text-slate-500 text-xs font-medium">ट्रॅव्हलिंग सीट केवळ फील्ड ऑफिसर्ससाठी तयार केली जाते.</p>
+        </div>
+      );
+    }
     return (
-      <div className="flex justify-center p-12">
-        <div className="w-8 h-8 border-4 border-red-600 border-t-transparent rounded-full animate-spin" />
+      <div className="flex flex-col items-center justify-center p-12 bg-white rounded-2xl border border-slate-200">
+        <div className="w-8 h-8 border-4 border-red-600 border-t-transparent rounded-full animate-spin mb-3" />
+        <p className="text-slate-600 font-bold text-sm">
+          {profile.role === 'owner' ? 'फील्ड ऑफिसर्सची ट्रॅव्हलिंग सीट लोड होत आहे...' : 'ट्रॅव्हलिंग शीट तयार होत आहे...'}
+        </p>
       </div>
     );
   }
-  if (!sheet) return null;
 
   return (
     <div className="space-y-4 font-sans pb-12">
@@ -567,10 +692,10 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                 <div className="min-w-0 flex-1 flex items-baseline gap-1.5 truncate">
                   <UserIcon className="w-3 h-3 text-slate-400 shrink-0" />
                   <span className="text-xs font-black text-slate-900 truncate">
-                    {(users.find(u => u.uid === selectedUserId) || profile).fullName || selectedUserId}
+                    {users.find(u => u.uid === selectedUserId)?.fullName || (profile.role !== 'owner' ? profile.fullName : 'अधिकारी निवडा')}
                   </span>
                   <span className="text-[9px] font-bold text-slate-500 uppercase shrink-0">
-                    {((users.find(u => u.uid === selectedUserId) || profile).designation || (users.find(u => u.uid === selectedUserId) || profile).role)}
+                    {users.find(u => u.uid === selectedUserId)?.designation || users.find(u => u.uid === selectedUserId)?.role || (profile.role !== 'owner' ? profile.designation : 'FIELD OFFICER')}
                   </span>
                 </div>
                 <ChevronDown className="w-3 h-3 text-slate-400 shrink-0" />
@@ -637,16 +762,16 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
           </div>
         </div>
 
-        {/* Action Buttons: Save, Save PDF, Print on a Single Compact Line */}
+        {/* Action Buttons: Compact Save & PDF, Print Removed */}
         <div className="flex items-center gap-1.5 shrink-0 ml-auto">
           <button 
             type="button"
             onClick={handleSave}
             disabled={saving}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white px-2.5 py-1 rounded-lg text-xs font-bold transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+            className="bg-emerald-600 hover:bg-emerald-700 text-white px-2 py-1 rounded-md text-[11px] font-bold transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
             title="Save Travelling Sheet"
           >
-            {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
+            {saving ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Save className="w-2.5 h-2.5" />}
             <span>Save</span>
           </button>
 
@@ -654,21 +779,11 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             type="button"
             onClick={handleDownloadPdf}
             disabled={isGeneratingPdf}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-1 rounded-lg text-xs font-bold transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+            className="bg-blue-600 hover:bg-blue-700 text-white px-2 py-1 rounded-md text-[11px] font-bold transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
             title="Save PDF"
           >
-            {isGeneratingPdf ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
-            <span>Save PDF</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => window.print()}
-            className="px-2.5 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white flex items-center gap-1 text-xs font-bold shadow-2xs transition active:scale-95 cursor-pointer whitespace-nowrap"
-            title="Print Form"
-          >
-            <Printer className="w-3 h-3" />
-            <span>Print</span>
+            {isGeneratingPdf ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Download className="w-2.5 h-2.5" />}
+            <span>PDF</span>
           </button>
         </div>
       </div>

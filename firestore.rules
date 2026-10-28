@@ -87,6 +87,10 @@ service cloud.firestore {
     match /user_approval_requests/{docId} {
       allow read, write: if true;
     }
+
+    match /pricelist_backups/{docId} {
+      allow read, write: if true;
+    }
     
     match /test/{docId} {
       allow read, write: if true;

@@ -321,6 +321,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
         setLogoUrl(data.logoUrl || '');
         setLogoSize(data.logoSize || 80);
       }
+    }, (err) => {
+      console.warn('UserManagement branding sync notice:', err);
     });
     return () => unsubBranding();
   }, []);
@@ -338,6 +340,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
       });
       list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
       setPendingRequests(list);
+    }, (err) => {
+      console.warn('UserManagement approval requests sync notice:', err);
     });
     return () => unsub();
   }, []);

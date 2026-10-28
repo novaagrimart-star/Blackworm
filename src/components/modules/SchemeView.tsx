@@ -45,7 +45,18 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
   const userIsAdmin = isAdmin(profile);
   const printableRef = useRef<HTMLDivElement>(null);
 
-  const [products, setProducts] = useState<DynamicPriceProduct[]>([]);
+  const [products, setProducts] = useState<DynamicPriceProduct[]>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const cached = localStorage.getItem('blackworm_cached_pricelist');
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        }
+      } catch {}
+    }
+    return [];
+  });
   const [logoUrl, setLogoUrl] = useState<string>('');
   const [logoSize, setLogoSize] = useState<number>(75);
   
@@ -87,6 +98,8 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
         setLogoUrl(data.logoUrl || '');
         setLogoSize(data.logoSize || 75);
       }
+    }, (err) => {
+      console.warn('Scheme branding live sync notice:', err);
     });
 
     return () => unsubBranding();
@@ -107,6 +120,8 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
           });
         }
       }
+    }, (err) => {
+      console.warn('Scheme discounts live sync notice:', err);
     });
 
     return () => unsubDiscounts();
@@ -140,13 +155,43 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
           return (a.orderIndex || 0) - (b.orderIndex || 0);
         });
         setProducts(list);
+        try {
+          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(list));
+        } catch {}
       } else {
+        try {
+          const cached = localStorage.getItem('blackworm_cached_pricelist');
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              setProducts(parsed);
+              return;
+            }
+          }
+        } catch {}
         const fallback: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
           ...item,
           id: `ref_${idx + 1}`,
         }));
         setProducts(fallback);
       }
+    }, (err) => {
+      console.warn('Scheme products live sync notice:', err);
+      try {
+        const cached = localStorage.getItem('blackworm_cached_pricelist');
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setProducts(parsed);
+            return;
+          }
+        }
+      } catch {}
+      const fallback: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
+        ...item,
+        id: `ref_${idx + 1}`,
+      }));
+      setProducts(fallback);
     });
 
     return () => unsub();

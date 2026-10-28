@@ -280,6 +280,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         const val = Number(snap.data()?.currentSequence) || 0;
         setGlobalSequence(val);
       }
+    }, (err) => {
+      console.warn('Dealer sequence sync notice:', err);
     });
     return () => unsubSeq();
   }, []);
@@ -440,54 +442,51 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     return () => unsub();
   }, []);
 
-  // Real-time listener for individual dealer document updates across all devices in milliseconds
+  // Populate form fields directly from memory cache (Zero extra network reads!)
   useEffect(() => {
     if (viewMode === 'form' && currentId) {
-      const unsubDoc = onSnapshot(doc(db, 'dealers_application', currentId), (docSnap) => {
-        if (docSnap.exists()) {
-          const item = docSnap.data() as DealershipFormItem;
-          setCenter(item.center || '');
-          setShopOpeningDate(item.shopOpeningDate || '');
-          setDealerCode(item.dealerCode || '');
-          setVillage(item.village || '');
-          setSecurityDeposit(item.securityDeposit || 'NA');
-          setDealershipAddressPhoto(item.dealershipAddressPhoto || '');
-          setFirmName(item.firmName || '');
-          setProprietorName(item.proprietorName || '');
-          setStateName(item.state || 'Maharashtra');
-          setContactNumber(item.contactNumber || '');
-          setEmailId(item.emailId || '');
-          setResponsiblePerson(item.responsiblePerson || '');
-          setResponsibleContact(item.responsibleContact || '');
-          setAadhaarNo(item.aadhaarNo || '');
-          setDistrict(item.district || '');
-          setPanNo(item.panNo || '');
-          setDateOfBirth(item.dateOfBirth || '');
-          setGstNo(item.gstNo || '');
-          setPinCode(item.pinCode || '');
-          setBankName(item.bankName || '');
-          setBankAddress(item.bankAddress || '');
-          setAccountNo(item.accountNo || '');
-          setIfscCode(item.ifscCode || '');
-          setChequeNos(item.chequeNos || '');
-          setPlace(item.place || 'Sangli');
-          setDeclarationDate(item.declarationDate || new Date().toISOString().slice(0, 10));
-          setRemarks(item.remarks || '');
-          // Preserve strictly the officer name of the user who filled the form
-          const origOfficer = item.officerName || item.created_by_name || (item.userId && usersMap[item.userId]) || (item.created_by_user_id && usersMap[item.created_by_user_id]) || (item.loginId && usersMap[item.loginId.toLowerCase()]) || '';
-          const displayOfficer = (origOfficer || profile.fullName || 'OFFICER').toUpperCase();
-          setOfficerName(displayOfficer);
-          setCreatedByUserId(item.created_by_user_id || item.createdByUid || item.userId || '');
-          setCreatedByName(displayOfficer);
-          setOfficeDate(item.officeDate || '');
-          setOfficeTime(item.officeTime || '');
-          setOfficePlace(item.officePlace || '');
-          setStatus(item.status || 'Approved');
-        }
-      });
-      return () => unsubDoc();
+      const item = dealers.find(d => d.id === currentId);
+      if (item) {
+        setCenter(item.center || '');
+        setShopOpeningDate(item.shopOpeningDate || '');
+        setDealerCode(item.dealerCode || '');
+        setVillage(item.village || '');
+        setSecurityDeposit(item.securityDeposit || 'NA');
+        setDealershipAddressPhoto(item.dealershipAddressPhoto || '');
+        setFirmName(item.firmName || '');
+        setProprietorName(item.proprietorName || '');
+        setStateName(item.state || 'Maharashtra');
+        setContactNumber(item.contactNumber || '');
+        setEmailId(item.emailId || '');
+        setResponsiblePerson(item.responsiblePerson || '');
+        setResponsibleContact(item.responsibleContact || '');
+        setAadhaarNo(item.aadhaarNo || '');
+        setDistrict(item.district || '');
+        setPanNo(item.panNo || '');
+        setDateOfBirth(item.dateOfBirth || '');
+        setGstNo(item.gstNo || '');
+        setPinCode(item.pinCode || '');
+        setBankName(item.bankName || '');
+        setBankAddress(item.bankAddress || '');
+        setAccountNo(item.accountNo || '');
+        setIfscCode(item.ifscCode || '');
+        setChequeNos(item.chequeNos || '');
+        setPlace(item.place || 'Sangli');
+        setDeclarationDate(item.declarationDate || new Date().toISOString().slice(0, 10));
+        setRemarks(item.remarks || '');
+        // Preserve strictly the officer name of the user who filled the form
+        const origOfficer = item.officerName || item.created_by_name || (item.userId && usersMap[item.userId]) || (item.created_by_user_id && usersMap[item.created_by_user_id]) || (item.loginId && usersMap[item.loginId.toLowerCase()]) || '';
+        const displayOfficer = (origOfficer || profile.fullName || 'OFFICER').toUpperCase();
+        setOfficerName(displayOfficer);
+        setCreatedByUserId(item.created_by_user_id || item.createdByUid || item.userId || '');
+        setCreatedByName(displayOfficer);
+        setOfficeDate(item.officeDate || '');
+        setOfficeTime(item.officeTime || '');
+        setOfficePlace(item.officePlace || '');
+        setStatus(item.status || 'Approved');
+      }
     }
-  }, [viewMode, currentId]);
+  }, [viewMode, currentId, dealers]);
 
   // Global Auto-Increment Sequence Counter (Guaranteed continuous sequence across ALL users)
   const allocateGlobalDealerCode = async (): Promise<string> => {

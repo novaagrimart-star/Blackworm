@@ -400,6 +400,7 @@ export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{ 
     'targets',
     'travel_records',
     'products_pricelist_v2',
+    'pricelist_backups',
     'config',
     'deleted_records',
     'audit_logs',

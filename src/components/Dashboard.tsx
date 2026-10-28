@@ -1,6 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { doc, onSnapshot } from 'firebase/firestore';
-import { db } from '../firebase';
+
 import { 
   Target, 
   User as UserIcon, 
@@ -37,7 +36,7 @@ import { PriceListView } from './modules/PriceListView';
 import { DealerView } from './modules/DealerView';
 import { TravelView } from './modules/TravelView';
 import { SchemeView } from './modules/SchemeView';
-import { ReportView, preloadReportData } from './modules/ReportView';
+import { ReportView } from './modules/ReportView';
 import { SettingView } from './modules/SettingView';
 
 interface DashboardProps {
@@ -88,31 +87,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     });
   };
 
-  // Live listener for current logged-in user profile
-  useEffect(() => {
-    if (profile.uid) {
-      const unsubUser = onSnapshot(doc(db, 'users', profile.uid), (snap) => {
-        if (snap.exists()) {
-          const updated = { ...profile, ...snap.data() };
-          setCurrentUserData(updated);
-          try {
-            localStorage.setItem('blackworm_user_profile', JSON.stringify(updated));
-          } catch (e) {}
-        }
-      });
-      return () => unsubUser();
-    }
-  }, [profile.uid]);
 
-  // Preload and cache report data in background so Report tab opens instantly
-  useEffect(() => {
-    if (currentUserData && currentUserData.uid) {
-      const timer = setTimeout(() => {
-        preloadReportData(currentUserData);
-      }, 5000); // Increased delay to prioritize main UI and sync
-      return () => clearTimeout(timer);
-    }
-  }, [currentUserData?.uid]);
 
   const modules = [
     { id: 'target', label: t.targetSheet, icon: Target, color: 'text-blue-500', bg: 'bg-blue-50' },

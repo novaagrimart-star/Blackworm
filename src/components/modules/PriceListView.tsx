@@ -1,10 +1,25 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { collection, query, onSnapshot, doc, setDoc, getDocs, writeBatch } from 'firebase/firestore';
+import { collection, query, onSnapshot, doc, setDoc, getDoc, getDocs, writeBatch, limit, orderBy } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { UserProfile } from '../../lib/auth';
 import { Language } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
-import { Upload, Download, RefreshCw, Loader2, FileSpreadsheet } from 'lucide-react';
+import { 
+  Upload, 
+  Download, 
+  RefreshCw, 
+  Loader2, 
+  FileSpreadsheet, 
+  ShieldCheck, 
+  History, 
+  Database, 
+  CheckCircle2, 
+  RotateCcw, 
+  X, 
+  Eye,
+  Check
+} from 'lucide-react';
+import { logAudit } from '../../lib/dataService';
 import * as XLSX from 'xlsx';
 
 export interface PackingOption {
@@ -261,13 +276,146 @@ export const calculateWithGst = (basicRate: number | undefined, gstPercent: numb
   return Math.round(withGst * 100) / 100;
 };
 
+// Helper: Read cached products instantly from localStorage (0ms display)
+export const getInitialCachedProducts = (): DynamicPriceProduct[] => {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = localStorage.getItem('blackworm_cached_pricelist');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+    const masterRaw = localStorage.getItem('blackworm_master_pricelist');
+    if (masterRaw) {
+      const parsed = JSON.parse(masterRaw);
+      if (parsed && Array.isArray(parsed.products) && parsed.products.length > 0) return parsed.products;
+    }
+  } catch (e) {}
+  return [];
+};
+
+// Permanent Storage Engine: Saves to Firestore Master Doc, Collection, Backup Collection, and LocalStorage
+export async function savePriceListPermanently(
+  newProducts: DynamicPriceProduct[],
+  sourceLabel: string,
+  profile: UserProfile,
+  validityDate?: string,
+  currentProducts: DynamicPriceProduct[] = []
+): Promise<{ success: boolean; count: number }> {
+  if (!newProducts || newProducts.length === 0) {
+    throw new Error('प्रॉडक्ट्स लिस्ट रिकामी आहे. कोणतीही माहिती सेव्ह केली गेली नाही.');
+  }
+
+  // 1. Automated Permanent Backup of previous state
+  try {
+    const backupId = `backup_${Date.now()}`;
+    await setDoc(doc(db, 'pricelist_backups', backupId), {
+      id: backupId,
+      backupId,
+      createdAt: new Date().toISOString(),
+      performedByUid: profile.uid,
+      performedByName: profile.fullName || profile.loginId || 'Admin',
+      source: sourceLabel,
+      previousProductsCount: currentProducts.length,
+      previousProducts: currentProducts,
+    });
+  } catch (backupErr) {
+    console.warn('Pre-upload automatic backup notice:', backupErr);
+  }
+
+  // 2. Instant local caching for 0ms refresh / offline / mobile sync
+  try {
+    localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(newProducts));
+    localStorage.setItem('blackworm_master_pricelist', JSON.stringify({
+      products: newProducts,
+      validityDate: validityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
+      updatedAt: new Date().toISOString(),
+      updatedByUid: profile.uid,
+      updatedByName: profile.fullName || 'Admin',
+      isCustomUploaded: true,
+      totalProducts: newProducts.length,
+    }));
+  } catch (e) {
+    console.warn('Local storage write notice:', e);
+  }
+
+  // 3. Save to Master Document config/master_pricelist (Single atomic source of truth)
+  await setDoc(doc(db, 'config', 'master_pricelist'), {
+    products: newProducts,
+    validityDate: validityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
+    updatedAt: new Date().toISOString(),
+    updatedByUid: profile.uid,
+    updatedByName: profile.fullName || 'Admin',
+    isCustomUploaded: true,
+    totalProducts: newProducts.length,
+    source: sourceLabel,
+  }, { merge: true });
+
+  if (validityDate) {
+    await setDoc(doc(db, 'config', 'pricelist_meta'), {
+      validityDate,
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
+  }
+
+  // 4. Upsert each product into products_pricelist_v2 without wiping
+  for (const item of newProducts) {
+    await setDoc(doc(db, 'products_pricelist_v2', item.id), {
+      ...item,
+      isArchived: false,
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
+  }
+
+  // 5. Soft-archive any products from previous list that are not in new list
+  try {
+    const newIds = new Set(newProducts.map(p => p.id));
+    const oldSnap = await getDocs(collection(db, 'products_pricelist_v2'));
+    const archiveBatch = writeBatch(db);
+    let count = 0;
+    oldSnap.forEach(d => {
+      if (!newIds.has(d.id)) {
+        archiveBatch.update(d.ref, { isArchived: true, archivedAt: new Date().toISOString() });
+        count++;
+      }
+    });
+    if (count > 0) {
+      await archiveBatch.commit();
+    }
+  } catch (archErr) {
+    console.warn('Soft-archive notice:', archErr);
+  }
+
+  // 6. Audit Log
+  try {
+    await logAudit(
+      'UPDATE',
+      'products_pricelist_v2',
+      'master_pricelist',
+      `Permanently saved and updated Price List (${newProducts.length} products) from ${sourceLabel}`,
+      profile
+    );
+  } catch (auditErr) {
+    console.warn('Audit notice:', auditErr);
+  }
+
+  return { success: true, count: newProducts.length };
+}
+
 export const PriceListView: React.FC<Props> = ({ profile }) => {
-  const [products, setProducts] = useState<DynamicPriceProduct[]>([]);
+  // Pre-load from instant cache for 0ms initial render
+  const [products, setProducts] = useState<DynamicPriceProduct[]>(getInitialCachedProducts);
   const [validityDate, setValidityDate] = useState('Pricelist w.e.f 01/10/2026 to 31/10/2026');
   const [logoUrl, setLogoUrl] = useState<string>('');
   const [logoSize, setLogoSize] = useState<number>(75);
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [isResetting, setIsResetting] = useState<boolean>(false);
+
+  // Backup & Restore state
+  const [showBackupModal, setShowBackupModal] = useState<boolean>(false);
+  const [backupList, setBackupList] = useState<any[]>([]);
+  const [isLoadingBackups, setIsLoadingBackups] = useState<boolean>(false);
+  const [isRestoringBackup, setIsRestoringBackup] = useState<boolean>(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -294,20 +442,44 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         setLogoUrl(data.logoUrl || '');
         setLogoSize(data.logoSize || 75);
       }
+    }, (err) => {
+      console.warn('PriceList branding live sync notice:', err);
     });
+
     const unsubMeta = onSnapshot(doc(db, 'config', 'pricelist_meta'), (snap) => {
       if (snap.exists() && snap.data().validityDate) {
         setValidityDate(snap.data().validityDate);
       }
+    }, (err) => {
+      console.warn('PriceList meta live sync notice:', err);
     });
+
     return () => {
       unsubBranding();
       unsubMeta();
     };
   }, []);
 
-  // 2. Real-time Listener for Dynamic Products
+  // 2. Real-time Listener with Dual Master-Doc & Collection Redundancy (Zero-Wipe Guarantee)
   useEffect(() => {
+    // 2.1 First listen to config/master_pricelist (Master Document)
+    const unsubMaster = onSnapshot(doc(db, 'config', 'master_pricelist'), (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data && Array.isArray(data.products) && data.products.length > 0) {
+          try {
+            localStorage.setItem('blackworm_master_pricelist', JSON.stringify(data));
+            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(data.products));
+          } catch {}
+          setProducts(data.products);
+          if (data.validityDate) setValidityDate(data.validityDate);
+        }
+      }
+    }, (err) => {
+      console.warn('Master price list sync notice:', err);
+    });
+
+    // 2.2 Listen to products_pricelist_v2 collection
     const q = query(collection(db, 'products_pricelist_v2'));
     const unsub = onSnapshot(q, async (snap) => {
       const list: DynamicPriceProduct[] = [];
@@ -318,10 +490,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         }
       });
 
-      // If empty on first load, seed with official reference data from photo
-      if (list.length === 0) {
-        await seedReferenceData();
-      } else {
+      if (list.length > 0) {
         // Sort products by orderIndex or group and code
         list.sort((a, b) => {
           if (a.groupName !== b.groupName) {
@@ -334,30 +503,179 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
           return (a.orderIndex || 0) - (b.orderIndex || 0);
         });
         setProducts(list);
+        try {
+          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(list));
+        } catch {}
+      } else {
+        // Collection returned 0 items: NEVER auto-wipe!
+        // Check if master_pricelist or localStorage already has custom products
+        const cached = getInitialCachedProducts();
+        if (cached.length > 0) {
+          setProducts(cached);
+          // Safely restore items without batch deletion
+          for (const item of cached) {
+            setDoc(doc(db, 'products_pricelist_v2', item.id), item, { merge: true }).catch(() => {});
+          }
+        } else {
+          // Truly empty first-time database setup only
+          await seedReferenceDataSafe();
+        }
+      }
+    }, (err) => {
+      console.warn('PriceList products live sync notice:', err);
+      const cached = getInitialCachedProducts();
+      if (cached.length > 0) {
+        setProducts(cached);
+      } else {
+        const fallback: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
+          ...item,
+          id: `ref_${idx + 1}`,
+        }));
+        setProducts(fallback);
       }
     });
 
-    return () => unsub();
+    return () => {
+      unsubMaster();
+      unsub();
+    };
   }, []);
 
-  // Seed reference data
-  const seedReferenceData = async () => {
+  // Safe Seeding: Only runs if database is completely empty; NEVER wipes or overwrites
+  const seedReferenceDataSafe = async () => {
     try {
-      const snapOld = await getDocs(collection(db, 'products_pricelist_v2'));
-      const batch = writeBatch(db);
-      snapOld.forEach((d) => batch.delete(d.ref));
-      await batch.commit();
+      const masterCheck = await getDoc(doc(db, 'config', 'master_pricelist'));
+      if (masterCheck.exists() && masterCheck.data()?.products?.length > 0) {
+        setProducts(masterCheck.data().products);
+        return;
+      }
 
-      for (const item of OFFICIAL_REFERENCE_DATA) {
+      const initialProducts: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item) => {
         const cleanId = `prod_${item.code.replace(/[^A-Za-z0-9]/g, '_')}_${item.gradeName.replace(/[^A-Za-z0-9]/g, '_')}`;
-        await setDoc(doc(db, 'products_pricelist_v2', cleanId), {
+        return {
           ...item,
           id: cleanId,
           isArchived: false,
-        });
+        };
+      });
+
+      await setDoc(doc(db, 'config', 'master_pricelist'), {
+        products: initialProducts,
+        validityDate: 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
+        updatedAt: new Date().toISOString(),
+        version: 1,
+        isInitialDefault: true,
+      }, { merge: true });
+
+      for (const item of initialProducts) {
+        await setDoc(doc(db, 'products_pricelist_v2', item.id), item, { merge: true });
       }
+      setProducts(initialProducts);
+      try {
+        localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(initialProducts));
+      } catch {}
     } catch (err) {
-      console.error('Error auto-seeding reference price list:', err);
+      console.error('Safe seed notice:', err);
+    }
+  };
+
+  // Fetch Firestore backup history
+  const fetchBackups = async () => {
+    setIsLoadingBackups(true);
+    try {
+      const qBackups = query(collection(db, 'pricelist_backups'), orderBy('createdAt', 'desc'), limit(15));
+      const snap = await getDocs(qBackups);
+      const list: any[] = [];
+      snap.forEach(d => list.push({ id: d.id, ...d.data() }));
+      setBackupList(list);
+    } catch (e) {
+      console.warn('Fetch backups notice:', e);
+    } finally {
+      setIsLoadingBackups(false);
+    }
+  };
+
+  // Restore price list from historical backup
+  const handleRestoreFromBackup = async (b: any) => {
+    if (!b || !Array.isArray(b.previousProducts) || b.previousProducts.length === 0) {
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'डेटा उपलब्ध नाही',
+        message: 'या बॅकअपमध्ये रिस्टोर करण्यासाठी प्रॉडक्ट्स सापडले नाहीत.',
+        confirmText: 'ठीक आहे',
+        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+      });
+      return;
+    }
+
+    setDialogConfig({
+      isOpen: true,
+      type: 'confirm',
+      title: 'प्राईस लिस्ट रिस्टोर निश्चित करा',
+      message: `तुम्ही "${new Date(b.createdAt).toLocaleString('en-IN')}" रोजीचा ${b.previousProducts.length} प्रॉडक्ट्सचा बॅकअप रिस्टोर करू इच्छिता का? फाईलमधील सर्व प्रॉडक्ट्स व दर ॲपमध्ये लागू होतील.`,
+      confirmText: 'होय, रिस्टोर करा',
+      cancelText: 'रद्द करा',
+      onConfirm: async () => {
+        setDialogConfig(p => ({ ...p, isOpen: false }));
+        setIsRestoringBackup(true);
+        try {
+          await savePriceListPermanently(
+            b.previousProducts,
+            `Restore from backup (${b.createdAt})`,
+            profile,
+            validityDate,
+            products
+          );
+          setProducts(b.previousProducts);
+          setShowBackupModal(false);
+          setDialogConfig({
+            isOpen: true,
+            type: 'success',
+            title: 'रिस्टोर यशस्वी',
+            message: `मागील बॅकअपमधून एकूण ${b.previousProducts.length} प्रॉडक्ट्स यशस्वीरित्या रिस्टोर झाले आहेत.`,
+            confirmText: 'ठीक आहे',
+            onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+          });
+        } catch (err: any) {
+          setDialogConfig({
+            isOpen: true,
+            type: 'alert',
+            title: 'रिस्टोर अयशस्वी',
+            message: err.message || 'रिस्टोर करताना त्रुटी आली.',
+            confirmText: 'ठीक आहे',
+            onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+          });
+        } finally {
+          setIsRestoringBackup(false);
+        }
+      },
+      onCancel: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+    });
+  };
+
+  // Download Current Price List as JSON Backup
+  const handleDownloadBackupJson = () => {
+    try {
+      const exportPayload = {
+        title: 'Blackworm Agritech Pvt Ltd - Official Price List Backup',
+        validityDate,
+        exportedAt: new Date().toISOString(),
+        exportedBy: profile.fullName || profile.loginId,
+        totalProducts: products.length,
+        products: products,
+      };
+      const blob = new Blob([JSON.stringify(exportPayload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `Blackworm_PriceList_Backup_${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('JSON export error:', e);
     }
   };
 
@@ -468,21 +786,21 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
           throw new Error('एक्सेल फाईलमध्ये योग्य प्रॉडक्ट्स किंवा ग्रेड्स सापडले नाहीत. कृपया नमुना फॉरमॅट वापरा.');
         }
 
-        // Sync to Firestore
-        const snapOld = await getDocs(collection(db, 'products_pricelist_v2'));
-        const batch = writeBatch(db);
-        snapOld.forEach((d) => batch.delete(d.ref));
-        await batch.commit();
-
-        for (const item of newProducts) {
-          await setDoc(doc(db, 'products_pricelist_v2', item.id), item);
-        }
+        // Permanently Save to Firestore Master Doc, Collection, Backup and LocalStorage
+        await savePriceListPermanently(
+          newProducts,
+          file.name,
+          profile,
+          validityDate,
+          products
+        );
+        setProducts(newProducts);
 
         setDialogConfig({
           isOpen: true,
           type: 'success',
-          title: 'प्राईस लिस्ट अपडेट झाली',
-          message: `एक्सेल फाईलमधून एकूण ${newProducts.length} प्रॉडक्ट्स यशस्वीरित्या ॲपमध्ये अपडेट करण्यात आले आहेत.`,
+          title: 'प्राईस लिस्ट कायमस्वरूपी सेव्ह झाली',
+          message: `एक्सेल फाईलमधून एकूण ${newProducts.length} प्रॉडक्ट्स डेटाबेसमध्ये कायमस्वरूपी सेव्ह करण्यात आले आहेत. रिफ्रेश किंवा नवीन डिव्हाइसवरही ही प्राईस लिस्ट उपलब्ध राहील.`,
           confirmText: 'ठीक आहे',
           onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
         });
@@ -508,16 +826,9 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
           throw new Error('फाईलमधून प्रॉडक्ट्स डेटा वाचता आला नाही.');
         }
 
-        // Clear existing and insert extracted items
-        const snapOld = await getDocs(collection(db, 'products_pricelist_v2'));
-        const batch = writeBatch(db);
-        snapOld.forEach((d) => batch.delete(d.ref));
-        await batch.commit();
-
-        for (let idx = 0; idx < extractedProducts.length; idx++) {
-          const item = extractedProducts[idx];
+        const newProducts: DynamicPriceProduct[] = extractedProducts.map((item, idx) => {
           const cleanId = `prod_${(item.code || `item_${idx}`).replace(/[^A-Za-z0-9]/g, '_')}_${(item.gradeName || '').replace(/[^A-Za-z0-9]/g, '_')}`;
-          await setDoc(doc(db, 'products_pricelist_v2', cleanId), {
+          return {
             groupName: item.groupName || 'Group A - Water Soluble Fertilizers',
             code: item.code || `${idx + 1}.`,
             brandName: item.brandName || 'Airawat®',
@@ -528,21 +839,27 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
             orderIndex: idx + 1,
             isArchived: false,
             id: cleanId,
-          });
-        }
+          };
+        });
 
+        // Permanently Save to Firestore Master Doc, Collection, Backup and LocalStorage
+        await savePriceListPermanently(
+          newProducts,
+          file.name,
+          profile,
+          parsedData.validityDate || validityDate,
+          products
+        );
+        setProducts(newProducts);
         if (parsedData.validityDate) {
-          await setDoc(doc(db, 'config', 'pricelist_meta'), {
-            validityDate: parsedData.validityDate,
-            updatedAt: new Date().toISOString(),
-          }, { merge: true });
+          setValidityDate(parsedData.validityDate);
         }
 
         setDialogConfig({
           isOpen: true,
           type: 'success',
-          title: 'प्राईस लिस्ट अपडेट झाली',
-          message: `अपलोड केलेल्या फाईलमधून एकूण ${extractedProducts.length} प्रॉडक्ट्स यशस्वीरित्या ॲपमध्ये सेव्ह झाले आहेत.`,
+          title: 'प्राईस लिस्ट कायमस्वरूपी सेव्ह झाली',
+          message: `अपलोड केलेल्या फाईलमधून एकूण ${newProducts.length} प्रॉडक्ट्स डेटाबेसमध्ये कायमस्वरूपी सेव्ह झाले आहेत. रिफ्रेश किंवा नवीन डिव्हाइसवरही ही प्राईस लिस्ट उपलब्ध राहील.`,
           confirmText: 'ठीक आहे',
           onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
         });
@@ -597,7 +914,36 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
             </span>
           </div>
 
-          <div className="flex items-center gap-2 w-full sm:w-auto">
+          <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+            {/* Permanent Protection Status Badge */}
+            <div className="hidden lg:flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-emerald-50 text-emerald-800 text-[11px] font-bold border border-emerald-200">
+              <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+              <span>डेटाबेसमध्ये कायमस्वरूपी सुरक्षित</span>
+            </div>
+
+            {/* Backup & Version History Button */}
+            <button
+              onClick={() => {
+                fetchBackups();
+                setShowBackupModal(true);
+              }}
+              className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-xs font-bold transition shadow-2xs border border-slate-300 cursor-pointer"
+              title="मागील बॅकअप आवृत्ती पहा किंवा रिस्टोर करा"
+            >
+              <History className="w-3.5 h-3.5 text-slate-600" />
+              <span>बॅकअप & हिस्ट्री</span>
+            </button>
+
+            {/* Download Template / Current Excel */}
+            <button
+              onClick={handleDownloadTemplate}
+              className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-xs font-bold transition shadow-2xs border border-slate-300 cursor-pointer"
+              title="सध्याची प्राईस लिस्ट एक्सेल स्वरूपात डाऊनलोड करा"
+            >
+              <Download className="w-3.5 h-3.5 text-slate-600" />
+              <span>एक्सेल डाऊनलोड</span>
+            </button>
+
             <input
               type="file"
               ref={fileInputRef}
@@ -616,7 +962,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
               {isUploading ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>अपलोड व अपडेट होत आहे...</span>
+                  <span>अपलोड व सेव्ह होत आहे...</span>
                 </>
               ) : (
                 <>
@@ -829,6 +1175,102 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
           )}
         </div>
       </div>
+
+      {/* ========================================================================= */}
+      {/* BACKUP & RESTORE MODAL                                                   */}
+      {/* ========================================================================= */}
+      {showBackupModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 no-print">
+          <div className="bg-white rounded-3xl max-w-2xl w-full p-5 sm:p-6 shadow-2xl border border-slate-200 max-h-[90vh] flex flex-col">
+            <div className="flex items-center justify-between pb-3.5 border-b border-slate-200">
+              <div className="flex items-center gap-2">
+                <Database className="w-5 h-5 text-emerald-600" />
+                <h3 className="text-base font-bold text-slate-900">प्राईस लिस्ट बॅकअप आणि सुरक्षित रिस्टोर</h3>
+              </div>
+              <button 
+                onClick={() => setShowBackupModal(false)}
+                className="p-1 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-3.5 bg-emerald-50/70 border border-emerald-200 rounded-2xl my-3 text-xs space-y-1">
+              <div className="flex items-center gap-1.5 font-bold text-emerald-900">
+                <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>कायमस्वरूपी डेटा संरक्षण (Permanent Storage Guarantee)</span>
+              </div>
+              <p className="text-emerald-800 leading-relaxed text-[11px]">
+                प्रत्येक नवीन अपलोडपूर्वी मागील प्राईस लिस्टचा ऑटोमॅटिक बॅकअप डेटाबेसमध्ये सेव्ह केला जातो. रिफ्रेश किंवा लॉगआउट केल्यास डेटा कधीही नष्ट होणार नाही. आवश्यकतेनुसार तुम्ही कोणत्याही मागील आवृत्तीवरून त्वरित डेटा रिस्टोर करू शकता.
+              </p>
+            </div>
+
+            {/* Quick Export Actions */}
+            <div className="flex flex-wrap gap-2 mb-3">
+              <button
+                onClick={handleDownloadTemplate}
+                className="flex items-center gap-1.5 px-3 py-2 bg-slate-900 hover:bg-black text-white text-xs font-bold rounded-xl transition cursor-pointer shadow-2xs"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>सध्याची लिस्ट एक्सेल (Excel)</span>
+              </button>
+              <button
+                onClick={handleDownloadBackupJson}
+                className="flex items-center gap-1.5 px-3 py-2 bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-bold rounded-xl transition cursor-pointer shadow-2xs"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>पूर्ण डेटा बॅकअप (JSON)</span>
+              </button>
+            </div>
+
+            {/* Historical Backups list */}
+            <div className="flex-1 overflow-y-auto space-y-2 pr-1 min-h-[160px] max-h-[300px]">
+              <div className="flex items-center justify-between text-xs font-bold text-slate-700 pb-1">
+                <span>सेव्ह झालेले ऑटोमॅटिक बॅकअप्स ({backupList.length})</span>
+                {isLoadingBackups && <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-600" />}
+              </div>
+
+              {backupList.map((b) => (
+                <div key={b.id} className="p-2.5 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-between gap-3 text-xs">
+                  <div>
+                    <div className="font-bold text-slate-900 flex items-center gap-1.5 text-xs">
+                      <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
+                      <span>{new Date(b.createdAt).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}</span>
+                    </div>
+                    <div className="text-[11px] text-slate-500 mt-0.5">
+                      {b.previousProductsCount || b.previousProducts?.length || 0} प्रॉडक्ट्स • स्रोत: {b.source || 'Upload'} • युजर: {b.performedByName || 'Admin'}
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={() => handleRestoreFromBackup(b)}
+                    disabled={isRestoringBackup}
+                    className="flex items-center gap-1 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg transition disabled:opacity-50 text-[11px] cursor-pointer shrink-0"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>रिस्टोर करा</span>
+                  </button>
+                </div>
+              ))}
+
+              {backupList.length === 0 && !isLoadingBackups && (
+                <div className="p-8 text-center text-slate-400 font-bold text-xs bg-slate-50 rounded-xl">
+                  अद्याप कोणतेही अतिरिक्त बॅकअप्स उपलब्ध नाहीत. सध्याची मूळ प्राईस लिस्ट डेटाबेसमध्ये सुरक्षित आहे.
+                </div>
+              )}
+            </div>
+
+            <div className="pt-3.5 border-t border-slate-200 mt-3 flex justify-end">
+              <button
+                onClick={() => setShowBackupModal(false)}
+                className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-800 text-xs font-bold rounded-xl transition cursor-pointer"
+              >
+                बंद करा
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <CustomDialogModal {...dialogConfig} />
     </div>

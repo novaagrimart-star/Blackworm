@@ -38,15 +38,14 @@ export function setCachedBranding(config: BrandingConfig) {
   }
 }
 
-/**
- * Custom React Hook for Instant, Synchronized Company Branding (Single Source of Truth)
- */
-export function useBranding() {
-  const [branding, setBranding] = useState<BrandingConfig>(getCachedBranding);
+let sharedUnsub: (() => void) | null = null;
+const brandingSubscribers = new Set<(config: BrandingConfig) => void>();
+let currentBrandingState: BrandingConfig = getCachedBranding();
 
-  useEffect(() => {
-    // Real-time synchronization from Firestore 'config/branding'
-    const unsub = onSnapshot(
+function startSharedBrandingListener() {
+  if (sharedUnsub) return;
+  try {
+    sharedUnsub = onSnapshot(
       doc(db, 'config', 'branding'),
       (snap) => {
         if (snap.exists()) {
@@ -55,16 +54,37 @@ export function useBranding() {
             logoUrl: data.logoUrl || '',
             logoSize: Number(data.logoSize) || 80,
           };
-          setBranding(fresh);
+          currentBrandingState = fresh;
           setCachedBranding(fresh);
+          brandingSubscribers.forEach((cb) => cb(fresh));
         }
       },
       (err) => {
-        console.warn('Branding real-time sync error:', err);
+        console.warn('Shared branding sync notice:', err);
       }
     );
+  } catch (e) {
+    console.warn('Failed to start shared branding listener:', e);
+  }
+}
 
-    return () => unsub();
+/**
+ * Custom React Hook for Instant, Synchronized Company Branding (Shared Singleton Listener)
+ */
+export function useBranding() {
+  const [branding, setBranding] = useState<BrandingConfig>(() => currentBrandingState);
+
+  useEffect(() => {
+    brandingSubscribers.add(setBranding);
+    startSharedBrandingListener();
+
+    return () => {
+      brandingSubscribers.delete(setBranding);
+      if (brandingSubscribers.size === 0 && sharedUnsub) {
+        sharedUnsub();
+        sharedUnsub = null;
+      }
+    };
   }, []);
 
   const saveBranding = async (newUrl: string, newSize: number, userId?: string) => {

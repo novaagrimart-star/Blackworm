@@ -26,12 +26,21 @@ import {
   ChevronDown,
   Save,
   CheckCircle2,
-  Printer,
   Download,
   Loader2,
   Phone,
   Mail
 } from 'lucide-react';
+
+export const formatTitleCase = (str: string | undefined | null): string => {
+  if (!str) return '';
+  return str
+    .toLowerCase()
+    .split(' ')
+    .filter(Boolean)
+    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
+};
 
 interface MonthlyData {
   month: string;
@@ -167,6 +176,8 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
         setLogoUrl(data.logoUrl || '');
         setLogoSize(data.logoSize || 80);
       }
+    }, (err) => {
+      console.warn('TargetSheet branding sync notice:', err);
     });
     return () => unsubBranding();
   }, []);
@@ -254,13 +265,19 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
           const data = docSnap.data() as YearlySheet;
           // Normalize and clean all numbers to 2 decimal places using toDecimal2
           if (data.months) {
-            data.months = data.months.map(m => ({
-              ...m,
-              target: toDecimal2(m.target),
-              achievement: toDecimal2(m.achievement),
-              collection: toDecimal2(m.collection),
-              actualCollection: toDecimal2(m.actualCollection),
-            }));
+            const perc = Number(data.collectionPercent) || 0;
+            data.months = data.months.map(m => {
+              const target = toDecimal2(m.target);
+              const achievement = toDecimal2(m.achievement);
+              const collection = perc > 0 ? multiplyDecimal2(target > 0 ? target : achievement, perc) : toDecimal2(m.collection);
+              return {
+                ...m,
+                target,
+                achievement,
+                collection,
+                actualCollection: toDecimal2(m.actualCollection),
+              };
+            });
           }
           data.lastYearSale = toDecimal2(data.lastYearSale);
           data.lastYearCollection = toDecimal2(data.lastYearCollection);
@@ -315,13 +332,13 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     if (updates.hasOwnProperty('lastYearOutstanding')) newSheet.lastYearOutstanding = toDecimal2(updates.lastYearOutstanding);
     if (updates.hasOwnProperty('lastYearCollection')) newSheet.lastYearCollection = toDecimal2(updates.lastYearCollection);
 
-    // If collectionPercent updated, update all months' collection targets using exact integer arithmetic
+    // If collectionPercent updated, auto-update all months' collection in lakh using exact decimal arithmetic
     if (updates.hasOwnProperty('collectionPercent')) {
       const perc = Number(updates.collectionPercent) || 0;
       newSheet.collectionPercent = perc;
       newSheet.months = newSheet.months.map(m => ({
         ...m,
-        collection: multiplyDecimal2(m.achievement, perc)
+        collection: multiplyDecimal2(m.target > 0 ? m.target : m.achievement, perc)
       }));
     }
     
@@ -336,19 +353,23 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     const newMonths = [...sheet.months];
     let monthUpdate = { ...newMonths[index], ...updates };
     
+    // Target update: automatically updates Collection in Lakh based on collection percentage
     if (updates.hasOwnProperty('target')) {
-      monthUpdate.target = toDecimal2(updates.target);
+      const tgt = toDecimal2(updates.target);
+      monthUpdate.target = tgt;
+      const perc = sheet.collectionPercent || 0;
+      monthUpdate.collection = multiplyDecimal2(tgt > 0 ? tgt : monthUpdate.achievement, perc);
     }
-    // If achievement updated, auto-calculate collection target based on percentage rounded cleanly
+    // If achievement updated and target is 0, recalculate collection target
     if (updates.hasOwnProperty('achievement')) {
       const ach = toDecimal2(updates.achievement);
       monthUpdate.achievement = ach;
       const perc = sheet.collectionPercent || 0;
-      monthUpdate.collection = multiplyDecimal2(ach, perc);
+      if (!monthUpdate.target || monthUpdate.target === 0) {
+        monthUpdate.collection = multiplyDecimal2(ach, perc);
+      }
     }
-    if (updates.hasOwnProperty('collection')) {
-      monthUpdate.collection = toDecimal2(updates.collection);
-    }
+    // Actual Collection remains manually editable per requirement
     if (updates.hasOwnProperty('actualCollection')) {
       monthUpdate.actualCollection = toDecimal2(updates.actualCollection);
     }
@@ -476,14 +497,14 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
           </div>
           <div>
             <h2 className="text-base font-bold text-slate-800">Target & Collection Sheet 2026-27</h2>
-            <p className="text-xs text-slate-500">Official Yearly Target Sheet</p>
+            <p className="text-xs text-slate-500">Yearly Target Sheet</p>
           </div>
         </div>
 
         {/* User Selection & Actions */}
         <div className="flex flex-wrap items-center gap-2">
           {userIsAdmin && (
-            <div className="relative min-w-[210px] sm:min-w-[240px]">
+            <div className="relative min-w-[210px] sm:min-w-[260px]">
               <button
                 type="button"
                 onClick={() => setIsUserDropdownOpen(!isUserDropdownOpen)}
@@ -491,11 +512,13 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               >
                 <div className="min-w-0 flex-1 flex items-baseline gap-1.5 truncate">
                   <span className="text-xs font-black text-slate-900 truncate">
-                    {selectedUser.fullName || selectedUser.uid}
+                    {formatTitleCase(selectedUser.fullName || selectedUser.uid)}
                   </span>
-                  <span className="text-[9.5px] font-bold text-slate-500 uppercase shrink-0">
-                    {selectedUser.role === 'owner' ? '(TOTAL)' : `(${selectedUser.designation || selectedUser.role})`}
-                  </span>
+                  {selectedUser.role === 'owner' ? (
+                    <span className="text-[10px] font-bold text-red-600 uppercase shrink-0">
+                      (Total)
+                    </span>
+                  ) : null}
                 </div>
                 <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
               </button>
@@ -503,7 +526,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               {isUserDropdownOpen && (
                 <>
                   <div className="fixed inset-0 z-40" onClick={() => setIsUserDropdownOpen(false)} />
-                  <div className="absolute left-0 mt-1 w-full sm:w-72 bg-white border border-slate-200 rounded-xl shadow-xl z-50 max-h-60 overflow-y-auto p-1 divide-y divide-slate-100">
+                  <div className="absolute left-0 mt-1 w-full sm:w-80 bg-white border border-slate-200 rounded-xl shadow-xl z-50 max-h-60 overflow-y-auto p-1 divide-y divide-slate-100">
                     {users.map((u) => (
                       <div
                         key={u.uid}
@@ -512,14 +535,18 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                           setIsUserDropdownOpen(false);
                         }}
                         className={cn(
-                          "p-1.5 px-2 rounded-lg cursor-pointer transition flex flex-col",
-                          selectedUserId === u.uid ? "bg-red-50 text-red-900" : "hover:bg-slate-50 text-slate-800"
+                          "p-2 px-2.5 rounded-lg cursor-pointer transition flex items-center justify-between gap-2 whitespace-nowrap",
+                          selectedUserId === u.uid ? "bg-red-50 text-red-900 font-black" : "hover:bg-slate-50 text-slate-800 font-bold"
                         )}
                       >
-                        <span className="text-xs font-black text-slate-900 truncate">{u.fullName || u.uid}</span>
-                        <span className="text-[9.5px] font-bold text-slate-500 uppercase">
-                          {u.role === 'owner' ? 'OWNER / CONSOLIDATED TOTAL' : (u.designation || u.role)}
+                        <span className="text-xs truncate">
+                          {formatTitleCase(u.fullName || u.uid)}
                         </span>
+                        {u.role === 'owner' && (
+                          <span className="text-[10px] font-black text-red-600 uppercase shrink-0 bg-red-100 px-1.5 py-0.5 rounded">
+                            Owner (Total)
+                          </span>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -547,15 +574,6 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
           >
             {isGeneratingPdf ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Download className="w-2.5 h-2.5" />}
             <span>PDF</span>
-          </button>
-
-          <button
-            onClick={() => window.print()}
-            className="flex items-center gap-1 px-2 py-0.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-[10px] font-bold transition border border-slate-200 cursor-pointer active:scale-95"
-            title="Print"
-          >
-            <Printer className="w-2.5 h-2.5" />
-            <span>Print</span>
           </button>
         </div>
       </div>
@@ -591,14 +609,15 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               )}
               <div>
                 <h1 className="text-xl sm:text-2xl font-black text-red-600 tracking-tight leading-none uppercase">
-                  Blackworm Agri Tech Pvt Ltd
+                  BLACKWORM AGRITECH PVT LTD
                 </h1>
-                <p className="text-[10px] font-bold text-black tracking-wide uppercase mt-1">
-                  Plot No. 12, Krushi Vikas Sankul, Market Yard, Pune - 411037
-                </p>
-                <div className="flex items-center gap-4 text-[9px] font-black text-black mt-0.5">
-                  <span className="flex items-center gap-1"><Phone className="w-2.5 h-2.5" /> +91 98765 43210</span>
-                  <span className="flex items-center gap-1"><Mail className="w-2.5 h-2.5" /> contact@blackwormagri.com</span>
+                <div className="text-[8px] sm:text-[8.5px] font-bold text-slate-800 leading-tight mt-1 space-y-0.5">
+                  <p>CIN: U01409PN2022PTC217246, GST No.: 27AALCB3069J1ZC</p>
+                  <p>Address: Gat No. 17, Vijaynagar (Mhaisal), Tal. Miraj, Dist. Sangli – 416409</p>
+                  <p className="flex items-center gap-4 mt-0.5">
+                    <span className="flex items-center gap-1 text-red-600 font-bold"><Phone className="w-2.5 h-2.5" /> +91 7798716201</span>
+                    <span className="flex items-center gap-1 text-red-600 font-bold underline"><Mail className="w-2.5 h-2.5" /> blackwormagritechpvtltd@gmail.com</span>
+                  </p>
                 </div>
               </div>
             </div>
@@ -612,39 +631,41 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
           </div>
 
           {/* 2. Document Title Banner */}
-          <div className="text-center py-2 border-b-2 border-black bg-amber-300">
-            <h2 className="text-base sm:text-lg font-black uppercase tracking-wider text-black">
+          <div className="text-center py-2 border-b-2 border-black bg-amber-400">
+            <h2 className="text-base sm:text-lg font-black uppercase tracking-wider text-slate-950">
               Target & Collection Sheet 2026-27
             </h2>
           </div>
 
           {/* 3. Officer Profile & Top Statistics Grid */}
           <div className="grid grid-cols-3 border-b-2 border-black divide-x-2 divide-black text-xs">
-            {/* Column 1: Officer Information */}
+            {/* Column 1: Officer Information - Designation removed, names on single line in Title Case */}
             <div className="divide-y-2 divide-black">
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-24 shrink-0 px-2 uppercase tracking-tighter">Officer -</span>
+                <span className="font-black text-black w-24 shrink-0 px-2 tracking-tight whitespace-nowrap">
+                  {isOwnerView ? 'Owner -' : 'Officer -'}
+                </span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
-                  <span className="w-full font-black text-black uppercase text-center block text-xs">
-                    {selectedUser.fullName || sheet.fullName}
+                  <span className="w-full font-black text-black text-center block text-xs sm:text-[13px] whitespace-nowrap overflow-hidden text-ellipsis">
+                    {formatTitleCase(selectedUser.fullName || sheet.fullName)}
                   </span>
                 </div>
               </div>
 
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-24 shrink-0 px-2 uppercase tracking-tighter">Designation -</span>
+                <span className="font-black text-black w-24 shrink-0 px-2 tracking-tight whitespace-nowrap">Center (HQ) -</span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
-                  <span className="w-full font-black text-black uppercase text-center block text-[9.5px]">
-                    {selectedUser.designation || sheet.designation}
+                  <span className="w-full font-black text-black text-center block text-xs sm:text-[13px] whitespace-nowrap overflow-hidden text-ellipsis">
+                    {isOwnerView ? 'All Centers' : (selectedUser.center || sheet.center || '-')}
                   </span>
                 </div>
               </div>
 
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-24 shrink-0 px-2 uppercase tracking-tighter">Center (HQ) -</span>
+                <span className="font-black text-black w-24 shrink-0 px-2 tracking-tight whitespace-nowrap">Year -</span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
-                  <span className="w-full font-black text-black uppercase text-center block text-xs">
-                    {selectedUser.center || sheet.center || '-'}
+                  <span className="w-full font-black text-black text-center block text-xs sm:text-[13px] whitespace-nowrap">
+                    2026-27
                   </span>
                 </div>
               </div>
@@ -653,7 +674,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
             {/* Column 2: Sales Data */}
             <div className="divide-y-2 divide-black">
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-28 shrink-0 px-2 uppercase tracking-tighter">L.Y. Sale -</span>
+                <span className="font-black text-black w-28 shrink-0 px-2 tracking-tight whitespace-nowrap">L.Y. Sale -</span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
                   <CellInput
                     value={sheet.lastYearSale}
@@ -667,7 +688,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               </div>
 
               <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-red-50/50">
-                <span className="font-black text-red-600 w-28 shrink-0 px-2 uppercase tracking-tighter">Target -</span>
+                <span className="font-black text-red-600 w-28 shrink-0 px-2 tracking-tight whitespace-nowrap">Target -</span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
                   <CellInput
                     value={sheet.salesTarget}
@@ -681,7 +702,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               </div>
 
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-28 shrink-0 px-2 uppercase tracking-tighter">L.Y. Outstd -</span>
+                <span className="font-black text-black w-28 shrink-0 px-2 tracking-tight whitespace-nowrap">L.Y. Outstd -</span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
                   <CellInput
                     value={sheet.lastYearOutstanding}
@@ -698,7 +719,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
             {/* Column 3: Collection Data & Calculations */}
             <div className="divide-y-2 divide-black">
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-28 shrink-0 px-2 uppercase tracking-tighter">L.Y. Coll. -</span>
+                <span className="font-black text-black w-28 shrink-0 px-2 tracking-tight whitespace-nowrap">L.Y. Coll. -</span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
                   <CellInput
                     value={sheet.lastYearCollection}
@@ -712,38 +733,38 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               </div>
 
               <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-amber-50">
-                <span className="font-black text-amber-900 w-28 shrink-0 px-2 uppercase tracking-tighter text-[9px]">Curr. L.Y. Outstd -</span>
+                <span className="font-black text-amber-950 w-28 shrink-0 px-2 tracking-tight whitespace-nowrap text-[9.5px]">Curr. Outstd -</span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
-                  <span className="w-full font-black text-amber-900 font-mono text-center">
+                  <span className="w-full font-black text-amber-950 font-mono text-center">
                     {formatAmount(subtractDecimal2(sheet.lastYearOutstanding, sheet.lastYearCollection))}
                   </span>
-                  <span className="font-black text-amber-900 text-[8px] uppercase ml-0.5 shrink-0">Lakh</span>
+                  <span className="font-black text-amber-950 text-[8px] uppercase ml-0.5 shrink-0">Lakh</span>
                 </div>
               </div>
 
-              <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-blue-50">
-                <span className="font-black text-blue-800 w-28 shrink-0 px-2 uppercase tracking-tighter">Coll. Target -</span>
+              <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-blue-50/80">
+                <span className="font-black text-blue-900 w-28 shrink-0 px-2 tracking-tight whitespace-nowrap">Coll. Target -</span>
                 <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
                   {isOwnerView || isGeneratingPdf ? (
-                    <span className="w-full font-black text-blue-800 font-mono text-center">
+                    <span className="w-full font-black text-blue-900 font-mono text-center">
                       {sheet.collectionPercent || 0}%
                     </span>
                   ) : (
                     <input 
                       type="text" 
-                      inputMode="numeric"
-                      value={sheet.collectionPercent || ''} 
+                      inputMode="decimal"
+                      value={sheet.collectionPercent === 0 ? '' : sheet.collectionPercent} 
                       onChange={e => {
                         const val = e.target.value;
-                        if (/^\d*$/.test(val)) {
-                          updateSheet({ collectionPercent: Number(val) || 0 });
+                        if (/^\d*\.?\d*$/.test(val)) {
+                          updateSheet({ collectionPercent: val === '' ? 0 : Number(val) || 0 });
                         }
                       }} 
                       placeholder="0"
-                      className="w-full bg-transparent font-black text-blue-800 focus:outline-none font-mono text-center" 
+                      className="w-full bg-transparent font-black text-blue-900 focus:outline-none font-mono text-center" 
                     />
                   )}
-                  <span className="font-black text-blue-800 text-[8px] uppercase ml-0.5 shrink-0">%</span>
+                  <span className="font-black text-blue-900 text-[8px] uppercase ml-0.5 shrink-0">%</span>
                 </div>
               </div>
             </div>
@@ -755,13 +776,13 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               <thead>
                 <tr className="bg-slate-900 text-white font-black uppercase text-center border-b-2 border-black text-xs sm:text-[12.5px]">
                   <th className="p-2 border-r-2 border-black whitespace-nowrap w-12 text-center">Sr.</th>
-                  <th className="p-2 border-r-2 border-black w-28 text-center">Month</th>
-                  <th className="p-2 border-r-2 border-black text-center">Target (Lakh)</th>
-                  <th className="p-2 border-r-2 border-black text-center">Achieve (Lakh)</th>
-                  <th className="p-2 border-r-2 border-black text-center">% Ach.</th>
-                  <th className="p-2 border-r-2 border-black text-center">Collection (Lakh)</th>
-                  <th className="p-2 border-r-2 border-black text-center">Actual Coll.</th>
-                  <th className="p-2 text-center">% Coll.</th>
+                  <th className="p-2 border-r-2 border-black whitespace-nowrap w-28 text-center">Month</th>
+                  <th className="p-2 border-r-2 border-black whitespace-nowrap text-center">Target (Lakh)</th>
+                  <th className="p-2 border-r-2 border-black whitespace-nowrap text-center">Achieve (Lakh)</th>
+                  <th className="p-2 border-r-2 border-black whitespace-nowrap text-center">% Ach.</th>
+                  <th className="p-2 border-r-2 border-black whitespace-nowrap text-center">Collection (Lakh)</th>
+                  <th className="p-2 border-r-2 border-black whitespace-nowrap text-center">Actual Coll.</th>
+                  <th className="p-2 whitespace-nowrap text-center">% Coll.</th>
                 </tr>
               </thead>
               <tbody className="divide-y-2 divide-black text-black font-black">
@@ -772,7 +793,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                     <React.Fragment key={m.month}>
                       <tr className="hover:bg-slate-50 transition-colors">
                         <td className="p-1.5 border-r-2 border-black text-center font-black text-black text-xs sm:text-[13px]">{idx + 1}</td>
-                        <td className="p-1.5 border-r-2 border-black font-black uppercase text-center text-xs sm:text-[13px]">{m.month}</td>
+                        <td className="p-1.5 border-r-2 border-black font-black uppercase text-center text-xs sm:text-[13px] whitespace-nowrap">{m.month}</td>
                         <td className="p-1 border-r-2 border-black">
                           <CellInput
                             value={m.target}
@@ -788,34 +809,30 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                             disabled={isOwnerView}
                             isPdfOrPrint={isGeneratingPdf}
                             onChange={v => updateMonth(idx, { achievement: v })}
-                            colorClass="text-blue-700"
+                            colorClass="text-blue-800"
                           />
                         </td>
                         <td className="p-1.5 border-r-2 border-black text-center font-black font-mono text-xs sm:text-[13px] text-slate-900">{achPercentStr}</td>
-                        <td className="p-1 border-r-2 border-black">
-                          <CellInput
-                            value={m.collection}
-                            disabled={isOwnerView}
-                            isPdfOrPrint={isGeneratingPdf}
-                            onChange={v => updateMonth(idx, { collection: v })}
-                            colorClass="text-black"
-                          />
+                        {/* Collection in Lakh: strictly auto-calculated based on Target & Percentage, non-editable */}
+                        <td className="p-1.5 border-r-2 border-black text-center font-mono font-black text-xs sm:text-[13px] text-slate-950 bg-slate-50/60">
+                          {formatAmount(m.collection)}
                         </td>
+                        {/* Actual Collection: remains editable */}
                         <td className="p-1 border-r-2 border-black">
                           <CellInput
                             value={m.actualCollection}
                             disabled={isOwnerView}
                             isPdfOrPrint={isGeneratingPdf}
                             onChange={v => updateMonth(idx, { actualCollection: v })}
-                            colorClass="text-emerald-700"
+                            colorClass="text-emerald-800"
                           />
                         </td>
                         <td className="p-1.5 text-center font-black font-mono text-xs sm:text-[13px] text-slate-900">{collPercentStr}</td>
                       </tr>
                       {/* Render Quarter Subtotal Row */}
                       {(idx === 2 || idx === 5 || idx === 8 || idx === 11) && (
-                        <tr className="bg-amber-200/90 font-black text-black border-y-2 border-black text-xs sm:text-[13px]">
-                          <td colSpan={2} className="p-2 border-r-2 border-black text-center uppercase tracking-wider font-black">
+                        <tr className="bg-amber-100 font-black text-slate-950 border-y-2 border-black text-xs sm:text-[13px]">
+                          <td colSpan={2} className="p-2 border-r-2 border-black text-center uppercase tracking-wider font-black whitespace-nowrap">
                             {idx === 2 ? 'Q1' : idx === 5 ? 'Q2' : idx === 8 ? 'Q3' : 'Q4'} TOTAL
                           </td>
                           {(() => {
@@ -823,10 +840,10 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                             return (
                               <>
                                 <td className="p-2 border-r-2 border-black text-center font-mono font-black text-xs sm:text-[13px]">{formatAmount(q.target)}</td>
-                                <td className="p-2 border-r-2 border-black text-center font-mono text-blue-900 font-black text-xs sm:text-[13px]">{formatAmount(q.achievement)}</td>
+                                <td className="p-2 border-r-2 border-black text-center font-mono text-blue-950 font-black text-xs sm:text-[13px]">{formatAmount(q.achievement)}</td>
                                 <td className="p-2 border-r-2 border-black text-center font-mono font-black text-xs sm:text-[13px]">{calcPercent(q.achievement, q.target)}</td>
                                 <td className="p-2 border-r-2 border-black text-center font-mono font-black text-xs sm:text-[13px]">{formatAmount(q.collection)}</td>
-                                <td className="p-2 border-r-2 border-black text-center font-mono text-emerald-900 font-black text-xs sm:text-[13px]">{formatAmount(q.actual)}</td>
+                                <td className="p-2 border-r-2 border-black text-center font-mono text-emerald-950 font-black text-xs sm:text-[13px]">{formatAmount(q.actual)}</td>
                                 <td className="p-2 text-center font-mono font-black text-xs sm:text-[13px]">{calcPercent(q.actual, q.collection)}</td>
                               </>
                             );
