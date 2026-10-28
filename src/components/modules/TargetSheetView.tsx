@@ -11,6 +11,7 @@ import { UserProfile, isAdmin } from '../../lib/auth';
 import { logAudit } from '../../lib/dataService';
 import { Language } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
+import { useBranding } from '../../lib/branding';
 import { 
   toDecimal2, 
   addDecimal2, 
@@ -83,7 +84,7 @@ const CellInput: React.FC<{
   className?: string;
   placeholder?: string;
   colorClass?: string;
-}> = ({ value, disabled, isPdfOrPrint, onChange, className, placeholder = "0.00", colorClass = "text-black" }) => {
+}> = ({ value, disabled, isPdfOrPrint, onChange, className, placeholder = "0.00", colorClass = "text-slate-900" }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [text, setText] = useState('');
 
@@ -95,7 +96,7 @@ const CellInput: React.FC<{
 
   if (disabled || isPdfOrPrint) {
     return (
-      <span className={cn("inline-block w-full text-center font-black font-mono text-xs sm:text-[13px] select-text tracking-tight", colorClass)}>
+      <span className={cn("inline-block w-full text-center font-bold font-mono text-xs sm:text-[13px] select-text tracking-tight", colorClass)}>
         {formatAmount(value)}
       </span>
     );
@@ -129,7 +130,7 @@ const CellInput: React.FC<{
       }}
       placeholder={placeholder}
       className={cn(
-        "w-full px-1 py-1 bg-transparent border-none focus:outline-none focus:bg-amber-100/70 rounded text-center font-black font-mono text-xs sm:text-[13px] tracking-tight transition-colors",
+        "w-full px-1 py-1 bg-transparent border-none focus:outline-none focus:bg-blue-50/80 rounded text-center font-bold font-mono text-xs sm:text-[13px] tracking-tight transition-colors",
         colorClass,
         className
       )}
@@ -139,10 +140,30 @@ const CellInput: React.FC<{
 
 export const TargetSheetView: React.FC<Props> = ({ profile }) => {
   const userIsAdmin = isAdmin(profile);
-  const [users, setUsers] = useState<UserProfile[]>([]);
+  const [users, setUsers] = useState<UserProfile[]>(() => {
+    try {
+      const cached = localStorage.getItem('blackworm_cached_users');
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {}
+    return [];
+  });
   const [selectedUserId, setSelectedUserId] = useState<string>(profile.uid);
-  const [sheet, setYearlySheet] = useState<YearlySheet | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [sheet, setYearlySheet] = useState<YearlySheet | null>(() => {
+    try {
+      const cached = localStorage.getItem(`yearly_target_sheet_${profile.uid}`);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed && Array.isArray(parsed.months) && parsed.months.length > 0) {
+          return parsed;
+        }
+      }
+    } catch {}
+    return null;
+  });
+  const [loading, setLoading] = useState(!sheet);
   const [saving, setSaving] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
@@ -155,9 +176,8 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     }
   }, [userIsAdmin, profile.uid]);
 
-  // Branding
-  const [logoUrl, setLogoUrl] = useState<string>('');
-  const [logoSize, setLogoSize] = useState<number>(80);
+  // Shared Singleton Branding Hook (0ms read, no redundant Firestore reads)
+  const { logoUrl, logoSize } = useBranding();
 
   const printableSheetRef = useRef<HTMLDivElement>(null);
 
@@ -168,21 +188,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     'January', 'February', 'March'
   ];
 
-  // Branding listener
-  useEffect(() => {
-    const unsubBranding = onSnapshot(doc(db, 'config', 'branding'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        setLogoUrl(data.logoUrl || '');
-        setLogoSize(data.logoSize || 80);
-      }
-    }, (err) => {
-      console.warn('TargetSheet branding sync notice:', err);
-    });
-    return () => unsubBranding();
-  }, []);
-
-  // Fetch users for dropdown
+  // Fetch users for dropdown with cache synchronization
   useEffect(() => {
     const q = query(collection(db, 'users'));
     const unsub = onSnapshot(q, (snap) => {
@@ -190,6 +196,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
       snap.forEach(d => list.push({ ...d.data(), uid: d.id } as UserProfile));
       list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
       setUsers(list);
+      try {
+        localStorage.setItem('blackworm_cached_users', JSON.stringify(list));
+      } catch {}
     }, (error) => {
       handleFirestoreError(error, OperationType.LIST, 'users');
     });
@@ -289,6 +298,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
           data.designation = selectedUser.designation || data.designation || 'FIELD OFFICER';
           data.center = selectedUser.center || data.center || '';
           setYearlySheet(data);
+          try {
+            localStorage.setItem(`yearly_target_sheet_${selectedUserId}`, JSON.stringify(data));
+          } catch {}
         } else {
           const newSheet: YearlySheet = {
             id: sheetId,
@@ -402,6 +414,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
         }))
       };
 
+      try {
+        localStorage.setItem(`yearly_target_sheet_${cleanedSheet.userId}`, JSON.stringify(cleanedSheet));
+      } catch {}
       await setDoc(doc(db, 'yearly_targets', sheet.id), {
         ...cleanedSheet,
         updatedAt: new Date().toISOString()
@@ -422,19 +437,20 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     try {
       setIsGeneratingPdf(true);
       // Wait a moment for React to render clean static spans instead of inputs
-      await new Promise(r => setTimeout(r, 100));
+      await new Promise(r => setTimeout(r, 120));
 
       const element = printableSheetRef.current;
       
       const canvas = await html2canvas(element, {
-        scale: 2.5,
+        scale: 3, // 3x high resolution for razor-sharp text and clear borders
         useCORS: true,
         logging: false,
         backgroundColor: '#ffffff',
         windowWidth: 1024,
       });
 
-      const imgData = canvas.toDataURL('image/jpeg', 0.98);
+      // Lossless PNG prevents JPEG artifacts and ensures sharp text rendering
+      const imgData = canvas.toDataURL('image/png');
       const pdf = new jsPDF({
         orientation: 'portrait',
         unit: 'mm',
@@ -444,7 +460,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
       const pdfWidth = pdf.internal.pageSize.getWidth();
       const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
       
-      pdf.addImage(imgData, 'JPEG', 0, 0, pdfWidth, Math.min(pdfHeight, 297));
+      pdf.addImage(imgData, 'PNG', 0, 0, pdfWidth, Math.min(pdfHeight, 297), undefined, 'FAST');
       const sanitizedName = (sheet?.fullName ? `Target_Sheet_${sheet.fullName}` : 'Target_Sheet_2026_27').replace(/[^a-zA-Z0-9_-]/g, '_');
       pdf.save(`${sanitizedName}.pdf`);
     } catch (err: any) {
@@ -458,7 +474,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
   if (loading) {
     return (
       <div className="flex justify-center p-12">
-        <div className="w-8 h-8 border-4 border-red-600 border-t-transparent rounded-full animate-spin" />
+        <div className="w-8 h-8 border-4 border-slate-700 border-t-transparent rounded-full animate-spin" />
       </div>
     );
   }
@@ -490,35 +506,39 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
   return (
     <div className="space-y-4 font-sans pb-12">
       {/* Top Action Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-3 bg-white p-4 rounded-xl border border-slate-200 shadow-sm print:hidden">
-        <div className="flex items-center gap-3">
-          <div className="p-2 bg-red-50 text-red-600 rounded-lg">
-            <Target className="w-5 h-5" />
+      <div className="bg-white p-2.5 sm:p-4 rounded-xl border border-slate-200 shadow-xs print:hidden space-y-2.5 sm:space-y-0 sm:flex sm:items-center sm:justify-between sm:gap-3">
+        {/* Title area */}
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="p-1.5 sm:p-2 bg-slate-100 text-slate-700 border border-slate-200 rounded-lg shrink-0">
+            <Target className="w-4 h-4 sm:w-5 sm:h-5 text-slate-700" />
           </div>
-          <div>
-            <h2 className="text-base font-bold text-slate-800">Target & Collection Sheet 2026-27</h2>
-            <p className="text-xs text-slate-500">Yearly Target Sheet</p>
+          <div className="min-w-0">
+            <h2 className="text-xs sm:text-base font-bold text-slate-900 truncate">Target & Collection Sheet 2026-27</h2>
+            <p className="text-[10px] sm:text-xs text-slate-500 truncate">Yearly Target Sheet &bull; Blackworm Agritech</p>
           </div>
         </div>
 
-        {/* User Selection & Actions */}
-        <div className="flex flex-wrap items-center gap-2">
-          {userIsAdmin && (
-            <div className="relative min-w-[210px] sm:min-w-[260px]">
+        {/* User Selection & Actions: In a single line (flex-nowrap) on mobile, tablet, laptop, and monitor! */}
+        <div className="flex items-center gap-1.5 sm:gap-2 flex-nowrap w-full sm:w-auto shrink-0">
+          {userIsAdmin ? (
+            <div className="relative flex-1 sm:w-56 md:w-64 min-w-0">
               <button
                 type="button"
                 onClick={() => setIsUserDropdownOpen(!isUserDropdownOpen)}
-                className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1 px-2.5 rounded-lg text-left flex items-center justify-between gap-1.5 cursor-pointer hover:bg-slate-100 transition shadow-2xs"
+                className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1.5 px-2 sm:px-2.5 rounded-lg text-left flex items-center justify-between gap-1 cursor-pointer hover:bg-slate-100 transition shadow-2xs min-w-0"
               >
-                <div className="min-w-0 flex-1 flex items-baseline gap-1.5 truncate">
-                  <span className="text-xs font-black text-slate-900 truncate">
+                <div className="min-w-0 flex-1 flex items-center gap-1 truncate">
+                  <span className="text-[10px] font-bold text-slate-500 uppercase shrink-0">
+                    {selectedUser.role === 'owner' ? 'Owner:' : 'Officer:'}
+                  </span>
+                  <span className="text-xs font-bold text-slate-900 truncate">
                     {formatTitleCase(selectedUser.fullName || selectedUser.uid)}
                   </span>
-                  {selectedUser.role === 'owner' ? (
-                    <span className="text-[10px] font-bold text-red-600 uppercase shrink-0">
-                      (Total)
+                  {selectedUser.role === 'owner' && (
+                    <span className="text-[9px] font-bold text-slate-600 uppercase shrink-0 bg-slate-200 px-1 py-0.2 rounded">
+                      Total
                     </span>
-                  ) : null}
+                  )}
                 </div>
                 <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
               </button>
@@ -526,7 +546,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               {isUserDropdownOpen && (
                 <>
                   <div className="fixed inset-0 z-40" onClick={() => setIsUserDropdownOpen(false)} />
-                  <div className="absolute left-0 mt-1 w-full sm:w-80 bg-white border border-slate-200 rounded-xl shadow-xl z-50 max-h-60 overflow-y-auto p-1 divide-y divide-slate-100">
+                  <div className="absolute right-0 sm:left-0 mt-1 w-64 sm:w-80 bg-white border border-slate-200 rounded-xl shadow-xl z-50 max-h-60 overflow-y-auto p-1 divide-y divide-slate-100">
                     {users.map((u) => (
                       <div
                         key={u.uid}
@@ -535,15 +555,15 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                           setIsUserDropdownOpen(false);
                         }}
                         className={cn(
-                          "p-2 px-2.5 rounded-lg cursor-pointer transition flex items-center justify-between gap-2 whitespace-nowrap",
-                          selectedUserId === u.uid ? "bg-red-50 text-red-900 font-black" : "hover:bg-slate-50 text-slate-800 font-bold"
+                          "p-2 px-2.5 rounded-lg cursor-pointer transition flex items-center justify-between gap-2 whitespace-nowrap text-xs",
+                          selectedUserId === u.uid ? "bg-blue-50 text-blue-900 font-bold" : "hover:bg-slate-50 text-slate-800 font-medium"
                         )}
                       >
-                        <span className="text-xs truncate">
+                        <span className="truncate">
                           {formatTitleCase(u.fullName || u.uid)}
                         </span>
                         {u.role === 'owner' && (
-                          <span className="text-[10px] font-black text-red-600 uppercase shrink-0 bg-red-100 px-1.5 py-0.5 rounded">
+                          <span className="text-[10px] font-bold text-slate-600 uppercase shrink-0 bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded">
                             Owner (Total)
                           </span>
                         )}
@@ -553,26 +573,35 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                 </>
               )}
             </div>
+          ) : (
+            <div className="flex-1 sm:w-auto min-w-0 bg-slate-50 border border-slate-300 py-1.5 px-2.5 rounded-lg flex items-center gap-1.5 truncate">
+              <span className="text-[10px] font-bold text-slate-500 uppercase shrink-0">Officer:</span>
+              <span className="text-xs font-bold text-slate-900 truncate">
+                {formatTitleCase(selectedUser.fullName || selectedUser.uid)}
+              </span>
+            </div>
           )}
 
           {!isOwnerView && (
             <button
               onClick={handleSave}
               disabled={saving}
-              className="flex items-center gap-1 px-2 py-0.5 bg-red-600 hover:bg-red-700 text-white rounded text-[10px] font-bold transition shadow-2xs disabled:opacity-50 cursor-pointer active:scale-95"
+              className="shrink-0 flex items-center gap-1 px-2.5 sm:px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition shadow-2xs disabled:opacity-50 cursor-pointer active:scale-95 whitespace-nowrap"
+              title="Save Changes"
             >
-              {saving ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Save className="w-2.5 h-2.5" />}
-              <span>{saving ? 'Saving...' : 'Save Changes'}</span>
+              {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+              <span className="hidden xs:inline">Save</span>
             </button>
           )}
 
+          {/* PDF Button: GUARANTEED directly next to the Name/Selector on the SAME LINE */}
           <button
             onClick={handleDownloadPdf}
             disabled={isGeneratingPdf}
-            className="flex items-center gap-1 px-2 py-0.5 bg-slate-800 hover:bg-slate-900 text-white rounded text-[10px] font-bold transition shadow-2xs disabled:opacity-50 cursor-pointer active:scale-95"
+            className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold transition shadow-2xs disabled:opacity-50 cursor-pointer active:scale-95 whitespace-nowrap"
             title="Download PDF"
           >
-            {isGeneratingPdf ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Download className="w-2.5 h-2.5" />}
+            {isGeneratingPdf ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
             <span>PDF</span>
           </button>
         </div>
@@ -586,85 +615,98 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
       )}
 
       {/* Main Printable Document Layout */}
-      <div className="overflow-x-auto p-1 sm:p-2 bg-slate-100 rounded-xl">
+      <div className="overflow-x-auto p-1.5 sm:p-3 bg-slate-100/70 rounded-2xl border border-slate-200">
         <div 
           ref={printableSheetRef}
-          className="min-w-[840px] max-w-[940px] mx-auto bg-white p-5 sm:p-6 shadow-md border-2 border-black font-sans text-black relative"
+          className="w-[880px] min-w-[880px] mx-auto bg-white p-5 sm:p-6 shadow-sm border border-slate-300 rounded-xl font-sans text-slate-800 relative"
           style={{ minHeight: '1080px' }}
         >
-          {/* 1. Header with Company Logo & Details */}
-          <div className="flex items-center justify-between border-b-2 border-black pb-3">
-            <div className="flex items-center gap-3">
-              {logoUrl ? (
-                <img 
-                  src={logoUrl} 
-                  alt="Company Logo" 
-                  style={{ width: `${logoSize}px`, height: 'auto' }}
-                  className="object-contain max-h-24"
-                />
-              ) : (
-                <div className="w-16 h-16 bg-red-600 text-white flex items-center justify-center font-black text-xl rounded-lg shadow-sm">
-                  BW
-                </div>
-              )}
-              <div>
-                <h1 className="text-xl sm:text-2xl font-black text-red-600 tracking-tight leading-none uppercase">
+          {/* 1. Header with Company Logo & Details centered & balanced */}
+          <div className="border-b-2 border-slate-400 pb-3 pt-1">
+            <div className="flex items-center justify-center gap-4 sm:gap-6 max-w-[820px] mx-auto">
+              {/* Left Logo */}
+              <div className="w-20 h-20 shrink-0 flex items-center justify-center p-1 bg-white border border-slate-300 rounded-lg shadow-2xs">
+                {logoUrl ? (
+                  <img 
+                    src={logoUrl} 
+                    alt="Company Logo" 
+                    style={{ width: `${logoSize}px`, height: 'auto' }}
+                    className="object-contain max-h-20 max-w-full" 
+                  />
+                ) : (
+                  <div className="w-16 h-16 bg-slate-800 text-white flex items-center justify-center font-black text-xl rounded-lg shadow-sm">
+                    BW
+                  </div>
+                )}
+              </div>
+
+              {/* Company Info centered right next to the logo */}
+              <div className="text-center space-y-1">
+                <h1 className="text-xl sm:text-2xl font-black text-slate-900 tracking-wide uppercase leading-tight">
                   BLACKWORM AGRITECH PVT LTD
                 </h1>
-                <div className="text-[8px] sm:text-[8.5px] font-bold text-slate-800 leading-tight mt-1 space-y-0.5">
-                  <p>CIN: U01409PN2022PTC217246, GST No.: 27AALCB3069J1ZC</p>
-                  <p>Address: Gat No. 17, Vijaynagar (Mhaisal), Tal. Miraj, Dist. Sangli – 416409</p>
-                  <p className="flex items-center gap-4 mt-0.5">
-                    <span className="flex items-center gap-1 text-red-600 font-bold"><Phone className="w-2.5 h-2.5" /> +91 7798716201</span>
-                    <span className="flex items-center gap-1 text-red-600 font-bold underline"><Mail className="w-2.5 h-2.5" /> blackwormagritechpvtltd@gmail.com</span>
-                  </p>
+                <div className="text-[11px] font-bold text-slate-800 tracking-tight flex items-center justify-center gap-2.5">
+                  <span>CIN: U01409PN2022PTC217246</span>
+                  <span className="text-slate-400 font-normal">&bull;</span>
+                  <span>GST No.: 27AALCB3069J1ZC</span>
+                </div>
+                <p className="text-[11px] font-bold text-slate-800 leading-tight">
+                  Address: Gat No. 17, Vijaynagar (Mhaisal), Tal. Miraj, Dist. Sangli – 416409
+                </p>
+                <div className="flex items-center justify-center gap-4 pt-0.5 text-slate-900 font-bold text-[11px]">
+                  <span className="flex items-center gap-1.5">
+                    <Phone className="w-3 h-3 text-slate-600" /> +91 7798716201
+                  </span>
+                  <span className="text-slate-400 font-normal">&bull;</span>
+                  <span className="flex items-center gap-1.5">
+                    <Mail className="w-3 h-3 text-slate-600" /> blackwormagritechpvtltd@gmail.com
+                  </span>
                 </div>
               </div>
             </div>
-
-            <div className="text-right">
-              <span className="inline-block border-2 border-black px-2.5 py-1 text-xs font-black uppercase tracking-wider bg-slate-50">
-                FY 2026-27
-              </span>
-              <p className="text-[9px] font-black text-black mt-1 uppercase">Doc Ref: BW/TS/26-27</p>
-            </div>
           </div>
 
-          {/* 2. Document Title Banner */}
-          <div className="text-center py-2 border-b-2 border-black bg-amber-400">
-            <h2 className="text-base sm:text-lg font-black uppercase tracking-wider text-slate-950">
-              Target & Collection Sheet 2026-27
+          {/* 2. Document Title Banner - Clean, Calm, Professional with Ref & FY */}
+          <div className="flex items-center justify-between px-3.5 py-1.5 border-b-2 border-slate-400 bg-slate-100 text-xs font-bold">
+            <span className="text-[10px] font-bold text-slate-700 tracking-wide uppercase">
+              Doc Ref: BW/TS/2026-27
+            </span>
+            <h2 className="text-xs sm:text-sm font-black uppercase tracking-wider text-slate-900">
+              Target &amp; Collection Sheet 2026-27
             </h2>
+            <span className="text-[10px] font-black text-slate-800 uppercase bg-white border border-slate-300 px-2.5 py-0.5 rounded shadow-2xs">
+              FY 2026-27
+            </span>
           </div>
 
           {/* 3. Officer Profile & Top Statistics Grid */}
-          <div className="grid grid-cols-3 border-b-2 border-black divide-x-2 divide-black text-xs">
-            {/* Column 1: Officer Information - Designation removed, names on single line in Title Case */}
-            <div className="divide-y-2 divide-black">
+          <div className="grid grid-cols-3 border-b-2 border-slate-400 divide-x-2 divide-slate-400 text-xs bg-white">
+            {/* Column 1: Officer Information - No designation, single line Title Case */}
+            <div className="divide-y-2 divide-slate-300">
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-24 shrink-0 px-2 tracking-tight whitespace-nowrap">
+                <span className="font-extrabold text-slate-800 w-24 shrink-0 px-2.5 tracking-tight whitespace-nowrap">
                   {isOwnerView ? 'Owner -' : 'Officer -'}
                 </span>
-                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
-                  <span className="w-full font-black text-black text-center block text-xs sm:text-[13px] whitespace-nowrap overflow-hidden text-ellipsis">
+                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center px-1">
+                  <span className="w-full font-extrabold text-slate-950 text-center block text-xs sm:text-[13px] whitespace-nowrap overflow-hidden text-ellipsis">
                     {formatTitleCase(selectedUser.fullName || sheet.fullName)}
                   </span>
                 </div>
               </div>
 
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-24 shrink-0 px-2 tracking-tight whitespace-nowrap">Center (HQ) -</span>
-                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
-                  <span className="w-full font-black text-black text-center block text-xs sm:text-[13px] whitespace-nowrap overflow-hidden text-ellipsis">
+                <span className="font-extrabold text-slate-800 w-24 shrink-0 px-2.5 tracking-tight whitespace-nowrap">Center (HQ) -</span>
+                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center px-1">
+                  <span className="w-full font-bold text-slate-900 text-center block text-xs sm:text-[13px] whitespace-nowrap overflow-hidden text-ellipsis">
                     {isOwnerView ? 'All Centers' : (selectedUser.center || sheet.center || '-')}
                   </span>
                 </div>
               </div>
 
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-24 shrink-0 px-2 tracking-tight whitespace-nowrap">Year -</span>
-                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-1">
-                  <span className="w-full font-black text-black text-center block text-xs sm:text-[13px] whitespace-nowrap">
+                <span className="font-extrabold text-slate-800 w-24 shrink-0 px-2.5 tracking-tight whitespace-nowrap">Year -</span>
+                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center px-1">
+                  <span className="w-full font-extrabold text-slate-900 text-center block text-xs sm:text-[13px] whitespace-nowrap">
                     2026-27
                   </span>
                 </div>
@@ -672,81 +714,81 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
             </div>
 
             {/* Column 2: Sales Data */}
-            <div className="divide-y-2 divide-black">
+            <div className="divide-y-2 divide-slate-300">
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-28 shrink-0 px-2 tracking-tight whitespace-nowrap">L.Y. Sale -</span>
-                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
+                <span className="font-extrabold text-slate-800 w-28 shrink-0 px-2.5 tracking-tight whitespace-nowrap">L.Y. Sale -</span>
+                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center justify-center px-1">
                   <CellInput
                     value={sheet.lastYearSale}
                     disabled={isOwnerView}
                     isPdfOrPrint={isGeneratingPdf}
                     onChange={v => updateSheet({ lastYearSale: v })}
-                    colorClass="text-black"
+                    colorClass="text-slate-900 font-bold"
                   />
-                  <span className="font-black text-black text-[8px] uppercase ml-0.5 shrink-0">Lakh</span>
+                  <span className="font-bold text-slate-700 text-[8.5px] uppercase ml-0.5 shrink-0">Lakh</span>
                 </div>
               </div>
 
-              <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-red-50/50">
-                <span className="font-black text-red-600 w-28 shrink-0 px-2 tracking-tight whitespace-nowrap">Target -</span>
-                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-blue-50/50">
+                <span className="font-extrabold text-blue-950 w-28 shrink-0 px-2.5 tracking-tight whitespace-nowrap">Target -</span>
+                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center justify-center px-1">
                   <CellInput
                     value={sheet.salesTarget}
                     disabled={isOwnerView}
                     isPdfOrPrint={isGeneratingPdf}
                     onChange={v => updateSheet({ salesTarget: v })}
-                    colorClass="text-red-600"
+                    colorClass="text-blue-950 font-bold"
                   />
-                  <span className="font-black text-red-600 text-[8px] uppercase ml-0.5 shrink-0">Lakh</span>
+                  <span className="font-bold text-blue-900 text-[8.5px] uppercase ml-0.5 shrink-0">Lakh</span>
                 </div>
               </div>
 
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-28 shrink-0 px-2 tracking-tight whitespace-nowrap">L.Y. Outstd -</span>
-                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
+                <span className="font-extrabold text-slate-800 w-28 shrink-0 px-2.5 tracking-tight whitespace-nowrap">L.Y. Outstd -</span>
+                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center justify-center px-1">
                   <CellInput
                     value={sheet.lastYearOutstanding}
                     disabled={isOwnerView}
                     isPdfOrPrint={isGeneratingPdf}
                     onChange={v => updateSheet({ lastYearOutstanding: v })}
-                    colorClass="text-black"
+                    colorClass="text-slate-900 font-bold"
                   />
-                  <span className="font-black text-black text-[8px] uppercase ml-0.5 shrink-0">Lakh</span>
+                  <span className="font-bold text-slate-700 text-[8.5px] uppercase ml-0.5 shrink-0">Lakh</span>
                 </div>
               </div>
             </div>
 
             {/* Column 3: Collection Data & Calculations */}
-            <div className="divide-y-2 divide-black">
+            <div className="divide-y-2 divide-slate-300">
               <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                <span className="font-black text-black w-28 shrink-0 px-2 tracking-tight whitespace-nowrap">L.Y. Coll. -</span>
-                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
+                <span className="font-extrabold text-slate-800 w-28 shrink-0 px-2.5 tracking-tight whitespace-nowrap">L.Y. Coll. -</span>
+                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center justify-center px-1">
                   <CellInput
                     value={sheet.lastYearCollection}
                     disabled={isOwnerView}
                     isPdfOrPrint={isGeneratingPdf}
                     onChange={v => updateSheet({ lastYearCollection: v })}
-                    colorClass="text-black"
+                    colorClass="text-slate-900 font-bold"
                   />
-                  <span className="font-black text-black text-[8px] uppercase ml-0.5 shrink-0">Lakh</span>
+                  <span className="font-bold text-slate-700 text-[8.5px] uppercase ml-0.5 shrink-0">Lakh</span>
                 </div>
               </div>
 
-              <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-amber-50">
-                <span className="font-black text-amber-950 w-28 shrink-0 px-2 tracking-tight whitespace-nowrap text-[9.5px]">Curr. Outstd -</span>
-                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
-                  <span className="w-full font-black text-amber-950 font-mono text-center">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-slate-50">
+                <span className="font-extrabold text-slate-900 w-28 shrink-0 px-2.5 tracking-tight whitespace-nowrap text-[9.5px]">Curr. Outstd -</span>
+                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center justify-center px-1">
+                  <span className="w-full font-extrabold text-slate-950 font-mono text-center">
                     {formatAmount(subtractDecimal2(sheet.lastYearOutstanding, sheet.lastYearCollection))}
                   </span>
-                  <span className="font-black text-amber-950 text-[8px] uppercase ml-0.5 shrink-0">Lakh</span>
+                  <span className="font-bold text-slate-700 text-[8.5px] uppercase ml-0.5 shrink-0">Lakh</span>
                 </div>
               </div>
 
-              <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-blue-50/80">
-                <span className="font-black text-blue-900 w-28 shrink-0 px-2 tracking-tight whitespace-nowrap">Coll. Target -</span>
-                <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center justify-center px-1">
+              <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-blue-50/60">
+                <span className="font-extrabold text-blue-950 w-28 shrink-0 px-2.5 tracking-tight whitespace-nowrap">Coll. Target -</span>
+                <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center justify-center px-1">
                   {isOwnerView || isGeneratingPdf ? (
-                    <span className="w-full font-black text-blue-900 font-mono text-center">
+                    <span className="w-full font-extrabold text-blue-950 font-mono text-center">
                       {sheet.collectionPercent || 0}%
                     </span>
                   ) : (
@@ -761,90 +803,90 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                         }
                       }} 
                       placeholder="0"
-                      className="w-full bg-transparent font-black text-blue-900 focus:outline-none font-mono text-center" 
+                      className="w-full bg-transparent font-extrabold text-blue-950 focus:outline-none font-mono text-center" 
                     />
                   )}
-                  <span className="font-black text-blue-900 text-[8px] uppercase ml-0.5 shrink-0">%</span>
+                  <span className="font-extrabold text-blue-950 text-[8.5px] uppercase ml-0.5 shrink-0">%</span>
                 </div>
               </div>
             </div>
           </div>
 
           {/* 4. Target Data Table */}
-          <div className="overflow-x-auto bg-white">
+          <div className="overflow-x-auto bg-white border-2 border-slate-400 rounded-lg shadow-2xs">
             <table className="w-full text-left border-collapse text-xs sm:text-[13px]">
               <thead>
-                <tr className="bg-slate-900 text-white font-black uppercase text-center border-b-2 border-black text-xs sm:text-[12.5px]">
-                  <th className="p-2 border-r-2 border-black whitespace-nowrap w-12 text-center">Sr.</th>
-                  <th className="p-2 border-r-2 border-black whitespace-nowrap w-28 text-center">Month</th>
-                  <th className="p-2 border-r-2 border-black whitespace-nowrap text-center">Target (Lakh)</th>
-                  <th className="p-2 border-r-2 border-black whitespace-nowrap text-center">Achieve (Lakh)</th>
-                  <th className="p-2 border-r-2 border-black whitespace-nowrap text-center">% Ach.</th>
-                  <th className="p-2 border-r-2 border-black whitespace-nowrap text-center">Collection (Lakh)</th>
-                  <th className="p-2 border-r-2 border-black whitespace-nowrap text-center">Actual Coll.</th>
+                <tr className="bg-slate-800 text-white font-bold uppercase text-center border-b-2 border-slate-400 text-xs sm:text-[12.5px]">
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap w-12 text-center">Sr.</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap w-28 text-center">Month</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap text-center">Target (Lakh)</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap text-center">Achieve (Lakh)</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap text-center">% Ach.</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap text-center">Collection (Lakh)</th>
+                  <th className="p-2 border-r border-slate-400 whitespace-nowrap text-center">Actual Coll.</th>
                   <th className="p-2 whitespace-nowrap text-center">% Coll.</th>
                 </tr>
               </thead>
-              <tbody className="divide-y-2 divide-black text-black font-black">
+              <tbody className="text-slate-900 font-medium">
                 {sheet.months.map((m, idx) => {
                   const achPercentStr = calcPercent(m.achievement, m.target);
                   const collPercentStr = calcPercent(m.actualCollection, m.collection);
                   return (
                     <React.Fragment key={m.month}>
-                      <tr className="hover:bg-slate-50 transition-colors">
-                        <td className="p-1.5 border-r-2 border-black text-center font-black text-black text-xs sm:text-[13px]">{idx + 1}</td>
-                        <td className="p-1.5 border-r-2 border-black font-black uppercase text-center text-xs sm:text-[13px] whitespace-nowrap">{m.month}</td>
-                        <td className="p-1 border-r-2 border-black">
+                      <tr className="hover:bg-slate-50/80 transition-colors">
+                        <td className="p-1.5 border-r border-b border-slate-300 text-center font-bold text-slate-800 text-xs sm:text-[13px]">{idx + 1}</td>
+                        <td className="p-1.5 border-r border-b border-slate-300 font-bold uppercase text-center text-xs sm:text-[13px] whitespace-nowrap text-slate-900">{m.month}</td>
+                        <td className="p-1 border-r border-b border-slate-300">
                           <CellInput
                             value={m.target}
                             disabled={isOwnerView}
                             isPdfOrPrint={isGeneratingPdf}
                             onChange={v => updateMonth(idx, { target: v })}
-                            colorClass="text-black"
+                            colorClass="text-slate-900 font-bold"
                           />
                         </td>
-                        <td className="p-1 border-r-2 border-black">
+                        <td className="p-1 border-r border-b border-slate-300">
                           <CellInput
                             value={m.achievement}
                             disabled={isOwnerView}
                             isPdfOrPrint={isGeneratingPdf}
                             onChange={v => updateMonth(idx, { achievement: v })}
-                            colorClass="text-blue-800"
+                            colorClass="text-blue-900 font-bold"
                           />
                         </td>
-                        <td className="p-1.5 border-r-2 border-black text-center font-black font-mono text-xs sm:text-[13px] text-slate-900">{achPercentStr}</td>
+                        <td className="p-1.5 border-r border-b border-slate-300 text-center font-bold font-mono text-xs sm:text-[13px] text-slate-900">{achPercentStr}</td>
                         {/* Collection in Lakh: strictly auto-calculated based on Target & Percentage, non-editable */}
-                        <td className="p-1.5 border-r-2 border-black text-center font-mono font-black text-xs sm:text-[13px] text-slate-950 bg-slate-50/60">
+                        <td className="p-1.5 border-r border-b border-slate-300 text-center font-mono font-bold text-xs sm:text-[13px] text-slate-900 bg-slate-50/90">
                           {formatAmount(m.collection)}
                         </td>
                         {/* Actual Collection: remains editable */}
-                        <td className="p-1 border-r-2 border-black">
+                        <td className="p-1 border-r border-b border-slate-300">
                           <CellInput
                             value={m.actualCollection}
                             disabled={isOwnerView}
                             isPdfOrPrint={isGeneratingPdf}
                             onChange={v => updateMonth(idx, { actualCollection: v })}
-                            colorClass="text-emerald-800"
+                            colorClass="text-emerald-900 font-bold"
                           />
                         </td>
-                        <td className="p-1.5 text-center font-black font-mono text-xs sm:text-[13px] text-slate-900">{collPercentStr}</td>
+                        <td className="p-1.5 border-b border-slate-300 text-center font-bold font-mono text-xs sm:text-[13px] text-slate-900">{collPercentStr}</td>
                       </tr>
                       {/* Render Quarter Subtotal Row */}
                       {(idx === 2 || idx === 5 || idx === 8 || idx === 11) && (
-                        <tr className="bg-amber-100 font-black text-slate-950 border-y-2 border-black text-xs sm:text-[13px]">
-                          <td colSpan={2} className="p-2 border-r-2 border-black text-center uppercase tracking-wider font-black whitespace-nowrap">
+                        <tr className="bg-slate-100 font-extrabold text-slate-900 border-y-2 border-slate-400 text-xs sm:text-[13px]">
+                          <td colSpan={2} className="p-2 border-r border-b border-slate-400 text-center uppercase tracking-wide font-extrabold whitespace-nowrap">
                             {idx === 2 ? 'Q1' : idx === 5 ? 'Q2' : idx === 8 ? 'Q3' : 'Q4'} TOTAL
                           </td>
                           {(() => {
                             const q = idx === 2 ? Q1 : idx === 5 ? Q2 : idx === 8 ? Q3 : Q4;
                             return (
                               <>
-                                <td className="p-2 border-r-2 border-black text-center font-mono font-black text-xs sm:text-[13px]">{formatAmount(q.target)}</td>
-                                <td className="p-2 border-r-2 border-black text-center font-mono text-blue-950 font-black text-xs sm:text-[13px]">{formatAmount(q.achievement)}</td>
-                                <td className="p-2 border-r-2 border-black text-center font-mono font-black text-xs sm:text-[13px]">{calcPercent(q.achievement, q.target)}</td>
-                                <td className="p-2 border-r-2 border-black text-center font-mono font-black text-xs sm:text-[13px]">{formatAmount(q.collection)}</td>
-                                <td className="p-2 border-r-2 border-black text-center font-mono text-emerald-950 font-black text-xs sm:text-[13px]">{formatAmount(q.actual)}</td>
-                                <td className="p-2 text-center font-mono font-black text-xs sm:text-[13px]">{calcPercent(q.actual, q.collection)}</td>
+                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{formatAmount(q.target)}</td>
+                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono text-blue-900 font-extrabold text-xs sm:text-[13px]">{formatAmount(q.achievement)}</td>
+                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{calcPercent(q.achievement, q.target)}</td>
+                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{formatAmount(q.collection)}</td>
+                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono text-emerald-900 font-extrabold text-xs sm:text-[13px]">{formatAmount(q.actual)}</td>
+                                <td className="p-2 border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{calcPercent(q.actual, q.collection)}</td>
                               </>
                             );
                           })()}
@@ -854,30 +896,30 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                   );
                 })}
                 {/* Annual Grand Total Row */}
-                <tr className="bg-red-600 text-white font-black text-xs sm:text-sm uppercase border-t-2 border-black">
-                  <td colSpan={2} className="p-2.5 text-center tracking-tight border-r-2 border-black font-black">
+                <tr className="bg-slate-800 text-white font-extrabold text-xs sm:text-sm uppercase border-t-2 border-slate-700">
+                  <td colSpan={2} className="p-2.5 text-center tracking-normal border-r border-slate-600 font-extrabold">
                     Grand Total 2026-27
                   </td>
-                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black text-xs sm:text-sm">{formatAmount(Total.target)}</td>
-                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black text-xs sm:text-sm">{formatAmount(Total.achievement)}</td>
-                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black text-xs sm:text-sm">{calcPercent(Total.achievement, Total.target)}</td>
-                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black text-xs sm:text-sm">{formatAmount(Total.collection)}</td>
-                  <td className="p-2.5 text-center border-r-2 border-black font-mono font-black text-xs sm:text-sm">{formatAmount(Total.actual)}</td>
-                  <td className="p-2.5 text-center font-mono font-black text-xs sm:text-sm">{calcPercent(Total.actual, Total.collection)}</td>
+                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.target)}</td>
+                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.achievement)}</td>
+                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{calcPercent(Total.achievement, Total.target)}</td>
+                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.collection)}</td>
+                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.actual)}</td>
+                  <td className="p-2.5 text-center font-mono font-extrabold text-xs sm:text-sm">{calcPercent(Total.actual, Total.collection)}</td>
                 </tr>
               </tbody>
             </table>
           </div>
 
           {/* Footer Approval Space */}
-          <div className="grid grid-cols-2 border-t-2 border-black mt-8 pt-6 pb-2 text-xs font-black uppercase">
+          <div className="grid grid-cols-2 border-t-2 border-slate-400 mt-8 pt-6 pb-2 text-xs font-bold uppercase text-slate-800">
             <div className="text-center space-y-8">
               <p>Officer Signature</p>
-              <div className="border-t border-dashed border-black w-48 mx-auto" />
+              <div className="border-t-2 border-dashed border-slate-400 w-52 mx-auto" />
             </div>
             <div className="text-center space-y-8">
               <p>Managing Director / Owner</p>
-              <div className="border-t border-dashed border-black w-48 mx-auto" />
+              <div className="border-t-2 border-dashed border-slate-400 w-52 mx-auto" />
             </div>
           </div>
         </div>
