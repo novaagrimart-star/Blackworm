@@ -402,22 +402,14 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
   // Real-time synchronization of all dealer applications across ALL devices and users
   useEffect(() => {
-    let q = query(
+    const q = query(
       collection(db, 'dealers_application'),
       limit(500)
     );
 
-    // Optimized Server-Side Filtering: Non-admins only fetch their own records
-    if (!isAdmin(profile)) {
-      q = query(
-        collection(db, 'dealers_application'),
-        where('userId', '==', profile.uid),
-        limit(500)
-      );
-    }
-
     const unsub = onSnapshot(
       q,
+      { includeMetadataChanges: true },
       (snap) => {
         const list: DealershipFormItem[] = [];
         snap.forEach((d) => {

@@ -309,26 +309,15 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     }
   }, [showNewOrderModal, selectedOrderDetails, successOrder]);
 
-  // Load Orders from Firestore (using built-in persistent cache for speed)
+  // Load Orders from Firestore with Central Real-Time Synchronization across ALL devices
   useEffect(() => {
-
-    let q = query(
+    const q = query(
       collection(db, 'orders'),
       orderBy('createdAt', 'desc'),
       limit(300)
     );
 
-    // Optimized Server-Side Filtering: Non-admins only fetch their own records to save data and time
-    if (!isAdmin(profile)) {
-      q = query(
-        collection(db, 'orders'),
-        where('userId', '==', profile.uid),
-        orderBy('createdAt', 'desc'),
-        limit(200)
-      );
-    }
-
-    const unsub = onSnapshot(q, (snap) => {
+    const unsub = onSnapshot(q, { includeMetadataChanges: true }, (snap) => {
       const list: OrderItem[] = [];
       snap.forEach((d) => {
         const data = d.data() as any;
@@ -825,14 +814,9 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     }
   };
 
-  // WhatsApp & Clipboard Message Generator (Dealer, Order, Quantity, Date focused)
+  // WhatsApp & Clipboard Message Generator strictly formatted as requested:
+  // Dealer, Proprietor Name, Contact Number, Location, and Order Quantity (No Blackworm title, no booking details, no order number, no date)
   const generateWhatsAppMessage = (order: OrderItem) => {
-    const dateStr = new Date(order.createdAt).toLocaleDateString('en-IN', {
-      day: '2-digit',
-      month: 'short',
-      year: 'numeric',
-    });
-
     let itemsListText = '';
     if (order.items && order.items.length > 0) {
       itemsListText = order.items
@@ -842,23 +826,20 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         )
         .join('\n');
     } else {
-      itemsListText = `1. Order Items (Qty: ${order.totalQuantity} Nos.)`;
+      itemsListText = `1. Order Items - *${order.totalQuantity} Nos.*`;
     }
 
-    const message = `🌿 *BLACKWORM AGRITECH PVT LTD* 🌿
-📦 *ORDER BOOKING DETAILS*
-━━━━━━━━━━━━━━━━━━━━━
-*Order No:* ${order.orderNumber}
-*Date:* ${dateStr}
-*Dealer / Shop:* ${order.dealerName}
-${order.cropName ? `*Crop / पीक:* ${order.cropName}\n` : ''}${order.farmerName ? `*Proprietor:* ${order.farmerName}\n` : ''}${order.dealerContact ? `*Contact:* ${order.dealerContact}\n` : ''}${order.dealerVillage ? `*Location:* ${order.dealerVillage}${order.dealerDistrict ? `, ${order.dealerDistrict}` : ''}\n` : ''}
-📋 *ORDERED PRODUCTS & QUANTITY:*
+    const locationStr = [order.dealerVillage, order.dealerDistrict].filter(Boolean).join(', ');
+
+    const message = `*Dealer:* ${order.dealerName}
+*Proprietor Name:* ${order.farmerName || '-'}
+*Contact Number:* ${order.dealerContact || '-'}
+*Location:* ${locationStr || '-'}
+
+*Order Quantity:*
 ${itemsListText}
 
-━━━━━━━━━━━━━━━━━━━━━
-*TOTAL QUANTITY:* *${order.totalQuantity} Nos.*
-*BOOKED BY:* ${order.createdByName || 'Officer'}
-━━━━━━━━━━━━━━━━━━━━━`;
+*Total Quantity:* *${order.totalQuantity} Nos.*`;
 
     return message;
   };
@@ -1393,7 +1374,7 @@ ${itemsListText}
         </div>
       )}
 
-      {/* Hidden receipt card container for generating WhatsApp Order Photo */}
+      {/* Hidden receipt card container for generating WhatsApp Order Photo strictly formatted */}
       <div className="fixed -left-[9999px] top-0 pointer-events-none" aria-hidden="true">
         {capturingOrder && (
           <div
@@ -1401,65 +1382,33 @@ ${itemsListText}
             className="w-[420px] bg-white p-5 border-2 border-slate-900 rounded-2xl font-sans text-slate-900 space-y-3"
             style={{ width: '420px' }}
           >
-            {/* Company Banner */}
-            <div className="text-center border-b-2 border-slate-900 pb-2.5">
-              <div className="inline-block px-3 py-0.5 rounded bg-purple-700 text-white font-black text-[11px] tracking-wider mb-1 shadow-xs">
-                Blackworm Agri Tech Pvt Ltd
-              </div>
-              <p className="text-[9.5px] font-bold text-slate-500 uppercase tracking-wide">Quality Agricultural Inputs & Nutrition Solutions</p>
-              <h2 className="text-base font-black text-slate-900 tracking-tight mt-0.5">ORDER BOOKING DETAILS</h2>
-              <div className="flex justify-between items-center text-[10px] font-bold text-slate-600 mt-1 border-t border-slate-200 pt-1">
-                <span>Order No: <strong className="font-mono text-purple-800 text-[11px]">{capturingOrder.orderNumber}</strong></span>
-                <span>Date: {new Date(capturingOrder.createdAt).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })} {new Date(capturingOrder.createdAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', hour12: true })}</span>
-              </div>
+            {/* Dealer & Location Information */}
+            <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 text-xs space-y-1.5">
+              <p className="text-slate-800">
+                <span className="font-bold text-slate-500">Dealer:</span>{' '}
+                <strong className="text-sm font-black text-slate-900">{toTitleCase(capturingOrder.dealerName)}</strong>
+              </p>
+              <p className="text-slate-800">
+                <span className="font-bold text-slate-500">Proprietor Name:</span>{' '}
+                <strong className="text-slate-900">{toTitleCase(capturingOrder.farmerName || '-')}</strong>
+              </p>
+              <p className="text-slate-800">
+                <span className="font-bold text-slate-500">Contact Number:</span>{' '}
+                <strong className="font-mono text-slate-900">{capturingOrder.dealerContact || '-'}</strong>
+              </p>
+              <p className="text-slate-800">
+                <span className="font-bold text-slate-500">Location:</span>{' '}
+                <strong className="text-slate-900">{[toTitleCase(capturingOrder.dealerVillage), toTitleCase(capturingOrder.dealerDistrict)].filter(Boolean).join(', ') || '-'}</strong>
+              </p>
             </div>
 
-            {/* Complete Dealer & Order Information */}
-            <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200 text-[11px] space-y-1">
-              <div className="flex justify-between items-start">
-                <div>
-                  <span className="text-[9px] font-bold text-slate-400 block">Dealer / Firm Name</span>
-                  <p className="font-black text-xs text-slate-900">{toTitleCase(capturingOrder.dealerName)}</p>
-                </div>
-                {capturingOrder.dealerCode && (
-                  <span className="text-[10px] font-mono font-bold bg-white px-2 py-0.5 rounded border border-slate-200 text-purple-700">
-                    Code: {capturingOrder.dealerCode}
-                  </span>
-                )}
-              </div>
-
-              <div className="grid grid-cols-2 gap-1.5 pt-1 border-t border-slate-200/60 text-[10.5px]">
-                {capturingOrder.cropName && (
-                  <p className="text-slate-700 col-span-2">
-                    Crop / पीक: <strong className="text-emerald-800 bg-emerald-50 px-1.5 py-0.5 rounded font-bold">{toTitleCase(capturingOrder.cropName)}</strong>
-                  </p>
-                )}
-                {capturingOrder.farmerName && (
-                  <p className="text-slate-700">Proprietor: <strong className="text-slate-900">{toTitleCase(capturingOrder.farmerName)}</strong></p>
-                )}
-                {capturingOrder.dealerContact && (
-                  <p className="text-slate-700">Contact: <strong className="font-mono text-slate-900">{capturingOrder.dealerContact}</strong></p>
-                )}
-                {capturingOrder.dealerVillage && (
-                  <p className="text-slate-700 col-span-2">Location: <strong className="text-slate-900">{toTitleCase(capturingOrder.dealerVillage)}{capturingOrder.dealerDistrict ? `, ${toTitleCase(capturingOrder.dealerDistrict)}` : ''}</strong></p>
-                )}
-                <p className="text-slate-700">Payment: <strong className="text-slate-900">{capturingOrder.paymentMode || 'Credit / Normal Terms'}</strong></p>
-                <p className="text-slate-700">Booked By: <strong className="text-slate-900">{toTitleCase(capturingOrder.createdByName)}</strong></p>
-              </div>
-
-              {capturingOrder.approvedBy && (
-                <div className="pt-1 border-t border-slate-200/60 text-[10px] text-blue-800 font-semibold">
-                  Approved By: {toTitleCase(capturingOrder.approvedBy)} ({new Date(capturingOrder.approvedAt || '').toLocaleDateString('en-IN')})
-                </div>
-              )}
-            </div>
-
-            {/* Ordered Products Table (Strictly: Product Name, Packing, Quantity - NO PRICE / TOTAL PRICE) */}
+            {/* Order Quantity Section */}
             <div>
+              <p className="text-xs font-black text-slate-800 uppercase tracking-wide mb-1.5">Order Quantity:</p>
               <table className="w-full text-left border-collapse text-[11px]">
                 <thead>
                   <tr className="bg-slate-900 text-white font-black text-[10px] uppercase">
-                    <th className="p-1.5 pl-2"># Product Name & Grade</th>
+                    <th className="p-1.5 pl-2"># Product</th>
                     <th className="p-1.5 text-center w-24">Packing</th>
                     <th className="p-1.5 text-center w-24">Quantity</th>
                   </tr>
@@ -1475,17 +1424,11 @@ ${itemsListText}
                 </tbody>
                 <tfoot className="bg-emerald-50 font-black text-emerald-950 text-[11px]">
                   <tr>
-                    <td colSpan={2} className="p-2 pl-2 text-right uppercase">TOTAL QUANTITY:</td>
+                    <td colSpan={2} className="p-2 pl-2 text-right uppercase">Total Quantity:</td>
                     <td className="p-2 text-center font-mono font-black text-sm text-emerald-900">{capturingOrder.totalQuantity} Nos.</td>
                   </tr>
                 </tfoot>
               </table>
-            </div>
-
-            {/* Footer details */}
-            <div className="pt-1.5 border-t border-slate-200 text-[9.5px] text-slate-500 flex justify-between items-center">
-              <span>Booked by Officer: <strong>{capturingOrder.createdByName}</strong></span>
-              <span>Blackworm Agri Tech Pvt Ltd</span>
             </div>
           </div>
         )}

@@ -635,13 +635,14 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
         </div>
 
         {/* User Selection & Actions: In a single line (flex-nowrap) on mobile, tablet, laptop, and monitor! */}
-        <div className="flex items-center gap-1 xs:gap-1.5 sm:gap-2 flex-nowrap w-full sm:w-auto shrink-0">
+        <div className="flex items-center gap-1 xs:gap-1.5 sm:gap-2 flex-nowrap w-full sm:w-auto shrink-0 min-w-0">
           {userIsAdmin ? (
-            <div className="relative flex-1 min-w-[120px] xs:min-w-[140px] sm:w-60 md:w-72">
+            <div className="relative flex-1 min-w-0 sm:w-64 md:w-80">
               <button
                 type="button"
                 onClick={() => setIsUserDropdownOpen(!isUserDropdownOpen)}
                 className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1.5 px-2 xs:px-2.5 rounded-lg text-left flex items-center justify-between gap-1 xs:gap-1.5 cursor-pointer hover:bg-slate-100 transition shadow-2xs min-w-0"
+                title={selectedUser.fullName || selectedUser.uid}
               >
                 <div className="min-w-0 flex-1 flex items-center gap-1 xs:gap-1.5">
                   <span className="text-[10px] font-bold text-slate-500 uppercase shrink-0">
@@ -667,13 +668,13 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                     onClick={() => setIsUserDropdownOpen(false)} 
                   />
                   {/* Responsive Dropdown: on mobile fixed with side margins (left-3 right-3), on desktop absolute under button */}
-                  <div className="fixed left-3 right-3 top-28 sm:top-auto sm:left-0 sm:right-auto sm:absolute sm:mt-1 sm:w-80 md:w-96 z-[100] bg-white border border-slate-300 rounded-2xl shadow-2xl overflow-hidden ring-1 ring-black/10">
-                    {/* Header */}
+                  <div className="fixed left-3 right-3 top-24 sm:top-auto sm:left-0 sm:right-auto sm:absolute sm:mt-1 sm:w-80 md:w-96 z-[100] bg-white border border-slate-300 rounded-2xl shadow-2xl overflow-hidden ring-1 ring-black/10">
+                    {/* Header: Strictly Officer (<count>) */}
                     <div className="p-3 bg-slate-100 border-b border-slate-200 flex items-center justify-between">
                       <div className="flex items-center gap-2">
                         <UserIcon className="w-4 h-4 text-slate-700" />
                         <span className="text-xs font-bold text-slate-800 uppercase tracking-wide">
-                          अधिकारी / Owner निवडा ({users.length})
+                          Officer ({users.length})
                         </span>
                       </div>
                       <button 
@@ -686,7 +687,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                       </button>
                     </div>
 
-                    {/* Officer list */}
+                    {/* Officer list - Only Officer Names */}
                     <div className="max-h-64 sm:max-h-80 overflow-y-auto p-1.5 divide-y divide-slate-100">
                       {users.map((u) => (
                         <div
@@ -706,9 +707,6 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                             <p className="font-bold text-slate-900 whitespace-normal break-words leading-snug">
                               {formatTitleCase(u.fullName || u.uid)}
                             </p>
-                            <p className="text-[10px] text-slate-500 uppercase mt-0.5">
-                              {u.designation || u.role || 'FIELD OFFICER'}
-                            </p>
                           </div>
                           {u.role === 'owner' && (
                             <span className="text-[10px] font-bold text-slate-700 uppercase shrink-0 bg-slate-200 px-2 py-0.5 rounded-md">
@@ -723,9 +721,9 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               )}
             </div>
           ) : (
-            <div className="flex-1 min-w-[120px] xs:min-w-[140px] sm:w-auto bg-slate-50 border border-slate-300 py-1.5 px-2 xs:px-2.5 rounded-lg flex items-center gap-1.5">
+            <div className="flex-1 min-w-0 bg-slate-50 border border-slate-300 py-1.5 px-2 xs:px-2.5 rounded-lg flex items-center gap-1.5">
               <span className="text-[10px] font-bold text-slate-500 uppercase shrink-0">Officer:</span>
-              <span className="text-[11px] xs:text-xs sm:text-sm font-bold text-slate-900 leading-tight break-words line-clamp-1">
+              <span className="text-[11px] xs:text-xs sm:text-sm font-bold text-slate-900 leading-tight break-words line-clamp-1 flex-1">
                 {formatTitleCase(selectedUser.fullName || selectedUser.uid)}
               </span>
             </div>
@@ -1076,23 +1074,23 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
             </table>
           </div>
 
-          {/* Footer Approval Space */}
-          <div className="grid grid-cols-2 border-t-2 border-slate-400 mt-8 pt-6 pb-2 text-xs font-bold uppercase text-slate-800">
-            <div className="text-center space-y-8">
+          {/* Footer Approval Space with reduced vertical padding */}
+          <div className="grid grid-cols-2 border-t-2 border-slate-400 mt-4 pt-3 pb-1 text-xs font-bold uppercase text-slate-800">
+            <div className="text-center space-y-6">
               <p>Officer Signature</p>
-              <div className="border-t-2 border-dashed border-slate-400 w-52 mx-auto" />
+              <div className="border-t-2 border-dashed border-slate-400 w-48 mx-auto" />
             </div>
-            <div className="text-center space-y-8">
+            <div className="text-center space-y-6">
               <p>Managing Director / Owner</p>
-              <div className="border-t-2 border-dashed border-slate-400 w-52 mx-auto" />
+              <div className="border-t-2 border-dashed border-slate-400 w-48 mx-auto" />
             </div>
           </div>
 
-          {/* Direct Timestamp Footnote - Printed cleanly without any placeholder box or border */}
-          <div className="mt-8 pt-3 border-t border-slate-300 flex items-center justify-between text-[10.5px] font-mono font-bold text-slate-600 select-text">
-            <span>OFFICIAL RECORD &bull; BLACKWORM AGRITECH PVT LTD</span>
-            <span>Generated on: {downloadTimestamp || (new Date().toLocaleDateString('en-GB') + ' ' + new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }))}</span>
+          {/* Current Date & Time strictly displayed directly above the line */}
+          <div className="mt-3 pb-1 text-right text-[11px] font-mono font-bold text-slate-700 select-text">
+            Date & Time: {downloadTimestamp || (new Date().toLocaleDateString('en-GB') + ' ' + new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }))}
           </div>
+          <div className="border-t border-slate-300" />
         </div>
       </div>
     </div>
