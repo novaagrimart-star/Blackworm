@@ -31,7 +31,7 @@ import { TargetSheetView } from './modules/TargetSheetView';
 import { UserManagementView } from './modules/UserManagementView';
 import { OrderView } from './modules/OrderView';
 import { CollectionView } from './modules/CollectionView';
-import { OrderCalculatorView } from './modules/OrderCalculatorView';
+import { OutstandingView } from './modules/OutstandingView';
 import { PriceListView } from './modules/PriceListView';
 import { DealerView } from './modules/DealerView';
 import { TravelView } from './modules/TravelView';
@@ -94,7 +94,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     { id: 'user', label: 'User Form', icon: UserPlus, color: 'text-emerald-500', bg: 'bg-emerald-50' },
     { id: 'order', label: t.orders, icon: ShoppingBag, color: 'text-purple-500', bg: 'bg-purple-50' },
     { id: 'collection', label: t.collections, icon: IndianRupee, color: 'text-emerald-600', bg: 'bg-emerald-50' },
-    { id: 'calculator', label: t.orderCalculator, icon: Calculator, color: 'text-teal-500', bg: 'bg-teal-50' },
+    { id: 'calculator', label: t.outstanding || 'Outstanding', icon: FileText, color: 'text-teal-600', bg: 'bg-teal-50' },
     { id: 'price', label: t.priceList, icon: FileText, color: 'text-sky-500', bg: 'bg-sky-50' },
     { id: 'dealer', label: t.dealer, icon: Users, color: 'text-rose-500', bg: 'bg-rose-50' },
     { id: 'travel', label: 'Traveling', icon: Bike, color: 'text-amber-500', bg: 'bg-amber-50' },
@@ -186,7 +186,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
       case 'user': return <UserManagementView profile={currentUserData} lang={lang} onProfileUpdate={onProfileUpdate} />;
       case 'order': return <OrderView profile={currentUserData} lang={lang} />;
       case 'collection': return <CollectionView profile={currentUserData} lang={lang} />;
-      case 'calculator': return <OrderCalculatorView profile={currentUserData} lang={lang} />;
+      case 'outstanding':
+      case 'calculator': return <OutstandingView profile={currentUserData} lang={lang} />;
       case 'price': return <PriceListView profile={currentUserData} lang={lang} />;
       case 'dealer': return <DealerView profile={currentUserData} lang={lang} />;
       case 'travel': return <TravelView profile={currentUserData} lang={lang} />;

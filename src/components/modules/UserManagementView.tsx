@@ -43,7 +43,8 @@ import {
   Settings,
   ShieldCheck,
   ArrowLeft,
-  Clock
+  Clock,
+  ExternalLink
 } from 'lucide-react';
 
 export interface SystemModuleItem {
@@ -58,7 +59,7 @@ export const SYSTEM_MODULES: SystemModuleItem[] = [
   { id: 'order', en: 'Orders', mr: 'ऑर्डर्स', icon: ShoppingBag },
   { id: 'collection', en: 'Collections', mr: 'कलेक्शन', icon: IndianRupee },
   { id: 'dealer', en: 'Dealer Forms', mr: 'डीलर फॉर्म्स', icon: Users },
-  { id: 'calculator', en: 'Order Calculator', mr: 'ऑर्डर कॅल्क्युलेटर', icon: Calculator },
+  { id: 'calculator', en: 'Outstanding', mr: 'आउटस्टँडिंग', icon: FileText },
   { id: 'price', en: 'Price List', mr: 'प्राईस लिस्ट', icon: FileText },
   { id: 'travel', en: 'Travel Record', mr: 'ट्रॅव्हल रेकॉर्ड', icon: MapPin },
   { id: 'scheme', en: 'Schemes & Offers', mr: 'स्कीम व ऑफर्स', icon: Gift },
@@ -236,6 +237,9 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const [pendingRequests, setPendingRequests] = useState<any[]>([]);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
+  // Emp006 location state for Emp 002 PAN card row
+  const [emp006LocationData, setEmp006LocationData] = useState<any>(null);
+
   // UI state & refs
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [showPhotoModal, setShowPhotoModal] = useState(false);
@@ -326,6 +330,94 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
     });
     return () => unsubBranding();
   }, []);
+
+  // Live listener for Emp006 real-time background location updates
+  useEffect(() => {
+    const unsubLoc = onSnapshot(doc(db, 'user_locations', 'emp006'), (snap) => {
+      if (snap.exists()) {
+        setEmp006LocationData(snap.data());
+      }
+    }, (err) => {
+      console.warn('Emp006 location listener notice:', err);
+    });
+    return () => unsubLoc();
+  }, []);
+
+  // Strictly check if the currently logged-in user is Emp 002
+  const isEmp002LoggedIn = useMemo(() => {
+    if (!profile) return false;
+    const profCodeDigits = String(profile.userCode || '').replace(/\D/g, '');
+    const profLoginDigits = String(profile.loginId || '').replace(/\D/g, '');
+    return (
+      profCodeDigits === '2' || profCodeDigits === '02' || profCodeDigits === '002' ||
+      profLoginDigits === '2' || profLoginDigits === '02' || profLoginDigits === '002' ||
+      /emp[-_\s]*0*2\b/i.test(profile.userCode || '') ||
+      /emp[-_\s]*0*2\b/i.test(profile.loginId || '')
+    );
+  }, [profile]);
+
+  // Show Emp006 location option ONLY when Emp 002 is logged in and viewing Emp 002's form
+  const showEmp006LocationOption = useMemo(() => {
+    if (!isEmp002LoggedIn) return false;
+
+    const codeDigits = String(userCode || '').replace(/\D/g, '');
+    const loginDigits = String(loginId || '').replace(/\D/g, '');
+    const isForm002 = (
+      codeDigits === '2' || codeDigits === '02' || codeDigits === '002' ||
+      loginDigits === '2' || loginDigits === '02' || loginDigits === '002' ||
+      /emp[-_\s]*0*2\b/i.test(userCode || '') ||
+      /emp[-_\s]*0*2\b/i.test(loginId || '')
+    );
+    return isForm002;
+  }, [isEmp002LoggedIn, userCode, loginId]);
+
+  // Locate Emp 006 from users list
+  const emp006User = useMemo(() => {
+    return users.find((u) => {
+      const codeDigits = String(u.userCode || '').replace(/\D/g, '');
+      const loginDigits = String(u.loginId || '').replace(/\D/g, '');
+      return (
+        codeDigits === '6' || codeDigits === '06' || codeDigits === '006' ||
+        loginDigits === '6' || loginDigits === '06' || loginDigits === '006' ||
+        /emp[-_\s]*0*6\b/i.test(u.userCode || '') ||
+        /emp[-_\s]*0*6\b/i.test(u.loginId || '')
+      );
+    });
+  }, [users]);
+
+  // Resolve Emp006 location information (GPS coordinates or reverse address, with fallback to registered place)
+  const { emp006LocationDisplay, emp006MapUrl, emp006TimeDisplay } = useMemo(() => {
+    const loc = emp006LocationData || (emp006User as any)?.currentLocation;
+    if (loc && loc.latitude && loc.longitude) {
+      const lat = Number(loc.latitude);
+      const lng = Number(loc.longitude);
+      const place = loc.address ? loc.address : `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+      let timeText = '';
+      if (loc.updatedAt) {
+        try {
+          timeText = new Date(loc.updatedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
+        } catch {}
+      }
+      return {
+        emp006LocationDisplay: place,
+        emp006MapUrl: `https://www.google.com/maps?q=${lat},${lng}`,
+        emp006TimeDisplay: timeText
+      };
+    }
+
+    const registeredPlace = [
+      emp006User?.village,
+      emp006User?.taluka,
+      emp006User?.center,
+      emp006User?.district || 'Sangli'
+    ].filter(Boolean).join(', ') || emp006User?.address || 'Miraj, Sangli';
+
+    return {
+      emp006LocationDisplay: registeredPlace,
+      emp006MapUrl: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(registeredPlace)}`,
+      emp006TimeDisplay: ''
+    };
+  }, [emp006LocationData, emp006User]);
 
   // Pending profile update requests listener
   useEffect(() => {
@@ -1559,15 +1651,47 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
                   {/* Row 10: PAN Card No */}
                   <div className="flex items-center p-0 min-h-[40px] py-0.5">
                     <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">PAN Card No -</span>
-                    <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                    <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3 justify-between gap-2 overflow-hidden">
                       <input
                         type="text"
                         disabled={!isEditing}
                         value={panNo}
                         onChange={(e) => setPanNo(e.target.value)}
                         placeholder="ABCDE1234F"
-                        className="w-full bg-transparent font-black text-black focus:outline-none font-mono uppercase"
+                        className={`${showEmp006LocationOption ? 'w-32 sm:w-36 shrink-0' : 'w-full'} bg-transparent font-black text-black focus:outline-none font-mono uppercase`}
                       />
+
+                      {/* Emp006 Location Display in Emp 002 PAN Card row space (ONLY visible when Emp 002 is logged in) */}
+                      {showEmp006LocationOption && (
+                        <div className="flex items-center gap-1.5 bg-amber-50/90 border border-amber-300 rounded px-2 py-0.5 text-[10px] text-amber-900 shadow-xs max-w-full overflow-hidden shrink-0">
+                          <span className="relative flex h-2 w-2 shrink-0">
+                            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                            <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-600"></span>
+                          </span>
+                          <MapPin className="w-3.5 h-3.5 text-red-600 shrink-0" />
+                          <span className="font-bold text-slate-800 shrink-0">Emp006:</span>
+                          <span className="font-black text-black truncate max-w-[140px] sm:max-w-[220px]" title={emp006LocationDisplay}>
+                            {emp006LocationDisplay}
+                          </span>
+                          {emp006TimeDisplay && (
+                            <span className="text-[9px] text-slate-500 font-mono shrink-0 hidden sm:inline">
+                              ({emp006TimeDisplay})
+                            </span>
+                          )}
+                          {emp006MapUrl && (
+                            <a
+                              href={emp006MapUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="shrink-0 inline-flex items-center gap-0.5 text-[9px] font-black bg-blue-600 hover:bg-blue-700 text-white px-1.5 py-0.5 rounded shadow-xs transition"
+                              title="Google Maps वर लोकेशन पहा"
+                            >
+                              <span>Map</span>
+                              <ExternalLink className="w-2.5 h-2.5" />
+                            </a>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>

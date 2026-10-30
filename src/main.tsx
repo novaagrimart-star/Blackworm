@@ -1,48 +1,41 @@
-import {createRoot} from 'react-dom/client';
-import App from './App.tsx';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import ErrorBoundary from './components/ErrorBoundary';
 import './index.css';
 
 import { registerSW } from 'virtual:pwa-register';
 
-// Auto-check for updates and prevent stale service worker caching
-const updateSW = registerSW({
-  immediate: true,
-  onNeedRefresh() {
-    updateSW(true);
-  },
-  onOfflineReady() {
-    console.log('App ready for offline use');
-  },
-});
-
+// Register service worker gracefully without forcing sudden unexpected page reloads
 if (typeof window !== 'undefined') {
-  window.addEventListener('focus', () => {
-    updateSW();
+  // Prevent unhandled promise rejections from killing the app
+  window.addEventListener('unhandledrejection', (event) => {
+    console.warn('Caught unhandled promise rejection:', event.reason);
+    event.preventDefault();
   });
-  window.addEventListener('online', () => {
-    updateSW();
+
+  // Catch global errors safely
+  window.addEventListener('error', (event) => {
+    console.warn('Caught window error:', event.error || event.message);
   });
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-      updateSW();
-    }
-  });
-  // Auto-check for updates every 60 seconds so users always have latest build automatically
-  setInterval(() => {
-    updateSW();
-  }, 60 * 1000);
+
+  try {
+    registerSW({
+      immediate: true,
+      onNeedRefresh() {
+        // Log update without forcefully destroying user session
+        console.log('New app version available in background');
+      },
+      onOfflineReady() {
+        console.log('App ready for offline use');
+      },
+    });
+  } catch (e) {
+    console.warn('PWA registration skipped:', e);
+  }
 }
 
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.getRegistrations().then((registrations) => {
-    for (const registration of registrations) {
-      registration.update();
-    }
-  });
-
-  navigator.serviceWorker.addEventListener('controllerchange', () => {
-    window.location.reload();
-  });
-}
-
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!).render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>
+);

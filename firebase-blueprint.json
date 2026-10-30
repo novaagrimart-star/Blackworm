@@ -85,6 +85,26 @@
       },
       "required": ["id", "amount", "collectedByUid"]
     },
+    "outstandingRecord": {
+      "title": "Outstanding Record",
+      "description": "Persisted dealer standing amount records from statements or manual entry",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "firmName": { "type": "string" },
+        "cleanedFirmName": { "type": "string" },
+        "amount": { "type": "number" },
+        "formattedAmount": { "type": "string" },
+        "contactNumber": { "type": "string" },
+        "village": { "type": "string" },
+        "district": { "type": "string" },
+        "proprietorName": { "type": "string" },
+        "matchedDealerId": { "type": "string" },
+        "sourceFile": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "firmName", "amount"]
+    },
     "target": {
       "title": "Monthly Target",
       "description": "Monthly performance targets for sales staff",
