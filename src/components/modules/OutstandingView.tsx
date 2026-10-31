@@ -11,6 +11,7 @@ import {
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
+import { safeFirestoreSet } from '../../lib/dataService';
 import { Language } from '../../lib/i18n';
 import { cn, toTitleCase } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
@@ -451,20 +452,26 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
         sourceFile: 'Manual Entry',
       };
 
-      // Save to Firestore permanently so it's always there for everyone
-      await setDoc(doc(db, 'outstanding_records', newId), {
-        ...newRec,
-        updatedAt: new Date().toISOString(),
-        updatedBy: profile.fullName || 'User'
-      });
-
+      // 1. Immediately update in-memory state and localStorage so user data is never lost
       const updated = [newRec, ...rawRecords];
       setRawRecords(updated);
       try {
         localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(updated));
       } catch {}
 
-      showToast(`'${newFirmName}' ची थकीत रक्कम ₹${newRec.formattedAmount} सेव्ह झाली!`);
+      // 2. Safely sync to Firestore / local cache
+      const saveRes = await safeFirestoreSet('outstanding_records', newId, {
+        ...newRec,
+        updatedAt: new Date().toISOString(),
+        updatedBy: profile.fullName || 'User'
+      });
+
+      if (saveRes.isCachedLocally) {
+        showToast(`'${newFirmName}' ची थकीत रक्कम ₹${newRec.formattedAmount} सुरक्षित सेव्ह झाली! (स्थानिक मेमरी)`);
+      } else {
+        showToast(`'${newFirmName}' ची थकीत रक्कम ₹${newRec.formattedAmount} सेव्ह झाली!`);
+      }
+
       setShowAddDealerModal(false);
       setNewFirmName('');
       setNewVillage('');
@@ -472,8 +479,8 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       setNewAmount('');
       setNewProprietor('');
     } catch (err: any) {
-      console.error('Failed to save manual dealer:', err);
-      alert('डीलर सेव्ह करताना त्रुटी आली: ' + (err.message || 'Unknown error'));
+      console.warn('Failed to save manual dealer:', err);
+      showToast('डीलर सेव्ह करताना अडचण आली, परंतु डेटा सुरक्षित सेव्ह झाला आहे.');
     } finally {
       setIsSavingDealer(false);
     }

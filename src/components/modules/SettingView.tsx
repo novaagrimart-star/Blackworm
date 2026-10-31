@@ -7,7 +7,9 @@ import {
   DeletedRecordItem, 
   AuditLogItem, 
   exportFullDatabaseBackup, 
-  restoreDatabaseFromJson 
+  restoreDatabaseFromJson,
+  getPendingSyncCount,
+  startBackgroundSync
 } from '../../lib/dataService';
 import { Language, translations } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
@@ -48,6 +50,8 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
   const [isExportingBackup, setIsExportingBackup] = useState<boolean>(false);
   const [isRestoringBackup, setIsRestoringBackup] = useState<boolean>(false);
   const [backupStatusMessage, setBackupStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [pendingSyncCount, setPendingSyncCount] = useState<number>(0);
+  const [isSyncingNow, setIsSyncingNow] = useState<boolean>(false);
 
   useEffect(() => {
     const userIsAdmin = isAdmin(profile);
@@ -63,8 +67,13 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
       console.warn('SettingView audit logs sync notice:', err);
     });
 
+    const countInterval = setInterval(() => {
+      setPendingSyncCount(getPendingSyncCount());
+    }, 2000);
+
     return () => {
       unsubAudit();
+      clearInterval(countInterval);
     };
   }, []);
 
@@ -140,10 +149,34 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
           await reg.unregister();
         }
       }
+      // Clear localStorage but keep authentication
+      const profile = localStorage.getItem('blackworm_user_profile');
+      localStorage.clear();
+      if (profile) localStorage.setItem('blackworm_user_profile', profile);
+      
       // Force reload without cache
       window.location.href = window.location.origin + window.location.pathname + '?fresh=' + Date.now();
     } catch (e) {
       window.location.reload();
+    }
+  };
+
+  const handleManualSync = async () => {
+    if (isSyncingNow) return;
+    setIsSyncingNow(true);
+    try {
+      await startBackgroundSync();
+      setPendingSyncCount(getPendingSyncCount());
+      if (getPendingSyncCount() === 0) {
+        setBackupStatusMessage({ type: 'success', text: 'सर्व डेटाबेस सिंक झाला आहे!' });
+      } else {
+        setBackupStatusMessage({ type: 'error', text: 'काही डेटा सिंक होऊ शकला नाही. इंटरनेट तपासा.' });
+      }
+    } catch (e) {
+      console.error('Manual sync failed:', e);
+    } finally {
+      setIsSyncingNow(false);
+      setTimeout(() => setBackupStatusMessage(null), 3000);
     }
   };
 
@@ -315,15 +348,44 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
             </h3>
           </div>
 
-          <div>
-            <button
-              onClick={handleClearCacheAndSync}
-              disabled={isClearingCache}
-              className="w-full py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-bold shadow-2xs transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:opacity-50"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${isClearingCache ? 'animate-spin' : ''}`} />
-              <span>{isClearingCache ? 'Refreshing...' : 'Refresh Now'}</span>
-            </button>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+              <div className="flex items-center justify-between">
+                <h4 className="font-bold text-slate-800">Pending Sync Records</h4>
+                <span className={cn(
+                  "px-2 py-0.5 rounded-full text-[10px] font-black",
+                  pendingSyncCount > 0 ? "bg-amber-100 text-amber-700 animate-pulse" : "bg-emerald-100 text-emerald-700"
+                )}>
+                  {pendingSyncCount} Records
+                </span>
+              </div>
+              <p className="text-[10px] text-slate-500 leading-tight">
+                येथे अशा नोंदी आहेत ज्या अजूनही तुमच्या मोबाईलमध्ये आहेत आणि इंटरनेट नसल्यामुळे मुख्य सर्व्हरवर अपलोड झाल्या नाहीत.
+              </p>
+              <button
+                onClick={handleManualSync}
+                disabled={isSyncingNow || pendingSyncCount === 0}
+                className="w-full py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer"
+              >
+                {isSyncingNow ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                <span>{isSyncingNow ? 'सिंक होत आहे...' : 'सर्व सिंक करा (Upload All)'}</span>
+              </button>
+            </div>
+
+            <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+              <h4 className="font-bold text-slate-800">App Reload</h4>
+              <p className="text-[10px] text-slate-500 leading-tight">
+                ॲपमध्ये काही तांत्रिक अडचण आल्यास किंवा नवीन अपडेट पाहायचे असल्यास 'Refresh Now' बटण दाबा.
+              </p>
+              <button
+                onClick={handleClearCacheAndSync}
+                disabled={isClearingCache}
+                className="w-full py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isClearingCache ? 'animate-spin' : ''}`} />
+                <span>{isClearingCache ? 'Refreshing...' : 'Refresh Now'}</span>
+              </button>
+            </div>
           </div>
         </div>
       )}

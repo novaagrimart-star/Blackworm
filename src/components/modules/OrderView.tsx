@@ -13,7 +13,7 @@ import {
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { softDeleteRecord, logAudit } from '../../lib/dataService';
+import { softDeleteRecord, logAudit, safeFirestoreSet, mergeWithLocalData } from '../../lib/dataService';
 import { Language } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
 import { cn, toTitleCase } from '../../lib/utils';
@@ -335,11 +335,6 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
             };
           });
 
-          // Asynchronously update in Firestore if names were outdated
-          if (orderItemsChanged) {
-            updateDoc(doc(db, 'orders', d.id), { items: cleanedItems }).catch(() => {});
-          }
-
           list.push({
             id: d.id,
             orderNumber: data.orderNumber || `BW-${d.id.slice(-6)}`,
@@ -375,10 +370,16 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           });
         }
       });
-      // Firestore query already sorts by createdAt desc, but we keep this as safety
-      setOrders(list);
+
+      const merged = mergeWithLocalData('orders', list);
+      merged.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      setOrders(merged);
     }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'orders');
+      console.warn("Orders firestore notice (fallback to local cache):", error);
+      const merged = mergeWithLocalData('orders', []);
+      if (merged.length > 0) {
+        setOrders(merged);
+      }
     });
     return () => unsub();
   }, []);
@@ -726,7 +727,18 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           updatedByName: profile.fullName || profile.loginId || 'Officer',
         };
 
-        await setDoc(doc(db, 'orders', editingOrderId), updatedOrderPayload, { merge: true });
+        const saveRes = await safeFirestoreSet('orders', editingOrderId, updatedOrderPayload, { merge: true });
+
+        // Immediately update in-memory orders
+        setOrders((prev) => {
+          const idx = prev.findIndex((o) => o.id === editingOrderId);
+          if (idx >= 0) {
+            const updated = [...prev];
+            updated[idx] = { ...updated[idx], ...updatedOrderPayload } as OrderItem;
+            return updated;
+          }
+          return prev;
+        });
 
         try {
           await logAudit(
@@ -746,7 +758,9 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           isOpen: true,
           type: 'success',
           title: 'ऑर्डर अपडेट झाली!',
-          message: `ऑर्डर ${existingOrder?.orderNumber || ''} मधील बदल यशस्वीरित्या सेव्ह झाले आहेत.`,
+          message: saveRes.isCachedLocally
+            ? `ऑर्डर ${existingOrder?.orderNumber || ''} स्थानिक मेमरीमध्ये सुरक्षित सेव्ह झाली आहे.`
+            : `ऑर्डर ${existingOrder?.orderNumber || ''} मधील बदल यशस्वीरित्या सेव्ह झाले आहेत.`,
           confirmText: 'ठीक आहे',
           onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
         });
@@ -786,7 +800,10 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         isArchived: false,
       };
 
-      await setDoc(doc(db, 'orders', orderId), newOrder);
+      const saveRes = await safeFirestoreSet('orders', orderId, newOrder);
+
+      // Immediately add to in-memory orders
+      setOrders((prev) => [newOrder, ...prev]);
 
       try {
         await logAudit(

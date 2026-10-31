@@ -16,7 +16,7 @@ import {
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { logAudit } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, mergeWithLocalData } from '../../lib/dataService';
 import { toTitleCase } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
 import { compressImageFile } from '../../lib/imageCompression';
@@ -417,18 +417,24 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           list.push({ ...data, id: d.id });
         });
 
+        const merged = mergeWithLocalData('dealers_application', list);
+
         // Refined sort for global codes and creation dates
-        list.sort((a, b) => {
+        merged.sort((a, b) => {
           const aNum = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
           const bNum = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
           if (aNum && bNum && aNum !== bNum) return bNum - aNum;
           return (b.createdAt || '').localeCompare(a.createdAt || '');
         });
 
-        setDealers(list);
+        setDealers(merged);
       },
       (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'dealers_application');
+        console.warn("dealers_application firestore notice (fallback to local cache):", error);
+        const merged = mergeWithLocalData('dealers_application', []);
+        if (merged.length > 0) {
+          setDealers(merged);
+        }
       }
     );
     return () => unsub();
@@ -774,7 +780,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         payload.createdAt = new Date().toISOString();
       }
 
-      await setDoc(doc(db, 'dealers_application', id), payload, { merge: true });
+      const saveRes = await safeFirestoreSet('dealers_application', id, payload, { merge: true });
       await logAudit(
         isNewRecord ? 'CREATE' : 'UPDATE',
         'dealers_application',
@@ -782,6 +788,17 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         `${isNewRecord ? 'Created' : 'Updated'} Dealership Form for ${payload.firmName} (${payload.dealerCode}) by ${payload.officerName}`,
         profile
       );
+
+      // Immediately update in-memory state
+      setDealers((prev) => {
+        const idx = prev.findIndex((d) => d.id === id);
+        if (idx >= 0) {
+          const updated = [...prev];
+          updated[idx] = payload;
+          return updated;
+        }
+        return [payload, ...prev];
+      });
 
       setCurrentId(id);
       setDealerCode(finalCode);
@@ -797,7 +814,20 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           isOpen: true,
           type: 'success',
           title: `डीलर नंबर ऍड झाला: #${finalCode}`,
-          message: `डीलर डेटा यशस्वीरित्या सेव्ह झाला आहे. या फॉर्मला अधिकृत सिरीयल नंबर #${finalCode} मिळाला आहे.`,
+          message: saveRes.isCachedLocally
+            ? `डीलर डेटा स्थानिक सुरक्षित मेमरीमध्ये सेव्ह झाला आहे (#${finalCode}).`
+            : `डीलर डेटा यशस्वीरित्या सेव्ह झाला आहे. या फॉर्मला अधिकृत सिरीयल नंबर #${finalCode} मिळाला आहे.`,
+          confirmText: 'ठीक आहे',
+          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+        });
+      } else {
+        setDialogConfig({
+          isOpen: true,
+          type: 'success',
+          title: `डीलर माहिती अपडेट झाली`,
+          message: saveRes.isCachedLocally
+            ? `${payload.firmName} यांची माहिती सुरक्षित सेव्ह झाली आहे.`
+            : `${payload.firmName} यांची माहिती यशस्वीरित्या अपडेट करण्यात आली आहे.`,
           confirmText: 'ठीक आहे',
           onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
         });

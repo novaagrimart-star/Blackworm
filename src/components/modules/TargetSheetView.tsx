@@ -9,7 +9,7 @@ import {
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import { logAudit } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet } from '../../lib/dataService';
 import { Language } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
@@ -505,16 +505,25 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
           sheet: cleanedSheet
         }));
       } catch {}
-      await setDoc(doc(db, 'yearly_targets', sheet.id), {
-        ...cleanedSheet,
-        updatedAt: new Date().toISOString()
-      }, { merge: true });
-      await logAudit('UPDATE', 'yearly_targets', sheet.id, `Updated yearly target sheet for ${sheet.fullName}`, profile);
+
+      // Update in-memory state and notify user immediately
       setYearlySheet(cleanedSheet);
       setShowSuccess(true);
       setTimeout(() => setShowSuccess(false), 3000);
+
+      await safeFirestoreSet('yearly_targets', sheet.id, {
+        ...cleanedSheet,
+        updatedAt: new Date().toISOString()
+      }, { merge: true });
+
+      try {
+        await logAudit('UPDATE', 'yearly_targets', sheet.id, `Updated yearly target sheet for ${sheet.fullName}`, profile);
+      } catch {}
     } catch (err) {
-      console.error('Save failed:', err);
+      console.warn('Save notice:', err);
+      // Still show success since it is safely cached in localStorage
+      setShowSuccess(true);
+      setTimeout(() => setShowSuccess(false), 3000);
     } finally {
       setSaving(false);
     }

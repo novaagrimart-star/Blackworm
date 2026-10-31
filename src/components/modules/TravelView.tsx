@@ -8,7 +8,7 @@ import {
 } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import { logAudit } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet } from '../../lib/dataService';
 import { Language, translations } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
@@ -538,18 +538,20 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     } catch {}
 
     try {
-      await setDoc(doc(db, 'travel_sheets', sheet.id), {
+      await safeFirestoreSet('travel_sheets', sheet.id, {
         ...sheet,
         updatedAt: new Date().toISOString()
       }, { merge: true });
 
-      await logAudit(
-        'UPDATE', 
-        'travel_sheets', 
-        sheet.id, 
-        `Saved Travelling Sheet for ${sheet.officerName} (${sheet.monthName} ${sheet.yearNumber})`, 
-        profile
-      );
+      try {
+        await logAudit(
+          'UPDATE', 
+          'travel_sheets', 
+          sheet.id, 
+          `Saved Travelling Sheet for ${sheet.officerName} (${sheet.monthName} ${sheet.yearNumber})`, 
+          profile
+        );
+      } catch {}
       setShowSuccess(true);
       setTimeout(() => setShowSuccess(false), 3000);
     } catch (err) {

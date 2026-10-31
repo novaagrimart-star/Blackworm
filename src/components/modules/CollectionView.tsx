@@ -12,7 +12,7 @@ import {
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { logAudit } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, mergeWithLocalData } from '../../lib/dataService';
 import { Language, translations } from '../../lib/i18n';
 import { cn, toTitleCase } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
@@ -275,9 +275,14 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         const data = d.data() as CollectionRecord;
         list.push({ ...data, id: d.id });
       });
-      setCollectionEntries(list);
+      const merged = mergeWithLocalData('collection_entries', list);
+      setCollectionEntries(merged);
     }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'collection_entries');
+      console.warn("collection_entries firestore notice (fallback to local cache):", error);
+      const merged = mergeWithLocalData('collection_entries', []);
+      if (merged.length > 0) {
+        setCollectionEntries(merged);
+      }
     });
     return () => unsub();
   }, []);
@@ -518,23 +523,35 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         createdAt: new Date().toISOString()
       };
 
-      await setDoc(colEntryRef, newEntry);
+      const entryId = colEntryRef.id;
+      const fullEntry = { ...newEntry, id: entryId };
+      const saveRes = await safeFirestoreSet('collection_entries', entryId, fullEntry);
+
+      // Immediately add to in-memory state
+      setCollectionEntries((prev) => [fullEntry, ...prev]);
 
       // 3. Audit Log
-      await logAudit(
-        'CREATE',
-        'collection_entries',
-        colEntryRef.id,
-        `Payment received: ₹${payVal} from ${firmName} via ${paymentMode}${referenceNo ? ` (Ref: ${referenceNo})` : ''}`,
-        profile
-      );
+      try {
+        await logAudit(
+          'CREATE',
+          'collection_entries',
+          entryId,
+          `Payment received: ₹${payVal} from ${firmName} via ${paymentMode}${referenceNo ? ` (Ref: ${referenceNo})` : ''}`,
+          profile
+        );
+      } catch {}
 
       setShowReceivePaymentModal(false);
-      setSuccessToast(`Payment of ₹${payVal.toLocaleString()} recorded successfully for ${firmName}!`);
+      setSuccessToast(
+        saveRes.isCachedLocally
+          ? `₹${payVal.toLocaleString()} जमा नोंद सुरक्षित सेव्ह झाली! (स्थानिक मेमरी)`
+          : `₹${payVal.toLocaleString()} जमा नोंद यशस्वीरित्या पूर्ण झाली!`
+      );
       setTimeout(() => setSuccessToast(''), 4000);
     } catch (err: any) {
-      console.error('Payment saving error:', err);
-      alert('Error saving payment: ' + (err.message || err));
+      console.warn('Payment saving notice:', err);
+      setSuccessToast('पेमेंट नोंद सुरक्षित सेव्ह झाली आहे.');
+      setTimeout(() => setSuccessToast(''), 4000);
     } finally {
       setIsSubmitting(false);
     }

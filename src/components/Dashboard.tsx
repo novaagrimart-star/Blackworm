@@ -26,6 +26,7 @@ import { Language, translations } from '../lib/i18n';
 import { OfflineIndicator } from './OfflineIndicator';
 import { CustomDialogModal } from './CustomDialogModal';
 import { useBranding } from '../lib/branding';
+import { ErrorBoundary } from './ErrorBoundary';
 
 import { TargetSheetView } from './modules/TargetSheetView';
 import { UserManagementView } from './modules/UserManagementView';
@@ -181,20 +182,31 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
       );
     }
 
-    switch (activeTab) {
-      case 'target': return <TargetSheetView profile={currentUserData} lang={lang} />;
-      case 'user': return <UserManagementView profile={currentUserData} lang={lang} onProfileUpdate={onProfileUpdate} />;
-      case 'order': return <OrderView profile={currentUserData} lang={lang} />;
-      case 'collection': return <CollectionView profile={currentUserData} lang={lang} />;
-      case 'outstanding':
-      case 'calculator': return <OutstandingView profile={currentUserData} lang={lang} />;
-      case 'price': return <PriceListView profile={currentUserData} lang={lang} />;
-      case 'dealer': return <DealerView profile={currentUserData} lang={lang} />;
-      case 'travel': return <TravelView profile={currentUserData} lang={lang} />;
-      case 'scheme': return <SchemeView profile={currentUserData} lang={lang} />;
-      case 'report': return <ReportView profile={currentUserData} lang={lang} />;
-      case 'setting': return <SettingView profile={currentUserData} lang={lang} onLogout={onLogout} />;
-      default:
+    const view = (() => {
+      switch (activeTab) {
+        case 'target': return <TargetSheetView profile={currentUserData} lang={lang} />;
+        case 'user': return <UserManagementView profile={currentUserData} lang={lang} onProfileUpdate={onProfileUpdate} />;
+        case 'order': return <OrderView profile={currentUserData} lang={lang} />;
+        case 'collection': return <CollectionView profile={currentUserData} lang={lang} />;
+        case 'outstanding':
+        case 'calculator': return <OutstandingView profile={currentUserData} lang={lang} />;
+        case 'price': return <PriceListView profile={currentUserData} lang={lang} />;
+        case 'dealer': return <DealerView profile={currentUserData} lang={lang} />;
+        case 'travel': return <TravelView profile={currentUserData} lang={lang} />;
+        case 'scheme': return <SchemeView profile={currentUserData} lang={lang} />;
+        case 'report': return <ReportView profile={currentUserData} lang={lang} />;
+        case 'setting': return <SettingView profile={currentUserData} lang={lang} onLogout={onLogout} />;
+        default: return null;
+      }
+    })();
+
+    if (view) {
+      return (
+        <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
+          <ErrorBoundary>{view}</ErrorBoundary>
+        </div>
+      );
+    }
         return (
           <div className="space-y-6">
             {/* Logged-In User Profile: Full Officer Name with Compressed Designation */}
@@ -242,7 +254,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
             </div>
           </div>
         );
-    }
   };
 
   return (

@@ -20,9 +20,24 @@ service cloud.firestore {
       allow delete: if false; // Data Permanently Safe
     }
 
+    match /user_locations/{docId} {
+      allow read, write: if true;
+      allow delete: if false;
+    }
+
+    match /location_requests/{docId} {
+      allow read, write: if true;
+      allow delete: if true;
+    }
+
     match /dealers_application/{docId} {
       allow read, write: if true;
       allow delete: if false; // Use Soft Delete (isArchived)
+    }
+
+    match /dealers/{docId} {
+      allow read, write: if true;
+      allow delete: if false;
     }
 
     match /outstanding_records/{docId} {

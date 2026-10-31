@@ -512,10 +512,6 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         const cached = getInitialCachedProducts();
         if (cached.length > 0) {
           setProducts(cached);
-          // Safely restore items without batch deletion
-          for (const item of cached) {
-            setDoc(doc(db, 'products_pricelist_v2', item.id), item, { merge: true }).catch(() => {});
-          }
         } else {
           // Truly empty first-time database setup only
           await seedReferenceDataSafe();
