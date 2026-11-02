@@ -4,7 +4,8 @@ import {
   query, 
   onSnapshot, 
   doc, 
-  setDoc
+  setDoc,
+  getDocs
 } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
@@ -326,31 +327,36 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
 
   // Fetch users for dropdown - filter out Owner so Owner traveling sheet is never created or selected
   useEffect(() => {
-    const q = query(collection(db, 'users'));
-    const unsub = onSnapshot(q, (snap) => {
-      const list: UserProfile[] = [];
-      snap.forEach(d => {
-        const userData = d.data() as UserProfile;
-        // Strictly exclude owner from traveling sheet users
-        if (userData.role !== 'owner') {
-          list.push({ ...userData, uid: d.id });
-        }
-      });
-      list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
-      setUsers(list);
-
-      // Auto-select first officer if current selection is empty or is an owner
-      if (list.length > 0) {
-        setSelectedUserId(prev => {
-          if (!prev || (profile.role === 'owner' && prev === profile.uid)) {
-            return list[0].uid;
+    const loadUsers = async () => {
+      try {
+        const snap = await getDocs(query(collection(db, 'users')));
+        const list: UserProfile[] = [];
+        snap.forEach(d => {
+          const userData = d.data() as UserProfile;
+          // Strictly exclude owner from traveling sheet users
+          if (userData.role !== 'owner') {
+            list.push({ ...userData, uid: d.id });
           }
-          const exists = list.some(u => u.uid === prev);
-          return exists ? prev : list[0].uid;
         });
+        list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
+        setUsers(list);
+
+        // Auto-select first officer if current selection is empty or is an owner
+        if (list.length > 0) {
+          setSelectedUserId(prev => {
+            if (!prev || (profile.role === 'owner' && prev === profile.uid)) {
+              return list[0].uid;
+            }
+            const exists = list.some(u => u.uid === prev);
+            return exists ? prev : list[0].uid;
+          });
+        }
+      } catch (err) {
+        console.warn('TravelView users fetch notice:', err);
       }
-    });
-    return () => unsub();
+    };
+    
+    loadUsers();
   }, [profile.role, profile.uid]);
 
   // Fetch or initialize sheet with instant cache-first and live sync
@@ -535,6 +541,15 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     try {
       localStorage.setItem(cacheKey, JSON.stringify(sheet));
       localStorage.setItem(`travel_sheet_${sheet.userId}`, JSON.stringify(sheet));
+      const cachedAllRaw = localStorage.getItem('blackworm_cached_travel_sheets');
+      let cachedAll: any[] = cachedAllRaw ? JSON.parse(cachedAllRaw) : [];
+      const idx = cachedAll.findIndex((s: any) => s.id === sheet.id || s._id === sheet.id);
+      if (idx >= 0) {
+        cachedAll[idx] = sheet;
+      } else {
+        cachedAll.push(sheet);
+      }
+      localStorage.setItem('blackworm_cached_travel_sheets', JSON.stringify(cachedAll));
     } catch {}
 
     try {
@@ -798,39 +813,39 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
           </div>
         </div>
 
-        {/* Action Buttons: Compact Save & PDF, Print Removed */}
-        <div className="flex items-center gap-1.5 shrink-0 ml-auto">
+        {/* Action Buttons: Save & PDF */}
+        <div className="flex items-center gap-2 shrink-0 ml-auto">
           <button 
             type="button"
             onClick={handleSave}
             disabled={saving}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white px-2 py-1 rounded-md text-[11px] font-bold transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+            className="bg-emerald-600 hover:bg-emerald-700 text-white px-3.5 py-1.5 rounded-xl text-xs font-black transition flex items-center gap-1.5 shadow-sm active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
             title="Save Travelling Sheet"
           >
-            {saving ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Save className="w-2.5 h-2.5" />}
-            <span>Save</span>
+            {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+            <span>{saving ? 'सेव्ह होत आहे...' : 'सेव्ह करा (Save)'}</span>
           </button>
 
           <button
             type="button"
             onClick={handleDownloadPdf}
             disabled={isGeneratingPdf}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-2 py-1 rounded-md text-[11px] font-bold transition flex items-center gap-1 shadow-2xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+            className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-xl text-xs font-black transition flex items-center gap-1.5 shadow-sm active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
             title="Save PDF"
           >
-            {isGeneratingPdf ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Download className="w-2.5 h-2.5" />}
+            {isGeneratingPdf ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
             <span>PDF</span>
           </button>
         </div>
       </div>
 
       {showSuccess && (
-        <div className="bg-emerald-50 border border-emerald-200 p-3 rounded-xl flex items-center justify-between text-emerald-800 text-xs font-bold animate-in fade-in no-print">
+        <div className="fixed bottom-6 right-6 z-50 bg-emerald-700 text-white p-3.5 px-5 rounded-2xl shadow-2xl flex items-center justify-between gap-3 text-xs font-black animate-in fade-in slide-in-from-bottom-5 no-print border border-emerald-500">
           <div className="flex items-center gap-2">
-            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-            <span>Traveling sheet saved successfully!</span>
+            <CheckCircle2 className="w-5 h-5 text-white shrink-0" />
+            <span>ट्रॅव्हलिंग शीट यशस्वीरित्या सेव्ह झाली आहे!</span>
           </div>
-          <button onClick={() => setShowSuccess(false)} className="text-emerald-700">
+          <button onClick={() => setShowSuccess(false)} className="text-white/80 hover:text-white p-1 cursor-pointer">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -1133,6 +1148,19 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
               </div>
             </div>
           </div>
+        </div>
+
+        {/* Bottom Save Action Bar */}
+        <div className="p-3 bg-slate-50 border-t border-slate-200 flex items-center justify-end gap-3 no-print">
+          <button 
+            type="button"
+            onClick={handleSave}
+            disabled={saving}
+            className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-2.5 rounded-xl text-xs font-black transition flex items-center gap-2 shadow-md active:scale-95 disabled:opacity-50 cursor-pointer"
+          >
+            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+            <span>{saving ? 'सेव्ह होत आहे...' : 'ट्रॅव्हलिंग शीट सेव्ह करा (Save Travelling Sheet)'}</span>
+          </button>
         </div>
       </div>
     </div>

@@ -5,7 +5,8 @@ import {
   onSnapshot, 
   doc, 
   setDoc,
-  getDoc
+  getDoc,
+  getDocs
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
@@ -240,21 +241,30 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     'January', 'February', 'March'
   ];
 
-  // Fetch users for dropdown with cache synchronization
+  // Fetch users for dropdown with cache synchronization (Optimized for Free Tier)
   useEffect(() => {
-    const q = query(collection(db, 'users'));
-    const unsub = onSnapshot(q, { includeMetadataChanges: true }, (snap) => {
-      const list: UserProfile[] = [];
-      snap.forEach(d => list.push({ ...d.data(), uid: d.id } as UserProfile));
-      list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
-      setUsers(list);
+    const loadUsers = async () => {
       try {
+        const cached = localStorage.getItem('blackworm_cached_users');
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setUsers(parsed);
+          }
+        }
+
+        const snap = await getDocs(query(collection(db, 'users')));
+        const list: UserProfile[] = [];
+        snap.forEach(d => list.push({ ...d.data(), uid: d.id } as UserProfile));
+        list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
+        setUsers(list);
         localStorage.setItem('blackworm_cached_users', JSON.stringify(list));
-      } catch {}
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'users');
-    });
-    return () => unsub();
+      } catch (err) {
+        console.warn('TargetSheetView users fetch notice:', err);
+      }
+    };
+    
+    loadUsers();
   }, [syncKey]);
 
   // Fetch or init sheet for selected user with 0ms instant cache resolution & live real-time sync

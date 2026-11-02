@@ -6,7 +6,7 @@ import { Dashboard } from './components/Dashboard';
 import { Login } from './components/Login';
 import { Language } from './lib/i18n';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { startBackgroundSync } from './lib/dataService';
+import { startBackgroundSync, isQuotaBlocked } from './lib/dataService';
 
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(() => {
@@ -175,14 +175,26 @@ export default function App() {
               };
 
               // 1. Update user_locations collection
-              await setDoc(doc(db, 'user_locations', docId), locPayload, { merge: true });
+              try {
+                if (!isQuotaBlocked()) {
+                  await setDoc(doc(db, 'user_locations', docId), locPayload, { merge: true });
+                }
+              } catch (e) {
+                console.warn('Location write deferred:', e);
+              }
 
               // 2. Mark location_requests as completed with payload
-              await setDoc(doc(db, 'location_requests', docId), {
-                status: 'completed',
-                completedAt: nowIso,
-                location: locPayload,
-              }, { merge: true });
+              try {
+                if (!isQuotaBlocked()) {
+                  await setDoc(doc(db, 'location_requests', docId), {
+                    status: 'completed',
+                    completedAt: nowIso,
+                    location: locPayload,
+                  }, { merge: true });
+                }
+              } catch (e) {
+                console.warn('Location status write deferred:', e);
+              }
             } catch (err) {
               // Completely silent error handling
             } finally {

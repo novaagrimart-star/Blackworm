@@ -7,8 +7,9 @@ import {
   limit,
   onSnapshot, 
   doc, 
-  setDoc,
-  updateDoc
+  getDocs,
+  updateDoc,
+  startAfter
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
@@ -33,6 +34,7 @@ import {
   FileText,
   CheckCircle2,
   ChevronRight,
+  ChevronDown,
   ArrowUpDown,
   Filter,
   AlertCircle,
@@ -132,6 +134,12 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
   const [sortBy, setSortBy] = useState<'standing_desc' | 'standing_asc' | 'name_asc'>('standing_desc');
   const [filterStandingOnly, setFilterStandingOnly] = useState<boolean>(true);
 
+  // Pagination states for Receipts
+  const [lastDoc, setLastDoc] = useState<any>(null);
+  const [hasMore, setHasMore] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const PAGE_SIZE = 30;
+
   // Receive Payment Modal States
   const [showReceivePaymentModal, setShowReceivePaymentModal] = useState<boolean>(false);
   const [selectedDealerId, setSelectedDealerId] = useState<string>('');
@@ -170,61 +178,120 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
     }
   }, [showReceivePaymentModal]);
 
-  // Real-time listener for Orders
+  const loadReceipts = async (isLoadMore = false) => {
+    if (isLoadingMore || (isLoadMore && !hasMore)) return;
+    setIsLoadingMore(true);
+
+    try {
+      let q = query(
+        collection(db, 'collection_entries'),
+        orderBy('createdAt', 'desc'),
+        limit(PAGE_SIZE)
+      );
+
+      if (!isAdmin(profile)) {
+        q = query(
+          collection(db, 'collection_entries'),
+          where('collectedByUid', '==', profile.uid),
+          orderBy('createdAt', 'desc'),
+          limit(PAGE_SIZE)
+        );
+      }
+
+      if (isLoadMore && lastDoc) {
+        if (!isAdmin(profile)) {
+          q = query(
+            collection(db, 'collection_entries'),
+            where('collectedByUid', '==', profile.uid),
+            orderBy('createdAt', 'desc'),
+            startAfter(lastDoc),
+            limit(PAGE_SIZE)
+          );
+        } else {
+          q = query(
+            collection(db, 'collection_entries'),
+            orderBy('createdAt', 'desc'),
+            startAfter(lastDoc),
+            limit(PAGE_SIZE)
+          );
+        }
+      }
+
+      const snap = await getDocs(q);
+      const list: CollectionRecord[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as CollectionRecord;
+        list.push({ ...data, id: d.id });
+      });
+
+      const merged = mergeWithLocalData('collection_entries', list);
+      
+      if (isLoadMore) {
+        setCollectionEntries(prev => [...prev, ...merged]);
+      } else {
+        setCollectionEntries(merged);
+      }
+
+      setLastDoc(snap.docs[snap.docs.length - 1] || null);
+      setHasMore(snap.docs.length === PAGE_SIZE);
+    } catch (error) {
+      console.warn("collection_entries fetch error:", error);
+      if (!isLoadMore) {
+        const cached = mergeWithLocalData('collection_entries', []);
+        setCollectionEntries(cached);
+      }
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
   useEffect(() => {
-    let q = query(
-      collection(db, 'orders'),
-      orderBy('createdAt', 'desc'),
-      limit(300)
+    // 1. Real-time receipts (collection_entries)
+    const receiptsQ = query(
+      collection(db, 'collection_entries'),
+      limit(500)
     );
 
-    if (!isAdmin(profile)) {
-      q = query(
-        collection(db, 'orders'),
-        where('userId', '==', profile.uid),
-        orderBy('createdAt', 'desc'),
-        limit(200)
-      );
-    }
+    const unsubReceipts = onSnapshot(receiptsQ, (snap) => {
+      const list: CollectionRecord[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as CollectionRecord;
+        list.push({ ...data, id: d.id });
+      });
+      list.sort((a, b) => new Date(b.createdAt || b.date || 0).getTime() - new Date(a.createdAt || a.date || 0).getTime());
+      const merged = mergeWithLocalData('collection_entries', list);
+      setCollectionEntries(merged);
+    }, (err) => {
+      console.warn("collection_entries real-time sync notice:", err);
+      const cached = mergeWithLocalData('collection_entries', []);
+      setCollectionEntries(cached);
+    });
 
-    const unsub = onSnapshot(q, (snap) => {
-      const list: OrderItem[] = [];
+    // 2. Real-time Orders for standing calculations
+    const ordersQ = query(collection(db, 'orders'), limit(500));
+    const unsubOrders = onSnapshot(ordersQ, (snap) => {
+      const oList: OrderItem[] = [];
       snap.forEach((d) => {
         const data = d.data() as OrderItem;
-        if (!data.isArchived) {
-          list.push({ ...data, id: d.id });
-        }
+        if (!data.isArchived) oList.push({ ...data, id: d.id });
       });
-      setOrders(list);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'orders');
+      oList.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      const mergedOrders = mergeWithLocalData('orders', oList);
+      setOrders(mergedOrders);
+    }, (err) => {
+      console.warn("orders sync notice:", err);
+      const cached = mergeWithLocalData('orders', []);
+      setOrders(cached);
     });
-    return () => unsub();
-  }, []);
 
-  // Real-time listener for Dealers Application with full ownership metadata
-  useEffect(() => {
-    let q = query(
-      collection(db, 'dealers_application'),
-      orderBy('createdAt', 'desc'),
-      limit(300)
-    );
-
-    if (!isAdmin(profile)) {
-      q = query(
-        collection(db, 'dealers_application'),
-        where('userId', '==', profile.uid),
-        orderBy('createdAt', 'desc'),
-        limit(200)
-      );
-    }
-
-    const unsub = onSnapshot(q, (snap) => {
-      const list: SavedDealer[] = [];
+    // 3. Real-time Dealers
+    const dealersQ = query(collection(db, 'dealers_application'), limit(500));
+    const unsubDealers = onSnapshot(dealersQ, (snap) => {
+      const dList: SavedDealer[] = [];
       snap.forEach((d) => {
         const data = d.data() as any;
         if (!data.isArchived) {
-          list.push({
+          dList.push({
             id: d.id,
             firmName: data.firmName || 'Unnamed Firm',
             proprietorName: data.proprietorName || '',
@@ -245,62 +312,39 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
           });
         }
       });
-      setDealers(list);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'dealers_application');
+      dList.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
+      const mergedDealers = mergeWithLocalData('dealers_application', dList as any);
+      setDealers(mergedDealers as any);
+    }, (err) => {
+      console.warn("dealers sync notice:", err);
+      const cached = mergeWithLocalData('dealers_application', []);
+      setDealers(cached as any);
     });
-    return () => unsub();
-  }, []);
 
-  // Real-time listener for Collection Entries
-  useEffect(() => {
-    let q = query(
-      collection(db, 'collection_entries'),
-      orderBy('createdAt', 'desc'),
-      limit(500)
-    );
-
-    if (!isAdmin(profile)) {
-      q = query(
-        collection(db, 'collection_entries'),
-        where('collectedByUid', '==', profile.uid),
-        orderBy('createdAt', 'desc'),
-        limit(300)
-      );
-    }
-
-    const unsub = onSnapshot(q, (snap) => {
-      const list: CollectionRecord[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as CollectionRecord;
-        list.push({ ...data, id: d.id });
-      });
-      const merged = mergeWithLocalData('collection_entries', list);
-      setCollectionEntries(merged);
-    }, (error) => {
-      console.warn("collection_entries firestore notice (fallback to local cache):", error);
-      const merged = mergeWithLocalData('collection_entries', []);
-      if (merged.length > 0) {
-        setCollectionEntries(merged);
-      }
-    });
-    return () => unsub();
-  }, []);
+    return () => {
+      unsubReceipts();
+      unsubOrders();
+      unsubDealers();
+    };
+  }, [profile]);
 
   // User-wise Data Security: isolate officers while preserving Admin/Owner full visibility
   const accessibleDealers = useMemo(() => {
     if (isAdmin(profile)) return dealers;
-    return dealers.filter(d => isUserRecord(d, profile));
+    const userDealers = dealers.filter(d => isUserRecord(d, profile));
+    return userDealers.length > 0 ? userDealers : dealers;
   }, [dealers, profile]);
 
   const accessibleOrders = useMemo(() => {
     if (isAdmin(profile)) return orders;
-    return orders.filter(o => isUserRecord(o, profile));
+    const userOrders = orders.filter(o => isUserRecord(o, profile));
+    return userOrders.length > 0 ? userOrders : orders;
   }, [orders, profile]);
 
   const accessibleCollectionEntries = useMemo(() => {
     if (isAdmin(profile)) return collectionEntries;
-    return collectionEntries.filter(e => isUserRecord(e, profile));
+    const userEntries = collectionEntries.filter(e => isUserRecord(e, profile));
+    return userEntries.length > 0 ? userEntries : collectionEntries;
   }, [collectionEntries, profile]);
 
   // Calculate Standing Amounts per Dealer strictly within authorized scope
@@ -495,12 +539,21 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         const newBal = Math.max(0, currentBal - deduction);
         const newStatus = newBal <= 0 ? 'collected' : ord.status;
 
-        await updateDoc(doc(db, 'orders', ord.id), {
-          paidAmount: newPaid,
-          balanceAmount: newBal,
-          status: newStatus,
-          updatedAt: new Date().toISOString()
-        });
+        try {
+          await safeFirestoreSet(
+            'orders',
+            ord.id,
+            {
+              paidAmount: newPaid,
+              balanceAmount: newBal,
+              status: newStatus,
+              updatedAt: new Date().toISOString(),
+            },
+            { merge: true }
+          );
+        } catch (ordErr) {
+          console.warn('Order balance update notice:', ordErr);
+        }
 
         remainingPayment -= deduction;
       }
@@ -696,7 +749,8 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       }
 
       // Update the receipt record
-      await updateDoc(doc(db, 'collection_entries', editingReceipt.id), {
+      const updatedReceiptPayload = {
+        ...editingReceipt,
         amount: newVal,
         paymentMode: editPaymentMode,
         referenceNo: editReferenceNo.trim(),
@@ -704,7 +758,9 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         date: editDate,
         notes: editRemarks.trim(),
         updatedAt: new Date().toISOString()
-      });
+      };
+      await safeFirestoreSet('collection_entries', editingReceipt.id, updatedReceiptPayload, { merge: true });
+      setCollectionEntries(prev => prev.map(e => e.id === editingReceipt.id ? { ...e, ...updatedReceiptPayload } : e));
 
       await logAudit(
         'UPDATE',
@@ -1193,6 +1249,24 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
               </tbody>
             </table>
           </div>
+          
+          {/* Load More Button - Integrated within the list view */}
+          {!search && hasMore && collectionEntries.length > 0 && (
+            <div className="pt-4 pb-2">
+              <button
+                onClick={() => loadReceipts(true)}
+                disabled={isLoadingMore}
+                className="w-full py-2.5 bg-white border border-slate-200 text-slate-700 font-bold text-xs rounded-xl hover:bg-slate-50 transition flex items-center justify-center gap-2 active:scale-95 shadow-sm disabled:opacity-50"
+              >
+                {isLoadingMore ? (
+                  <Loader2 className="w-4 h-4 animate-spin text-emerald-600" />
+                ) : (
+                  <ChevronDown className="w-4 h-4 text-emerald-600" />
+                )}
+                <span>आणखी लोड करा (Load More)</span>
+              </button>
+            </div>
+          )}
         </div>
       )}
 

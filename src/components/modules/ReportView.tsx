@@ -4,6 +4,7 @@ import { db } from '../../firebase';
 import { Language } from '../../lib/i18n';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { toTitleCase } from '../../lib/utils';
+import { mergeWithLocalData } from '../../lib/dataService';
 import html2canvas from 'html2canvas-pro';
 import { 
   BarChart3, 
@@ -66,6 +67,25 @@ let reportStaticCache: StaticCacheData | null = (() => {
 
 const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
+export const getTodayLocalDate = (): string => {
+  const now = new Date();
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, '0');
+  const d = String(now.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+};
+
+export function formatReportDisplayDate(dateStr: string): string {
+  try {
+    const [y, m, d] = dateStr.split('-').map(Number);
+    if (!y || !m || !d) return dateStr;
+    const dateObj = new Date(y, m - 1, d);
+    return dateObj.toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' });
+  } catch {
+    return dateStr;
+  }
+}
+
 export function parseDateKeys(dateStr: string) {
   const [yStr, mStr, dStr] = dateStr.split('-');
   const year = parseInt(yStr, 10);
@@ -90,7 +110,7 @@ export function buildReportRows(
   profile: UserProfile
 ): OfficerDailyReport[] {
   const userIsAdmin = isAdmin(profile);
-  const { dayOfMonth, sheetMonthKey, targetMonthName } = parseDateKeys(selectedDate);
+  const { year, monthIndex, dayOfMonth, sheetMonthKey, targetMonthName } = parseDateKeys(selectedDate);
 
   let officers = userIsAdmin
     ? allUsers.filter((u) => u.role !== 'owner')
@@ -132,7 +152,7 @@ export function buildReportRows(
     const travelSheetId = `travel_${officer.uid}_${sheetMonthKey}`;
     let travelData = travelMap.get(travelSheetId) || 
                      travelMap.get(`${officer.uid}_${sheetMonthKey}`) ||
-                     travelMap.get(`${officer.uid}_${parseDateKeys(selectedDate).year}_${targetMonthName.toLowerCase()}`);
+                     travelMap.get(`${officer.uid}_${year}_${targetMonthName.toLowerCase()}`);
 
     if (!travelData && officer.loginId) {
       travelData = travelMap.get(`travel_${officer.loginId}_${sheetMonthKey}`) || 
@@ -142,25 +162,36 @@ export function buildReportRows(
     if (!travelData) {
       try {
         const cachedLocal = localStorage.getItem(`travel_sheet_${officer.uid}_${sheetMonthKey}`) ||
-                            (officer.loginId ? localStorage.getItem(`travel_sheet_${officer.loginId}_${sheetMonthKey}`) : null) ||
-                            localStorage.getItem(`travel_sheet_${officer.uid}`);
+                            (officer.loginId ? localStorage.getItem(`travel_sheet_${officer.loginId}_${sheetMonthKey}`) : null);
         if (cachedLocal) {
           travelData = JSON.parse(cachedLocal);
         }
       } catch (e) {}
     }
 
-    if (!travelData) {
-      travelData = travelMap.get(officer.uid);
+    // Verify travelData strictly matches the requested year and month to avoid mixing data across months
+    if (travelData) {
+      const sYear = travelData.yearNumber ? Number(travelData.yearNumber) : null;
+      const sMonth = travelData.monthName ? travelData.monthName.toLowerCase() : null;
+      const isMatchingMonth = (!sYear || sYear === year) && 
+        (!sMonth || sMonth === targetMonthName.toLowerCase() || (travelData.id && travelData.id.includes(sheetMonthKey)));
+      if (!isMatchingMonth) {
+        travelData = null;
+      }
     }
     
     let route = '-', openingKm = 0, closingKm = 0, dailyExpense = 0, recordedKm = 0;
     if (travelData && Array.isArray(travelData.rows)) {
-      const dayRow = travelData.rows.find((r: any) => 
-        Number(r.dayNumber) === dayOfMonth || 
-        r.date === selectedDate ||
-        (r.date && r.date.startsWith(selectedDate))
-      );
+      // Find row for this EXACT date
+      const dayRow = travelData.rows.find((r: any) => {
+        if (r.date && r.date.trim() === selectedDate.trim()) return true;
+        if (Number(r.dayNumber) === dayOfMonth) {
+          if (r.date && !r.date.startsWith(`${year}-`)) return false;
+          return true;
+        }
+        return false;
+      });
+
       if (dayRow) {
         route = (dayRow.route || '').trim() || '-';
         openingKm = Number(dayRow.openingKm) || 0;
@@ -172,6 +203,10 @@ export function buildReportRows(
 
     const paymentCollection = collDocs
       .filter((d: any) => {
+        const dDate = (d.date || '').trim();
+        const matchesDate = dDate === selectedDate || dDate.startsWith(selectedDate);
+        if (!matchesDate) return false;
+
         return (
           d.collectedByUid === officer.uid ||
           d.userId === officer.uid ||
@@ -220,13 +255,16 @@ export function buildReportRows(
 function getInitialCachedUsers(): UserProfile[] {
   try {
     const raw = localStorage.getItem('blackworm_cached_users');
+    let list: any[] = [];
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      if (Array.isArray(parsed) && parsed.length > 0) list = parsed;
+    } else if (reportStaticCache && reportStaticCache.users && reportStaticCache.users.length > 0) {
+      list = reportStaticCache.users;
     }
-    if (reportStaticCache && reportStaticCache.users && reportStaticCache.users.length > 0) {
-      return reportStaticCache.users;
-    }
+    const withIds = list.map((u: any) => ({ ...u, id: u.uid || u.id }));
+    const merged = mergeWithLocalData('users', withIds);
+    return merged.map((u: any) => ({ ...u, uid: u.uid || u.id })) as unknown as UserProfile[];
   } catch (e) {}
   return [];
 }
@@ -234,19 +272,20 @@ function getInitialCachedUsers(): UserProfile[] {
 function getInitialCachedTravel(): any[] {
   try {
     const raw = localStorage.getItem('blackworm_cached_travel_sheets');
+    let list: any[] = [];
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      if (Array.isArray(parsed) && parsed.length > 0) list = parsed;
+    } else if (reportStaticCache && reportStaticCache.travelSheets) {
+      list = reportStaticCache.travelSheets;
     }
-    if (reportStaticCache && reportStaticCache.travelSheets) {
-      return reportStaticCache.travelSheets;
-    }
+    return mergeWithLocalData('travel_sheets', list);
   } catch (e) {}
   return [];
 }
 
 export const ReportView: React.FC<Props> = ({ profile }) => {
-  const todayDate = new Date().toISOString().slice(0, 10);
+  const todayDate = getTodayLocalDate();
   const [selectedDate, setSelectedDate] = useState(todayDate);
   const printableSheetRef = useRef<HTMLDivElement>(null);
 
@@ -320,14 +359,19 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
     // 1. Live Users Listener (Cached immediately)
     const qUsers = query(collection(db, 'users'));
     const unsubUsers = onSnapshot(qUsers, (snap) => {
-      const uList = snap.docs.map(d => ({ ...d.data(), uid: d.id } as UserProfile));
-      usersRef.current = uList;
+      const uList = snap.docs.map(d => ({ ...d.data(), id: d.id, uid: d.id }));
+      const mergedUsers = mergeWithLocalData('users', uList) as unknown as UserProfile[];
+      usersRef.current = mergedUsers;
       try {
-        localStorage.setItem('blackworm_cached_users', JSON.stringify(uList));
+        localStorage.setItem('blackworm_cached_users', JSON.stringify(mergedUsers));
       } catch (e) {}
       recomputeLiveReport();
     }, (err) => {
       console.warn('Users live sync notice:', err);
+      const currentWithIds = (usersRef.current || []).map((u: any) => ({ ...u, id: u.uid || u.id }));
+      const mergedUsers = mergeWithLocalData('users', currentWithIds) as unknown as UserProfile[];
+      usersRef.current = mergedUsers;
+      recomputeLiveReport();
       setLoading(false);
     });
 
@@ -336,14 +380,18 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
       ? query(collection(db, 'travel_sheets'))
       : query(collection(db, 'travel_sheets'), where('userId', '==', profile.uid));
     const unsubTravel = onSnapshot(qTravel, (snap) => {
-      const tList = snap.docs.map(d => ({ ...d.data(), _id: d.id }));
-      travelRef.current = tList;
+      const tList = snap.docs.map(d => ({ ...d.data(), id: d.id, _id: d.id }));
+      const mergedTravel = mergeWithLocalData('travel_sheets', tList as any[]);
+      travelRef.current = mergedTravel;
       try {
-        localStorage.setItem('blackworm_cached_travel_sheets', JSON.stringify(tList));
+        localStorage.setItem('blackworm_cached_travel_sheets', JSON.stringify(mergedTravel));
       } catch (e) {}
       recomputeLiveReport();
     }, (err) => {
       console.warn('Travel live sync notice:', err);
+      const mergedTravel = mergeWithLocalData('travel_sheets', travelRef.current as any[]);
+      travelRef.current = mergedTravel;
+      recomputeLiveReport();
       setLoading(false);
     });
 
@@ -352,7 +400,7 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
       ? query(collection(db, 'yearly_targets'))
       : query(collection(db, 'yearly_targets'), where('userId', '==', profile.uid));
     const unsubTargets = onSnapshot(qTargets, (snap) => {
-      targetsRef.current = snap.docs.map(d => ({ ...d.data(), _id: d.id }));
+      targetsRef.current = snap.docs.map(d => ({ ...d.data(), id: d.id, _id: d.id }));
       recomputeLiveReport();
     }, (err) => {
       console.warn('Targets live sync notice:', err);
@@ -377,10 +425,15 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
   useEffect(() => {
     const qColl = query(collection(db, 'collection_entries'), where('date', '==', selectedDate));
     const unsubColl = onSnapshot(qColl, (snap) => {
-      collDocsRef.current = snap.docs.map(d => d.data());
+      const list = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+      const merged = mergeWithLocalData('collection_entries', list);
+      collDocsRef.current = merged.filter((d: any) => (d.date || '').trim() === selectedDate.trim() || (d.date && d.date.startsWith(selectedDate)));
       recomputeLiveReport();
     }, (err) => {
       console.warn('Collections live sync notice:', err);
+      const merged = mergeWithLocalData('collection_entries', collDocsRef.current);
+      collDocsRef.current = merged.filter((d: any) => (d.date || '').trim() === selectedDate.trim() || (d.date && d.date.startsWith(selectedDate)));
+      recomputeLiveReport();
       setLoading(false);
     });
 
@@ -513,7 +566,7 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
             <div className="flex items-center justify-center gap-6 text-xs font-bold text-slate-600">
               <span className="flex items-center gap-1.5">
                 <Calendar className="w-3.5 h-3.5 text-indigo-600" />
-                <span>Date: {new Date(selectedDate).toLocaleDateString('en-GB', { day: '2-digit', month: 'long', year: 'numeric' })}</span>
+                <span>Date: {formatReportDisplayDate(selectedDate)}</span>
               </span>
               <span className="flex items-center gap-1.5">
                 <TableIcon className="w-3.5 h-3.5 text-emerald-600" />

@@ -75,7 +75,7 @@ export function CustomDialogModal({
               type === 'confirm' ? 'bg-rose-600 hover:bg-rose-700 shadow-rose-200' : 'bg-slate-900 hover:bg-slate-800'
             }`}
           >
-            {type === 'confirm' ? confirmText : 'OK'}
+            {confirmText || (type === 'confirm' ? 'Confirm' : 'OK')}
           </button>
         </div>
       </div>

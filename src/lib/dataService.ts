@@ -23,6 +23,42 @@ export interface AuditLogItem {
   timestamp: string;
 }
 
+let quotaExceededUntil = (() => {
+  try {
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('blackworm_quota_blocked_until');
+      if (stored) {
+        const val = Number(stored);
+        if (!isNaN(val) && val > Date.now()) return val;
+      }
+    }
+  } catch {}
+  return 0;
+})();
+
+export function isQuotaBlocked(): boolean {
+  try {
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('blackworm_quota_blocked_until');
+      if (stored) {
+        const until = Number(stored);
+        if (!isNaN(until) && Date.now() < until) return true;
+      }
+    }
+  } catch {}
+  return Date.now() < quotaExceededUntil;
+}
+
+export function setQuotaBlocked(durationMs: number = 30 * 60 * 1000) {
+  const until = Date.now() + durationMs;
+  quotaExceededUntil = until;
+  try {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('blackworm_quota_blocked_until', String(until));
+    }
+  } catch {}
+}
+
 /**
  * Safe Firestore write helper that guarantees zero data loss:
  * 1. Immediately saves record to localStorage for that collection (key: `blackworm_local_${colName}`)
@@ -55,6 +91,12 @@ export async function safeFirestoreSet<T extends Record<string, any>>(
     console.warn(`Local caching notice for ${colName}/${docId}:`, e);
   }
 
+  // If daily quota is currently blocked, queue locally without making doomed network requests
+  if (isQuotaBlocked()) {
+    addToPendingSync(colName, docId, data, options);
+    return { success: true, isCachedLocally: true, error: 'Quota limit threshold active' };
+  }
+
   // 2. Attempt remote Firestore save with exponential backoff
   try {
     await setDoc(doc(db, colName, docId), data, options);
@@ -63,8 +105,15 @@ export async function safeFirestoreSet<T extends Record<string, any>>(
     return { success: true, isCachedLocally: false };
   } catch (err: any) {
     const rawMsg = err instanceof Error ? err.message : String(err);
-    const isQuota = rawMsg.toLowerCase().includes('quota') || rawMsg.toLowerCase().includes('resource_exhausted');
+    const isQuota = rawMsg.toLowerCase().includes('quota') || rawMsg.toLowerCase().includes('resource_exhausted') || rawMsg.toLowerCase().includes('resource-exhausted');
     
+    if (isQuota) {
+      setQuotaBlocked(10 * 60 * 1000); // 10 minute backoff to protect free tier
+      console.warn(`Firestore quota reached. Backing off writes: ${colName}/${docId}`);
+      addToPendingSync(colName, docId, data, options);
+      return { success: true, isCachedLocally: true, error: rawMsg };
+    }
+
     // If it's a network error and we haven't reached max retries, try again
     const isNetworkError = rawMsg.toLowerCase().includes('network') || rawMsg.toLowerCase().includes('unavailable') || rawMsg.toLowerCase().includes('offline');
     if (isNetworkError && retryCount < 3) {
@@ -120,11 +169,14 @@ function removeFromPendingSync(colName: string, docId: string) {
  * Background worker to sync pending data to Firestore
  */
 let isSyncing = false;
+let syncStarted = false;
+
 export async function startBackgroundSync() {
-  if (isSyncing || typeof window === 'undefined') return;
-  isSyncing = true;
+  if (typeof window === 'undefined') return;
 
   const processQueue = async () => {
+    if (isSyncing || isQuotaBlocked()) return;
+    isSyncing = true;
     try {
       const qKey = 'blackworm_pending_sync';
       const queueRaw = localStorage.getItem(qKey);
@@ -139,23 +191,22 @@ export async function startBackgroundSync() {
         return;
       }
 
-      console.log(`Syncing ${queue.length} pending records to Firestore...`);
-      
       const remaining: any[] = [];
       for (const item of queue) {
+        if (isQuotaBlocked()) {
+          remaining.push(...queue.slice(queue.indexOf(item)));
+          break;
+        }
         try {
-          // Attempt direct setDoc without recursion for background sync
           await setDoc(doc(db, item.collection, item.id), item.data, item.options);
-          console.log(`Successfully synced: ${item.collection}/${item.id}`);
         } catch (err: any) {
           const rawMsg = err instanceof Error ? err.message : String(err);
-          const isQuota = rawMsg.toLowerCase().includes('quota') || rawMsg.toLowerCase().includes('resource_exhausted');
+          const isQuota = rawMsg.toLowerCase().includes('quota') || rawMsg.toLowerCase().includes('resource_exhausted') || rawMsg.toLowerCase().includes('resource-exhausted');
           if (isQuota) {
-            // If quota hit, stop processing but keep remaining items
+            setQuotaBlocked(30 * 60 * 1000); // 30 minute backoff
             remaining.push(...queue.slice(queue.indexOf(item)));
             break;
           }
-          // For other errors (like offline), keep it in queue for next run
           remaining.push(item);
         }
       }
@@ -169,8 +220,13 @@ export async function startBackgroundSync() {
   };
 
   await processQueue();
-  // Run every 5 minutes
-  setInterval(processQueue, 5 * 60 * 1000);
+
+  if (!syncStarted) {
+    syncStarted = true;
+    window.addEventListener('online', processQueue);
+    window.addEventListener('focus', processQueue);
+    setInterval(processQueue, 60000); // Check every 60s
+  }
 }
 
 /**

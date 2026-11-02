@@ -6,12 +6,13 @@ import {
   limit,
   doc,
   setDoc,
+  getDocs,
   deleteDoc,
   writeBatch
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { safeFirestoreSet } from '../../lib/dataService';
+import { safeFirestoreSet, mergeWithLocalData } from '../../lib/dataService';
 import { Language } from '../../lib/i18n';
 import { cn, toTitleCase } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
@@ -237,65 +238,51 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
 
   // Real-time synchronization of persistent outstanding records from Firestore
   useEffect(() => {
-    const qOut = query(
-      collection(db, 'outstanding_records'),
-      limit(1000)
-    );
-
-    const unsubOut = onSnapshot(
-      qOut,
-      { includeMetadataChanges: true },
-      (snap) => {
-        if (!snap.empty) {
-          const list: ExtractedRecord[] = [];
-          snap.forEach((d) => {
-            const data = d.data() as ExtractedRecord;
-            list.push({ ...data, id: d.id });
-          });
-          setRawRecords(list);
-          try {
-            localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(list));
-          } catch {}
-        } else {
-          // If Firestore is empty, seed initial records including user's exact example
-          seedDefaultOutstandingRecords();
-        }
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'outstanding_records');
-      }
-    );
-
-    return () => unsubOut();
-  }, []);
-
-  // Real-time synchronization of dealer applications from Firestore
-  useEffect(() => {
     setLoadingDealers(true);
-    const q = query(
-      collection(db, 'dealers_application'),
-      limit(1000)
-    );
 
-    const unsub = onSnapshot(
-      q,
-      { includeMetadataChanges: true },
-      (snap) => {
-        const list: DealershipFormItem[] = [];
-        snap.forEach((d) => {
-          const data = d.data() as DealershipFormItem;
+    // 1. Real-time Outstanding Records
+    const qOut = query(collection(db, 'outstanding_records'), limit(500));
+    const unsubOut = onSnapshot(qOut, (snapOut) => {
+      if (!snapOut.empty) {
+        const list: ExtractedRecord[] = [];
+        snapOut.forEach((d) => {
+          const data = d.data() as ExtractedRecord;
           list.push({ ...data, id: d.id });
         });
-        setDealers(list);
-        setLoadingDealers(false);
-      },
-      (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'dealers_application');
-        setLoadingDealers(false);
+        const merged = mergeWithLocalData('outstanding_records', list);
+        setRawRecords(merged);
+        localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(merged));
+      } else {
+        seedDefaultOutstandingRecords();
       }
-    );
+      setLoadingDealers(false);
+    }, (err) => {
+      console.warn("Outstanding records real-time sync notice:", err);
+      const saved = mergeWithLocalData('outstanding_records', []);
+      if (saved.length > 0) setRawRecords(saved);
+      setLoadingDealers(false);
+    });
 
-    return () => unsub();
+    // 2. Real-time Dealers
+    const qDealers = query(collection(db, 'dealers_application'), limit(500));
+    const unsubDealers = onSnapshot(qDealers, (snapDealers) => {
+      const dList: DealershipFormItem[] = [];
+      snapDealers.forEach((d) => {
+        const data = d.data() as DealershipFormItem;
+        dList.push({ ...data, id: d.id });
+      });
+      const mergedDealers = mergeWithLocalData('dealers_application', dList);
+      setDealers(mergedDealers);
+    }, (err) => {
+      console.warn("Dealers sync notice in OutstandingView:", err);
+      const cached = mergeWithLocalData('dealers_application', []);
+      setDealers(cached);
+    });
+
+    return () => {
+      unsubOut();
+      unsubDealers();
+    };
   }, []);
 
   // Filter dealers accessible to current user / selected officer

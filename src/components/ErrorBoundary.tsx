@@ -27,6 +27,10 @@ export class ErrorBoundary extends Component<Props, State> {
     this.setState({ error, errorInfo });
   }
 
+  private handleTryAgain = () => {
+    this.setState({ hasError: false, error: null, errorInfo: null });
+  };
+
   private handleReset = () => {
     this.setState({ hasError: false, error: null, errorInfo: null });
     window.location.reload();
@@ -34,15 +38,21 @@ export class ErrorBoundary extends Component<Props, State> {
 
   private handleHardReset = () => {
     try {
-      // Clear session storage overrides if corrupt
-      sessionStorage.removeItem('blackworm_outstanding_sent');
+      sessionStorage.clear();
+      // Keep user login profile so user isn't logged out unnecessarily
+      const profile = localStorage.getItem('blackworm_user_profile');
+      localStorage.clear();
+      if (profile) {
+        localStorage.setItem('blackworm_user_profile', profile);
+      }
     } catch {}
     this.setState({ hasError: false, error: null, errorInfo: null });
-    window.location.href = '/';
+    window.location.reload();
   };
 
   public render() {
     if (this.state.hasError) {
+      const errMsg = this.state.error?.message || String(this.state.error || 'Unknown technical error');
       return (
         <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
           <div className="max-w-md w-full bg-white rounded-2xl border-2 border-red-200 shadow-xl p-6 text-center space-y-4">
@@ -55,21 +65,30 @@ export class ErrorBoundary extends Component<Props, State> {
                 काहीतरी तांत्रिक अडचण आली
               </h2>
               <p className="text-xs text-slate-500">
-                ॲप क्रॅश होण्यापासून सुरक्षित ठेवण्यात आले आहे. खालील बटण दाबून ॲप लगेच पुन्हा सुरू करू शकता.
+                ॲप क्रॅश होण्यापासून सुरक्षित ठेवण्यात आले आहे. खालीलपैकी योग्य पर्याय निवडा:
               </p>
             </div>
 
-            {this.state.error && (
-              <div className="p-2.5 bg-slate-100 rounded-xl text-left overflow-x-auto max-h-32 text-[11px] font-mono text-slate-700 border border-slate-200">
-                {this.state.error.message || 'Unknown technical error'}
+            {errMsg && (
+              <div className="p-2.5 bg-slate-100 rounded-xl text-left overflow-x-auto max-h-28 text-[11px] font-mono text-slate-700 border border-slate-200 break-words">
+                {errMsg}
               </div>
             )}
 
-            <div className="flex items-center justify-center gap-2 pt-2">
+            <div className="flex flex-wrap items-center justify-center gap-2 pt-2">
+              <button
+                type="button"
+                onClick={this.handleTryAgain}
+                className="flex items-center gap-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold shadow-xs transition active:scale-95 cursor-pointer"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>पुन्हा प्रयत्न करा</span>
+              </button>
+
               <button
                 type="button"
                 onClick={this.handleReset}
-                className="flex items-center gap-1.5 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-xl text-xs font-bold shadow-xs transition active:scale-95 cursor-pointer"
+                className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-900 text-white rounded-xl text-xs font-bold shadow-xs transition active:scale-95 cursor-pointer"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
                 <span>ॲप रीलोड करा</span>
@@ -81,7 +100,7 @@ export class ErrorBoundary extends Component<Props, State> {
                 className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold border border-slate-200 transition active:scale-95 cursor-pointer"
               >
                 <Home className="w-3.5 h-3.5" />
-                <span>मुख्य पानावर जा</span>
+                <span>कॅश रीसेट करा</span>
               </button>
             </div>
           </div>

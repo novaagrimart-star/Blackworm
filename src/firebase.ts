@@ -6,9 +6,14 @@ import {
   persistentLocalCache, 
   persistentMultipleTabManager,
   doc, 
-  getDocFromServer 
+  getDocFromServer,
+  setLogLevel
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
+
+try {
+  setLogLevel('error');
+} catch {}
 
 const app = initializeApp(firebaseConfig);
 

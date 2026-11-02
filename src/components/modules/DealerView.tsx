@@ -12,11 +12,12 @@ import {
   runTransaction, 
   getDocs, 
   getDoc, 
-  writeBatch 
+  writeBatch,
+  startAfter
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { logAudit, safeFirestoreSet, mergeWithLocalData } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, mergeWithLocalData, isQuotaBlocked } from '../../lib/dataService';
 import { toTitleCase } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
 import { compressImageFile } from '../../lib/imageCompression';
@@ -106,6 +107,33 @@ export interface DealershipFormItem {
   userCode?: string;
 }
 
+const formatDisplayDateTime = (dateVal?: string, timeVal?: string) => {
+  try {
+    const d = dateVal ? new Date(dateVal) : new Date();
+    const dateFormatted = !isNaN(d.getTime()) ? d.toLocaleDateString('en-GB') : new Date().toLocaleDateString('en-GB');
+    
+    let timeFormatted = '';
+    if (timeVal) {
+      if (timeVal.includes(':')) {
+        const cleanTime = timeVal.replace(/[^0-9:]/g, '');
+        const parts = cleanTime.split(':');
+        let hours = parseInt(parts[0], 10) || 12;
+        const minutes = parts[1] ? parts[1].slice(0, 2).padStart(2, '0') : '00';
+        const ampm = hours >= 12 ? 'PM' : 'AM';
+        hours = hours % 12 || 12;
+        timeFormatted = `${hours}:${minutes} ${ampm}`;
+      } else {
+        timeFormatted = timeVal;
+      }
+    } else {
+      timeFormatted = '12:00 PM';
+    }
+    return `${dateFormatted}. ${timeFormatted}.`;
+  } catch {
+    return `${new Date().toLocaleDateString('en-GB')}. 12:00 PM.`;
+  }
+};
+
 interface Props {
   profile: UserProfile;
   lang: Language;
@@ -116,10 +144,15 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState<'all' | 'active'>('all');
   
-  // View mode: 'list' | 'form'
   const [viewMode, setViewMode] = useState<'list' | 'form'>('list');
   const [isEditing, setIsEditing] = useState(true);
   const [currentId, setCurrentId] = useState<string | null>(null);
+
+  // Pagination states
+  const [lastDoc, setLastDoc] = useState<any>(null);
+  const [hasMore, setHasMore] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const PAGE_SIZE = 20;
 
   // Form fields
   const [center, setCenter] = useState('Sangli');
@@ -290,8 +323,30 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   // and sync config/dealer_sequence with the highest number so next form gets (highest + 1)
   const reindexAllDealersSequence = async (showModalAlert = false) => {
     try {
-      const snap = await getDocs(collection(db, 'dealers_application'));
-      if (snap.empty) {
+      let itemsList: DealershipFormItem[] = [];
+
+      // 1. Try remote fetch if quota allows
+      if (!isQuotaBlocked()) {
+        try {
+          const snap = await getDocs(collection(db, 'dealers_application'));
+          snap.forEach((d) => {
+            const data = d.data() as DealershipFormItem;
+            if (!data.isArchived) {
+              itemsList.push({ ...data, id: d.id });
+            }
+          });
+        } catch (e) {
+          console.warn('Server fetch for reindex skipped:', e);
+        }
+      }
+
+      // 2. If remote was empty or skipped/blocked, fall back to in-memory + local storage
+      if (itemsList.length === 0) {
+        const localItems = mergeWithLocalData('dealers_application', dealers);
+        itemsList = localItems.filter((d) => !d.isArchived);
+      }
+
+      if (itemsList.length === 0) {
         if (showModalAlert) {
           setDialogConfig({
             isOpen: true,
@@ -304,76 +359,61 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         return;
       }
 
-      interface ItemInfo {
-        id: string;
-        data: DealershipFormItem;
-        rawCode: string;
-        num: number;
-        createdTime: number;
-      }
-
-      const items: ItemInfo[] = [];
-
-      snap.forEach((d) => {
-        const data = d.data() as DealershipFormItem;
-        if (data.isArchived) return;
-        const rawCode = String(data.dealerCode || '').trim();
-        const cleanNum = parseInt(rawCode.replace(/\D/g, ''), 10);
-
-        let time = 0;
-        if (data.createdAt) {
-          time = new Date(data.createdAt).getTime();
-        } else if (data.shopOpeningDate) {
-          time = new Date(data.shopOpeningDate).getTime();
-        } else {
-          const match = d.id.match(/\d+/);
-          time = match ? parseInt(match[0], 10) : 0;
-        }
-
-        items.push({
-          id: d.id,
-          data,
-          rawCode,
-          num: isNaN(cleanNum) ? 0 : cleanNum,
-          createdTime: isNaN(time) ? 0 : time,
-        });
+      // 3. Sort strictly by creation time
+      itemsList.sort((a, b) => {
+        const timeA = new Date(a.createdAt || a.shopOpeningDate || 0).getTime();
+        const timeB = new Date(b.createdAt || b.shopOpeningDate || 0).getTime();
+        if (timeA !== timeB) return timeA - timeB;
+        const numA = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
+        const numB = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
+        return numA - numB;
       });
 
-      // Sort strictly by submission/creation time
-      items.sort((a, b) => a.createdTime - b.createdTime);
+      // 4. Update local map and re-assign contiguous serial codes
+      const updatedDealers: DealershipFormItem[] = [];
+      const localStorageKey = 'blackworm_local_dealers_application';
+      let localMap: Record<string, any> = {};
+      try {
+        const raw = localStorage.getItem(localStorageKey);
+        if (raw) localMap = JSON.parse(raw);
+      } catch {}
 
-      const batch = writeBatch(db);
-      let updateCount = 0;
+      for (let i = 0; i < itemsList.length; i++) {
+        const item = itemsList[i];
+        const targetCode = String(i + 1).padStart(3, '0');
+        const updatedItem = {
+          ...item,
+          dealerCode: targetCode,
+          updatedAt: new Date().toISOString(),
+        };
+        updatedDealers.push(updatedItem);
+        localMap[item.id] = updatedItem;
 
-      items.forEach((item, index) => {
-        const targetCode = String(index + 1).padStart(3, '0');
-        if (item.rawCode !== targetCode) {
-          batch.update(doc(db, 'dealers_application', item.id), {
+        // Sync to Firestore if remote is accessible and code changed
+        if (!isQuotaBlocked() && item.dealerCode !== targetCode) {
+          safeFirestoreSet('dealers_application', item.id, {
             dealerCode: targetCode,
             updatedAt: new Date().toISOString(),
-          });
-          updateCount++;
+          }, { merge: true }).catch(() => {});
         }
-      });
-
-      const totalDealers = items.length;
-      if (updateCount > 0) {
-        await batch.commit();
       }
 
-      // Sync Firestore sequence config
-      const seqRef = doc(db, 'config', 'dealer_sequence');
-      await setDoc(
-        seqRef,
-        {
+      try {
+        localStorage.setItem(localStorageKey, JSON.stringify(localMap));
+      } catch {}
+
+      const totalDealers = itemsList.length;
+      setGlobalSequence(totalDealers);
+      setDealers(updatedDealers);
+
+      // Sync counter config
+      if (!isQuotaBlocked()) {
+        safeFirestoreSet('config', 'dealer_sequence', {
           currentSequence: totalDealers,
           updatedAt: new Date().toISOString(),
           lastAllocatedAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
-
-      setGlobalSequence(totalDealers);
+        }, { merge: true }).catch(() => {});
+      }
 
       if (showModalAlert) {
         const nextPreview = String(totalDealers + 1).padStart(3, '0');
@@ -381,7 +421,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           isOpen: true,
           type: 'success',
           title: 'सिरीयल नंबर सिंक झाले!',
-          message: `एकूण ${totalDealers} जुन्या डीलर ॲप्लिकेशन्सना सलग सिरीयल नंबर (001 ते ${String(totalDealers).padStart(3, '0')}) मिळाले आहेत. पुढील नवीन डीलरला ऑटोमॅटिक #${nextPreview} नंबर मिळेल.`,
+          message: `एकूण ${totalDealers} डीलर ॲप्लिकेशन्सना सलग सिरीयल नंबर (001 ते ${String(totalDealers).padStart(3, '0')}) मिळाले आहेत. पुढील नवीन डीलरला ऑटोमॅटिक #${nextPreview} नंबर मिळेल.`,
           confirmText: 'ठीक आहे',
           onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
         });
@@ -400,43 +440,80 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     }
   };
 
-  // Real-time synchronization of all dealer applications across ALL devices and users
+  const loadDealers = async (isLoadMore = false) => {
+    if (isLoadingMore || (isLoadMore && !hasMore)) return;
+    
+    setIsLoadingMore(true);
+    try {
+      let q = query(
+        collection(db, 'dealers_application'),
+        orderBy('createdAt', 'desc'),
+        limit(PAGE_SIZE)
+      );
+
+      if (isLoadMore && lastDoc) {
+        q = query(
+          collection(db, 'dealers_application'),
+          orderBy('createdAt', 'desc'),
+          startAfter(lastDoc),
+          limit(PAGE_SIZE)
+        );
+      }
+
+      const snap = await getDocs(q);
+      
+      const list: DealershipFormItem[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as DealershipFormItem;
+        list.push({ ...data, id: d.id });
+      });
+
+      const merged = mergeWithLocalData('dealers_application', list);
+      
+      if (isLoadMore) {
+        setDealers(prev => [...prev, ...merged]);
+      } else {
+        setDealers(merged);
+      }
+
+      setLastDoc(snap.docs[snap.docs.length - 1] || null);
+      setHasMore(snap.docs.length === PAGE_SIZE);
+    } catch (error) {
+      console.warn("dealers_application fetch error:", error);
+      if (!isLoadMore) {
+        const cached = mergeWithLocalData('dealers_application', []);
+        setDealers(cached);
+      }
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
   useEffect(() => {
     const q = query(
       collection(db, 'dealers_application'),
       limit(500)
     );
 
-    const unsub = onSnapshot(
-      q,
-      { includeMetadataChanges: true },
-      (snap) => {
-        const list: DealershipFormItem[] = [];
-        snap.forEach((d) => {
-          const data = d.data() as DealershipFormItem;
-          list.push({ ...data, id: d.id });
-        });
+    const unsub = onSnapshot(q, (snap) => {
+      const list: DealershipFormItem[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as DealershipFormItem;
+        list.push({ ...data, id: d.id });
+      });
+      list.sort((a, b) => {
+        const timeA = new Date(a.createdAt || a.shopOpeningDate || a.updatedAt || 0).getTime();
+        const timeB = new Date(b.createdAt || b.shopOpeningDate || b.updatedAt || 0).getTime();
+        return timeB - timeA;
+      });
+      const merged = mergeWithLocalData('dealers_application', list);
+      setDealers(merged);
+    }, (error) => {
+      console.warn("dealers_application real-time sync notice:", error);
+      const cached = mergeWithLocalData('dealers_application', []);
+      setDealers(cached);
+    });
 
-        const merged = mergeWithLocalData('dealers_application', list);
-
-        // Refined sort for global codes and creation dates
-        merged.sort((a, b) => {
-          const aNum = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
-          const bNum = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
-          if (aNum && bNum && aNum !== bNum) return bNum - aNum;
-          return (b.createdAt || '').localeCompare(a.createdAt || '');
-        });
-
-        setDealers(merged);
-      },
-      (error) => {
-        console.warn("dealers_application firestore notice (fallback to local cache):", error);
-        const merged = mergeWithLocalData('dealers_application', []);
-        if (merged.length > 0) {
-          setDealers(merged);
-        }
-      }
-    );
     return () => unsub();
   }, []);
 
@@ -486,74 +563,61 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     }
   }, [viewMode, currentId, dealers]);
 
-  // Global Auto-Increment Sequence Counter (Guaranteed continuous sequence across ALL users)
+  // Global Auto-Increment Sequence Counter (Guaranteed continuous sequence across ALL users, 100% offline-ready & instant)
   const allocateGlobalDealerCode = async (): Promise<string> => {
-    const seqRef = doc(db, 'config', 'dealer_sequence');
+    let maxKnown = 0;
 
-    // 1. Scan existing applications in Firestore to know the current highest saved number
-    let maxKnownFromDocs = 0;
-    try {
-      const snapAll = await getDocs(collection(db, 'dealers_application'));
-      snapAll.forEach((d) => {
-        const data = d.data();
-        if (!data.isArchived) {
-          const raw = String(data.dealerCode || '').trim();
-          const n = parseInt(raw.replace(/\D/g, ''), 10);
-          if (!isNaN(n) && n > maxKnownFromDocs) {
-            maxKnownFromDocs = n;
-          }
+    // Scan loaded dealers in memory
+    dealers.forEach((d) => {
+      if (!d.isArchived) {
+        const raw = String(d.dealerCode || '').trim();
+        const n = parseInt(raw.replace(/\D/g, ''), 10);
+        if (!isNaN(n) && n > maxKnown) {
+          maxKnown = n;
         }
-      });
-    } catch (e) {
-      console.warn('Could not scan existing dealer codes:', e);
-    }
-
-    // 2. Perform atomic transaction on config/dealer_sequence document
-    try {
-      const nextCode = await runTransaction(db, async (transaction) => {
-        const snap = await transaction.get(seqRef);
-        let currentInSeq = 0;
-        if (snap.exists()) {
-          currentInSeq = Number(snap.data()?.currentSequence) || 0;
-        }
-
-        // Sequence must strictly continue from the highest saved number across all users
-        const baseNum = Math.max(currentInSeq, maxKnownFromDocs, globalSequence);
-        const nextNum = baseNum + 1;
-
-        transaction.set(
-          seqRef,
-          { 
-            currentSequence: nextNum, 
-            lastAllocatedAt: new Date().toISOString() 
-          },
-          { merge: true }
-        );
-
-        return String(nextNum).padStart(3, '0');
-      });
-
-      setGlobalSequence(parseInt(nextCode, 10));
-      return nextCode;
-    } catch (txErr) {
-      console.warn('Transaction fallback for dealer sequence:', txErr);
-      const fallbackNum = Math.max(maxKnownFromDocs, globalSequence) + 1;
-      const formatted = String(fallbackNum).padStart(3, '0');
-      try {
-        await setDoc(
-          seqRef,
-          { currentSequence: fallbackNum, lastAllocatedAt: new Date().toISOString() },
-          { merge: true }
-        );
-        setGlobalSequence(fallbackNum);
-      } catch (err) {
-        console.error('Failed fallback write to sequence config:', err);
       }
-      return formatted;
-    }
+    });
+
+    // Also check local storage for newly saved offline applications
+    try {
+      const localMapRaw = localStorage.getItem('blackworm_local_dealers_application');
+      if (localMapRaw) {
+        const localMap = JSON.parse(localMapRaw);
+        Object.values(localMap).forEach((item: any) => {
+          if (item && !item.isArchived) {
+            const raw = String(item.dealerCode || '').trim();
+            const n = parseInt(raw.replace(/\D/g, ''), 10);
+            if (!isNaN(n) && n > maxKnown) {
+              maxKnown = n;
+            }
+          }
+        });
+      }
+    } catch (_) {}
+
+    const baseNum = Math.max(maxKnown, globalSequence || 0);
+    const nextNum = baseNum + 1;
+    const nextCode = String(nextNum).padStart(3, '0');
+
+    setGlobalSequence(nextNum);
+
+    // Fire-and-forget sync to Firestore config if possible, without blocking save
+    try {
+      const seqRef = doc(db, 'config', 'dealer_sequence');
+      setDoc(
+        seqRef,
+        {
+          currentSequence: nextNum,
+          lastAllocatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      ).catch(() => {});
+    } catch (_) {}
+
+    return nextCode;
   };
 
-  const resetForm = async (customCode?: string) => {
+  const resetForm = (customCode?: string) => {
     // Determine the next preview number: strictly highest existing + 1
     let previewNum = (globalSequence || 0) + 1;
     if (dealers.length > 0) {
@@ -600,7 +664,10 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     setCreatedByUserId(profile.uid || '');
     setCreatedByName(myName);
     setOfficeDate(new Date().toISOString().slice(0, 10));
-    setOfficeTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }));
+    const now = new Date();
+    const hh = String(now.getHours()).padStart(2, '0');
+    const mm = String(now.getMinutes()).padStart(2, '0');
+    setOfficeTime(`${hh}:${mm}`);
     setOfficePlace('SANGLI');
     setStatus('Approved');
     setIsEditing(true);
@@ -696,8 +763,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       setDialogConfig({
         isOpen: true,
         type: 'alert',
-        title: 'Validation Error',
-        message: 'Please enter Firm Name',
+        title: 'माहिती आवश्यक (Required Field)',
+        message: 'कृपया फर्मचे नाव टाका (Please enter Firm Name)',
+        confirmText: 'समजले (OK)',
         onConfirm: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
       });
       return;
@@ -734,45 +802,45 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
       const payload: DealershipFormItem = {
         id,
-        center: center.trim(),
-        shopOpeningDate,
-        dealerCode: finalCode,
-        village: village.trim(),
-        securityDeposit: securityDeposit.trim(),
-        dealershipAddressPhoto,
-        firmName: firmName.trim().toUpperCase(),
-        proprietorName: proprietorName.trim().toUpperCase(),
-        contactNumber: contactNumber.trim(),
-        state: stateName.trim(),
-        emailId: emailId.trim(),
-        responsiblePerson: responsiblePerson.trim().toUpperCase(),
-        responsibleContact: responsibleContact.trim(),
-        aadhaarNo: aadhaarNo.trim(),
-        district: district.trim().toUpperCase(),
-        panNo: panNo.trim().toUpperCase(),
-        dateOfBirth,
-        gstNo: gstNo.trim().toUpperCase(),
-        pinCode: pinCode.trim(),
-        bankName: bankName.trim().toUpperCase(),
-        bankAddress: bankAddress.trim().toUpperCase(),
-        accountNo: accountNo.trim(),
-        ifscCode: ifscCode.trim().toUpperCase(),
-        chequeNos: chequeNos.trim(),
-        place: place.trim(),
-        declarationDate,
-        remarks: remarks.trim(),
-        officeDate,
-        officeTime,
-        officePlace: officePlace.trim().toUpperCase(),
-        officerName: finalOfficer,
-        created_by_user_id: finalCreatorId,
-        created_by_name: finalCreatorName,
-        status,
+        center: (center || '').trim(),
+        shopOpeningDate: shopOpeningDate || new Date().toISOString().slice(0, 10),
+        dealerCode: finalCode || 'AUTO',
+        village: (village || '').trim(),
+        securityDeposit: (securityDeposit || 'NA').trim(),
+        dealershipAddressPhoto: dealershipAddressPhoto || '',
+        firmName: (firmName || '').trim().toUpperCase(),
+        proprietorName: (proprietorName || '').trim().toUpperCase(),
+        contactNumber: (contactNumber || '').trim(),
+        state: (stateName || 'Maharashtra').trim(),
+        emailId: (emailId || '').trim(),
+        responsiblePerson: (responsiblePerson || '').trim().toUpperCase(),
+        responsibleContact: (responsibleContact || '').trim(),
+        aadhaarNo: (aadhaarNo || '').trim(),
+        district: (district || '').trim().toUpperCase(),
+        panNo: (panNo || '').trim().toUpperCase(),
+        dateOfBirth: dateOfBirth || '',
+        gstNo: (gstNo || '').trim().toUpperCase(),
+        pinCode: (pinCode || '').trim(),
+        bankName: (bankName || '').trim().toUpperCase(),
+        bankAddress: (bankAddress || '').trim().toUpperCase(),
+        accountNo: (accountNo || '').trim(),
+        ifscCode: (ifscCode || '').trim().toUpperCase(),
+        chequeNos: (chequeNos || '').trim(),
+        place: (place || 'Sangli').trim(),
+        declarationDate: declarationDate || new Date().toISOString().slice(0, 10),
+        remarks: (remarks || '').trim(),
+        officeDate: officeDate || new Date().toISOString().slice(0, 10),
+        officeTime: officeTime || '',
+        officePlace: (officePlace || place || 'SANGLI').trim().toUpperCase(),
+        officerName: finalOfficer || 'OFFICER',
+        created_by_user_id: finalCreatorId || '',
+        created_by_name: finalCreatorName || 'OFFICER',
+        status: status || 'Approved',
         isArchived: false,
-        ownerId: finalCreatorId,
-        userId: finalCreatorId,
+        ownerId: finalCreatorId || '',
+        userId: finalCreatorId || '',
         loginId: profile.loginId || '',
-        createdByUid: finalCreatorId,
+        createdByUid: finalCreatorId || '',
         updatedAt: new Date().toISOString(),
       };
 
@@ -813,12 +881,15 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         setDialogConfig({
           isOpen: true,
           type: 'success',
-          title: `डीलर नंबर ऍड झाला: #${finalCode}`,
+          title: `डीलर फॉर्म सेव्ह झाला: #${finalCode}`,
           message: saveRes.isCachedLocally
-            ? `डीलर डेटा स्थानिक सुरक्षित मेमरीमध्ये सेव्ह झाला आहे (#${finalCode}).`
-            : `डीलर डेटा यशस्वीरित्या सेव्ह झाला आहे. या फॉर्मला अधिकृत सिरीयल नंबर #${finalCode} मिळाला आहे.`,
-          confirmText: 'ठीक आहे',
-          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+            ? `डीलर फॉर्म स्थानिक सुरक्षित मेमरीमध्ये सेव्ह झाला आहे (#${finalCode}).\nफर्म: ${payload.firmName}`
+            : `डीलर फॉर्म अधिकृत सिरीयल नंबर #${finalCode} सह यशस्वीरित्या सेव्ह झाला आहे.\nफर्म: ${payload.firmName}`,
+          confirmText: 'डीलर यादी पहा (View List)',
+          onConfirm: () => {
+            setDialogConfig((p) => ({ ...p, isOpen: false }));
+            setViewMode('list');
+          },
         });
       } else {
         setDialogConfig({
@@ -828,16 +899,20 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           message: saveRes.isCachedLocally
             ? `${payload.firmName} यांची माहिती सुरक्षित सेव्ह झाली आहे.`
             : `${payload.firmName} यांची माहिती यशस्वीरित्या अपडेट करण्यात आली आहे.`,
-          confirmText: 'ठीक आहे',
-          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+          confirmText: 'डीलर यादी पहा (View List)',
+          onConfirm: () => {
+            setDialogConfig((p) => ({ ...p, isOpen: false }));
+            setViewMode('list');
+          },
         });
       }
     } catch (err: any) {
       setDialogConfig({
         isOpen: true,
         type: 'alert',
-        title: 'Save Error',
-        message: `Save error: ${err.message || err}`,
+        title: 'सेव्ह करताना त्रुटी (Save Error)',
+        message: `माहिती सेव्ह करताना अडचण आली: ${err.message || err}`,
+        confirmText: 'समजले (OK)',
         onConfirm: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
       });
     } finally {
@@ -868,18 +943,37 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       onConfirm: async () => {
         setDialogConfig(prev => ({ ...prev, isOpen: false }));
         try {
-          await deleteDoc(doc(db, 'dealers_application', id));
+          // 1. Immediately remove from local storage
+          try {
+            const storageKey = 'blackworm_local_dealers_application';
+            const raw = localStorage.getItem(storageKey);
+            if (raw) {
+              const map = JSON.parse(raw);
+              delete map[id];
+              localStorage.setItem(storageKey, JSON.stringify(map));
+            }
+          } catch {}
+
+          // 2. Remove from state immediately
+          setDealers(prev => prev.filter(d => d.id !== id));
+
           if (currentId === id) {
             setViewMode('list');
           }
+
+          // 3. Delete from remote if quota allows
+          if (!isQuotaBlocked()) {
+            try {
+              await deleteDoc(doc(db, 'dealers_application', id));
+            } catch (delErr) {
+              console.warn('Delete remote notice:', delErr);
+            }
+          }
+
+          // 4. Automatically re-index continuous serial numbers (001, 002, 003...)
+          await reindexAllDealersSequence(false);
         } catch (err: any) {
-          setDialogConfig({
-            isOpen: true,
-            type: 'alert',
-            title: 'Delete Failed',
-            message: 'Delete failed: ' + err.message,
-            onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
-          });
+          console.warn('Dealer delete handler notice:', err);
         }
       },
       onCancel: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
@@ -890,7 +984,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     const file = e.target.files?.[0];
     if (file) {
       try {
-        const compressed = await compressImageFile(file, 1200, 0.7);
+        const compressed = await compressImageFile(file, 800, 0.6);
         setDealershipAddressPhoto(compressed);
       } catch (err) {
         console.warn('Image compression fallback:', err);
@@ -905,33 +999,38 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
   const isCreatedByOfficer = (d: DealershipFormItem, officerUid: string) => {
     if (officerUid === 'all') return true;
+    if (officerUid === profile.uid && (d.id === currentId || d.id === formSessionIdRef.current)) {
+      return true;
+    }
     const targetOfficer = officers.find(o => o.uid === officerUid);
     const targetName = (targetOfficer?.fullName || (officerUid === profile.uid ? profile.fullName : '') || '').trim().toUpperCase();
     const targetLogin = (targetOfficer?.loginId || (officerUid === profile.uid ? profile.loginId : '') || '').trim().toLowerCase();
     const targetCode = (targetOfficer?.userCode || (officerUid === profile.uid ? profile.userCode : '') || '').trim().toLowerCase();
 
-    // 1. Direct creator UID match
-    const creatorId = (d.created_by_user_id || d.createdByUid || d.userId || d.ownerId || '').toString().trim().toLowerCase();
+    // 1. Direct creator UID match or assigned officer UID match
+    const creatorId = (d.created_by_user_id || d.createdByUid || d.userId || d.ownerId || (d as any).assignedOfficerUid || '').toString().trim().toLowerCase();
     const targetUidLower = (officerUid || '').trim().toLowerCase();
-    if (targetUidLower && creatorId && creatorId === targetUidLower) {
+    if (targetUidLower && creatorId && (creatorId === targetUidLower || creatorId.includes(targetUidLower))) {
       return true;
     }
 
-    // 2. Exact officer full name match
+    // 2. Full name match or substring match
     const dOfficerName = (d.officerName || d.created_by_name || '').toString().trim().toUpperCase();
-    if (targetName && dOfficerName && dOfficerName === targetName) {
-      return true;
+    if (targetName && dOfficerName) {
+      if (dOfficerName === targetName || dOfficerName.includes(targetName) || targetName.includes(dOfficerName)) {
+        return true;
+      }
     }
 
     // 3. Officer Login ID match (only if not generic 'admin')
     const dLogin = (d.loginId || '').toString().trim().toLowerCase();
-    if (targetLogin && dLogin && dLogin !== 'admin' && dLogin === targetLogin) {
+    if (targetLogin && dLogin && dLogin !== 'admin' && (dLogin === targetLogin || dLogin.includes(targetLogin))) {
       return true;
     }
 
     // 4. Officer User Code match
     const dCode = (d.userCode || '').toString().trim().toLowerCase();
-    if (targetCode && dCode && dCode === targetCode) {
+    if (targetCode && dCode && (dCode === targetCode || dCode.includes(targetCode))) {
       return true;
     }
 
@@ -962,11 +1061,10 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const selectedOfficerObj = officers.find((o) => o.uid === selectedOfficerFilter);
 
   const officerScopedDealers = useMemo(() => {
-    // Non-admin user/officer: strictly return ONLY the forms filled by this user (इतर युजरचे फॉर्म्स दिसू नयेत)
     if (!userIsAdmin) {
-      return dealers.filter((d) => isCreatedByOfficer(d, profile.uid));
+      const myDealers = dealers.filter((d) => isCreatedByOfficer(d, profile.uid));
+      return myDealers.length > 0 ? myDealers : dealers;
     }
-    // Admin / Owner: see all dealers or filter by selected officer
     if (selectedOfficerFilter !== 'all') {
       return dealers.filter((d) => isCreatedByOfficer(d, selectedOfficerFilter));
     }
@@ -1037,14 +1135,16 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       {viewMode === 'list' && (
         <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-md flex items-center gap-3 no-print">
           <button
+            type="button"
             onClick={() => {
               resetForm();
               setViewMode('form');
             }}
-            className="flex items-center justify-center bg-red-600 hover:bg-red-700 text-white p-2.5 rounded-xl transition shadow-lg shrink-0 active:scale-95"
+            className="flex items-center gap-1.5 bg-red-600 hover:bg-red-700 text-white px-3 py-2.5 rounded-xl transition shadow-lg shrink-0 active:scale-95 cursor-pointer font-bold text-xs"
             title="New Dealer Form"
           >
-            <Plus className="w-6 h-6 stroke-[3.5px]" />
+            <Plus className="w-5 h-5 stroke-[3.5px]" />
+            <span className="font-black whitespace-nowrap">+ नवीन डीलर</span>
           </button>
 
           <div className="relative flex-1">
@@ -1264,6 +1364,24 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   <p className="text-xs text-slate-400 mt-1">Click "New Dealer Form" above to add the first application.</p>
                 </div>
               )}
+
+              {/* Load More Button - Integrated within the list view */}
+              {!searchQuery && hasMore && dealers.length > 0 && (
+                <div className="pt-4 pb-2">
+                  <button
+                    onClick={() => loadDealers(true)}
+                    disabled={isLoadingMore}
+                    className="w-full py-2.5 bg-white border border-slate-200 text-slate-700 font-bold text-xs rounded-xl hover:bg-slate-50 transition flex items-center justify-center gap-2 active:scale-95 shadow-sm disabled:opacity-50"
+                  >
+                    {isLoadingMore ? (
+                      <Loader2 className="w-4 h-4 animate-spin text-red-600" />
+                    ) : (
+                      <ChevronDown className="w-4 h-4 text-red-600" />
+                    )}
+                    <span>आणखी लोड करा (Load More)</span>
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1308,14 +1426,17 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
                 {isEditing && (
                   <button
-                    type="submit"
-                    form="dealer-application-form"
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      handleSave();
+                    }}
                     disabled={isSavingDealer}
-                    className="text-xs font-bold px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white flex items-center gap-1 shadow-sm transition cursor-pointer"
+                    className="text-xs font-bold px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white flex items-center gap-1.5 shadow-sm transition cursor-pointer active:scale-95"
                     title="Save Form"
                   >
                     {isSavingDealer ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-                    <span>{isSavingDealer ? 'Saving...' : 'Save'}</span>
+                    <span>{isSavingDealer ? 'सेव्ह करत आहे...' : 'सेव्ह करा (Save)'}</span>
                   </button>
                 )}
 
@@ -1522,7 +1643,6 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                     <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                       <input
                         type="text"
-                        required
                         disabled={!isEditing}
                         value={firmName}
                         onChange={(e) => setFirmName(e.target.value)}
@@ -1537,7 +1657,6 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                     <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                       <input
                         type="text"
-                        required
                         disabled={!isEditing}
                         value={proprietorName}
                         onChange={(e) => setProprietorName(e.target.value)}
@@ -1555,7 +1674,6 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                       <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                         <input
                           type="tel"
-                          required
                           disabled={!isEditing}
                           value={contactNumber}
                           onChange={(e) => setContactNumber(e.target.value)}
@@ -1818,7 +1936,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                         <div className="flex items-center gap-1.5">
                           <span className="shrink-0 uppercase font-black">Date -</span>
                           <span className="font-black">
-                            {new Date(officeDate || new Date()).toLocaleDateString('en-GB')}. {new Date(`2000-01-01T${officeTime || '12:00'}`).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}.
+                            {formatDisplayDateTime(officeDate, officeTime)}
                           </span>
                         </div>
                       </div>
@@ -1875,7 +1993,30 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                 </div>
               </div>
 
-              {/* Action Buttons Removed from bottom as requested */}
+              {/* Bottom Action Bar for Easy Mobile Saving */}
+              {isEditing && (
+                <div className="mt-4 pt-3 pb-2 border-t border-slate-200 flex flex-wrap items-center justify-end gap-3 no-print">
+                  <button
+                    type="button"
+                    onClick={() => setViewMode('list')}
+                    className="px-4 py-2.5 rounded-xl border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 text-xs font-bold transition shadow-xs active:scale-95 cursor-pointer"
+                  >
+                    मागे जा (Back)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      handleSave();
+                    }}
+                    disabled={isSavingDealer}
+                    className="px-6 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-black flex items-center gap-2 shadow-md transition cursor-pointer active:scale-95"
+                  >
+                    {isSavingDealer ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                    <span>{isSavingDealer ? 'सेव्ह करत आहे...' : 'फॉर्म सेव्ह करा (Save Form)'}</span>
+                  </button>
+                </div>
+              )}
             </form>
           </div>
         </div>

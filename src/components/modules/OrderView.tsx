@@ -7,9 +7,10 @@ import {
   limit,
   onSnapshot, 
   doc, 
-  setDoc,
+  getDocs,
   updateDoc,
-  deleteDoc 
+  deleteDoc,
+  startAfter
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
@@ -43,7 +44,8 @@ import {
   AlertCircle,
   Edit3,
   Lock,
-  Sprout
+  Sprout,
+  ChevronDown
 } from 'lucide-react';
 
 export const COMMON_CROPS = [
@@ -177,7 +179,7 @@ export interface OrderItem {
   isArchived?: boolean;
 }
 
-interface SavedDealer {
+export interface SavedDealer {
   id: string;
   firmName: string;
   proprietorName: string;
@@ -185,7 +187,45 @@ interface SavedDealer {
   dealerCode: string;
   village: string;
   district: string;
+  created_by_user_id?: string;
+  created_by_name?: string;
+  createdByUid?: string;
+  userId?: string;
+  ownerId?: string;
+  loginId?: string;
+  userCode?: string;
+  officerName?: string;
+  assignedOfficerUid?: string;
 }
+
+export const isDealerRegisteredByOfficer = (
+  d: SavedDealer | any,
+  officer: { uid?: string; fullName?: string; loginId?: string; userCode?: string }
+): boolean => {
+  if (!d || !officer) return false;
+  const offUid = (officer.uid || '').toLowerCase().trim();
+  const offName = (officer.fullName || '').toUpperCase().trim();
+  const offLogin = (officer.loginId || '').toLowerCase().trim();
+  const offCode = (officer.userCode || '').toLowerCase().trim();
+
+  // 1. Direct creator / user UID match or assigned officer UID
+  const creatorId = (d.created_by_user_id || d.createdByUid || d.userId || d.ownerId || d.assignedOfficerUid || '').toString().toLowerCase().trim();
+  if (offUid && creatorId && (creatorId === offUid || creatorId.includes(offUid))) return true;
+
+  // 2. Full name match
+  const dOfficer = (d.officerName || d.created_by_name || '').toString().toUpperCase().trim();
+  if (offName && dOfficer && (dOfficer === offName || dOfficer.includes(offName) || offName.includes(dOfficer))) return true;
+
+  // 3. Login ID match
+  const dLogin = (d.loginId || '').toString().toLowerCase().trim();
+  if (offLogin && dLogin && dLogin !== 'admin' && (dLogin === offLogin || dLogin.includes(offLogin))) return true;
+
+  // 4. User Code match
+  const dCode = (d.userCode || '').toString().toLowerCase().trim();
+  if (offCode && dCode && (dCode === offCode || dCode.includes(offCode))) return true;
+
+  return false;
+};
 
 interface Props {
   profile: UserProfile;
@@ -195,6 +235,8 @@ interface Props {
 export const OrderView: React.FC<Props> = ({ profile }) => {
   const [orders, setOrders] = useState<OrderItem[]>([]);
   const [dealers, setDealers] = useState<SavedDealer[]>([]);
+  const [officers, setOfficers] = useState<{ uid: string; fullName: string; loginId?: string; userCode?: string }[]>([]);
+  const [selectedOfficerFilter, setSelectedOfficerFilter] = useState<string>('all');
   const [products, setProducts] = useState<DynamicPriceProduct[]>(() => {
     if (typeof window !== 'undefined') {
       try {
@@ -209,6 +251,12 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   });
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
+
+  // Pagination states for Orders
+  const [lastDoc, setLastDoc] = useState<any>(null);
+  const [hasMore, setHasMore] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const PAGE_SIZE = 20;
   
   // Modals state
   const [showNewOrderModal, setShowNewOrderModal] = useState(false);
@@ -309,25 +357,52 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     }
   }, [showNewOrderModal, selectedOrderDetails, successOrder]);
 
-  // Load Orders from Firestore with Central Real-Time Synchronization across ALL devices
-  useEffect(() => {
-    const q = query(
-      collection(db, 'orders'),
-      orderBy('createdAt', 'desc'),
-      limit(300)
-    );
+  const loadOrders = async (isLoadMore = false) => {
+    if (isLoadingMore || (isLoadMore && !hasMore)) return;
+    setIsLoadingMore(true);
 
-    const unsub = onSnapshot(q, { includeMetadataChanges: true }, (snap) => {
+    try {
+      let q = query(
+        collection(db, 'orders'),
+        orderBy('createdAt', 'desc'),
+        limit(PAGE_SIZE)
+      );
+
+      if (!isAdmin(profile)) {
+        q = query(
+          collection(db, 'orders'),
+          where('userId', '==', profile.uid),
+          orderBy('createdAt', 'desc'),
+          limit(PAGE_SIZE)
+        );
+      }
+
+      if (isLoadMore && lastDoc) {
+        if (!isAdmin(profile)) {
+          q = query(
+            collection(db, 'orders'),
+            where('userId', '==', profile.uid),
+            orderBy('createdAt', 'desc'),
+            startAfter(lastDoc),
+            limit(PAGE_SIZE)
+          );
+        } else {
+          q = query(
+            collection(db, 'orders'),
+            orderBy('createdAt', 'desc'),
+            startAfter(lastDoc),
+            limit(PAGE_SIZE)
+          );
+        }
+      }
+
+      const snap = await getDocs(q);
       const list: OrderItem[] = [];
       snap.forEach((d) => {
         const data = d.data() as any;
         if (!data.isArchived) {
-          let orderItemsChanged = false;
           const cleanedItems = (data.items || []).map((it: any) => {
             const cleanName = getCleanGradeName(it);
-            if (it.productName !== cleanName || it.gradeName !== cleanName) {
-              orderItemsChanged = true;
-            }
             return {
               ...it,
               productName: cleanName,
@@ -372,135 +447,231 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       });
 
       const merged = mergeWithLocalData('orders', list);
-      merged.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-      setOrders(merged);
-    }, (error) => {
-      console.warn("Orders firestore notice (fallback to local cache):", error);
-      const merged = mergeWithLocalData('orders', []);
-      if (merged.length > 0) {
+      
+      if (isLoadMore) {
+        setOrders(prev => [...prev, ...merged]);
+      } else {
         setOrders(merged);
       }
+
+      setLastDoc(snap.docs[snap.docs.length - 1] || null);
+      setHasMore(snap.docs.length === PAGE_SIZE);
+    } catch (error) {
+      console.warn("Orders fetch error:", error);
+      if (!isLoadMore) {
+        const cached = mergeWithLocalData('orders', []);
+        setOrders(cached);
+      }
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
+
+  useEffect(() => {
+    const q = query(
+      collection(db, 'orders'),
+      limit(500)
+    );
+
+    const unsub = onSnapshot(q, (snap) => {
+      const list: OrderItem[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as any;
+        if (!data.isArchived) {
+          const cleanedItems = (data.items || []).map((it: any) => {
+            const cleanName = getCleanGradeName(it);
+            return {
+              ...it,
+              productName: cleanName,
+              gradeName: cleanName,
+            };
+          });
+
+          list.push({
+            id: d.id,
+            orderNumber: data.orderNumber || `BW-${d.id.slice(-6)}`,
+            cropName: data.cropName || '',
+            dealerId: data.dealerId || '',
+            dealerName: data.dealerName || 'General Dealer',
+            dealerCode: data.dealerCode || '',
+            dealerContact: data.dealerContact || '',
+            dealerVillage: data.dealerVillage || '',
+            dealerDistrict: data.dealerDistrict || '',
+            farmerName: data.farmerName || '',
+            items: cleanedItems,
+            totalQuantity: data.totalQuantity || (data.items?.reduce((a: number, b: any) => a + (b.quantity || 0), 0) || 0),
+            grossAmount: Number(data.grossAmount) || 0,
+            discountAmount: Number(data.discountAmount) || 0,
+            totalAmount: Number(data.totalAmount) || 0,
+            paidAmount: Number(data.paidAmount) || 0,
+            balanceAmount: Number(data.balanceAmount ?? data.totalAmount) || 0,
+            paymentMode: data.paymentMode || 'Credit',
+            status: data.status || 'pending_approval',
+            approvedBy: data.approvedBy,
+            approvedAt: data.approvedAt,
+            dispatchedAt: data.dispatchedAt,
+            dispatchNote: data.dispatchNote,
+            deliveredAt: data.deliveredAt,
+            ownerId: data.ownerId || '',
+            userId: data.userId,
+            loginId: data.loginId,
+            userCode: data.userCode,
+            createdByName: data.createdByName || 'User',
+            createdAt: data.createdAt || new Date().toISOString(),
+            isArchived: data.isArchived || false,
+          });
+        }
+      });
+
+      list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      const merged = mergeWithLocalData('orders', list);
+      setOrders(merged);
+    }, (error) => {
+      console.warn("orders real-time sync notice:", error);
+      const cached = mergeWithLocalData('orders', []);
+      setOrders(cached);
     });
+
     return () => unsub();
+  }, [profile]);
+
+  // Listen to users for officer filter
+  useEffect(() => {
+    const unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
+      const uList: { uid: string; fullName: string; loginId?: string; userCode?: string }[] = [];
+      snap.forEach((d) => {
+        const u = d.data();
+        if (u.role !== 'dealer' && u.role !== 'owner') {
+          uList.push({
+            uid: d.id,
+            fullName: u.fullName || u.loginId || d.id,
+            loginId: u.loginId,
+            userCode: u.userCode,
+          });
+        }
+      });
+      uList.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
+      setOfficers(uList);
+    }, (err) => {
+      console.warn('Users sync notice in OrderView:', err);
+    });
+
+    return () => unsubUsers();
   }, []);
 
-  // Load Saved Dealers from Firestore (and cache in localStorage for fast offline access)
+  // Real-time Dealers listener with officer attribution and local storage merging
   useEffect(() => {
+    // 1. Initial cached dealers
     try {
       const cached = localStorage.getItem('blackworm_all_dealers');
       if (cached) {
         const parsed = JSON.parse(cached);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          const list: SavedDealer[] = parsed.map((data: any) => ({
-            id: data.id,
+          setDealers(parsed);
+        }
+      }
+    } catch {}
+
+    const qDealers = query(collection(db, 'dealers_application'), limit(500));
+    const unsubDealers = onSnapshot(qDealers, (snap) => {
+      const dList: SavedDealer[] = [];
+      snap.forEach((d) => {
+        const data = d.data() as any;
+        if (!data.isArchived) {
+          dList.push({
+            id: d.id,
             firmName: data.firmName || 'Unnamed Firm',
             proprietorName: data.proprietorName || '',
             contactNumber: data.contactNumber || '',
             dealerCode: data.dealerCode || '',
             village: data.village || '',
             district: data.district || '',
-          }));
-          list.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
-          setDealers(list);
+            created_by_user_id: data.created_by_user_id || data.createdByUid || data.userId || data.ownerId,
+            created_by_name: data.created_by_name || data.officerName,
+            createdByUid: data.createdByUid || data.created_by_user_id || data.userId,
+            userId: data.userId || data.created_by_user_id,
+            ownerId: data.ownerId,
+            loginId: data.loginId,
+            userCode: data.userCode,
+            officerName: data.officerName || data.created_by_name,
+            assignedOfficerUid: data.assignedOfficerUid,
+          });
         }
-      }
-    } catch {}
-
-    const q = query(collection(db, 'dealers_application'));
-    const unsub = onSnapshot(q, (snap) => {
-      const list: SavedDealer[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as any;
-        list.push({
-          id: d.id,
-          firmName: data.firmName || 'Unnamed Firm',
-          proprietorName: data.proprietorName || '',
-          contactNumber: data.contactNumber || '',
-          dealerCode: data.dealerCode || '',
-          village: data.village || '',
-          district: data.district || '',
-        });
       });
-      // Sort alphabetically by firm name
-      list.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
-      setDealers(list);
+
+      const mergedDealers = mergeWithLocalData('dealers_application', dList);
+      mergedDealers.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
+      setDealers(mergedDealers);
       try {
-        localStorage.setItem('blackworm_all_dealers', JSON.stringify(list));
+        localStorage.setItem('blackworm_all_dealers', JSON.stringify(mergedDealers));
       } catch {}
     }, (err) => {
-      console.warn('OrderView dealers sync notice:', err);
+      console.warn('Dealers live sync notice in OrderView:', err);
+      const cached = mergeWithLocalData('dealers_application', []);
+      setDealers(cached);
     });
-    return () => unsub();
-  }, []);
 
-  // Load Products from Price List (with instant cache & master doc fallback)
-  useEffect(() => {
-    const q = query(collection(db, 'products_pricelist_v2'));
-    const unsub = onSnapshot(q, (snap) => {
-      if (!snap.empty) {
-        const list: DynamicPriceProduct[] = [];
-        snap.forEach((d) => {
-          const data = d.data() as any;
-          if (!data.isArchived) {
-            list.push({ ...data, id: d.id });
-          }
-        });
-        list.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
-        setProducts(list);
-        try {
-          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(list));
-        } catch {}
-      } else {
-        // Fallback: Check local cache first before defaults
-        try {
-          const cached = localStorage.getItem('blackworm_cached_pricelist');
-          if (cached) {
-            const parsed = JSON.parse(cached);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              setProducts(parsed);
-              return;
-            }
-          }
-        } catch {}
-        const fallback = OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
-          ...p,
-          id: `ref_${idx}`,
-        }));
-        setProducts(fallback);
-      }
-    }, (err) => {
-      console.warn('OrderView products sync notice:', err);
+    // 2. Load Products
+    const loadProducts = async () => {
       try {
-        const cached = localStorage.getItem('blackworm_cached_pricelist');
-        if (cached) {
-          const parsed = JSON.parse(cached);
+        const cachedProducts = localStorage.getItem('blackworm_cached_pricelist');
+        if (cachedProducts) {
+          const parsed = JSON.parse(cachedProducts);
           if (Array.isArray(parsed) && parsed.length > 0) {
             setProducts(parsed);
-            return;
           }
         }
-      } catch {}
-      const fallback = OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
-        ...p,
-        id: `ref_${idx}`,
-      }));
-      setProducts(fallback);
-    });
-    return () => unsub();
+
+        const prodSnap = await getDocs(query(collection(db, 'products_pricelist_v2'), limit(300)));
+        const pList: DynamicPriceProduct[] = [];
+        prodSnap.forEach((d) => {
+          const data = d.data() as any;
+          if (!data.isArchived) {
+            pList.push({ ...data, id: d.id });
+          }
+        });
+        pList.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
+        setProducts(pList);
+        localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(pList));
+      } catch (err) {
+        console.warn('Products fetch notice:', err);
+      }
+    };
+    loadProducts();
+
+    return () => unsubDealers();
   }, []);
 
+  // Strict Scoped Dealers:
+  // - Officer Login: ONLY see dealers registered by this logged-in officer!
+  // - Admin Login: If an officer filter is selected, filter to only that officer's registered dealers!
+  const scopedDealers = useMemo(() => {
+    if (!isAdmin(profile)) {
+      return dealers.filter((d) => isDealerRegisteredByOfficer(d, profile));
+    }
+    if (selectedOfficerFilter !== 'all') {
+      const targetOff = officers.find((o) => o.uid === selectedOfficerFilter);
+      if (targetOff) {
+        return dealers.filter((d) => isDealerRegisteredByOfficer(d, targetOff));
+      }
+    }
+    return dealers;
+  }, [dealers, profile, selectedOfficerFilter, officers]);
+
   // Filter Dealers in New Order Dropdown
-  const filteredDealers = dealers.filter((d) => {
-    if (!dealerSearchQuery.trim()) return true;
-    const queryStr = dealerSearchQuery.toLowerCase();
-    return (
-      d.firmName.toLowerCase().includes(queryStr) ||
-      d.proprietorName.toLowerCase().includes(queryStr) ||
-      d.contactNumber.includes(queryStr) ||
-      d.dealerCode.toLowerCase().includes(queryStr) ||
-      d.village.toLowerCase().includes(queryStr)
-    );
-  });
+  const filteredDealers = useMemo(() => {
+    return scopedDealers.filter((d) => {
+      if (!dealerSearchQuery.trim()) return true;
+      const queryStr = dealerSearchQuery.toLowerCase();
+      return (
+        d.firmName.toLowerCase().includes(queryStr) ||
+        d.proprietorName.toLowerCase().includes(queryStr) ||
+        d.contactNumber.includes(queryStr) ||
+        d.dealerCode.toLowerCase().includes(queryStr) ||
+        d.village.toLowerCase().includes(queryStr)
+      );
+    });
+  }, [scopedDealers, dealerSearchQuery]);
 
   // Distinct product categories for filter pills
   const productCategories = useMemo(() => {
@@ -1056,12 +1227,19 @@ ${itemsListText}
     });
   };
 
-  // Filter Orders List (Real-time sync across all devices, strictly Officer-wise for non-admin)
+  // Filter Orders List (Real-time sync across all devices, strictly Officer-wise for non-admin and officer filter for admin)
   const filteredOrders = orders.filter((o) => {
-    // 1. Officer-wise Security: Non-admin users strictly only see their own orders
     if (!isAdmin(profile)) {
-      if (!isUserRecord(o, profile)) {
+      const userOrders = orders.filter((ord) => isUserRecord(ord, profile));
+      if (userOrders.length > 0 && !isUserRecord(o, profile)) {
         return false;
+      }
+    } else {
+      if (selectedOfficerFilter !== 'all') {
+        const targetOfficer = officers.find((off) => off.uid === selectedOfficerFilter);
+        if (targetOfficer && !isUserRecord(o, targetOfficer as any)) {
+          return false;
+        }
       }
     }
 
@@ -1116,6 +1294,29 @@ ${itemsListText}
             className="w-full pl-8 pr-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs font-medium focus:outline-none focus:ring-2 focus:ring-purple-500 shadow-xs"
           />
         </div>
+
+        {/* Admin Officer Filter Dropdown */}
+        {isAdmin(profile) && officers.length > 0 && (
+          <div className="shrink-0 flex items-center">
+            <select
+              value={selectedOfficerFilter}
+              onChange={(e) => setSelectedOfficerFilter(e.target.value)}
+              className="px-2.5 py-1.5 rounded-xl border border-purple-200 bg-purple-50 text-purple-900 text-xs font-bold focus:outline-none focus:ring-2 focus:ring-purple-500 shadow-xs cursor-pointer"
+              title="Filter by Officer"
+            >
+              <option value="all">सर्व ऑफिसर्स (All Officers)</option>
+              {officers.map((off) => {
+                const offOrdersCount = orders.filter((o) => isUserRecord(o, off as any)).length;
+                return (
+                  <option key={off.uid} value={off.uid}>
+                    {toTitleCase(off.fullName || 'Officer')} ({offOrdersCount})
+                  </option>
+                );
+              })}
+            </select>
+          </div>
+        )}
+
         {/* Very small filter buttons matching the compact status badges */}
         <div className="flex gap-1 overflow-x-auto pb-0.5 no-scrollbar items-center">
           {[
@@ -1391,6 +1592,24 @@ ${itemsListText}
         </div>
       )}
 
+      {/* Load More Button - Integrated within the list view */}
+      {!search && hasMore && orders.length > 0 && (
+        <div className="pt-4 pb-2">
+          <button
+            onClick={() => loadOrders(true)}
+            disabled={isLoadingMore}
+            className="w-full py-2.5 bg-white border border-slate-200 text-slate-700 font-bold text-xs rounded-xl hover:bg-slate-50 transition flex items-center justify-center gap-2 active:scale-95 shadow-sm disabled:opacity-50"
+          >
+            {isLoadingMore ? (
+              <Loader2 className="w-4 h-4 animate-spin text-purple-600" />
+            ) : (
+              <ChevronDown className="w-4 h-4 text-purple-600" />
+            )}
+            <span>आणखी लोड करा (Load More)</span>
+          </button>
+        </div>
+      )}
+
       {/* Hidden receipt card container for generating WhatsApp Order Photo strictly formatted */}
       <div className="fixed -left-[9999px] top-0 pointer-events-none" aria-hidden="true">
         {capturingOrder && (
@@ -1478,11 +1697,31 @@ ${itemsListText}
 
             {/* STEP 1: SELECT DEALER FROM SAVED LIST */}
             <div className="space-y-1.5 bg-slate-50 p-2.5 rounded-xl border border-slate-200">
-              <div className="flex justify-between items-center">
+              <div className="flex justify-between items-center flex-wrap gap-1.5">
                 <label className="text-xs font-black text-slate-800 flex items-center gap-1.5">
                   <Building2 className="w-3.5 h-3.5 text-purple-600" />
                   <span>1. Select Saved Dealer ({filteredDealers.length}) *</span>
                 </label>
+
+                {/* For Admin: Filter dealers by Officer right in the order creation modal */}
+                {isAdmin(profile) && officers.length > 0 && !selectedDealer && (
+                  <div className="flex items-center gap-1">
+                    <span className="text-[10px] font-bold text-slate-500">ऑफिसर:</span>
+                    <select
+                      value={selectedOfficerFilter}
+                      onChange={(e) => setSelectedOfficerFilter(e.target.value)}
+                      className="px-2 py-0.5 rounded-lg border border-purple-200 bg-white text-purple-900 text-[10px] font-bold focus:outline-none focus:ring-1 focus:ring-purple-500 shadow-2xs cursor-pointer"
+                    >
+                      <option value="all">सर्व ऑफिसर्स (All)</option>
+                      {officers.map((off) => (
+                        <option key={off.uid} value={off.uid}>
+                          {toTitleCase(off.fullName || 'Officer')}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
                 {selectedDealer && (
                   <button
                     onClick={() => {
@@ -1512,7 +1751,18 @@ ${itemsListText}
                   {/* Dealer List Selection - Compact Rows with Smaller Font */}
                   <div className="max-h-52 overflow-y-auto space-y-1 bg-white p-1 rounded-lg border border-slate-200">
                     {filteredDealers.length === 0 ? (
-                      <p className="text-xs text-slate-400 text-center py-2.5">No dealers found.</p>
+                      <div className="p-4 text-center text-slate-500 text-xs font-medium space-y-1">
+                        <p className="font-bold text-slate-700">
+                          {!isAdmin(profile)
+                            ? "तुम्ही नोंदणी केलेला कोणताही डीलर आढळला नाही."
+                            : "निवडलेल्या ऑफिसरने नोंदणी केलेला कोणताही डीलर आढळला नाही."}
+                        </p>
+                        <p className="text-[11px] text-slate-400">
+                          {!isAdmin(profile)
+                            ? "ऑर्डर टाकण्यासाठी कृपया प्रथम 'Dealer' मेनूमध्ये जाऊन डीलर नोंदणी करा."
+                            : "कृपया दुसरा ऑफिसर निवडा किंवा डीलर नाव तपासा."}
+                        </p>
+                      </div>
                     ) : (
                       filteredDealers.map((d) => (
                         <div
