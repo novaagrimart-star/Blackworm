@@ -162,7 +162,7 @@ export interface OrderItem {
   paidAmount: number;
   balanceAmount: number;
   paymentMode: string;
-  status: 'pending' | 'pending_approval' | 'confirmed' | 'dispatched' | 'delivered' | 'collected';
+  status: 'pending' | 'pending_approval' | 'confirmed' | 'dispatched' | 'delivered' | 'collected' | 'complete' | 'approved';
   approvedBy?: string;
   approvedAt?: string;
   dispatchedAt?: string;
@@ -233,9 +233,39 @@ interface Props {
 }
 
 export const OrderView: React.FC<Props> = ({ profile }) => {
-  const [orders, setOrders] = useState<OrderItem[]>([]);
-  const [dealers, setDealers] = useState<SavedDealer[]>([]);
-  const [officers, setOfficers] = useState<{ uid: string; fullName: string; loginId?: string; userCode?: string }[]>([]);
+  const [orders, setOrders] = useState<OrderItem[]>(() => {
+    try {
+      const cached = mergeWithLocalData('orders', []);
+      if (cached && cached.length > 0) return cached as any;
+    } catch {}
+    return [];
+  });
+  const [dealers, setDealers] = useState<SavedDealer[]>(() => {
+    try {
+      const rawLocal = localStorage.getItem('blackworm_local_dealers_application');
+      if (rawLocal) {
+        const parsed = JSON.parse(rawLocal);
+        const list = Object.values(parsed).filter((d: any) => !d.isArchived);
+        if (list.length > 0) return list as any;
+      }
+      const cached = localStorage.getItem('blackworm_all_dealers');
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {}
+    return [];
+  });
+  const [officers, setOfficers] = useState<{ uid: string; fullName: string; loginId?: string; userCode?: string }[]>(() => {
+    try {
+      const cached = localStorage.getItem('blackworm_cached_users');
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        return parsed.filter((u: any) => u.role !== 'dealer' && u.role !== 'owner');
+      }
+    } catch {}
+    return [];
+  });
   const [selectedOfficerFilter, setSelectedOfficerFilter] = useState<string>('all');
   const [products, setProducts] = useState<DynamicPriceProduct[]>(() => {
     if (typeof window !== 'undefined') {
@@ -245,12 +275,19 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           const parsed = JSON.parse(cached);
           if (Array.isArray(parsed) && parsed.length > 0) return parsed;
         }
+        const masterRaw = localStorage.getItem('blackworm_master_pricelist');
+        if (masterRaw) {
+          const parsed = JSON.parse(masterRaw);
+          if (parsed && Array.isArray(parsed.products) && parsed.products.length > 0) {
+            return parsed.products;
+          }
+        }
       } catch {}
     }
-    return [];
+    return OFFICIAL_REFERENCE_DATA.map((p, idx) => ({ ...p, id: (p as any).id || `prod_ref_${idx + 1}` }));
   });
   const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState('pending');
 
   // Pagination states for Orders
   const [lastDoc, setLastDoc] = useState<any>(null);
@@ -611,7 +648,30 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       setDealers(cached);
     });
 
-    // 2. Load Products
+    // 2. Load & Sync Products with Firestore master_pricelist + products_pricelist_v2 + OFFICIAL_REFERENCE_DATA fallback
+    const fallbackProducts = OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
+      ...p,
+      id: (p as any).id || `prod_ref_${idx + 1}`,
+    }));
+
+    // Listen to config/master_pricelist (Single atomic source of truth updated by Admin)
+    const unsubMasterPricelist = onSnapshot(doc(db, 'config', 'master_pricelist'), (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data && Array.isArray(data.products) && data.products.length > 0) {
+          const validList = data.products.filter((p: any) => !p.isArchived);
+          if (validList.length > 0) {
+            setProducts(validList);
+            try {
+              localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(validList));
+            } catch {}
+          }
+        }
+      }
+    }, (err) => {
+      console.warn('Master pricelist live sync notice in OrderView:', err);
+    });
+
     const loadProducts = async () => {
       try {
         const cachedProducts = localStorage.getItem('blackworm_cached_pricelist');
@@ -630,16 +690,27 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
             pList.push({ ...data, id: d.id });
           }
         });
-        pList.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
-        setProducts(pList);
-        localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(pList));
+        if (pList.length > 0) {
+          pList.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
+          setProducts(pList);
+          try {
+            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(pList));
+          } catch {}
+        } else {
+          // If Firestore collection has no items, ensure fallback
+          setProducts((prev) => (prev && prev.length > 0 ? prev : fallbackProducts));
+        }
       } catch (err) {
-        console.warn('Products fetch notice:', err);
+        console.warn('Products fetch notice in OrderView:', err);
+        setProducts((prev) => (prev && prev.length > 0 ? prev : fallbackProducts));
       }
     };
     loadProducts();
 
-    return () => unsubDealers();
+    return () => {
+      unsubDealers();
+      unsubMasterPricelist();
+    };
   }, []);
 
   // Strict Scoped Dealers:
@@ -711,7 +782,6 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   const handleSelectProduct = (prod: DynamicPriceProduct) => {
     setSelectedProduct(prod);
     setFormError(null);
-    setProductSearchQuery(getCleanGradeName(prod));
     if (prod.packings && prod.packings.length > 0) {
       const first = prod.packings[0];
       setSelectedPacking(first.packingSize);
@@ -1112,24 +1182,35 @@ ${itemsListText}
     }, 150);
   };
 
-  // Workflow Action 1: Approve Order & Move to Dispatch
+  // Workflow Action 1: Approve Order & Move to Complete
   const handleApproveOrder = async (order: OrderItem) => {
     if (!isAdmin(profile)) return;
 
     const updatedData = {
-      status: 'dispatched' as const,
+      status: 'complete' as const,
       approvedBy: profile.fullName || 'Admin',
       approvedAt: new Date().toISOString(),
       dispatchedAt: new Date().toISOString(),
+      deliveredAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
 
-    await updateDoc(doc(db, 'orders', order.id), updatedData);
+    // Update state immediately
+    setOrders((prev) =>
+      prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
+    );
+
+    try {
+      await updateDoc(doc(db, 'orders', order.id), updatedData);
+    } catch {
+      await safeFirestoreSet('orders', order.id, updatedData, { merge: true });
+    }
+
     await logAudit(
       'UPDATE',
       'orders',
       order.id,
-      `Approved and Dispatched order ${order.orderNumber} by ${profile.fullName}`,
+      `Approved order ${order.orderNumber} (Moved to Complete) by ${profile.fullName}`,
       profile
     );
 
@@ -1227,18 +1308,33 @@ ${itemsListText}
     });
   };
 
-  // Filter Orders List (Real-time sync across all devices, strictly Officer-wise for non-admin and officer filter for admin)
+  // Filter Orders List (Strictly Officer-wise for non-admin, and officer filter for admin)
   const filteredOrders = orders.filter((o) => {
     if (!isAdmin(profile)) {
-      const userOrders = orders.filter((ord) => isUserRecord(ord, profile));
-      if (userOrders.length > 0 && !isUserRecord(o, profile)) {
+      if (!isUserRecord(o, profile)) {
         return false;
       }
     } else {
       if (selectedOfficerFilter !== 'all') {
         const targetOfficer = officers.find((off) => off.uid === selectedOfficerFilter);
-        if (targetOfficer && !isUserRecord(o, targetOfficer as any)) {
-          return false;
+        if (targetOfficer) {
+          const anyOrder = o as any;
+          const recUid = (anyOrder.userId || anyOrder.ownerId || anyOrder.created_by_user_id || anyOrder.createdByUid || '').toString().toLowerCase().trim();
+          const targetUid = (targetOfficer.uid || '').toLowerCase().trim();
+          const targetName = (targetOfficer.fullName || '').toLowerCase().trim();
+          const targetLogin = (targetOfficer.loginId || '').toLowerCase().trim();
+          const targetCode = (targetOfficer.userCode || '').toLowerCase().trim();
+          const recName = (anyOrder.createdByName || anyOrder.created_by_name || '').toString().toLowerCase().trim();
+          const recLogin = (anyOrder.loginId || '').toString().toLowerCase().trim();
+          const recCode = (anyOrder.userCode || '').toString().toLowerCase().trim();
+
+          const match =
+            (targetUid && recUid === targetUid) ||
+            (targetName && recName && (recName === targetName || recName.includes(targetName) || targetName.includes(recName))) ||
+            (targetLogin && recLogin && recLogin === targetLogin) ||
+            (targetCode && recCode && recCode === targetCode);
+
+          if (!match) return false;
         }
       }
     }
@@ -1255,6 +1351,7 @@ ${itemsListText}
 
     if (statusFilter === 'all') return true;
     if (statusFilter === 'pending') return o.status === 'pending_approval' || o.status === 'pending';
+    if (statusFilter === 'complete') return o.status === 'complete' || o.status === 'approved' || o.status === 'delivered';
     if (statusFilter === 'dispatched') return o.status === 'dispatched' || o.status === 'confirmed';
     if (statusFilter === 'delivered') return o.status === 'delivered';
     if (statusFilter === 'collected') return o.status === 'collected';
@@ -1317,28 +1414,46 @@ ${itemsListText}
           </div>
         )}
 
-        {/* Very small filter buttons matching the compact status badges */}
+        {/* Status filter buttons: Pending (default), Complete, All */}
         <div className="flex gap-1 overflow-x-auto pb-0.5 no-scrollbar items-center">
           {[
-            { id: 'all', label: 'All' },
             { id: 'pending', label: 'Pending' },
-            { id: 'dispatched', label: 'Dispatched' },
-            { id: 'delivered', label: 'Delivered' },
-            { id: 'collected', label: 'Collected' },
-          ].map((st) => (
-            <button
-              key={st.id}
-              onClick={() => setStatusFilter(st.id)}
-              className={cn(
-                "px-2 py-0.5 rounded text-[9.5px] font-bold transition whitespace-nowrap cursor-pointer active:scale-95",
-                statusFilter === st.id
-                  ? "bg-purple-600 text-white shadow-2xs"
-                  : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
-              )}
-            >
-              {st.label}
-            </button>
-          ))}
+            { id: 'complete', label: 'Complete' },
+            { id: 'all', label: 'All' },
+          ].map((st) => {
+            const count = orders.filter((o) => {
+              if (!isAdmin(profile)) {
+                if (!isUserRecord(o, profile)) return false;
+              } else if (selectedOfficerFilter !== 'all') {
+                const targetOfficer = officers.find((off) => off.uid === selectedOfficerFilter);
+                if (targetOfficer && !isUserRecord(o, targetOfficer as any)) return false;
+              }
+              if (st.id === 'pending') return o.status === 'pending_approval' || o.status === 'pending';
+              if (st.id === 'complete') return o.status === 'complete' || o.status === 'approved' || o.status === 'delivered';
+              return true;
+            }).length;
+
+            return (
+              <button
+                key={st.id}
+                onClick={() => setStatusFilter(st.id)}
+                className={cn(
+                  "px-2.5 py-1 rounded text-xs font-bold transition whitespace-nowrap cursor-pointer active:scale-95 flex items-center gap-1",
+                  statusFilter === st.id
+                    ? "bg-purple-600 text-white shadow-2xs"
+                    : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
+                )}
+              >
+                <span>{st.label}</span>
+                <span className={cn(
+                  "px-1.5 py-0.2 rounded-full text-[10px] font-mono",
+                  statusFilter === st.id ? "bg-white/25 text-white" : "bg-slate-100 text-slate-700"
+                )}>
+                  {count}
+                </span>
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -1353,8 +1468,8 @@ ${itemsListText}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {filteredOrders.map((o) => {
             const isPending = o.status === 'pending_approval' || o.status === 'pending';
+            const isComplete = o.status === 'complete' || o.status === 'approved' || o.status === 'delivered';
             const isDispatched = o.status === 'dispatched' || o.status === 'confirmed';
-            const isDelivered = o.status === 'delivered';
             const isCollected = o.status === 'collected';
 
             return (
@@ -1380,19 +1495,19 @@ ${itemsListText}
                         className={cn(
                           "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] font-black uppercase tracking-tight",
                           isPending && "bg-amber-50 text-amber-800 border border-amber-200",
-                          isDispatched && "bg-blue-50 text-blue-700 border border-blue-200",
-                          isDelivered && "bg-emerald-50 text-emerald-700 border border-emerald-200",
+                          isComplete && "bg-emerald-50 text-emerald-700 border border-emerald-200",
+                          isDispatched && !isComplete && "bg-blue-50 text-blue-700 border border-blue-200",
                           isCollected && "bg-green-100 text-green-800 border border-green-300"
                         )}
                       >
                         {isPending && <Clock className="w-2.5 h-2.5" />}
-                        {isDispatched && <Truck className="w-2.5 h-2.5" />}
-                        {isDelivered && <CheckCircle2 className="w-2.5 h-2.5" />}
+                        {isComplete && <CheckCircle2 className="w-2.5 h-2.5" />}
+                        {isDispatched && !isComplete && <Truck className="w-2.5 h-2.5" />}
                         {isCollected && <PackageCheck className="w-2.5 h-2.5" />}
                         <span>
                           {isPending && 'Pending'}
-                          {isDispatched && 'Dispatched'}
-                          {isDelivered && 'Delivered'}
+                          {isComplete && 'Complete'}
+                          {isDispatched && !isComplete && 'Dispatched'}
                           {isCollected && 'Collected'}
                         </span>
                       </span>
@@ -1522,12 +1637,12 @@ ${itemsListText}
                     <Eye className="w-3.5 h-3.5" />
                   </button>
 
-                  {/* Workflow Stage 1: Approve Order & Dispatch */}
+                  {/* Workflow Stage 1: Approve Order & Move to Complete */}
                   {isPending && isAdmin(profile) && (
                     <button
                       onClick={() => handleApproveOrder(o)}
-                      className="p-1 px-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-[10px] font-bold transition shadow-2xs cursor-pointer active:scale-95 flex items-center gap-1"
-                      title="Approve Order"
+                      className="p-1 px-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-[10px] font-bold transition shadow-2xs cursor-pointer active:scale-95 flex items-center gap-1"
+                      title="Approve Order (Move to Complete)"
                     >
                       <Check className="w-3 h-3 stroke-[3]" />
                       <span>Approve</span>
@@ -1589,24 +1704,6 @@ ${itemsListText}
               </div>
             );
           })}
-        </div>
-      )}
-
-      {/* Load More Button - Integrated within the list view */}
-      {!search && hasMore && orders.length > 0 && (
-        <div className="pt-4 pb-2">
-          <button
-            onClick={() => loadOrders(true)}
-            disabled={isLoadingMore}
-            className="w-full py-2.5 bg-white border border-slate-200 text-slate-700 font-bold text-xs rounded-xl hover:bg-slate-50 transition flex items-center justify-center gap-2 active:scale-95 shadow-sm disabled:opacity-50"
-          >
-            {isLoadingMore ? (
-              <Loader2 className="w-4 h-4 animate-spin text-purple-600" />
-            ) : (
-              <ChevronDown className="w-4 h-4 text-purple-600" />
-            )}
-            <span>आणखी लोड करा (Load More)</span>
-          </button>
         </div>
       )}
 
@@ -1809,235 +1906,306 @@ ${itemsListText}
 
             {/* STEP 2: SELECT PRODUCT & PACKING FROM PRICE LIST */}
             <div className="space-y-2 bg-purple-50/50 p-2.5 rounded-xl border border-purple-200">
-              <label className="text-xs font-black text-slate-800 flex items-center gap-1.5">
-                <Sparkles className="w-3.5 h-3.5 text-purple-600" />
-                <span>2. Select Product from Price List ({filteredProducts.length}) *</span>
-              </label>
+              <div className="flex justify-between items-center">
+                <label className="text-xs font-black text-slate-800 flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-purple-600" />
+                  <span>2. Select Product from Price List ({filteredProducts.length}/{products.length}) *</span>
+                </label>
+                {selectedProduct && (
+                  <span className="text-[10px] bg-purple-600 text-white font-bold px-2 py-0.5 rounded-full">
+                    {getCleanGradeName(selectedProduct)}
+                  </span>
+                )}
+              </div>
 
-              {!selectedDealer ? (
-                <div className="bg-white/80 p-3 rounded-lg border border-dashed border-purple-300 text-center text-xs text-purple-800 font-bold">
-                  👉 कृपया प्रथम वरील लिस्ट मधून डीलर निवडा (Please select a dealer above first)
+              {!selectedDealer && (
+                <div className="bg-amber-50 p-2 rounded-lg border border-amber-200 text-amber-800 text-[11px] font-medium flex items-center justify-between">
+                  <span>💡 टीप: तुम्ही प्रथम प्रॉडक्ट्स सिलेक्ट करू शकता, ऑर्डर सेव्ह करण्यापूर्वी वरील लिस्ट मधून डीलर निवडा.</span>
                 </div>
-              ) : (
-                <>
-                  {/* Product Search & Dropdown */}
-                  <div className="space-y-1.5">
-                    <div className="relative">
-                      <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-400" />
-                      <input
-                        type="text"
-                        placeholder="Search product name (e.g. Airawat 19:19:19, 0:52:34, CMB, Nitro King)..."
-                        value={productSearchQuery}
-                        onChange={(e) => {
-                          setProductSearchQuery(e.target.value);
-                          if (selectedProduct && `${selectedProduct.brandName} ${selectedProduct.gradeName}` !== e.target.value) {
-                            setSelectedProduct(null);
-                          }
+              )}
+
+              {/* Category Filter Chips */}
+              <div className="flex gap-1 overflow-x-auto pb-0.5 scrollbar-none">
+                <button
+                  type="button"
+                  onClick={() => setProductCategoryFilter('all')}
+                  className={cn(
+                    "px-2 py-0.5 rounded text-[10px] font-bold shrink-0 transition cursor-pointer",
+                    productCategoryFilter === 'all'
+                      ? "bg-purple-600 text-white shadow-2xs"
+                      : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
+                  )}
+                >
+                  All ({products.length})
+                </button>
+                {productCategories.map((cat) => (
+                  <button
+                    key={cat}
+                    type="button"
+                    onClick={() => setProductCategoryFilter(cat)}
+                    className={cn(
+                      "px-2 py-0.5 rounded text-[10px] font-bold shrink-0 transition cursor-pointer truncate max-w-[130px]",
+                      productCategoryFilter === cat
+                        ? "bg-purple-600 text-white shadow-2xs"
+                        : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
+                    )}
+                  >
+                    {cat}
+                  </button>
+                ))}
+              </div>
+
+              {/* Product Search & Dropdown */}
+              <div className="space-y-1.5">
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-400" />
+                  <input
+                    type="text"
+                    placeholder="Search product (उदा. 19:19:19, 0:52:34, Microgrip, Combi)..."
+                    value={productSearchQuery}
+                    onChange={(e) => setProductSearchQuery(e.target.value)}
+                    className="w-full pl-8 pr-8 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-medium focus:outline-none focus:ring-2 focus:ring-purple-500 shadow-xs"
+                  />
+                  {productSearchQuery && (
+                    <button
+                      type="button"
+                      onClick={() => setProductSearchQuery('')}
+                      className="absolute right-2.5 top-2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Filtered Products Compact Scrollable List */}
+                <div className="max-h-40 overflow-y-auto space-y-1 bg-white p-1 rounded-lg border border-slate-200">
+                  {filteredProducts.length === 0 ? (
+                    <div className="text-center py-3">
+                      <p className="text-xs text-slate-400">कोणतेही प्रॉडक्ट सापडले नाही.</p>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setProductSearchQuery('');
+                          setProductCategoryFilter('all');
                         }}
-                        className="w-full pl-8 pr-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-medium focus:outline-none focus:ring-2 focus:ring-purple-500 shadow-xs"
+                        className="mt-1 text-[11px] font-bold text-purple-600 hover:underline cursor-pointer"
+                      >
+                        सर्व प्रॉडक्ट्स दाखवा ({products.length})
+                      </button>
+                    </div>
+                  ) : (
+                    filteredProducts.map((p) => {
+                      const cleanName = getCleanGradeName(p);
+                      const isSelected = selectedProduct?.id === p.id;
+                      const g = (p.groupName || '').toLowerCase();
+                      const isBC = g.includes('group b') || g.includes('group c') || g.includes('micronutrient') || g.includes('growth regulator') || g.includes('pgr') || /microgrip|bw\s*combi|nutrijet/i.test(p.brandName || '') || /microgrip|bw\s*combi|nutrijet/i.test(p.gradeName || '');
+                      return (
+                        <div
+                          key={p.id}
+                          onClick={() => handleSelectProduct(p)}
+                          className={cn(
+                            "p-1.5 px-2 rounded-lg cursor-pointer transition flex justify-between items-center text-[11px]",
+                            isSelected
+                              ? "bg-purple-100 border border-purple-400 text-purple-950 font-bold"
+                              : "hover:bg-purple-50/70 border border-transparent text-slate-700"
+                          )}
+                        >
+                          <div className="min-w-0 pr-2 flex items-center gap-1.5">
+                            {isSelected ? (
+                              <CheckCircle2 className="w-3.5 h-3.5 text-purple-700 shrink-0" />
+                            ) : (
+                              <span className="w-1.5 h-1.5 rounded-full bg-slate-300 shrink-0" />
+                            )}
+                            <div className="truncate">
+                              {isBC ? (
+                                <span className="font-black text-amber-800 text-xs">{cleanName}</span>
+                              ) : (
+                                <>
+                                  {p.brandName && (
+                                    <span className="font-bold text-amber-700 text-[10.5px] mr-1">{p.brandName}</span>
+                                  )}
+                                  <span className="font-black text-sky-800">{cleanName}</span>
+                                </>
+                              )}
+                              {p.groupName && (
+                                <span className="text-[9.5px] text-slate-400 block truncate">{p.groupName}</span>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <span className="text-[9.5px] font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">
+                              {p.packings?.length || 0} Packings
+                            </span>
+                            {isSelected && (
+                              <span className="text-[9.5px] bg-purple-600 text-white font-bold px-1.5 py-0.5 rounded">
+                                निवडले ✓
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+
+              {/* Quick Packing & Quantity Picker when Product is Selected */}
+              {selectedProduct ? (
+                <div className="bg-white p-2.5 rounded-xl border border-purple-300 shadow-xs space-y-2">
+                  <div className="flex justify-between items-center border-b border-slate-100 pb-1.5">
+                    <div>
+                      <span className="text-xs font-black text-sky-800">
+                        {getCleanGradeName(selectedProduct)}
+                      </span>
+                      {selectedProduct.groupName && (
+                        <span className="text-[9.5px] text-slate-400 ml-1.5">({selectedProduct.groupName})</span>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedProduct(null)}
+                      className="text-[10px] font-bold text-rose-600 hover:underline cursor-pointer"
+                    >
+                      Clear Selection
+                    </button>
+                  </div>
+
+                  {/* Packing Selection Buttons - Compact Chips */}
+                  <div>
+                    <span className="text-[10px] font-bold text-slate-600 block mb-1">
+                      पॅकिंग निवडा (Select Packing):
+                    </span>
+                    <div className="flex flex-wrap gap-1">
+                      {selectedProduct.packings?.map((pk) => {
+                        const pkComputedRate = computeProductRate(selectedProduct, pk.packingSize);
+                        return (
+                          <button
+                            key={pk.packingSize}
+                            type="button"
+                            onClick={() => handleSelectPacking(pk.packingSize)}
+                            className={cn(
+                              "px-2.5 py-1 rounded text-[10px] font-bold transition border cursor-pointer active:scale-95 inline-flex items-center gap-1",
+                              selectedPacking === pk.packingSize
+                                ? "bg-purple-600 text-white border-purple-600 shadow-2xs"
+                                : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
+                            )}
+                          >
+                            <span>{pk.packingSize}</span>
+                            <span className={cn(
+                              "font-mono text-[9px] px-1 py-0.2 rounded font-black",
+                              selectedPacking === pk.packingSize ? "bg-white/20 text-white" : "bg-black/5 text-slate-800"
+                            )}>
+                              ₹{pkComputedRate}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Rate, Quantity, Discount & Add Item Row */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end pt-1">
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-600 block mb-0.5">दर (Rate ₹):</label>
+                      <input
+                        type="number"
+                        value={itemRate}
+                        onChange={(e) => setItemRate(e.target.value === '' ? '' : Number(e.target.value))}
+                        className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold focus:outline-none focus:ring-1 focus:ring-purple-500"
                       />
                     </div>
 
-                    {/* ALL Filtered Products Compact List */}
-                    {!selectedProduct && (
-                      <div className="max-h-48 overflow-y-auto space-y-1 bg-white p-1 rounded-lg border border-slate-200">
-                        {filteredProducts.length === 0 ? (
-                          <p className="text-xs text-slate-400 text-center py-2.5">No products found.</p>
-                        ) : (
-                          filteredProducts.map((p) => {
-                            const cleanName = getCleanGradeName(p);
-                            const g = (p.groupName || '').toLowerCase();
-                            const isBC = g.includes('group b') || g.includes('group c') || g.includes('micronutrient') || g.includes('growth regulator') || g.includes('pgr') || /microgrip|bw\s*combi|nutrijet/i.test(p.brandName || '') || /microgrip|bw\s*combi|nutrijet/i.test(p.gradeName || '');
-                            return (
-                              <div
-                                key={p.id}
-                                onClick={() => handleSelectProduct(p)}
-                                className="p-1.5 px-2 rounded-lg hover:bg-sky-50 cursor-pointer transition flex justify-between items-center text-[11px]"
-                              >
-                                <div className="min-w-0 pr-2">
-                                  {isBC ? (
-                                    <span className="font-black text-amber-800 text-xs">{cleanName}</span>
-                                  ) : (
-                                    <>
-                                      {p.brandName && (
-                                        <span className="font-bold text-amber-700 text-[10.5px] mr-1">{p.brandName}</span>
-                                      )}
-                                      <span className="font-black text-sky-700">{cleanName}</span>
-                                    </>
-                                  )}
-                                  {p.groupName && (
-                                    <span className="text-[9.5px] text-slate-400 block truncate">{p.groupName}</span>
-                                  )}
-                                </div>
-                                <span className="text-[9.5px] font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded shrink-0">
-                                  {p.packings?.length || 0} Packings
-                                </span>
-                              </div>
-                            );
-                          })
-                        )}
-                      </div>
-                    )}
-                  </div>
+                    <div>
+                      <label className="text-[10px] font-bold text-slate-600 block mb-0.5">नग (Quantity *):</label>
+                      <input
+                        type="number"
+                        min="1"
+                        value={itemQuantity}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setItemQuantity(val === '' ? '' : Number(val));
+                        }}
+                        onBlur={() => {
+                          if (itemQuantity === '' || Number(itemQuantity) < 1) {
+                            setItemQuantity(1);
+                          }
+                        }}
+                        className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold text-center focus:outline-none focus:ring-1 focus:ring-purple-500"
+                        placeholder="1"
+                      />
+                    </div>
 
-                  {/* Quick Packing & Quantity Picker */}
-                  {selectedProduct && (
-                    <div className="bg-white p-2.5 rounded-xl border border-purple-200 space-y-2">
-                      <div className="flex justify-between items-center border-b border-slate-100 pb-1.5">
-                        <div>
-                          <span className="text-xs font-black text-sky-700">
-                            {getCleanGradeName(selectedProduct)}
-                          </span>
-                          {selectedProduct.groupName && (
-                            <span className="text-[9.5px] text-slate-400 ml-1.5">({selectedProduct.groupName})</span>
-                          )}
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setSelectedProduct(null);
-                            setProductSearchQuery('');
-                          }}
-                          className="text-[10px] font-bold text-rose-600 hover:underline cursor-pointer"
-                        >
-                          Change Product
-                        </button>
-                      </div>
-
-                      {/* Packing Selection Buttons - Compact Chips */}
-                      <div>
-                        <span className="text-[10px] font-bold text-slate-600 block mb-1">
-                          Select Packing:
-                        </span>
-                        <div className="flex flex-wrap gap-1">
-                          {selectedProduct.packings?.map((pk) => {
-                            const pkComputedRate = computeProductRate(selectedProduct, pk.packingSize);
-                            return (
-                              <button
-                                key={pk.packingSize}
-                                type="button"
-                                onClick={() => handleSelectPacking(pk.packingSize)}
-                                className={cn(
-                                  "px-2 py-0.5 rounded text-[10px] font-bold transition border cursor-pointer active:scale-95 inline-flex items-center gap-1",
-                                  selectedPacking === pk.packingSize
-                                    ? "bg-purple-600 text-white border-purple-600 shadow-2xs"
-                                    : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
-                                )}
-                              >
-                                <span>{pk.packingSize}</span>
-                                <span className={cn(
-                                  "font-mono text-[9px] px-1 py-0.2 rounded font-black",
-                                  selectedPacking === pk.packingSize ? "bg-white/20 text-white" : "bg-black/5 text-slate-800"
-                                )}>
-                                  ₹{pkComputedRate}
-                                </span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      {/* Rate, Quantity, Discount & Add Item Row */}
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end pt-1">
-                        <div>
-                          <label className="text-[10px] font-bold text-slate-600 block mb-0.5">Rate (₹ With GST & Disc):</label>
-                          <input
-                            type="number"
-                            value={itemRate}
-                            onChange={(e) => setItemRate(e.target.value === '' ? '' : Number(e.target.value))}
-                            className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold focus:outline-none focus:ring-1 focus:ring-purple-500"
-                          />
-                        </div>
-
-                        <div>
-                          <label className="text-[10px] font-bold text-slate-600 block mb-0.5">Quantity *</label>
-                          <input
-                            type="number"
-                            min="1"
-                            value={itemQuantity}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setItemQuantity(val === '' ? '' : Number(val));
-                            }}
-                            onBlur={() => {
-                              if (itemQuantity === '' || Number(itemQuantity) < 1) {
-                                setItemQuantity(1);
-                              }
-                            }}
-                            className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold text-center focus:outline-none focus:ring-1 focus:ring-purple-500"
-                            placeholder="1"
-                          />
-                        </div>
-
-                        <div>
-                          <div className="flex justify-between items-center mb-0.5">
-                            <label className="text-[10px] font-bold text-slate-600">Discount:</label>
-                            <div className="flex text-[9px] font-bold bg-slate-100 rounded border border-slate-200 overflow-hidden">
-                              <button
-                                type="button"
-                                onClick={() => setDiscountType('percent')}
-                                className={cn(
-                                  "px-1 py-0.2 cursor-pointer transition",
-                                  discountType === 'percent' ? "bg-purple-600 text-white" : "text-slate-500"
-                                )}
-                              >
-                                %
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setDiscountType('flat')}
-                                className={cn(
-                                  "px-1 py-0.2 cursor-pointer transition",
-                                  discountType === 'flat' ? "bg-purple-600 text-white" : "text-slate-500"
-                                )}
-                              >
-                                ₹
-                              </button>
-                            </div>
-                          </div>
-                          <input
-                            type="number"
-                            min="0"
-                            value={itemDiscount}
-                            onChange={(e) => setItemDiscount(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
-                            className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold text-center focus:outline-none focus:ring-1 focus:ring-purple-500"
-                            placeholder={discountType === 'percent' ? "0%" : "₹0"}
-                          />
-                        </div>
-
-                        <div>
+                    <div>
+                      <div className="flex justify-between items-center mb-0.5">
+                        <label className="text-[10px] font-bold text-slate-600">सूट (Discount):</label>
+                        <div className="flex text-[9px] font-bold bg-slate-100 rounded border border-slate-200 overflow-hidden">
                           <button
                             type="button"
-                            onClick={handleAddItemToOrder}
-                            className="w-full py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition shadow-xs cursor-pointer flex items-center justify-center gap-1 active:scale-95 h-[30px]"
+                            onClick={() => setDiscountType('percent')}
+                            className={cn(
+                              "px-1 py-0.2 cursor-pointer transition",
+                              discountType === 'percent' ? "bg-purple-600 text-white" : "text-slate-500"
+                            )}
                           >
-                            <Plus className="w-3.5 h-3.5" />
-                            <span>+ Add Item</span>
+                            %
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDiscountType('flat')}
+                            className={cn(
+                              "px-1 py-0.2 cursor-pointer transition",
+                              discountType === 'flat' ? "bg-purple-600 text-white" : "text-slate-500"
+                            )}
+                          >
+                            ₹
                           </button>
                         </div>
                       </div>
-
-                      {/* Live Calculation Preview */}
-                      {(() => {
-                        const r = Number(itemRate) || 0;
-                        const q = typeof itemQuantity === 'string' && itemQuantity === '' ? 1 : Math.max(1, Number(itemQuantity) || 1);
-                        const gross = r * q;
-                        const d = Number(itemDiscount) || 0;
-                        const dAmt = discountType === 'percent' ? Math.round((gross * d) / 100) : d;
-                        const net = Math.max(0, gross - dAmt);
-                        return (
-                          <div className="flex justify-between items-center text-[10px] font-bold text-slate-500 pt-0.5 border-t border-slate-100">
-                            <span>Base: <span className="font-mono">₹{gross.toLocaleString()}</span></span>
-                            {dAmt > 0 && (
-                              <span className="text-rose-600 font-medium">Disc: -₹{dAmt.toLocaleString()}</span>
-                            )}
-                            <span>Subtotal: <span className="font-mono text-purple-700 font-black text-xs">₹{net.toLocaleString()}</span></span>
-                          </div>
-                        );
-                      })()}
+                      <input
+                        type="number"
+                        min="0"
+                        value={itemDiscount}
+                        onChange={(e) => setItemDiscount(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
+                        className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold text-center focus:outline-none focus:ring-1 focus:ring-purple-500"
+                        placeholder={discountType === 'percent' ? "0%" : "₹0"}
+                      />
                     </div>
-                  )}
-                </>
+
+                    <div>
+                      <button
+                        type="button"
+                        onClick={handleAddItemToOrder}
+                        className="w-full py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition shadow-xs cursor-pointer flex items-center justify-center gap-1 active:scale-95 h-[30px]"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>+ ॲड करा (Add Item)</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Live Calculation Preview */}
+                  {(() => {
+                    const r = Number(itemRate) || 0;
+                    const q = typeof itemQuantity === 'string' && itemQuantity === '' ? 1 : Math.max(1, Number(itemQuantity) || 1);
+                    const gross = r * q;
+                    const d = Number(itemDiscount) || 0;
+                    const dAmt = discountType === 'percent' ? Math.round((gross * d) / 100) : d;
+                    const net = Math.max(0, gross - dAmt);
+                    return (
+                      <div className="flex justify-between items-center text-[10px] font-bold text-slate-500 pt-0.5 border-t border-slate-100">
+                        <span>Base: <span className="font-mono">₹{gross.toLocaleString()}</span></span>
+                        {dAmt > 0 && (
+                          <span className="text-rose-600 font-medium">सूट: -₹{dAmt.toLocaleString()}</span>
+                        )}
+                        <span>एकूण (Subtotal): <span className="font-mono text-purple-700 font-black text-xs">₹{net.toLocaleString()}</span></span>
+                      </div>
+                    );
+                  })()}
+                </div>
+              ) : (
+                <div className="bg-white/80 p-2 rounded-lg border border-dashed border-purple-200 text-center text-[11px] text-purple-700 font-medium">
+                  👉 वरील लिस्ट मधून प्रॉडक्ट वर क्लिक करा (Click any product above to configure packing and quantity)
+                </div>
               )}
             </div>
 
@@ -2240,12 +2408,12 @@ ${itemsListText}
                     className={cn(
                       "px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-tight",
                       (selectedOrderDetails.status === 'pending_approval' || selectedOrderDetails.status === 'pending') && "bg-amber-50 text-amber-800 border border-amber-200",
+                      (selectedOrderDetails.status === 'complete' || selectedOrderDetails.status === 'approved' || selectedOrderDetails.status === 'delivered') && "bg-emerald-50 text-emerald-700 border border-emerald-200",
                       (selectedOrderDetails.status === 'dispatched' || selectedOrderDetails.status === 'confirmed') && "bg-blue-50 text-blue-700 border border-blue-200",
-                      selectedOrderDetails.status === 'delivered' && "bg-emerald-50 text-emerald-700 border border-emerald-200",
                       selectedOrderDetails.status === 'collected' && "bg-green-100 text-green-800 border border-green-300"
                     )}
                   >
-                    {selectedOrderDetails.status === 'dispatched' ? 'Dispatched' : selectedOrderDetails.status === 'delivered' ? 'Delivered' : selectedOrderDetails.status === 'collected' ? 'Collected' : 'Pending Approval'}
+                    {selectedOrderDetails.status === 'complete' || selectedOrderDetails.status === 'approved' || selectedOrderDetails.status === 'delivered' ? 'Complete (Approved)' : selectedOrderDetails.status === 'dispatched' ? 'Dispatched' : selectedOrderDetails.status === 'collected' ? 'Collected' : 'Pending Approval'}
                   </span>
                 </div>
                 <h3 className="text-sm font-black text-slate-900 mt-1">Order Details</h3>
@@ -2354,10 +2522,10 @@ ${itemsListText}
               {(selectedOrderDetails.status === 'pending_approval' || selectedOrderDetails.status === 'pending') && isAdmin(profile) && (
                 <button
                   onClick={() => handleApproveOrder(selectedOrderDetails)}
-                  className="flex-1 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer active:scale-95"
+                  className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer active:scale-95"
                 >
                   <Check className="w-3.5 h-3.5" />
-                  <span>Approve & Dispatch</span>
+                  <span>Approve (Complete)</span>
                 </button>
               )}
 

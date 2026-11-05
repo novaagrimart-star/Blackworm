@@ -340,6 +340,9 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
         });
         list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
         setUsers(list);
+        try {
+          localStorage.setItem('blackworm_cached_users', JSON.stringify(list));
+        } catch {}
 
         // Auto-select first officer if current selection is empty or is an owner
         if (list.length > 0) {
@@ -469,6 +472,16 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       setLoading(false);
     }, (err) => {
       console.warn('Travel sheet snapshot notice:', err);
+      // Offline fallback: load cached sheet from localStorage
+      try {
+        const cached = localStorage.getItem(cacheKey);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (parsed && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
+            setSheet(parsed);
+          }
+        }
+      } catch {}
       setLoading(false);
     });
 
@@ -789,7 +802,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
           )}
 
           {/* Unified Month / Date Box with Calendar Icon & Arrows */}
-          <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-300 px-2 py-1 rounded-lg">
+          <div className="flex items-center gap-1 bg-slate-50 border border-slate-300 px-2 py-1 rounded-lg">
             <Calendar className="w-3.5 h-3.5 text-red-600 shrink-0" />
             <button
               type="button"
@@ -799,7 +812,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             >
               <ChevronLeft className="w-3.5 h-3.5 stroke-[2.5]" />
             </button>
-            <span className="text-xs font-black text-slate-900 px-1 whitespace-nowrap">
+            <span className="text-[11px] sm:text-xs font-black text-slate-900 px-0.5 whitespace-nowrap">
               {selectedMonthName} {selectedYearNumber}
             </span>
             <button
@@ -811,31 +824,31 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
               <ChevronRight className="w-3.5 h-3.5 stroke-[2.5]" />
             </button>
           </div>
-        </div>
 
-        {/* Action Buttons: Save & PDF */}
-        <div className="flex items-center gap-2 shrink-0 ml-auto">
-          <button 
-            type="button"
-            onClick={handleSave}
-            disabled={saving}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white px-3.5 py-1.5 rounded-xl text-xs font-black transition flex items-center gap-1.5 shadow-sm active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
-            title="Save Travelling Sheet"
-          >
-            {saving ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-            <span>{saving ? 'सेव्ह होत आहे...' : 'सेव्ह करा (Save)'}</span>
-          </button>
+          {/* Action Buttons: Compact Save & PDF to fit on mobile alongside date selector */}
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button 
+              type="button"
+              onClick={handleSave}
+              disabled={saving}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white px-2.5 py-1 rounded-lg text-xs font-black transition flex items-center gap-1 shadow-xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+              title="Save Travelling Sheet"
+            >
+              {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
+              <span>{saving ? '...' : 'Save'}</span>
+            </button>
 
-          <button
-            type="button"
-            onClick={handleDownloadPdf}
-            disabled={isGeneratingPdf}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded-xl text-xs font-black transition flex items-center gap-1.5 shadow-sm active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
-            title="Save PDF"
-          >
-            {isGeneratingPdf ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
-            <span>PDF</span>
-          </button>
+            <button
+              type="button"
+              onClick={handleDownloadPdf}
+              disabled={isGeneratingPdf}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-1 rounded-lg text-xs font-black transition flex items-center gap-1 shadow-xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+              title="Save PDF"
+            >
+              {isGeneratingPdf ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+              <span>PDF</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -843,7 +856,11 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
         <div className="fixed bottom-6 right-6 z-50 bg-emerald-700 text-white p-3.5 px-5 rounded-2xl shadow-2xl flex items-center justify-between gap-3 text-xs font-black animate-in fade-in slide-in-from-bottom-5 no-print border border-emerald-500">
           <div className="flex items-center gap-2">
             <CheckCircle2 className="w-5 h-5 text-white shrink-0" />
-            <span>ट्रॅव्हलिंग शीट यशस्वीरित्या सेव्ह झाली आहे!</span>
+            <span>
+              {typeof navigator !== 'undefined' && !navigator.onLine 
+                ? 'ट्रॅव्हलिंग शीट स्थानिक सुरक्षित सेव्ह झाली! (इंटरनेट आल्यावर सिंक होईल)' 
+                : 'ट्रॅव्हलिंग शीट यशस्वीरित्या सेव्ह झाली आहे!'}
+            </span>
           </div>
           <button onClick={() => setShowSuccess(false)} className="text-white/80 hover:text-white p-1 cursor-pointer">
             <X className="w-4 h-4" />
@@ -1148,19 +1165,6 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
               </div>
             </div>
           </div>
-        </div>
-
-        {/* Bottom Save Action Bar */}
-        <div className="p-3 bg-slate-50 border-t border-slate-200 flex items-center justify-end gap-3 no-print">
-          <button 
-            type="button"
-            onClick={handleSave}
-            disabled={saving}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-2.5 rounded-xl text-xs font-black transition flex items-center gap-2 shadow-md active:scale-95 disabled:opacity-50 cursor-pointer"
-          >
-            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-            <span>{saving ? 'सेव्ह होत आहे...' : 'ट्रॅव्हलिंग शीट सेव्ह करा (Save Travelling Sheet)'}</span>
-          </button>
         </div>
       </div>
     </div>

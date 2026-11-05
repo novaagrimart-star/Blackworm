@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { collection, getDocs, doc, setDoc, onSnapshot } from 'firebase/firestore';
 import { db } from '../firebase';
 import { UserProfile } from '../lib/auth';
-import { User, Lock, ArrowRight, AlertCircle, ShieldCheck, Eye, EyeOff, Loader2 } from 'lucide-react';
+import { User, Lock, ArrowRight, AlertCircle, ShieldCheck, Eye, EyeOff, Loader2, Key } from 'lucide-react';
 
 import { useBranding } from '../lib/branding';
 
@@ -230,22 +230,47 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
             </div>
           </div>
 
+          {/* Glassmorphic Liquid Login Button */}
           <button
             type="submit"
             disabled={loading}
-            className="w-full py-3.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs sm:text-sm font-black shadow-lg shadow-rose-200 transition flex items-center justify-center gap-2 active:scale-95 disabled:opacity-70 disabled:cursor-not-allowed mt-2 cursor-pointer"
+            className="group relative w-full py-3.5 px-6 rounded-2xl text-xs sm:text-sm font-black transition-all duration-500 overflow-hidden shadow-lg border border-slate-200/80 active:scale-95 disabled:opacity-75 disabled:cursor-not-allowed mt-2 cursor-pointer bg-white/70 backdrop-blur-md"
+            style={{
+              boxShadow: '0 8px 30px rgba(225, 29, 72, 0.15)',
+            }}
           >
-            {loading ? (
-              <>
-                <Loader2 className="w-4 h-4 animate-spin" />
-                <span>Signing In...</span>
-              </>
-            ) : (
-              <>
-                <span>Sign In</span>
-                <ArrowRight className="w-4 h-4" />
-              </>
-            )}
+            {/* Liquid Background Layer that fills up smoothly like liquid on hover / active / loading */}
+            <div 
+              className={`absolute inset-0 bg-gradient-to-r from-rose-600 via-rose-500 to-indigo-600 transition-all duration-700 ease-out pointer-events-none ${
+                loading 
+                  ? 'translate-y-0 opacity-100' 
+                  : 'translate-y-[102%] group-hover:translate-y-0 opacity-90 group-hover:opacity-100'
+              }`}
+            >
+              {/* Liquid Wave Ripple on the surface */}
+              <div className="absolute -top-3 left-0 right-0 h-4 bg-gradient-to-r from-rose-400 via-pink-300 to-indigo-400 opacity-75 blur-[2px] animate-pulse" />
+              {/* Shimmer light bar across liquid */}
+              <div className="absolute inset-0 bg-gradient-to-b from-white/20 via-transparent to-black/10" />
+            </div>
+
+            {/* Glowing liquid ambient blur */}
+            <div className="absolute inset-0 rounded-2xl opacity-0 group-hover:opacity-100 transition-opacity duration-500 bg-rose-500/20 blur-xl pointer-events-none" />
+
+            {/* Button Label and Icons with smooth color transition */}
+            <div className="relative z-10 flex items-center justify-center gap-2.5 transition-colors duration-500 text-slate-800 group-hover:text-white">
+              {loading ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin text-white" />
+                  <span className="tracking-wide text-white font-black">Logging In...</span>
+                </>
+              ) : (
+                <>
+                  <Key className="w-4 h-4 text-rose-600 group-hover:text-white transition-colors duration-300 transform group-hover:rotate-12" />
+                  <span className="tracking-wider uppercase font-black text-[13px] sm:text-sm">Login</span>
+                  <ArrowRight className="w-4 h-4 text-slate-400 group-hover:text-white group-hover:translate-x-1 transition-all duration-300" />
+                </>
+              )}
+            </div>
           </button>
         </form>
 

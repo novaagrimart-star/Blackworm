@@ -43,10 +43,7 @@ import {
   Settings,
   ShieldCheck,
   ArrowLeft,
-  Clock,
-  ExternalLink,
-  Navigation,
-  RefreshCw
+  Clock
 } from 'lucide-react';
 
 export interface SystemModuleItem {
@@ -189,7 +186,13 @@ interface Props {
 
 export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUpdate }) => {
   const t = translations[lang];
-  const [users, setUsers] = useState<DetailedUserProfile[]>([]);
+  const [users, setUsers] = useState<DetailedUserProfile[]>(() => {
+    try {
+      const merged = mergeWithLocalData('users', []) as DetailedUserProfile[];
+      if (merged && merged.length > 0) return merged;
+    } catch {}
+    return [];
+  });
   const [viewMode, setViewMode] = useState<'list' | 'form'>('list');
   const [activeFilter, setActiveFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -239,19 +242,6 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const [pendingRequests, setPendingRequests] = useState<any[]>([]);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
-  // Tracked location states for Emp 002 PAN card row (Emp006 & Emp005)
-  const [emp006LocationData, setEmp006LocationData] = useState<any>(null);
-  const [emp005LocationData, setEmp005LocationData] = useState<any>(null);
-  const [selectedTrackedEmp, setSelectedTrackedEmp] = useState<'emp006' | 'emp005'>('emp006');
-  const [showLocationMapModal, setShowLocationMapModal] = useState(false);
-
-  // On-demand location check states (Free-tier safe request/response protocol)
-  const [isCheckingLocation, setIsCheckingLocation] = useState(false);
-  const [locationCheckStatus, setLocationCheckStatus] = useState<'idle' | 'requesting' | 'completed' | 'timeout' | 'gps_error'>('idle');
-  const [locationCheckMessage, setLocationCheckMessage] = useState<string>('');
-  const locationTimeoutRef = useRef<any>(null);
-  const locationUnsubRef = useRef<(() => void) | null>(null);
-
   // UI state & refs
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [showPhotoModal, setShowPhotoModal] = useState(false);
@@ -259,6 +249,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
   const printableUserFormRef = useRef<HTMLDivElement>(null);
+  const hasAutoOpenedRef = useRef(false);
 
   // Mobile Hardware / Navigation Back Button Integration
   useEffect(() => {
@@ -311,9 +302,10 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
     return () => unsubscribe();
   }, [profile]);
 
-  // Auto-open own form for non-admin users so they immediately see only their own form
+  // Auto-open own form for non-admin users so they immediately see only their own form on initial mount
   useEffect(() => {
-    if (!isAdmin(profile) && viewMode === 'list') {
+    if (!isAdmin(profile) && viewMode === 'list' && !hasAutoOpenedRef.current) {
+      hasAutoOpenedRef.current = true;
       const myUser = users.find((u) => {
         const uUid = (u.uid || '').trim().toLowerCase();
         const profUid = (profile.uid || '').trim().toLowerCase();
@@ -349,226 +341,6 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
     });
     return () => unsubBranding();
   }, []);
-
-  // Live listener for Emp006 & Emp005 real-time background location updates
-  useEffect(() => {
-    const unsub006 = onSnapshot(doc(db, 'user_locations', 'emp006'), (snap) => {
-      if (snap.exists()) {
-        setEmp006LocationData(snap.data());
-      }
-    }, (err) => {
-      console.warn('Emp006 location listener notice:', err);
-    });
-
-    const unsub005 = onSnapshot(doc(db, 'user_locations', 'emp005'), (snap) => {
-      if (snap.exists()) {
-        setEmp005LocationData(snap.data());
-      }
-    }, (err) => {
-      console.warn('Emp005 location listener notice:', err);
-    });
-
-    return () => {
-      unsub006();
-      unsub005();
-    };
-  }, []);
-
-  // Cleanup location checking timeouts and listeners on unmount
-  useEffect(() => {
-    return () => {
-      if (locationTimeoutRef.current) clearTimeout(locationTimeoutRef.current);
-      if (locationUnsubRef.current) locationUnsubRef.current();
-    };
-  }, []);
-
-  // On-demand location fetch request handler (Smart Sync Protocol)
-  const handleRequestLiveLocation = async (targetEmpKey?: 'emp006' | 'emp005') => {
-    const targetKey = targetEmpKey || selectedTrackedEmp;
-    if (isCheckingLocation) return;
-
-    if (locationTimeoutRef.current) clearTimeout(locationTimeoutRef.current);
-    if (locationUnsubRef.current) {
-      locationUnsubRef.current();
-      locationUnsubRef.current = null;
-    }
-
-    setIsCheckingLocation(true);
-    setLocationCheckStatus('requesting');
-    const targetLabel = targetKey === 'emp006' ? 'Emp 006' : 'Emp 005';
-    setLocationCheckMessage(`${targetLabel} च्या मोबाईलशी संपर्क साधत आहे... GPS मिळवत आहे (कृपया 15-20 सेकंद थांबा)`);
-
-    try {
-      const reqDocRef = doc(db, 'location_requests', targetKey);
-      await setDoc(reqDocRef, {
-        status: 'pending',
-        targetDocId: targetKey,
-        targetUserCode: targetKey === 'emp006' ? 'EMP-06' : 'EMP-05',
-        targetName: targetKey === 'emp006' ? 'Emp 006' : 'Emp 005',
-        requestedAt: Date.now(),
-        requestedByUid: profile.uid,
-        requestedByName: profile.fullName || 'Admin',
-      }, { merge: true });
-
-      const unsub = onSnapshot(reqDocRef, (snap) => {
-        if (!snap.exists()) return;
-        const data = snap.data();
-        if (data.status === 'completed') {
-          if (locationTimeoutRef.current) clearTimeout(locationTimeoutRef.current);
-          setIsCheckingLocation(false);
-          setLocationCheckStatus('completed');
-          setLocationCheckMessage('✓ लाईव्ह लोकेशन यशस्वीरित्या प्राप्त झाले आणि नकाशा अपडेट झाला!');
-          if (locationUnsubRef.current) {
-            locationUnsubRef.current();
-            locationUnsubRef.current = null;
-          }
-        } else if (data.status === 'gps_error') {
-          if (locationTimeoutRef.current) clearTimeout(locationTimeoutRef.current);
-          setIsCheckingLocation(false);
-          setLocationCheckStatus('gps_error');
-          setLocationCheckMessage('⚠️ कर्मचाऱ्याच्या मोबाईलवर GPS बंद आहे किंवा लोकेशन परवानगी नाही.');
-          if (locationUnsubRef.current) {
-            locationUnsubRef.current();
-            locationUnsubRef.current = null;
-          }
-        }
-      });
-      locationUnsubRef.current = unsub;
-
-      // 25 second timeout safeguard for offline or app-closed mobile
-      locationTimeoutRef.current = setTimeout(async () => {
-        if (locationUnsubRef.current) {
-          locationUnsubRef.current();
-          locationUnsubRef.current = null;
-        }
-        setIsCheckingLocation(false);
-        setLocationCheckStatus('timeout');
-        setLocationCheckMessage('⚠️ कर्मचारी सध्या ऑफलाइन आहे किंवा मोबाईलवर ॲप बंद आहे (Employee offline / App closed).');
-        try {
-          await setDoc(reqDocRef, { status: 'timeout', timedOutAt: new Date().toISOString() }, { merge: true });
-        } catch {}
-      }, 25000);
-    } catch (err: any) {
-      console.warn('Location request error:', err);
-      setIsCheckingLocation(false);
-      setLocationCheckStatus('timeout');
-      setLocationCheckMessage('लोकेशन रिक्वेस्ट पाठवताना त्रुटी आली.');
-    }
-  };
-
-  // Strictly check if the currently logged-in user is Emp 002
-  const isEmp002LoggedIn = useMemo(() => {
-    if (!profile) return false;
-    const profCodeDigits = String(profile.userCode || '').replace(/\D/g, '');
-    const profLoginDigits = String(profile.loginId || '').replace(/\D/g, '');
-    return (
-      profCodeDigits === '2' || profCodeDigits === '02' || profCodeDigits === '002' ||
-      profLoginDigits === '2' || profLoginDigits === '02' || profLoginDigits === '002' ||
-      /emp[-_\s]*0*2\b/i.test(profile.userCode || '') ||
-      /emp[-_\s]*0*2\b/i.test(profile.loginId || '')
-    );
-  }, [profile]);
-
-  // Show location option ONLY when Emp 002 is logged in and viewing Emp 002's form
-  const showEmpLocationOption = useMemo(() => {
-    if (!isEmp002LoggedIn) return false;
-
-    const codeDigits = String(userCode || '').replace(/\D/g, '');
-    const loginDigits = String(loginId || '').replace(/\D/g, '');
-    const isForm002 = (
-      codeDigits === '2' || codeDigits === '02' || codeDigits === '002' ||
-      loginDigits === '2' || loginDigits === '02' || loginDigits === '002' ||
-      /emp[-_\s]*0*2\b/i.test(userCode || '') ||
-      /emp[-_\s]*0*2\b/i.test(loginId || '')
-    );
-    return isForm002;
-  }, [isEmp002LoggedIn, userCode, loginId]);
-
-  // Locate Emp 006 from users list
-  const emp006User = useMemo(() => {
-    return users.find((u) => {
-      const codeDigits = String(u.userCode || '').replace(/\D/g, '');
-      const loginDigits = String(u.loginId || '').replace(/\D/g, '');
-      return (
-        codeDigits === '6' || codeDigits === '06' || codeDigits === '006' ||
-        loginDigits === '6' || loginDigits === '06' || loginDigits === '006' ||
-        /emp[-_\s]*0*6\b/i.test(u.userCode || '') ||
-        /emp[-_\s]*0*6\b/i.test(u.loginId || '')
-      );
-    });
-  }, [users]);
-
-  // Locate Emp 005 from users list
-  const emp005User = useMemo(() => {
-    return users.find((u) => {
-      const codeDigits = String(u.userCode || '').replace(/\D/g, '');
-      const loginDigits = String(u.loginId || '').replace(/\D/g, '');
-      return (
-        codeDigits === '5' || codeDigits === '05' || codeDigits === '005' ||
-        loginDigits === '5' || loginDigits === '05' || loginDigits === '005' ||
-        /emp[-_\s]*0*5\b/i.test(u.userCode || '') ||
-        /emp[-_\s]*0*5\b/i.test(u.loginId || '')
-      );
-    });
-  }, [users]);
-
-  // Resolve active tracked employee location information (Emp 006 or Emp 005)
-  const activeTrackedInfo = useMemo(() => {
-    const is006 = selectedTrackedEmp === 'emp006';
-    const rawLoc = is006 ? emp006LocationData : emp005LocationData;
-    const targetUser = is006 ? emp006User : emp005User;
-    const label = is006 ? 'Emp 006' : 'Emp 005';
-    const altLabel = is006 ? 'Emp 005' : 'Emp 006';
-    const officerName = targetUser?.fullName || (is006 ? 'Akash Sanjay Kadam' : 'Rushikesh Maruti Jadhav');
-
-    // Default base coordinates for designated centers if live GPS has not arrived yet
-    const defaultLat = is006 ? 17.0988 : 16.8286;
-    const defaultLng = is006 ? 74.4532 : 74.7431;
-    const defaultPlace = is006 ? 'Palus - Walwa, Sangli' : 'Bedag, Miraj - Kavathe Mahankal';
-
-    const loc = rawLoc || (targetUser as any)?.currentLocation;
-    const hasLiveGps = !!(loc && loc.latitude && loc.longitude);
-    const lat = hasLiveGps ? Number(loc.latitude) : defaultLat;
-    const lng = hasLiveGps ? Number(loc.longitude) : defaultLng;
-    const place = loc?.address || (targetUser?.center ? `${targetUser.center}, Sangli` : defaultPlace);
-
-    let timeText = '';
-    let isFresh = false;
-    if (loc?.updatedAt) {
-      try {
-        const updateTime = new Date(loc.updatedAt).getTime();
-        const diffMinutes = Math.floor((Date.now() - updateTime) / (1000 * 60));
-        if (diffMinutes <= 1) {
-          isFresh = true;
-          timeText = 'आत्ताच (Live)';
-        } else if (diffMinutes < 60) {
-          if (diffMinutes < 15) isFresh = true;
-          timeText = `${diffMinutes} मि. पूर्वी`;
-        } else {
-          timeText = new Date(loc.updatedAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
-        }
-      } catch {}
-    } else {
-      timeText = 'आजचे लोकेशन';
-    }
-
-    return {
-      key: selectedTrackedEmp,
-      label,
-      altLabel,
-      officerName,
-      hasLiveGps,
-      isFresh,
-      latitude: lat,
-      longitude: lng,
-      locationDisplay: place,
-      // Robust standard Google Maps URLs that guarantee red pin placement
-      mapUrl: `https://maps.google.com/?q=${lat},${lng}`,
-      embedUrl: `https://maps.google.com/maps?q=${lat},${lng}&hl=mr&z=15&output=embed`,
-      directionsUrl: `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`,
-      timeDisplay: timeText
-    };
-  }, [selectedTrackedEmp, emp006LocationData, emp005LocationData, emp006User, emp005User]);
 
   // Pending profile update requests listener
   useEffect(() => {
@@ -789,6 +561,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
     setIfscCode(u.ifscCode || '');
     setHasSecurityCheque(!!u.hasSecurityCheque || !!u.securityChequeNumber);
     setSecurityChequeNumber(u.securityChequeNumber || '');
+
     setShowAccessList(false);
     setIsEditing(editMode);
     setViewMode('form');
@@ -1230,7 +1003,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
 
       {/* ======================= TOP BAR (LIST VIEW - ADMIN ONLY) ======================= */}
       {viewMode === 'list' && isAdmin(profile) && (
-        <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-md flex items-center gap-3 no-print">
+        <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-md flex items-center gap-2.5 sm:gap-3 no-print">
           <button
             onClick={() => resetForm()}
             className="flex items-center justify-center bg-red-600 hover:bg-red-700 text-white p-2.5 rounded-xl transition shadow-lg shrink-0 active:scale-95 cursor-pointer"
@@ -1312,34 +1085,36 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
 
           {/* User Cards Grid: Strictly Code and Full Name in Single Line */}
           <div className="space-y-2.5">
-            {filteredUsers.map((u) => (
-              <div
-                key={u.uid}
-                onClick={() => loadUserToForm(u, true)}
-                className="bg-white rounded-2xl border border-slate-200 hover:border-red-400 hover:shadow-md p-3.5 sm:p-4 transition-all cursor-pointer flex items-center justify-between gap-3 group relative overflow-hidden"
-              >
-                <div className="flex items-center gap-4 min-w-0 flex-1">
-                  <span className="text-xs font-black text-red-600 bg-red-50 border border-red-200 px-3 py-1.5 rounded-lg uppercase tracking-wider shrink-0 font-mono shadow-sm">
-                    {u.userCode || 'USER'}
-                  </span>
-                  
-                  <div className="flex-1 min-w-0">
-                    <h3 className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 transition-colors tracking-wide truncate whitespace-nowrap leading-snug">
-                      {toTitleCase(u.fullName) || 'Unnamed User'}
-                    </h3>
-                    <span className="text-[9.5px] font-bold text-slate-600 block mt-0.5 truncate whitespace-nowrap">
-                      {toTitleCase(u.designation || u.role)} {u.center && `• ${toTitleCase(u.center)}`}
+            {filteredUsers.map((u) => {
+              return (
+                <div
+                  key={u.uid}
+                  onClick={() => loadUserToForm(u, true)}
+                  className="bg-white rounded-2xl border border-slate-200 hover:border-red-400 hover:shadow-md p-3.5 sm:p-4 transition-all cursor-pointer flex items-center justify-between gap-3 group relative overflow-hidden"
+                >
+                  <div className="flex items-center gap-4 min-w-0 flex-1">
+                    <span className="text-xs font-black text-red-600 bg-red-50 border border-red-200 px-3 py-1.5 rounded-lg uppercase tracking-wider shrink-0 font-mono shadow-sm">
+                      {u.userCode || 'USER'}
+                    </span>
+                    
+                    <div className="flex-1 min-w-0">
+                      <h3 className="text-sm sm:text-base font-black text-slate-900 group-hover:text-red-600 transition-colors tracking-wide truncate whitespace-nowrap leading-snug">
+                        {toTitleCase(u.fullName) || 'Unnamed User'}
+                      </h3>
+                      <span className="text-[9.5px] font-bold text-slate-600 block mt-0.5 truncate whitespace-nowrap">
+                        {toTitleCase(u.designation || u.role)} {u.center && `• ${toTitleCase(u.center)}`}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0 no-print">
+                    <span className="text-xs font-bold text-slate-400 group-hover:text-red-600 transition">
+                      👉
                     </span>
                   </div>
                 </div>
-
-                <div className="flex items-center gap-2 shrink-0 no-print">
-                  <span className="text-xs font-bold text-slate-400 group-hover:text-red-600 transition">
-                    👉
-                  </span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
 
             {filteredUsers.length === 0 && (
               <div className="col-span-full bg-white rounded-2xl border border-dashed border-slate-300 p-8 text-center text-slate-500">
@@ -1361,10 +1136,11 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
                 <button
                   type="button"
                   onClick={() => {
-                    if (window.history.state?.userFormOpen) {
-                      window.history.back();
-                    } else {
-                      setViewMode('list');
+                    setViewMode('list');
+                    if (typeof window !== 'undefined' && window.history.state?.userFormOpen) {
+                      try {
+                        window.history.back();
+                      } catch {}
                     }
                   }}
                   className="p-1.5 px-2 rounded-lg bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 flex items-center gap-1 text-[11px] sm:text-xs font-bold transition shadow-xs active:scale-95 cursor-pointer shrink-0"
@@ -1804,89 +1580,15 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
                   {/* Row 10: PAN Card No */}
                   <div className="flex items-center p-0 min-h-[40px] py-0.5">
                     <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">PAN Card No -</span>
-                    <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3 justify-between gap-2 overflow-hidden">
+                    <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
                       <input
                         type="text"
                         disabled={!isEditing}
                         value={panNo}
                         onChange={(e) => setPanNo(e.target.value)}
                         placeholder="ABCDE1234F"
-                        className={`${showEmpLocationOption ? 'w-28 sm:w-36 shrink-0' : 'w-full'} bg-transparent font-black text-black focus:outline-none font-mono uppercase`}
+                        className="w-full bg-transparent font-black text-black focus:outline-none font-mono uppercase"
                       />
-
-                      {/* Location Display in Emp 002 PAN Card row space (Arrow toggles between Emp006 & Emp005) */}
-                      {showEmpLocationOption && (
-                        <div className="flex items-center gap-1.5 bg-amber-50/95 border border-amber-300 rounded px-1.5 py-0.5 text-[10px] text-amber-900 shadow-xs max-w-full overflow-hidden shrink-0">
-                          {/* Arrow switcher button between Emp 006 and Emp 005 without occupying extra space */}
-                          <button
-                            type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setSelectedTrackedEmp(prev => prev === 'emp006' ? 'emp005' : 'emp006');
-                            }}
-                            className="flex items-center gap-1 bg-white hover:bg-amber-100 border border-amber-400 text-slate-900 font-black px-1.5 py-0.5 rounded shadow-2xs transition active:scale-95 cursor-pointer shrink-0 select-none"
-                            title={`क्लिक करा आणि ${activeTrackedInfo.altLabel} चे लोकेशन पहा`}
-                          >
-                            <span className="text-[10px] font-black">{activeTrackedInfo.label}</span>
-                            <ChevronDown className="w-3 h-3 text-amber-700 shrink-0" />
-                          </button>
-
-                          {/* Quick On-Demand Location Check Button (Sends silent request) */}
-                          <button
-                            type="button"
-                            disabled={isCheckingLocation}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleRequestLiveLocation(selectedTrackedEmp);
-                            }}
-                            className={`flex items-center gap-1 px-1.5 py-0.5 rounded font-black text-[9px] transition cursor-pointer shrink-0 ${
-                              isCheckingLocation
-                                ? 'bg-amber-200 text-amber-800 animate-pulse'
-                                : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-2xs active:scale-95'
-                            }`}
-                            title="क्लिक करा: कर्मचाऱ्याच्या फोनवरून आत्ताच लाईव्ह GPS लोकेशन मिळवा"
-                          >
-                            <RefreshCw className={`w-2.5 h-2.5 ${isCheckingLocation ? 'animate-spin' : ''}`} />
-                            <span className="hidden sm:inline">{isCheckingLocation ? 'तपासत...' : 'तपासा'}</span>
-                          </button>
-
-                          {/* Clickable Location info - clicking opens live map modal with exact pin! */}
-                          <button
-                            type="button"
-                            onClick={() => setShowLocationMapModal(true)}
-                            className="flex items-center gap-1.5 hover:opacity-85 transition cursor-pointer select-none text-left"
-                            title="क्लिक करा: नकाशावर करंट लोकेशन पहा (Open Map)"
-                          >
-                            <span className="relative flex h-2 w-2 shrink-0">
-                              <span className={`animate-ping absolute inline-flex h-full w-full rounded-full ${activeTrackedInfo.isFresh ? 'bg-emerald-400' : 'bg-amber-400'} opacity-75`}></span>
-                              <span className={`relative inline-flex rounded-full h-2 w-2 ${activeTrackedInfo.isFresh ? 'bg-emerald-600' : 'bg-amber-600'}`}></span>
-                            </span>
-
-                            <MapPin className="w-3.5 h-3.5 text-red-600 shrink-0" />
-
-                            <span
-                              className="font-black text-black underline decoration-red-400 decoration-dotted underline-offset-2 truncate max-w-[110px] sm:max-w-[180px]"
-                              title={`${activeTrackedInfo.label}: ${activeTrackedInfo.locationDisplay} (क्लिक करून मॅप पहा)`}
-                            >
-                              {activeTrackedInfo.locationDisplay}
-                            </span>
-
-                            {activeTrackedInfo.timeDisplay && (
-                              <span className="text-[9px] text-slate-500 font-mono shrink-0 hidden sm:inline">
-                                ({activeTrackedInfo.timeDisplay})
-                              </span>
-                            )}
-
-                            <span
-                              className="shrink-0 inline-flex items-center gap-0.5 text-[9px] font-black bg-blue-600 hover:bg-blue-700 text-white px-1.5 py-0.5 rounded shadow-xs transition"
-                              title="Google Maps वर करंट लोकेशन पहा"
-                            >
-                              <span>Map</span>
-                              <ExternalLink className="w-2.5 h-2.5" />
-                            </span>
-                          </button>
-                        </div>
-                      )}
                     </div>
                   </div>
                 </div>
@@ -2271,190 +1973,6 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
                 className="w-full py-2.5 rounded-xl border border-slate-200 text-xs font-bold text-slate-600 hover:bg-slate-50 transition"
               >
                 Cancel
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Live Location & Interactive Map Modal for Emp 006 / Emp 005 */}
-      {showLocationMapModal && (
-        <div className="fixed inset-0 z-50 bg-black/65 backdrop-blur-xs flex items-center justify-center p-3 animate-fade-in">
-          <div className="bg-white rounded-2xl shadow-2xl border-2 border-slate-900 max-w-lg w-full overflow-hidden flex flex-col max-h-[92vh]">
-            {/* Modal Header */}
-            <div className="bg-slate-900 text-white px-4 py-3 flex items-center justify-between">
-              <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-xl bg-red-600 flex items-center justify-center text-white shadow-xs shrink-0">
-                  <MapPin className="w-4 h-4" />
-                </div>
-                <div>
-                  <div className="flex items-center gap-2">
-                    <h3 className="font-black text-sm uppercase tracking-wide">
-                      {activeTrackedInfo.label} करंट लोकेशन
-                    </h3>
-                    <span className="text-[10px] bg-emerald-500 text-white font-black px-1.5 py-0.2 rounded-full animate-pulse">
-                      LIVE
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-slate-300 font-bold truncate max-w-[280px]">
-                    {activeTrackedInfo.officerName}
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowLocationMapModal(false)}
-                className="w-8 h-8 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center transition cursor-pointer"
-                title="बंद करा (Close)"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Modal Body */}
-            <div className="p-4 space-y-3 overflow-y-auto">
-              {/* Employee Switcher Buttons Inside Modal */}
-              <div className="flex items-center justify-between bg-slate-100 p-1.5 rounded-xl border border-slate-200">
-                <span className="text-xs font-black text-slate-700 px-2">कर्मचारी निवडा:</span>
-                <div className="flex gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => setSelectedTrackedEmp('emp006')}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-black transition cursor-pointer ${
-                      selectedTrackedEmp === 'emp006'
-                        ? 'bg-red-600 text-white shadow-xs'
-                        : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-300'
-                    }`}
-                  >
-                    Emp 006 (आकाश कदम)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSelectedTrackedEmp('emp005')}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-black transition cursor-pointer ${
-                      selectedTrackedEmp === 'emp005'
-                        ? 'bg-red-600 text-white shadow-xs'
-                        : 'bg-white text-slate-700 hover:bg-slate-200 border border-slate-300'
-                    }`}
-                  >
-                    Emp 005 (ऋषिकेश जाधव)
-                  </button>
-                </div>
-              </div>
-
-              {/* On-Demand Real-Time GPS Fetch Trigger (Free Tier Safe Protocol) */}
-              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5">
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                    <span className="text-xs font-black text-slate-800">
-                      ऑन-डिमांड लाईव्ह GPS चेकिंग
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    disabled={isCheckingLocation}
-                    onClick={() => handleRequestLiveLocation(selectedTrackedEmp)}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-black shadow-xs transition active:scale-95 disabled:opacity-60 cursor-pointer"
-                    title="कर्मचाऱ्याच्या मोबाईलवरून थेट लाईव्ह GPS मागवा"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isCheckingLocation ? 'animate-spin' : ''}`} />
-                    <span>{isCheckingLocation ? 'तपासत आहे...' : 'लाईव्ह लोकेशन तपासा'}</span>
-                  </button>
-                </div>
-
-                {/* Status alert / Progress */}
-                {isCheckingLocation && (
-                  <div className="flex items-center gap-2 p-2 bg-blue-50 border border-blue-200 rounded-lg text-[11px] text-blue-900 font-bold animate-pulse">
-                    <Loader2 className="w-4 h-4 animate-spin text-blue-600 shrink-0" />
-                    <span>{locationCheckMessage}</span>
-                  </div>
-                )}
-
-                {!isCheckingLocation && locationCheckStatus === 'completed' && (
-                  <div className="flex items-center gap-2 p-2 bg-emerald-50 border border-emerald-200 rounded-lg text-[11px] text-emerald-900 font-bold">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                    <span>{locationCheckMessage}</span>
-                  </div>
-                )}
-
-                {!isCheckingLocation && (locationCheckStatus === 'timeout' || locationCheckStatus === 'gps_error') && (
-                  <div className="flex items-center gap-2 p-2 bg-rose-50 border border-rose-200 rounded-lg text-[11px] text-rose-900 font-bold">
-                    <span className="text-sm">⚠️</span>
-                    <span>{locationCheckMessage}</span>
-                  </div>
-                )}
-              </div>
-
-              {/* Location Information Card */}
-              <div className="bg-amber-50 border border-amber-300 rounded-xl p-3 space-y-1.5 shadow-2xs">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-1.5 text-xs text-amber-950 font-black">
-                    <MapPin className="w-4 h-4 text-red-600 shrink-0" />
-                    <span>{activeTrackedInfo.locationDisplay}</span>
-                  </div>
-                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${
-                    activeTrackedInfo.isFresh 
-                      ? 'text-emerald-700 bg-emerald-100 border-emerald-300' 
-                      : 'text-amber-800 bg-amber-100 border-amber-300'
-                  }`}>
-                    {activeTrackedInfo.isFresh ? 'GPS Live' : 'GPS Active'}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between text-[11px] text-slate-600 font-mono">
-                  <span>अक्षांश-रेखांश: {activeTrackedInfo.latitude.toFixed(6)}, {activeTrackedInfo.longitude.toFixed(6)}</span>
-                  <span className="text-[10px] text-slate-500 font-sans font-medium">{activeTrackedInfo.timeDisplay}</span>
-                </div>
-              </div>
-
-              {/* Embedded Google Map with Red Pin on Exact Coordinates */}
-              <div className="relative rounded-xl overflow-hidden border-2 border-slate-800 bg-slate-100 h-64 shadow-inner">
-                <iframe
-                  title="Google Map Live Location"
-                  src={activeTrackedInfo.embedUrl}
-                  className="w-full h-full border-0"
-                  loading="lazy"
-                  referrerPolicy="no-referrer-when-downgrade"
-                />
-              </div>
-
-              {/* Direct Action Buttons */}
-              <div className="grid grid-cols-2 gap-2 pt-1">
-                <a
-                  href={activeTrackedInfo.mapUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center justify-center gap-1.5 py-2.5 px-3 bg-blue-600 hover:bg-blue-700 text-white font-black text-xs rounded-xl shadow-xs transition active:scale-95 text-center cursor-pointer"
-                >
-                  <MapPin className="w-4 h-4" />
-                  <span>Google Maps ॲप</span>
-                  <ExternalLink className="w-3.5 h-3.5" />
-                </a>
-
-                <a
-                  href={activeTrackedInfo.directionsUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center justify-center gap-1.5 py-2.5 px-3 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs rounded-xl shadow-xs transition active:scale-95 text-center cursor-pointer"
-                >
-                  <Navigation className="w-4 h-4" />
-                  <span>दिशामार्ग (Route)</span>
-                  <ExternalLink className="w-3.5 h-3.5" />
-                </a>
-              </div>
-            </div>
-
-            {/* Modal Footer */}
-            <div className="bg-slate-50 px-4 py-2.5 border-t border-slate-200 flex justify-between items-center">
-              <span className="text-[10px] text-slate-500 font-medium">
-                * करंट लोकेशन अचूक पाहण्यासाठी Google Maps ॲप बटण दाबा
-              </span>
-              <button
-                type="button"
-                onClick={() => setShowLocationMapModal(false)}
-                className="px-4 py-1.5 bg-slate-900 hover:bg-black text-white rounded-lg text-xs font-bold transition cursor-pointer"
-              >
-                बंद करा (Close)
               </button>
             </div>
           </div>

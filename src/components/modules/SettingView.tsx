@@ -139,6 +139,12 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
   const handleClearCacheAndSync = async () => {
     setIsClearingCache(true);
     try {
+      // 1. Flush any pending offline sync items before clearing cache
+      try {
+        await startBackgroundSync();
+      } catch (_) {}
+
+      // 2. Clear browser cache storage and service workers
       if ('caches' in window) {
         const cacheNames = await caches.keys();
         await Promise.all(cacheNames.map((name) => caches.delete(name)));
@@ -149,12 +155,15 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
           await reg.unregister();
         }
       }
-      // Clear localStorage but keep authentication
-      const profile = localStorage.getItem('blackworm_user_profile');
+
+      // 3. Clear localStorage but preserve authenticated profile & company branding
+      const savedProfile = localStorage.getItem('blackworm_user_profile');
+      const savedBranding = localStorage.getItem('blackworm_branding');
       localStorage.clear();
-      if (profile) localStorage.setItem('blackworm_user_profile', profile);
+      if (savedProfile) localStorage.setItem('blackworm_user_profile', savedProfile);
+      if (savedBranding) localStorage.setItem('blackworm_branding', savedBranding);
       
-      // Force reload without cache
+      // 4. Force reload without stale cache to fetch fresh data from server
       window.location.href = window.location.origin + window.location.pathname + '?fresh=' + Date.now();
     } catch (e) {
       window.location.reload();
@@ -275,7 +284,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
           className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'cache' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
         >
           <RefreshCw className="w-3.5 h-3.5" />
-          <span>App Update & Cache</span>
+          <span>Refresh Now</span>
         </button>
         <button
           onClick={() => setActiveTab('backup')}
@@ -344,45 +353,29 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
           <div>
             <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
               <RefreshCw className="w-4 h-4 text-rose-600" />
-              <span>App Update & Cache</span>
+              <span>App Update & Data Sync</span>
             </h3>
+            <p className="text-[11px] text-slate-500 mt-1">
+              नवीन डेटा किंवा अपडेट्स त्वरित लोड करण्यासाठी खालील 'Refresh Now' बटण दाबा. सर्व डेटा तात्काळ सर्व्हरवरून रीफ्रेश केला जाईल.
+            </p>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
-              <div className="flex items-center justify-between">
-                <h4 className="font-bold text-slate-800">Pending Sync Records</h4>
-                <span className={cn(
-                  "px-2 py-0.5 rounded-full text-[10px] font-black",
-                  pendingSyncCount > 0 ? "bg-amber-100 text-amber-700 animate-pulse" : "bg-emerald-100 text-emerald-700"
-                )}>
-                  {pendingSyncCount} Records
-                </span>
+          <div className="p-5 bg-slate-50 border border-slate-200 rounded-xl space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <h4 className="font-bold text-slate-800 text-sm">Real-Time Data Refresh</h4>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  सर्व्हरवरून थेट डेटा अपडेट आणि ॲप स्टेट तात्काळ रिफ्रेश करा.
+                </p>
               </div>
-              <p className="text-[10px] text-slate-500 leading-tight">
-                येथे अशा नोंदी आहेत ज्या अजूनही तुमच्या मोबाईलमध्ये आहेत आणि इंटरनेट नसल्यामुळे मुख्य सर्व्हरवर अपलोड झाल्या नाहीत.
-              </p>
-              <button
-                onClick={handleManualSync}
-                disabled={isSyncingNow || pendingSyncCount === 0}
-                className="w-full py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-slate-200 disabled:text-slate-400 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer"
-              >
-                {isSyncingNow ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-                <span>{isSyncingNow ? 'सिंक होत आहे...' : 'सर्व सिंक करा (Upload All)'}</span>
-              </button>
-            </div>
 
-            <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
-              <h4 className="font-bold text-slate-800">App Reload</h4>
-              <p className="text-[10px] text-slate-500 leading-tight">
-                ॲपमध्ये काही तांत्रिक अडचण आल्यास किंवा नवीन अपडेट पाहायचे असल्यास 'Refresh Now' बटण दाबा.
-              </p>
               <button
+                type="button"
                 onClick={handleClearCacheAndSync}
                 disabled={isClearingCache}
-                className="w-full py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer disabled:opacity-50"
+                className="px-6 py-2.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-2 shadow-sm active:scale-95 cursor-pointer shrink-0"
               >
-                <RefreshCw className={`w-3.5 h-3.5 ${isClearingCache ? 'animate-spin' : ''}`} />
+                <RefreshCw className={`w-4 h-4 ${isClearingCache ? 'animate-spin' : ''}`} />
                 <span>{isClearingCache ? 'Refreshing...' : 'Refresh Now'}</span>
               </button>
             </div>

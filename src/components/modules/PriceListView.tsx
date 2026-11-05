@@ -4,6 +4,7 @@ import { db } from '../../firebase';
 import { UserProfile } from '../../lib/auth';
 import { Language } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
+import { cn } from '../../lib/utils';
 import { 
   Upload, 
   Download, 
@@ -294,6 +295,275 @@ export const getInitialCachedProducts = (): DynamicPriceProduct[] => {
   return [];
 };
 
+// Helper: Clean numeric string to number (handles ₹, commas, /-, spaces)
+export const cleanNumber = (val: any, fallback = 0): number => {
+  if (val === null || val === undefined) return fallback;
+  if (typeof val === 'number') return isNaN(val) ? fallback : val;
+  const cleaned = String(val).replace(/[^0-9.-]/g, '');
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? fallback : num;
+};
+
+// Helper: Normalize string for fuzzy matching (case, spaces, symbols)
+export const normStr = (s: string): string => {
+  return (s || '')
+    .toLowerCase()
+    .replace(/®/g, '')
+    .replace(/blackworm|airawat/g, '')
+    .replace(/[^a-z0-9]/g, '');
+};
+
+// Robust Excel Parser: Supports multi-sheet, dynamic header rows (row 0, 1, 2, 3+), Marathi/English headers, and auto-grouping
+export function parseExcelToProducts(workbook: XLSX.WorkBook): { products: DynamicPriceProduct[]; validity?: string } {
+  const allParsed: DynamicPriceProduct[] = [];
+  let foundValidity = '';
+
+  for (const sheetName of workbook.SheetNames) {
+    const worksheet = workbook.Sheets[sheetName];
+    if (!worksheet) continue;
+
+    const rawRows = XLSX.utils.sheet_to_json(worksheet, { header: 1, defval: '' }) as any[][];
+    if (!rawRows || rawRows.length === 0) continue;
+
+    // Scan for validity date in top 10 rows
+    for (let r = 0; r < Math.min(10, rawRows.length); r++) {
+      const rowStr = (rawRows[r] || []).map(c => String(c || '')).join(' ');
+      const match = rowStr.match(/pricelist\s*w\.?e\.?f\.?[^,;\n]+/i) || rowStr.match(/w\.?e\.?f\.?\s*\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}[^\n]*/i);
+      if (match && !foundValidity) {
+        foundValidity = match[0].trim();
+      }
+    }
+
+    // Find the header row by scoring keywords
+    let headerRowIdx = -1;
+    let maxHeaderScore = 0;
+
+    for (let r = 0; r < Math.min(15, rawRows.length); r++) {
+      const row = rawRows[r] || [];
+      let score = 0;
+      for (const cell of row) {
+        const c = String(cell || '').trim().toLowerCase();
+        if (/(grade|product|item|particular|तपशील|प्रॉडक्ट|उत्पादन|नाव)/.test(c)) score += 3;
+        if (/(rate|price|दर|किंमत|basic rate|company price|dp)/.test(c)) score += 3;
+        if (/(pack|size|वजन|पॅकिंग)/.test(c)) score += 2;
+        if (/(mrp|एमआरपी)/.test(c)) score += 2;
+        if (/(gst|जीएसटी|hsn)/.test(c)) score += 1;
+        if (/(sr|s\.n|code|क्रमांक|क्र|अ\.क्र)/.test(c)) score += 1;
+        if (/(category|group|विभाग|गट)/.test(c)) score += 1;
+      }
+      if (score > maxHeaderScore && score >= 3) {
+        maxHeaderScore = score;
+        headerRowIdx = r;
+      }
+    }
+
+    if (headerRowIdx === -1) {
+      headerRowIdx = 0;
+    }
+
+    const headerRow = rawRows[headerRowIdx] || [];
+    const headers = headerRow.map((c: any) => String(c || '').trim().toLowerCase());
+
+    let gradeCol = -1;
+    let packCol = -1;
+    let rateCol = -1;
+    let mrpCol = -1;
+    let gstCol = -1;
+    let groupCol = -1;
+    let codeCol = -1;
+    let brandCol = -1;
+    let hsnCol = -1;
+
+    headers.forEach((h: string, idx: number) => {
+      if (gradeCol === -1 && /(product\s*name|product\s*grade|grade|product|item|particular|तपशील|प्रॉडक्ट|उत्पादन)/.test(h)) {
+        gradeCol = idx;
+      }
+      if (packCol === -1 && /(pack|size|वजन|पॅकिंग)/.test(h)) {
+        packCol = idx;
+      }
+      if (rateCol === -1 && /(basic\s*rate|company\s*price|price|rate|दर|किंमत|dp|billing)/.test(h)) {
+        rateCol = idx;
+      }
+      if (mrpCol === -1 && /(mrp|एमआरपी|max\s*retail)/.test(h)) {
+        mrpCol = idx;
+      }
+      if (gstCol === -1 && /(gst|जीएसटी)/.test(h)) {
+        gstCol = idx;
+      }
+      if (groupCol === -1 && /(category|group|cat|विभाग|गट|section)/.test(h)) {
+        groupCol = idx;
+      }
+      if (codeCol === -1 && /(sr|s\.n|code|क्रमांक|क्र|अ\.क्र|no\.)/.test(h)) {
+        codeCol = idx;
+      }
+      if (brandCol === -1 && /(brand|कंपनी|ब्रँड|make)/.test(h)) {
+        brandCol = idx;
+      }
+      if (hsnCol === -1 && /(hsn|एचएसएन)/.test(h)) {
+        hsnCol = idx;
+      }
+    });
+
+    if (gradeCol === -1) {
+      gradeCol = headers.length > 1 ? 1 : 0;
+    }
+    if (rateCol === -1) {
+      rateCol = headers.findIndex((_, idx) => idx !== gradeCol && idx !== packCol);
+    }
+
+    let currentSection = 'Group A - Water Soluble Fertilizers';
+    const productMap = new Map<string, DynamicPriceProduct>();
+
+    for (let r = headerRowIdx + 1; r < rawRows.length; r++) {
+      const row = rawRows[r] as any[];
+      if (!row || row.length === 0) continue;
+
+      // Section header detection
+      const nonBlankCells = (row || [])
+        .map((c: any, i: number) => ({ val: String(c || '').trim(), idx: i }))
+        .filter((c: { val: string; idx: number }) => c.val.length > 0);
+
+      if (nonBlankCells.length === 1 && nonBlankCells[0].val.length > 3) {
+        const text = nonBlankCells[0].val;
+        if (/group|specialty|micro|fertilizer|grade|वर्ग|गट|विभाग/i.test(text) && !/\d{2,}/.test(text)) {
+          currentSection = text;
+          continue;
+        }
+      }
+
+      const rawGrade = String(row[gradeCol] || '').trim();
+      if (!rawGrade || rawGrade.toLowerCase() === 'total' || rawGrade.toLowerCase() === 'एकूण') continue;
+
+      const groupName = (groupCol !== -1 && String(row[groupCol] || '').trim()) || currentSection;
+      const code = (codeCol !== -1 && String(row[codeCol] || '').trim()) || '';
+      const brandName = (brandCol !== -1 && String(row[brandCol] || '').trim()) || 'Airawat®';
+      const hsn = (hsnCol !== -1 && String(row[hsnCol] || '').trim()) || '31052000';
+      const gstRate = cleanNumber(gstCol !== -1 ? row[gstCol] : 5, 5);
+      const rawPacking = packCol !== -1 ? String(row[packCol] || '').trim() : '';
+      const packingSize = rawPacking || '25 Kg';
+      const rate = cleanNumber(rateCol !== -1 ? row[rateCol] : 0, 0);
+      const mrp = cleanNumber(mrpCol !== -1 ? row[mrpCol] : 0, Math.round(rate * 1.3));
+
+      const normGrade = normStr(rawGrade);
+      const key = `${groupName.toLowerCase()}___${normGrade}`;
+
+      if (!productMap.has(key)) {
+        const cleanId = `prod_${code.replace(/[^A-Za-z0-9]/g, '_')}_${rawGrade.replace(/[^A-Za-z0-9]/g, '_')}`;
+        productMap.set(key, {
+          id: cleanId,
+          groupName,
+          code: code || `${productMap.size + 1}.`,
+          brandName,
+          gradeName: rawGrade,
+          hsn,
+          gstRate,
+          packings: [{ packingSize, rate, mrp }],
+          orderIndex: productMap.size + 1,
+          isArchived: false,
+        });
+      } else {
+        const existing = productMap.get(key)!;
+        const pkIdx = existing.packings.findIndex(p => normStr(p.packingSize) === normStr(packingSize));
+        if (pkIdx >= 0) {
+          existing.packings[pkIdx] = { packingSize, rate, mrp };
+        } else {
+          existing.packings.push({ packingSize, rate, mrp });
+        }
+      }
+    }
+
+    productMap.forEach(prod => allParsed.push(prod));
+  }
+
+  return { products: allParsed, validity: foundValidity };
+}
+
+// Intelligent Merge Engine: Detects new products added and price changes, updates in-place and preserves unmentioned items
+export function mergeUploadedProducts(
+  uploadedProducts: DynamicPriceProduct[],
+  currentProducts: DynamicPriceProduct[]
+): {
+  merged: DynamicPriceProduct[];
+  newAddedCount: number;
+  priceUpdatedCount: number;
+} {
+  let newAddedCount = 0;
+  let priceUpdatedCount = 0;
+
+  const resultMap = new Map<string, DynamicPriceProduct>();
+  currentProducts.forEach(p => {
+    resultMap.set(p.id, { ...p, packings: [...(p.packings || []).map(pk => ({ ...pk }))] });
+  });
+
+  uploadedProducts.forEach((up, upIdx) => {
+    let matchedId: string | null = null;
+    const upNorm = normStr(up.gradeName);
+
+    for (const [id, cur] of resultMap.entries()) {
+      const curNorm = normStr(cur.gradeName);
+      if (curNorm === upNorm || (curNorm.length > 3 && upNorm.length > 3 && (curNorm.includes(upNorm) || upNorm.includes(curNorm)))) {
+        matchedId = id;
+        break;
+      }
+      if (cur.code && up.code && cur.code.trim().toLowerCase() === up.code.trim().toLowerCase() && cur.groupName === up.groupName) {
+        matchedId = id;
+        break;
+      }
+    }
+
+    if (matchedId) {
+      // Existing product found -> UPDATE prices and packings!
+      const existing = resultMap.get(matchedId)!;
+      let hasPriceChange = false;
+
+      (up.packings || []).forEach(upPk => {
+        const existingPkIdx = existing.packings.findIndex(p => normStr(p.packingSize) === normStr(upPk.packingSize));
+        if (existingPkIdx >= 0) {
+          const oldPk = existing.packings[existingPkIdx];
+          if (oldPk.rate !== upPk.rate || oldPk.mrp !== upPk.mrp) {
+            hasPriceChange = true;
+          }
+          existing.packings[existingPkIdx] = {
+            packingSize: upPk.packingSize,
+            rate: upPk.rate > 0 ? upPk.rate : oldPk.rate,
+            mrp: upPk.mrp > 0 ? upPk.mrp : oldPk.mrp,
+          };
+        } else {
+          // New packing size added to existing product!
+          existing.packings.push({ ...upPk });
+          hasPriceChange = true;
+        }
+      });
+
+      if (up.gstRate && up.gstRate !== existing.gstRate) {
+        existing.gstRate = up.gstRate;
+        hasPriceChange = true;
+      }
+      if (up.brandName && up.brandName !== 'Airawat®') {
+        existing.brandName = up.brandName;
+      }
+      if (up.hsn) existing.hsn = up.hsn;
+
+      if (hasPriceChange) {
+        priceUpdatedCount++;
+      }
+    } else {
+      // NEW PRODUCT ADDED!
+      newAddedCount++;
+      const newId = `prod_new_${Date.now()}_${upIdx + 1}`;
+      resultMap.set(newId, {
+        ...up,
+        id: newId,
+        orderIndex: resultMap.size + 1,
+        isArchived: false,
+      });
+    }
+  });
+
+  const merged = Array.from(resultMap.values());
+  return { merged, newAddedCount, priceUpdatedCount };
+}
+
 // Permanent Storage Engine: Saves to Firestore Master Doc, Collection, Backup Collection, and LocalStorage
 export async function savePriceListPermanently(
   newProducts: DynamicPriceProduct[],
@@ -358,13 +628,13 @@ export async function savePriceListPermanently(
     }, { merge: true });
   }
 
-  // 4. Upsert each product into products_pricelist_v2 without wiping
+  // 4. Upsert each product into products_pricelist_v2 cleanly
   for (const item of newProducts) {
     await setDoc(doc(db, 'products_pricelist_v2', item.id), {
       ...item,
       isArchived: false,
       updatedAt: new Date().toISOString(),
-    }, { merge: true });
+    });
   }
 
   // 5. Soft-archive any products from previous list that are not in new list
@@ -417,7 +687,40 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
   const [isLoadingBackups, setIsLoadingBackups] = useState<boolean>(false);
   const [isRestoringBackup, setIsRestoringBackup] = useState<boolean>(false);
 
+  const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const isUploadingRef = useRef<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleManualRefresh = async () => {
+    setIsRefreshing(true);
+    try {
+      const masterSnap = await getDoc(doc(db, 'config', 'master_pricelist'));
+      if (masterSnap.exists() && Array.isArray(masterSnap.data()?.products) && masterSnap.data().products.length > 0) {
+        const validList = masterSnap.data().products.filter((p: any) => !p.isArchived);
+        setProducts(validList);
+        try {
+          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(validList));
+        } catch {}
+      } else {
+        const snap = await getDocs(query(collection(db, 'products_pricelist_v2')));
+        const pList: DynamicPriceProduct[] = [];
+        snap.forEach((d) => {
+          const data = d.data() as DynamicPriceProduct;
+          if (!data.isArchived) pList.push({ ...data, id: d.id });
+        });
+        if (pList.length > 0) {
+          setProducts(pList);
+          try {
+            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(pList));
+          } catch {}
+        }
+      }
+    } catch (e) {
+      console.warn('Manual refresh notice:', e);
+    } finally {
+      setTimeout(() => setIsRefreshing(false), 400);
+    }
+  };
 
   const [dialogConfig, setDialogConfig] = useState<{
     isOpen: boolean;
@@ -716,90 +1019,26 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
     }
   };
 
-  // Handle Upload of Excel (.xlsx/.xls) or PDF / Image
+  // Handle Upload of Excel (.xlsx/.xls/.csv) or PDF / Image with Intelligent Product Add & Price Update
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     setIsUploading(true);
+    isUploadingRef.current = true;
 
     try {
       const fileName = file.name.toLowerCase();
+      let uploadedProducts: DynamicPriceProduct[] = [];
+      let newValidity = validityDate;
 
       // Case A: Excel File (.xlsx, .xls, .csv)
       if (fileName.endsWith('.xlsx') || fileName.endsWith('.xls') || fileName.endsWith('.csv')) {
         const data = await file.arrayBuffer();
         const workbook = XLSX.read(data, { type: 'array' });
-        const sheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[sheetName];
-        const jsonRows: any[] = XLSX.utils.sheet_to_json(worksheet);
-
-        if (!jsonRows || jsonRows.length === 0) {
-          throw new Error('एक्सेल फाईलमध्ये कोणताही डेटा सापडला नाही.');
-        }
-
-        // Group rows by Grade Name so 1 Kg and 25 Kg stay grouped under the same product
-        const productMap = new Map<string, DynamicPriceProduct>();
-
-        jsonRows.forEach((row, idx) => {
-          const gradeName = String(row['Product Grade'] || row['Grade'] || row['Product Name'] || row['प्रॉडक्ट'] || '').trim();
-          if (!gradeName) return;
-
-          const groupName = String(row['Category'] || row['Group'] || 'Group A - Water Soluble Fertilizers').trim();
-          const code = String(row['Sr No'] || row['Sr. No.'] || row['Code'] || `${idx + 1}.`).trim();
-          const brandName = String(row['Brand'] || 'Airawat®').trim();
-          const hsn = String(row['HSN'] || row['hsn'] || '31052000').trim();
-          const gstRate = Number(row['GST Rate (%)'] || row['GST Rate'] || row['GST'] || 5);
-
-          const packingSize = String(row['Packing Size'] || row['Packing'] || '1 Kg').trim();
-          const rate = Number(row['Basic Rate'] || row['Rate'] || 0);
-          const mrp = Number(row['MRP'] || row['mrp'] || 0);
-
-          const key = `${groupName}__${code}__${gradeName}`;
-
-          if (!productMap.has(key)) {
-            const cleanId = `prod_${code.replace(/[^A-Za-z0-9]/g, '_')}_${gradeName.replace(/[^A-Za-z0-9]/g, '_')}`;
-            productMap.set(key, {
-              id: cleanId,
-              groupName,
-              code,
-              brandName,
-              gradeName,
-              hsn,
-              gstRate,
-              packings: [{ packingSize, rate, mrp }],
-              orderIndex: idx + 1,
-              isArchived: false,
-            });
-          } else {
-            productMap.get(key)!.packings.push({ packingSize, rate, mrp });
-          }
-        });
-
-        const newProducts = Array.from(productMap.values());
-
-        if (newProducts.length === 0) {
-          throw new Error('एक्सेल फाईलमध्ये योग्य प्रॉडक्ट्स किंवा ग्रेड्स सापडले नाहीत. कृपया नमुना फॉरमॅट वापरा.');
-        }
-
-        // Permanently Save to Firestore Master Doc, Collection, Backup and LocalStorage
-        await savePriceListPermanently(
-          newProducts,
-          file.name,
-          profile,
-          validityDate,
-          products
-        );
-        setProducts(newProducts);
-
-        setDialogConfig({
-          isOpen: true,
-          type: 'success',
-          title: 'प्राईस लिस्ट कायमस्वरूपी सेव्ह झाली',
-          message: `एक्सेल फाईलमधून एकूण ${newProducts.length} प्रॉडक्ट्स डेटाबेसमध्ये कायमस्वरूपी सेव्ह करण्यात आले आहेत. रिफ्रेश किंवा नवीन डिव्हाइसवरही ही प्राईस लिस्ट उपलब्ध राहील.`,
-          confirmText: 'ठीक आहे',
-          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
-        });
+        const parsed = parseExcelToProducts(workbook);
+        uploadedProducts = parsed.products;
+        if (parsed.validity) newValidity = parsed.validity;
       } else {
         // Case B: PDF or Image via Server AI Parser
         const formData = new FormData();
@@ -817,12 +1056,9 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
 
         const parsedData = await response.json();
         const extractedProducts: any[] = parsedData.products || [];
+        if (parsedData.validityDate) newValidity = parsedData.validityDate;
 
-        if (extractedProducts.length === 0) {
-          throw new Error('फाईलमधून प्रॉडक्ट्स डेटा वाचता आला नाही.');
-        }
-
-        const newProducts: DynamicPriceProduct[] = extractedProducts.map((item, idx) => {
+        uploadedProducts = extractedProducts.map((item, idx) => {
           const cleanId = `prod_${(item.code || `item_${idx}`).replace(/[^A-Za-z0-9]/g, '_')}_${(item.gradeName || '').replace(/[^A-Za-z0-9]/g, '_')}`;
           return {
             groupName: item.groupName || 'Group A - Water Soluble Fertilizers',
@@ -837,29 +1073,38 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
             id: cleanId,
           };
         });
-
-        // Permanently Save to Firestore Master Doc, Collection, Backup and LocalStorage
-        await savePriceListPermanently(
-          newProducts,
-          file.name,
-          profile,
-          parsedData.validityDate || validityDate,
-          products
-        );
-        setProducts(newProducts);
-        if (parsedData.validityDate) {
-          setValidityDate(parsedData.validityDate);
-        }
-
-        setDialogConfig({
-          isOpen: true,
-          type: 'success',
-          title: 'प्राईस लिस्ट कायमस्वरूपी सेव्ह झाली',
-          message: `अपलोड केलेल्या फाईलमधून एकूण ${newProducts.length} प्रॉडक्ट्स डेटाबेसमध्ये कायमस्वरूपी सेव्ह झाले आहेत. रिफ्रेश किंवा नवीन डिव्हाइसवरही ही प्राईस लिस्ट उपलब्ध राहील.`,
-          confirmText: 'ठीक आहे',
-          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
-        });
       }
+
+      if (!uploadedProducts || uploadedProducts.length === 0) {
+        throw new Error('फाईलमधून प्रॉडक्ट्स डेटा वाचता आला नाही. कृपया योग्य एक्सेल किंवा डॉक्युमेंट फाईल निवडा.');
+      }
+
+      // Intelligently check products: detect new products added and price changes
+      const { merged, newAddedCount, priceUpdatedCount } = mergeUploadedProducts(uploadedProducts, products);
+
+      // Permanently Save to Firestore Master Doc, Collection, Backup and LocalStorage
+      await savePriceListPermanently(
+        merged,
+        file.name,
+        profile,
+        newValidity,
+        products
+      );
+
+      // Instantly update component state
+      setProducts(merged);
+      if (newValidity) {
+        setValidityDate(newValidity);
+      }
+
+      setDialogConfig({
+        isOpen: true,
+        type: 'success',
+        title: 'प्राईस लिस्ट यशस्वीरित्या अपडेट झाली',
+        message: `अपलोड केलेल्या फाईलनुसार प्राईस लिस्ट अपडेट झाली आहे:\n• नवीन ऍड झालेले प्रॉडक्ट्स: ${newAddedCount}\n• दर/पॅकिंग अपडेट झालेले प्रॉडक्ट्स: ${priceUpdatedCount}\n• एकूण उपलब्ध प्रॉडक्ट्स: ${merged.length}\n\nसर्व बदल डेटाबेसमध्ये कायमस्वरूपी सेव्ह करण्यात आले आहेत.`,
+        confirmText: 'ठीक आहे',
+        onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
+      });
     } catch (err: any) {
       console.error('File parse error:', err);
       setDialogConfig({
@@ -872,6 +1117,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       });
     } finally {
       setIsUploading(false);
+      isUploadingRef.current = false;
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
@@ -901,12 +1147,21 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       {isUserAdminOrOwner && (
         <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-3 no-print">
           <div className="flex items-center gap-2">
+            {/* Icon Button in front of Company Price */}
+            <button
+              type="button"
+              onClick={handleManualRefresh}
+              disabled={isRefreshing}
+              title="रीफ्रेश करा (Refresh Price List)"
+              className="p-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-lg border border-emerald-200 transition shadow-2xs cursor-pointer active:scale-95 disabled:opacity-50 flex items-center justify-center shrink-0"
+            >
+              <RefreshCw className={cn("w-3.5 h-3.5", isRefreshing && "animate-spin")} />
+            </button>
             <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-              <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
-              <span>कंपनी प्राईस लिस्ट</span>
+              <span>कंपनी प्राईस</span>
             </span>
             <span className="text-[11px] text-slate-500 hidden sm:inline">
-              (PDF, इमेज किंवा एक्सेल अपलोड करा; फाईलमधील सर्व प्रॉडक्ट्स व दर ऑटोमॅटिक अपडेट होतील)
+              (Excel, PDF किंवा इमेज अपलोड करा; सर्व प्रॉडक्ट्स, नवीन आयटम व दर त्वरित अपडेट होतील)
             </span>
           </div>
 
@@ -917,29 +1172,6 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
               <span>डेटाबेसमध्ये कायमस्वरूपी सुरक्षित</span>
             </div>
 
-            {/* Backup & Version History Button */}
-            <button
-              onClick={() => {
-                fetchBackups();
-                setShowBackupModal(true);
-              }}
-              className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-xs font-bold transition shadow-2xs border border-slate-300 cursor-pointer"
-              title="मागील बॅकअप आवृत्ती पहा किंवा रिस्टोर करा"
-            >
-              <History className="w-3.5 h-3.5 text-slate-600" />
-              <span>बॅकअप & हिस्ट्री</span>
-            </button>
-
-            {/* Download Template / Current Excel */}
-            <button
-              onClick={handleDownloadTemplate}
-              className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-xs font-bold transition shadow-2xs border border-slate-300 cursor-pointer"
-              title="सध्याची प्राईस लिस्ट एक्सेल स्वरूपात डाऊनलोड करा"
-            >
-              <Download className="w-3.5 h-3.5 text-slate-600" />
-              <span>एक्सेल डाऊनलोड</span>
-            </button>
-
             <input
               type="file"
               ref={fileInputRef}
@@ -948,22 +1180,22 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
               className="hidden"
             />
 
-            {/* Single Clean Upload Button */}
+            {/* Single Clean Upload Button in English */}
             <button
               onClick={() => fileInputRef.current?.click()}
               disabled={isUploading}
               className="w-full sm:w-auto flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-xl text-xs font-black transition shadow-sm disabled:opacity-50 cursor-pointer"
-              title="नवीन प्राईस लिस्ट फाईल अपलोड करा (PDF / इमेज / एक्सेल)"
+              title="Upload Price List (Excel / PDF / Image)"
             >
               {isUploading ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>अपलोड व सेव्ह होत आहे...</span>
+                  <span>Uploading & Saving...</span>
                 </>
               ) : (
                 <>
                   <Upload className="w-4 h-4" />
-                  <span>प्राईस लिस्ट अपलोड करा</span>
+                  <span>Upload Price List</span>
                 </>
               )}
             </button>

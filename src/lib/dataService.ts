@@ -37,34 +37,39 @@ let quotaExceededUntil = (() => {
 })();
 
 export function isQuotaBlocked(): boolean {
-  try {
-    if (typeof window !== 'undefined') {
-      const stored = localStorage.getItem('blackworm_quota_blocked_until');
-      if (stored) {
-        const until = Number(stored);
-        if (!isNaN(until) && Date.now() < until) return true;
-      }
-    }
-  } catch {}
-  return Date.now() < quotaExceededUntil;
+  return false;
 }
 
-export function setQuotaBlocked(durationMs: number = 30 * 60 * 1000) {
-  const until = Date.now() + durationMs;
-  quotaExceededUntil = until;
-  try {
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('blackworm_quota_blocked_until', String(until));
-    }
-  } catch {}
+export function setQuotaBlocked(_durationMs: number = 0) {
+  // Soft indicator - no hard blocking of user operations
 }
 
 /**
- * Safe Firestore write helper that guarantees zero data loss:
- * 1. Immediately saves record to localStorage for that collection (key: `blackworm_local_${colName}`)
- * 2. Attempts remote Firestore setDoc with retries
- * 3. If Firestore rejects due to Quota Limit / Network / Offline, safely enqueues to `blackworm_pending_sync`
- *    and returns { success: true, isCachedLocally: true } so user workflow is uninterrupted.
+ * Updates the persistent local cache for a collection so that incoming Firestore records
+ * are immediately preserved locally on this device, preventing any data disappearance across logins.
+ */
+export function updateCollectionCache<T extends { id: string }>(colName: string, items: T[]): void {
+  try {
+    if (typeof window === 'undefined' || !items || items.length === 0) return;
+    const storageKey = `blackworm_local_${colName}`;
+    const raw = localStorage.getItem(storageKey);
+    const existing = raw ? JSON.parse(raw) : {};
+    items.forEach((it) => {
+      if (it && it.id) {
+        existing[it.id] = { ...existing[it.id], ...it };
+      }
+    });
+    localStorage.setItem(storageKey, JSON.stringify(existing));
+  } catch (e) {
+    console.warn(`Cache update notice for ${colName}:`, e);
+  }
+}
+
+/**
+ * Safe Firestore write helper that guarantees real-time multi-device synchronization & zero data loss:
+ * 1. Immediately saves record to local collection cache for instant UI availability
+ * 2. Directly persists to remote Firestore so all devices see the record in real-time
+ * 3. Enqueues to pending queue if offline, syncing automatically as soon as connection is live
  */
 export async function safeFirestoreSet<T extends Record<string, any>>(
   colName: string,
@@ -91,40 +96,32 @@ export async function safeFirestoreSet<T extends Record<string, any>>(
     console.warn(`Local caching notice for ${colName}/${docId}:`, e);
   }
 
-  // If daily quota is currently blocked, queue locally without making doomed network requests
-  if (isQuotaBlocked()) {
+  // Fast offline return - 0ms blocking when offline
+  const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+  if (isCurrentlyOffline) {
     addToPendingSync(colName, docId, data, options);
-    return { success: true, isCachedLocally: true, error: 'Quota limit threshold active' };
+    return { success: true, isCachedLocally: true };
   }
 
-  // 2. Attempt remote Firestore save with exponential backoff
+  // 2. Direct remote Firestore save so other devices see data instantly
   try {
     await setDoc(doc(db, colName, docId), data, options);
-    // If successful, remove from pending sync if it was there
+    // If successful, remove from pending sync if it was queued
     removeFromPendingSync(colName, docId);
     return { success: true, isCachedLocally: false };
   } catch (err: any) {
     const rawMsg = err instanceof Error ? err.message : String(err);
-    const isQuota = rawMsg.toLowerCase().includes('quota') || rawMsg.toLowerCase().includes('resource_exhausted') || rawMsg.toLowerCase().includes('resource-exhausted');
-    
-    if (isQuota) {
-      setQuotaBlocked(10 * 60 * 1000); // 10 minute backoff to protect free tier
-      console.warn(`Firestore quota reached. Backing off writes: ${colName}/${docId}`);
-      addToPendingSync(colName, docId, data, options);
-      return { success: true, isCachedLocally: true, error: rawMsg };
-    }
-
-    // If it's a network error and we haven't reached max retries, try again
     const isNetworkError = rawMsg.toLowerCase().includes('network') || rawMsg.toLowerCase().includes('unavailable') || rawMsg.toLowerCase().includes('offline');
-    if (isNetworkError && retryCount < 3) {
-      const delay = Math.pow(2, retryCount) * 1000;
+
+    if (isNetworkError && retryCount < 2) {
+      const delay = Math.pow(2, retryCount) * 800;
       await new Promise(resolve => setTimeout(resolve, delay));
       return safeFirestoreSet(colName, docId, data, options, retryCount + 1);
     }
 
-    console.warn(`Firestore write deferred (${isQuota ? 'Daily Quota Limit' : 'Offline'}): ${colName}/${docId}`);
+    console.warn(`Firestore write queued for sync (${colName}/${docId}):`, rawMsg);
 
-    // Queue for subsequent synchronization
+    // Queue for background synchronization
     addToPendingSync(colName, docId, data, options);
 
     return {
@@ -238,6 +235,27 @@ export async function safeFirestoreUpdate(
   data: any,
   retryCount = 0
 ): Promise<{ success: boolean; error?: string }> {
+  // Update local collection cache immediately
+  try {
+    const storageKey = `blackworm_local_${colName}`;
+    const raw = typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null;
+    if (raw) {
+      const map = JSON.parse(raw);
+      if (map[docId]) {
+        map[docId] = { ...map[docId], ...data, updatedAt: new Date().toISOString(), _localSavedAt: new Date().toISOString() };
+        localStorage.setItem(storageKey, JSON.stringify(map));
+      }
+    }
+  } catch (e) {
+    console.warn(`Local cache update notice for ${colName}/${docId}:`, e);
+  }
+
+  const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+  if (isCurrentlyOffline) {
+    addToPendingSync(colName, docId, data, { merge: true });
+    return { success: true };
+  }
+
   try {
     await updateDoc(doc(db, colName, docId), {
       ...data,
@@ -268,6 +286,26 @@ export async function safeFirestoreAdd(
   data: any,
   retryCount = 0
 ): Promise<{ success: boolean; id?: string; error?: string }> {
+  const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+  if (isCurrentlyOffline) {
+    const tempId = `temp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    try {
+      const storageKey = `blackworm_local_${colName}`;
+      const raw = typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null;
+      const map = raw ? JSON.parse(raw) : {};
+      map[tempId] = {
+        ...data,
+        id: tempId,
+        _localSavedAt: new Date().toISOString(),
+      };
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(storageKey, JSON.stringify(map));
+      }
+    } catch {}
+    addToPendingSync(colName, tempId, data, { merge: true });
+    return { success: true, id: tempId };
+  }
+
   try {
     const docRef = await addDoc(collection(db, colName), {
       ...data,
@@ -287,6 +325,19 @@ export async function safeFirestoreAdd(
     
     // For addDoc, we don't have a docId yet, so we generate one for the queue
     const tempId = `temp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    try {
+      const storageKey = `blackworm_local_${colName}`;
+      const raw = typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null;
+      const map = raw ? JSON.parse(raw) : {};
+      map[tempId] = {
+        ...data,
+        id: tempId,
+        _localSavedAt: new Date().toISOString(),
+      };
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(storageKey, JSON.stringify(map));
+      }
+    } catch {}
     addToPendingSync(colName, tempId, data, { merge: true });
     return { success: false, id: tempId, error: rawMsg };
   }
@@ -331,7 +382,7 @@ export async function safeFirestoreQuery<T>(
 }
 
 /**
- * Merges Firestore snapshot data with any locally saved updates
+ * Merges Firestore snapshot data with locally cached records and updates the device cache
  */
 export function mergeWithLocalData<T extends { id: string }>(
   colName: string,
@@ -340,6 +391,12 @@ export function mergeWithLocalData<T extends { id: string }>(
   try {
     if (typeof window === 'undefined') return serverItems;
     const storageKey = `blackworm_local_${colName}`;
+
+    // Automatically update local cache whenever fresh server data arrives
+    if (serverItems && serverItems.length > 0) {
+      updateCollectionCache(colName, serverItems);
+    }
+
     const raw = localStorage.getItem(storageKey);
     if (!raw) return serverItems;
     
@@ -356,15 +413,14 @@ export function mergeWithLocalData<T extends { id: string }>(
 
     // First insert server items
     serverItems.forEach((it) => {
-      mergedMap.set(it.id, it);
+      if (it && it.id) mergedMap.set(it.id, it);
     });
 
-    // Then overlay/append locally saved items
+    // Then overlay/append locally saved items (retaining offline changes)
     Object.entries(map).forEach(([id, localDoc]) => {
       if (mergedMap.has(id)) {
-        // Only merge if local is newer or server data is missing key fields
         const serverItem = mergedMap.get(id);
-        const localTime = new Date(localDoc._localSavedAt || 0).getTime();
+        const localTime = new Date(localDoc._localSavedAt || localDoc.updatedAt || 0).getTime();
         const serverTime = new Date(serverItem.updatedAt || serverItem.createdAt || 0).getTime();
         
         if (localTime > serverTime) {
@@ -379,6 +435,20 @@ export function mergeWithLocalData<T extends { id: string }>(
   } catch (e) {
     console.warn(`Merge error for ${colName}:`, e);
     return serverItems;
+  }
+}
+
+/**
+ * Triggers a comprehensive sync across all devices and broadcasts a refresh event
+ */
+export async function triggerFullDataRefresh(): Promise<void> {
+  try {
+    await startBackgroundSync();
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('blackworm_data_refresh', { detail: { timestamp: Date.now() } }));
+    }
+  } catch (e) {
+    console.warn('triggerFullDataRefresh notice:', e);
   }
 }
 

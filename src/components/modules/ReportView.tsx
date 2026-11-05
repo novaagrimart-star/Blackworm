@@ -15,7 +15,9 @@ import {
   CheckCircle2, 
   RefreshCw,
   Camera,
-  Check
+  Check,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import { toDecimal2, addDecimal2, subtractDecimal2, formatAmount } from '../../lib/decimal';
 
@@ -109,91 +111,145 @@ export function buildReportRows(
   selectedDate: string,
   profile: UserProfile
 ): OfficerDailyReport[] {
-  const userIsAdmin = isAdmin(profile);
   const { year, monthIndex, dayOfMonth, sheetMonthKey, targetMonthName } = parseDateKeys(selectedDate);
 
-  let officers = userIsAdmin
-    ? allUsers.filter((u) => u.role !== 'owner')
-    : allUsers.filter((u) => u.uid === profile.uid || (u.loginId && profile.loginId && u.loginId.toLowerCase() === profile.loginId.toLowerCase()));
+  // 1. Collect all valid officers (all employees / field staff except purely dealer or owner)
+  let officers = allUsers.filter((u) => {
+    const r = (u.role || '').toLowerCase().trim();
+    return r !== 'owner' && r !== 'dealer';
+  });
 
+  if (officers.length === 0) {
+    officers = allUsers.filter((u) => (u.role || '').toLowerCase() !== 'owner');
+  }
   if (officers.length === 0) {
     officers = [profile];
   }
 
-  // Build high-performance lookup maps
-  const travelMap = new Map<string, any>();
+  // 2. Also ensure any officer who submitted a travel sheet for this month is included even if their user record was missing or filtered
   allTravelSheets.forEach((s) => {
-    if (s._id) travelMap.set(s._id, s);
-    if (s.id) travelMap.set(s.id, s);
-    if (s.userId && s.monthKey) travelMap.set(`${s.userId}_${s.monthKey}`, s);
-    if (s.userId && s.yearNumber && s.monthName) {
-      travelMap.set(`${s.userId}_${s.yearNumber}_${s.monthName.toLowerCase()}`, s);
-    }
-    const isCurrentMonth = (s.monthName && s.monthName.toLowerCase() === targetMonthName.toLowerCase()) ||
-                           (s.id && s.id.includes(sheetMonthKey));
-    if (s.userId && (isCurrentMonth || !travelMap.has(s.userId))) {
-      travelMap.set(s.userId, s);
+    const sId = (s.id || s._id || '') as string;
+    const matchesMonth = 
+      (s.yearNumber && Number(s.yearNumber) === year && s.monthName && s.monthName.toLowerCase() === targetMonthName.toLowerCase()) ||
+      sId.includes(sheetMonthKey);
+
+    if (!matchesMonth) return;
+
+    const officerUid = s.userId || (sId.startsWith('travel_') ? sId.split('_')[1] : null);
+    if (!officerUid) return;
+
+    const alreadyInList = officers.some(o => 
+      o.uid === officerUid || 
+      (o.loginId && o.loginId.toLowerCase() === officerUid.toLowerCase()) ||
+      (o.fullName && s.officerName && o.fullName.trim().toLowerCase() === s.officerName.trim().toLowerCase())
+    );
+
+    if (!alreadyInList) {
+      officers.push({
+        uid: officerUid,
+        fullName: s.officerName || officerUid,
+        role: 'field_officer',
+        emailId: null,
+        createdAt: ''
+      });
     }
   });
 
+  // Build target maps
   const yearlyTargetMap = new Map<string, any>();
   allYearlyTargets.forEach((t) => {
     if (t._id) yearlyTargetMap.set(t._id, t);
     if (t.id) yearlyTargetMap.set(t.id, t);
     if (t.userId) yearlyTargetMap.set(t.userId, t);
+    if (t.loginId) yearlyTargetMap.set(t.loginId.toLowerCase(), t);
   });
 
   const targetFallbackMap = new Map<string, any>();
   allTargets.forEach((t) => {
     if (t.userId) targetFallbackMap.set(t.userId, t);
+    if (t.loginId) targetFallbackMap.set(t.loginId.toLowerCase(), t);
   });
 
   return officers.map((officer, i) => {
-    const travelSheetId = `travel_${officer.uid}_${sheetMonthKey}`;
-    let travelData = travelMap.get(travelSheetId) || 
-                     travelMap.get(`${officer.uid}_${sheetMonthKey}`) ||
-                     travelMap.get(`${officer.uid}_${year}_${targetMonthName.toLowerCase()}`);
+    // Robust travel sheet matching for this officer and selected month
+    let travelData: any = null;
 
+    // A. Match by exact expected doc ID: travel_${uid}_${sheetMonthKey}
+    const targetId1 = `travel_${officer.uid}_${sheetMonthKey}`;
+    travelData = allTravelSheets.find(s => (s.id === targetId1 || s._id === targetId1));
+
+    // B. Match by loginId if available
     if (!travelData && officer.loginId) {
-      travelData = travelMap.get(`travel_${officer.loginId}_${sheetMonthKey}`) || 
-                   travelMap.get(`${officer.loginId}_${sheetMonthKey}`);
+      const targetId2 = `travel_${officer.loginId}_${sheetMonthKey}`;
+      travelData = allTravelSheets.find(s => (s.id === targetId2 || s._id === targetId2));
     }
 
+    // C. Match by userId attribute + matching month/year
+    if (!travelData) {
+      travelData = allTravelSheets.find(s => {
+        const matchesUser = s.userId === officer.uid || 
+          (officer.loginId && s.userId && s.userId.toLowerCase() === officer.loginId.toLowerCase());
+        if (!matchesUser) return false;
+
+        const sId = (s.id || s._id || '') as string;
+        if (sId.includes(sheetMonthKey)) return true;
+        if (s.yearNumber && Number(s.yearNumber) === year && s.monthName && s.monthName.toLowerCase() === targetMonthName.toLowerCase()) return true;
+        return false;
+      });
+    }
+
+    // D. Match by officerName matching officer.fullName
+    if (!travelData && officer.fullName) {
+      const cleanName = officer.fullName.trim().toLowerCase();
+      travelData = allTravelSheets.find(s => {
+        if (!s.officerName) return false;
+        if (s.officerName.trim().toLowerCase() !== cleanName) return false;
+        const sId = (s.id || s._id || '') as string;
+        if (sId.includes(sheetMonthKey)) return true;
+        if (s.yearNumber && Number(s.yearNumber) === year && s.monthName && s.monthName.toLowerCase() === targetMonthName.toLowerCase()) return true;
+        return false;
+      });
+    }
+
+    // E. LocalStorage cache fallback if available
     if (!travelData) {
       try {
         const cachedLocal = localStorage.getItem(`travel_sheet_${officer.uid}_${sheetMonthKey}`) ||
-                            (officer.loginId ? localStorage.getItem(`travel_sheet_${officer.loginId}_${sheetMonthKey}`) : null);
+                            (officer.loginId ? localStorage.getItem(`travel_sheet_${officer.loginId}_${sheetMonthKey}`) : null) ||
+                            localStorage.getItem(`travel_sheet_${officer.uid}`);
         if (cachedLocal) {
           travelData = JSON.parse(cachedLocal);
         }
       } catch (e) {}
     }
 
-    // Verify travelData strictly matches the requested year and month to avoid mixing data across months
-    if (travelData) {
-      const sYear = travelData.yearNumber ? Number(travelData.yearNumber) : null;
-      const sMonth = travelData.monthName ? travelData.monthName.toLowerCase() : null;
-      const isMatchingMonth = (!sYear || sYear === year) && 
-        (!sMonth || sMonth === targetMonthName.toLowerCase() || (travelData.id && travelData.id.includes(sheetMonthKey)));
-      if (!isMatchingMonth) {
-        travelData = null;
-      }
-    }
-    
     let route = '-', openingKm = 0, closingKm = 0, dailyExpense = 0, recordedKm = 0;
     if (travelData && Array.isArray(travelData.rows)) {
-      // Find row for this EXACT date
+      // Find row for this EXACT date or day number
       const dayRow = travelData.rows.find((r: any) => {
+        if (!r) return false;
+        // 1. Direct date match (e.g. 2026-11-05)
         if (r.date && r.date.trim() === selectedDate.trim()) return true;
-        if (Number(r.dayNumber) === dayOfMonth) {
-          if (r.date && !r.date.startsWith(`${year}-`)) return false;
-          return true;
+
+        // 2. Matching dayNumber
+        if (Number(r.dayNumber) === dayOfMonth) return true;
+
+        // 3. Match parsed date components (handles DD-MM-YYYY, DD/MM/YYYY, etc.)
+        if (r.date && typeof r.date === 'string') {
+          const parts = r.date.trim().split(/[-/]/);
+          if (parts.length === 3) {
+            // YYYY-MM-DD
+            if (parts[0] === String(year) && Number(parts[1]) === monthIndex + 1 && Number(parts[2]) === dayOfMonth) return true;
+            // DD-MM-YYYY
+            if (Number(parts[0]) === dayOfMonth && Number(parts[1]) === monthIndex + 1 && parts[2] === String(year)) return true;
+          }
         }
         return false;
       });
 
       if (dayRow) {
-        route = (dayRow.route || '').trim() || '-';
+        const rawRoute = (dayRow.route || '').trim();
+        route = rawRoute || '-';
         openingKm = Number(dayRow.openingKm) || 0;
         closingKm = Number(dayRow.closingKm) || 0;
         recordedKm = Number(dayRow.km) || 0;
@@ -218,7 +274,7 @@ export function buildReportRows(
 
     let monthlySalesTarget = 0, monthlyAchievement = 0;
     const targetSheetId = `yearly_${officer.uid}_2026_27`;
-    const targetData = yearlyTargetMap.get(targetSheetId) || yearlyTargetMap.get(officer.uid);
+    const targetData = yearlyTargetMap.get(targetSheetId) || yearlyTargetMap.get(officer.uid) || (officer.loginId ? yearlyTargetMap.get(officer.loginId.toLowerCase()) : null);
     if (targetData && targetData.months) {
       const monthData = (targetData.months || []).find((m: any) => (m.month || '').toLowerCase() === targetMonthName.toLowerCase());
       if (monthData) {
@@ -247,7 +303,7 @@ export function buildReportRows(
       dailyExpense,
       monthlySalesTarget,
       monthlyAchievement,
-      targetBacklog: Math.max(0, subtractDecimal2(monthlySalesTarget, monthlyAchievement)),
+      targetBacklog: Math.max(0, subtractDecimal2(monthlySalesTarget, monthlyAchievement))
     };
   });
 }
@@ -375,10 +431,8 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
       setLoading(false);
     });
 
-    // 2. Live Travel Sheets Listener
-    const qTravel = userIsAdmin
-      ? query(collection(db, 'travel_sheets'))
-      : query(collection(db, 'travel_sheets'), where('userId', '==', profile.uid));
+    // 2. Live Travel Sheets Listener - Always query all travel sheets so all officers' entries are updated in real-time
+    const qTravel = query(collection(db, 'travel_sheets'));
     const unsubTravel = onSnapshot(qTravel, (snap) => {
       const tList = snap.docs.map(d => ({ ...d.data(), id: d.id, _id: d.id }));
       const mergedTravel = mergeWithLocalData('travel_sheets', tList as any[]);
@@ -395,10 +449,8 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
       setLoading(false);
     });
 
-    // 3. Live Yearly Targets Listener
-    const qTargets = userIsAdmin
-      ? query(collection(db, 'yearly_targets'))
-      : query(collection(db, 'yearly_targets'), where('userId', '==', profile.uid));
+    // 3. Live Yearly Targets Listener - Query all targets for all officers
+    const qTargets = query(collection(db, 'yearly_targets'));
     const unsubTargets = onSnapshot(qTargets, (snap) => {
       targetsRef.current = snap.docs.map(d => ({ ...d.data(), id: d.id, _id: d.id }));
       recomputeLiveReport();
@@ -493,12 +545,42 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
     }
   };
 
+  const handlePrevDay = () => {
+    try {
+      const [y, m, d] = selectedDate.split('-').map(Number);
+      const curr = new Date(y, m - 1, d);
+      curr.setDate(curr.getDate() - 1);
+      const newY = curr.getFullYear();
+      const newM = String(curr.getMonth() + 1).padStart(2, '0');
+      const newD = String(curr.getDate()).padStart(2, '0');
+      setSelectedDate(`${newY}-${newM}-${newD}`);
+    } catch {}
+  };
+
+  const handleNextDay = () => {
+    try {
+      const [y, m, d] = selectedDate.split('-').map(Number);
+      const curr = new Date(y, m - 1, d);
+      curr.setDate(curr.getDate() + 1);
+      const newY = curr.getFullYear();
+      const newM = String(curr.getMonth() + 1).padStart(2, '0');
+      const newD = String(curr.getDate()).padStart(2, '0');
+      setSelectedDate(`${newY}-${newM}-${newD}`);
+    } catch {}
+  };
+
+  const handleToday = () => {
+    setSelectedDate(getTodayLocalDate());
+  };
+
   const totalKmSum = reportData.reduce((acc, r) => acc + r.totalKm, 0);
   const totalCollectionSum = reportData.reduce((acc, r) => acc + r.paymentCollection, 0);
   const totalExpenseSum = reportData.reduce((acc, r) => acc + r.dailyExpense, 0);
   const totalTargetSum = addDecimal2(...reportData.map(r => r.monthlySalesTarget));
   const totalAchieveSum = addDecimal2(...reportData.map(r => r.monthlyAchievement));
   const totalBacklogSum = addDecimal2(...reportData.map(r => r.targetBacklog));
+
+  const filledCount = reportData.filter(r => (r.route && r.route !== '-') || r.totalKm > 0 || r.dailyExpense > 0 || r.openingKm > 0 || r.closingKm > 0).length;
 
   return (
     <div className="space-y-4 w-full pb-20 font-sans">
@@ -510,15 +592,51 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
             <h2 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight">Report</h2>
           </div>
 
-          {/* Date Option right in front of Report */}
-          <div className="relative">
-            <Calendar className="w-4 h-4 absolute left-3 top-2.5 text-slate-400 pointer-events-none" />
-            <input 
-              type="date"
-              value={selectedDate}
-              onChange={(e) => setSelectedDate(e.target.value)}
-              className="pl-9 pr-3 py-1.5 sm:py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer"
-            />
+          {/* Quick Date Navigator (Prev, Input, Next) */}
+          <div className="flex items-center bg-slate-100 rounded-xl p-0.5 border border-slate-200 shadow-2xs">
+            <button
+              type="button"
+              onClick={handlePrevDay}
+              className="p-1.5 hover:bg-white rounded-lg text-slate-700 hover:text-slate-900 transition shadow-2xs cursor-pointer active:scale-95"
+              title="मागील दिवस (Previous Day)"
+            >
+              <ChevronLeft className="w-4 h-4" />
+            </button>
+            <div className="relative">
+              <Calendar className="w-3.5 h-3.5 absolute left-2.5 top-2 text-slate-400 pointer-events-none" />
+              <input 
+                type="date"
+                value={selectedDate}
+                onChange={(e) => setSelectedDate(e.target.value)}
+                className="pl-8 pr-2 py-1 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-900 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={handleNextDay}
+              className="p-1.5 hover:bg-white rounded-lg text-slate-700 hover:text-slate-900 transition shadow-2xs cursor-pointer active:scale-95"
+              title="पुढील दिवस (Next Day)"
+            >
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* Quick Today jump button */}
+          <button
+            type="button"
+            onClick={handleToday}
+            className="px-2.5 py-1.5 text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl transition border border-slate-200 cursor-pointer active:scale-95"
+            title="आजच्या तारखेवर जा"
+          >
+            Today (आज)
+          </button>
+
+          {/* Officer Submissions Count Badge */}
+          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-900 text-xs font-bold">
+            <span>रिपोर्ट भरलेले:</span>
+            <span className="px-1.5 py-0.5 bg-indigo-600 text-white rounded-md text-[11px] font-black">
+              {filledCount} / {reportData.length}
+            </span>
           </div>
 
           {/* Camera Button: Save Photo to Gallery */}
@@ -626,7 +744,11 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
                   </td>
                   {/* Today's Route: Single line, crisp and readable */}
                   <td className="p-2 border border-slate-300 text-left font-bold text-slate-800 whitespace-nowrap text-[11.5px]">
-                    {row.route}
+                    {row.route && row.route !== '-' ? (
+                      <span className="text-slate-900 font-bold">{row.route}</span>
+                    ) : (
+                      <span className="text-slate-400 font-normal italic">माहिती भरलेली नाही</span>
+                    )}
                   </td>
                   <td className="p-2 border border-slate-300 font-mono font-bold text-slate-800">
                     {row.openingKm}
