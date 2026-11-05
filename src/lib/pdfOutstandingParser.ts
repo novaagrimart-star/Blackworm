@@ -154,15 +154,35 @@ export function buildWhatsAppLink(
   //
   // *NEFT Total Amount - [Dynamic Outstanding Amount from PDF]/-*
 
-  const cleanAmount = amountFormatted.replace(/^₹\s*/, '').trim();
+  let cleanAmount = amountFormatted.replace(/^₹\s*/, '').replace(/\/-$/, '').trim();
+  const numericAmount = parseFloat(cleanAmount.replace(/,/g, ''));
+  if (!isNaN(numericAmount)) {
+    cleanAmount = numericAmount.toLocaleString('en-IN', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+  }
 
-  const message = `${firmName}
-Rajarambapu Sahakari Bank
-Br - Miraj
-Acc No. 035330268109560
-IFSC - RRBP0000035
+  const cleanFirm = firmName || 'Dealer';
 
-*NEFT Total Amount - ₹${cleanAmount}/-*`;
+  const message = `BLACKWORM AGRITECH PVT. LTD.
+
+Dear ${cleanFirm},
+
+As per our records, an outstanding amount of ₹${cleanAmount}/- is pending in your account.
+
+Kindly arrange the payment at the earliest through NEFT using the following bank details:
+
+Bank: Rajarambapu Sahakari Bank, Miraj
+Account No.: 035330268109560
+IFSC Code: RRBP0000035
+
+NEFT Amount: ₹${cleanAmount}/-
+
+Your prompt payment and cooperation will be highly appreciated.
+
+Regards,
+Blackworm Agritech Pvt. Ltd.`;
 
   const encoded = encodeURIComponent(message);
   const url = phoneWithCountry

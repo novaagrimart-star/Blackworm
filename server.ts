@@ -35,11 +35,11 @@ async function createServer() {
     next();
   });
 
-  // API Route for parsing price list
+  // API Route for parsing price list with Exponential Backoff & Multi-Model Fallback
   app.post('/api/parse-pricelist', upload.single('file') as any, async (req: any, res: any) => {
     try {
       if (!req.file) {
-        return res.status(400).json({ error: 'No file uploaded' });
+        return res.status(400).json({ error: 'कोणतीही फाईल निवडलेली नाही. कृपया फाईल निवडा.' });
       }
 
       const fileData = req.file.buffer.toString('base64');
@@ -73,62 +73,106 @@ async function createServer() {
 
       const prompt = "Parse this price list image/document and return the structured JSON object with validityDate and products array. Only return JSON.";
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
-        contents: [
-          { inlineData: { data: fileData, mimeType } },
-          { text: prompt }
-        ],
-        config: {
-          systemInstruction: systemInstruction,
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              validityDate: { type: Type.STRING },
-              products: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    groupName: { type: Type.STRING },
-                    code: { type: Type.STRING },
-                    brandName: { type: Type.STRING },
-                    gradeName: { type: Type.STRING },
-                    hsn: { type: Type.STRING },
-                    gstRate: { type: Type.NUMBER },
-                    packings: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          packingSize: { type: Type.STRING },
-                          rate: { type: Type.NUMBER },
-                          mrp: { type: Type.NUMBER }
-                        },
-                        required: ["packingSize", "rate", "mrp"]
-                      }
-                    }
-                  },
-                  required: ["groupName", "code", "gradeName", "hsn", "packings"]
+      const schema = {
+        type: Type.OBJECT,
+        properties: {
+          validityDate: { type: Type.STRING },
+          products: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                groupName: { type: Type.STRING },
+                code: { type: Type.STRING },
+                brandName: { type: Type.STRING },
+                gradeName: { type: Type.STRING },
+                hsn: { type: Type.STRING },
+                gstRate: { type: Type.NUMBER },
+                packings: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      packingSize: { type: Type.STRING },
+                      rate: { type: Type.NUMBER },
+                      mrp: { type: Type.NUMBER }
+                    },
+                    required: ["packingSize", "rate", "mrp"]
+                  }
                 }
-              }
-            },
-            required: ["products"]
+              },
+              required: ["groupName", "code", "gradeName", "hsn", "packings"]
+            }
+          }
+        },
+        required: ["products"]
+      };
+
+      // Resilient Multi-Tier Models with Exponential Backoff Retry (Auto Re-try Mechanism)
+      const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
+      const maxRetries = 3;
+      let lastError: any = null;
+      let parsedData: any = null;
+
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        const modelName = candidateModels[(attempt - 1) % candidateModels.length];
+        try {
+          console.log(`[AI Parser] Attempt ${attempt}/${maxRetries} requesting model: ${modelName}`);
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: [
+              { inlineData: { data: fileData, mimeType } },
+              { text: prompt }
+            ],
+            config: {
+              systemInstruction,
+              responseMimeType: "application/json",
+              responseSchema: schema
+            }
+          });
+
+          const text = response.text;
+          if (!text) throw new Error('Empty response from AI model');
+          parsedData = JSON.parse(text);
+          console.log(`[AI Parser] Success on attempt ${attempt} with ${parsedData?.products?.length || 0} products!`);
+          break; // Successfully parsed!
+        } catch (attemptErr: any) {
+          lastError = attemptErr;
+          const errMsg = String(attemptErr?.message || '');
+          const isOverload = errMsg.includes('503') || errMsg.includes('UNAVAILABLE') || errMsg.includes('overloaded') || errMsg.includes('429');
+          console.warn(`[AI Parser] Attempt ${attempt} encountered error:`, errMsg.slice(0, 150));
+
+          if (attempt < maxRetries) {
+            const backoffMs = attempt * 2000; // 2s, 4s...
+            console.log(`[AI Parser] Applying exponential backoff: waiting ${backoffMs}ms before attempt ${attempt + 1}...`);
+            await new Promise(r => setTimeout(r, backoffMs));
           }
         }
-      });
-
-      const text = response.text;
-      if (!text) {
-        throw new Error('Empty response from Gemini');
       }
-      
-      const parsedData = JSON.parse(text);
+
+      if (!parsedData) {
+        throw lastError || new Error('Failed to parse price list after automated retries');
+      }
+
       res.json(parsedData);
     } catch (error: any) {
-      console.error('Parsing error:', error);
-      res.status(500).json({ error: error.message || 'Failed to parse file' });
+      console.error('Final parsing error after retries:', error);
+      const errMsg = String(error?.message || '');
+      const is503 = errMsg.includes('503') || errMsg.includes('UNAVAILABLE') || errMsg.includes('overloaded');
+      const is429 = errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED');
+
+      let userFriendlyMessage = 'सर्व्हरकडून फाईल वाचताना त्रुटी आली. कृपया थोड्या वेळाने पुन्हा प्रयत्न करा.';
+      if (is503) {
+        userFriendlyMessage = 'AI सर्व्हरवर सध्या खूप जास्त लोड (High Demand) आहे. सिस्टीमने स्वयंचलित २-३ वेळा प्रयत्न केले, परंतु सर्व्हर तात्पुरता व्यस्त आहे. कृपया १-२ मिनिटांनंतर पुन्हा प्रयत्न करा किंवा थेट एक्सेल (.xlsx) फाईल वापरा जी त्वरित लोड होते.';
+      } else if (is429) {
+        userFriendlyMessage = 'सर्व्हरवरील रिक्वेस्ट मर्यादा संपली आहे. कृपया थोडा वेळ थांबून पुन्हा प्रयत्न करा.';
+      }
+
+      res.status(is503 ? 503 : 500).json({ 
+        error: userFriendlyMessage,
+        isOverloaded: is503 || is429,
+        status: is503 ? 'UNAVAILABLE' : 'SERVER_ERROR'
+      });
     }
   });
 
@@ -167,7 +211,7 @@ async function createServer() {
   } else {
     console.log('Starting application in development mode with Vite...');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false },
       appType: 'spa'
     });
     app.use(vite.middlewares);

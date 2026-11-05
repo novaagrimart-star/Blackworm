@@ -785,9 +785,31 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
   const handleSendPaymentReminder = (dealer: DealerStandingItem, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     const cleanPhone = (dealer.contactNumber || '').replace(/\D/g, '').slice(-10);
-    const formattedAmount = `${dealer.standingAmount.toLocaleString('en-IN')}`;
-    const firmNameText = dealer.firmName ? ` (${toTitleCase(dealer.firmName)})` : '';
-    const message = `Blackworm Agritech Pvt Ltd\n\nप्रिय डीलर${firmNameText},\nआपल्या खात्यावर थकबाकी रक्कम (Outstanding Amount): ₹${formattedAmount}/- शिल्लक आहे.\n\nBank Details:\nRajarambapu Sahakari Bank\nBranch - Miraj\nAcc No. 035330268109560\nIFSC - RRBP0000035\n\nNEFT Total Amount - ₹${formattedAmount}/-\n\nकृपया लवकरात लवकर रक्कम जमा करावी ही नम्र विनंती. धन्यवाद!`;
+    const amountVal = Number(dealer.standingAmount) || 0;
+    const formattedAmount = amountVal.toLocaleString('en-IN', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+    const firmName = toTitleCase(dealer.firmName) || 'Dealer';
+
+    const message = `BLACKWORM AGRITECH PVT. LTD.
+
+Dear ${firmName},
+
+As per our records, an outstanding amount of ₹${formattedAmount}/- is pending in your account.
+
+Kindly arrange the payment at the earliest through NEFT using the following bank details:
+
+Bank: Rajarambapu Sahakari Bank, Miraj
+Account No.: 035330268109560
+IFSC Code: RRBP0000035
+
+NEFT Amount: ₹${formattedAmount}/-
+
+Your prompt payment and cooperation will be highly appreciated.
+
+Regards,
+Blackworm Agritech Pvt. Ltd.`;
     
     if (cleanPhone && cleanPhone.length === 10) {
       const waUrl = `https://wa.me/91${cleanPhone}?text=${encodeURIComponent(message)}`;
