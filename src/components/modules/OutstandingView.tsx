@@ -14,7 +14,8 @@ import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { safeFirestoreSet, mergeWithLocalData } from '../../lib/dataService';
 import { Language } from '../../lib/i18n';
-import { cn, toTitleCase } from '../../lib/utils';
+import { cn, toTitleCase, openExternalLinkSafely } from '../../lib/utils';
+import { CustomDialogModal } from '../CustomDialogModal';
 import { useBranding } from '../../lib/branding';
 import { 
   parseOutstandingPdf, 
@@ -139,6 +140,21 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     setToast({ message, type });
     setTimeout(() => setToast(null), 3500);
   };
+
+  const [dialogConfig, setDialogConfig] = useState<{
+    isOpen: boolean;
+    type?: 'confirm' | 'alert' | 'success';
+    title?: string;
+    message: string;
+    confirmText?: string;
+    cancelText?: string;
+    onConfirm: () => void;
+    onCancel?: () => void;
+  }>({
+    isOpen: false,
+    message: '',
+    onConfirm: () => {},
+  });
 
   // Seed default outstanding records (including user's exact example: Ganesh Krushi Seva Kendra Manerajuri 9897594653)
   const seedDefaultOutstandingRecords = async () => {
@@ -412,12 +428,12 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
   const handleSaveNewDealer = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newFirmName.trim()) {
-      alert('कृपया डीलर / फर्मचे नाव टाका.');
+      showToast('कृपया डीलर / फर्मचे नाव टाका.', 'info');
       return;
     }
     const cleanAmount = parseFloat(newAmount.replace(/,/g, ''));
     if (isNaN(cleanAmount) || cleanAmount <= 0) {
-      alert('कृपया वैध थकीत येणेबाकी रक्कम टाका.');
+      showToast('कृपया वैध थकीत येणेबाकी रक्कम टाका.', 'info');
       return;
     }
 
@@ -474,15 +490,26 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
   };
 
   // Delete a dealer outstanding record from Firestore
-  const handleDeleteRecord = async (recordId: string, firmName: string) => {
-    if (!confirm(`तुम्हाला खरोखर '${firmName}' ची थकीत नोंद काढून टाकायची आहे का?`)) return;
-    try {
-      await deleteDoc(doc(db, 'outstanding_records', recordId));
-      setRawRecords(prev => prev.filter(r => r.id !== recordId));
-      showToast(`'${firmName}' ची नोंद काढली.`);
-    } catch (err) {
-      console.error('Failed to delete record:', err);
-    }
+  const handleDeleteRecord = (recordId: string, firmName: string) => {
+    setDialogConfig({
+      isOpen: true,
+      type: 'confirm',
+      title: 'नोंद काढून टाका',
+      message: `तुम्हाला खरोखर '${firmName}' ची थकीत नोंद काढून टाकायची आहे का?`,
+      confirmText: 'हटवा (Delete)',
+      cancelText: 'रद्द करा',
+      onConfirm: async () => {
+        setDialogConfig(p => ({ ...p, isOpen: false }));
+        try {
+          await deleteDoc(doc(db, 'outstanding_records', recordId));
+          setRawRecords(prev => prev.filter(r => r.id !== recordId));
+          showToast(`'${firmName}' ची नोंद काढली.`);
+        } catch (err) {
+          console.error('Failed to delete record:', err);
+        }
+      },
+      onCancel: () => setDialogConfig(p => ({ ...p, isOpen: false }))
+    });
   };
 
   // Remove a specific PDF file and its records
@@ -585,24 +612,35 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     showToast('डेमो आउटस्टँडिंग शीट यशस्वीरीत्या लोड झाली!');
   };
 
-  const handleClearData = async () => {
-    if (!confirm('तुम्हाला खरोखर सर्व थकीत येणेबाकी डेटा साफ करायचा आहे का?')) return;
-    try {
-      const batch = writeBatch(db);
-      rawRecords.forEach((r) => {
-        batch.delete(doc(db, 'outstanding_records', r.id));
-      });
-      await batch.commit();
-    } catch (e) {}
+  const handleClearData = () => {
+    setDialogConfig({
+      isOpen: true,
+      type: 'confirm',
+      title: 'डेटा साफ करा',
+      message: 'तुम्हाला खरोखर सर्व थकीत येणेबाकी डेटा साफ करायचा आहे का?',
+      confirmText: 'साफ करा (Clear)',
+      cancelText: 'रद्द करा',
+      onConfirm: async () => {
+        setDialogConfig(p => ({ ...p, isOpen: false }));
+        try {
+          const batch = writeBatch(db);
+          rawRecords.forEach((r) => {
+            batch.delete(doc(db, 'outstanding_records', r.id));
+          });
+          await batch.commit();
+        } catch (e) {}
 
-    setRawRecords([]);
-    setUploadedFiles([]);
-    setDuplicatesPreventedCount(0);
-    setParseError('');
-    try {
-      localStorage.removeItem('blackworm_saved_outstanding_records');
-    } catch {}
-    showToast('सर्व डेटा साफ केला.');
+        setRawRecords([]);
+        setUploadedFiles([]);
+        setDuplicatesPreventedCount(0);
+        setParseError('');
+        try {
+          localStorage.removeItem('blackworm_saved_outstanding_records');
+        } catch {}
+        showToast('सर्व डेटा साफ केला.');
+      },
+      onCancel: () => setDialogConfig(p => ({ ...p, isOpen: false }))
+    });
   };
 
   // Cross-reference extracted PDF records with dealers in dealers_application
@@ -743,7 +781,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
   const savePhoneOverride = (recordId: string, phone: string) => {
     const clean10 = cleanPhoneNumber(phone);
     if (!clean10 || clean10.length !== 10) {
-      alert('कृपया वैध १० अंकी मोबाईल नंबर टाका.');
+      showToast('कृपया वैध १० अंकी मोबाईल नंबर टाका.', 'info');
       return false;
     }
     const updated = { ...phoneOverrides, [recordId]: clean10 };
@@ -780,8 +818,8 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     // Mark as sent
     markAsSent(item.id);
 
-    // Directly open WhatsApp
-    window.open(url, '_blank', 'noopener,noreferrer');
+    // Directly open WhatsApp safely
+    openExternalLinkSafely(url);
     showToast(`${firm} साठी WhatsApp मेसेज उघडला!`);
   };
 
@@ -793,7 +831,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       const firm = missingPhoneModalItem.cleanedFirmName || missingPhoneModalItem.rawFirmName;
       const { url } = buildWhatsAppLink(clean10, firm, missingPhoneModalItem.formattedAmount);
       markAsSent(missingPhoneModalItem.id);
-      window.open(url, '_blank', 'noopener,noreferrer');
+      openExternalLinkSafely(url);
       setMissingPhoneModalItem(null);
       setManualPhoneInput('');
     }
@@ -1616,6 +1654,9 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           </div>
         </div>
       )}
+
+      {/* Confirmation & Alert Modal */}
+      <CustomDialogModal {...dialogConfig} />
     </div>
   );
 };

@@ -382,6 +382,328 @@ export async function safeFirestoreQuery<T>(
 }
 
 /**
+ * Normalizes string for deduplication (removes symbols, extra spaces, accents, registered trademarks)
+ */
+export function normalizeKey(s: any): string {
+  if (!s) return '';
+  return String(s)
+    .toLowerCase()
+    .replace(/[®™]/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Normalizes packing size strings to standard canonical formats:
+ * e.g. "1 Kg * 25 Nos", "1 Kg x 25", "1Kg", "1000 gm" -> "1 Kg"
+ * "2.5 Kg * 8 Nos", "2.5Kg", "2500 gm" -> "2.5 Kg"
+ * "25 Kg HDPE Bag", "25Kg" -> "25 Kg"
+ */
+export function normalizePackingSize(raw: any): string {
+  if (!raw) return '1 Kg';
+  const s = String(raw).toLowerCase().trim();
+  
+  if (/2\.5\s*(kg|kilo|bucket|bag|nos|\*|x)|2500\s*(gm|g)\b/.test(s)) {
+    return '2.5 Kg';
+  }
+  if (/(?:^|[^\d.])25(?:\.0)?\s*(kg|kilo|hdpe|bag|nos|\*|x)/.test(s)) {
+    return '25 Kg';
+  }
+  if (/(?:^|[^\d.])50(?:\.0)?\s*(kg|kilo|bag)/.test(s)) {
+    return '50 Kg';
+  }
+  if (/(?:^|[^\d.])1(?:\.0)?\s*(kg|kilo|box|bag|nos|\*|x)|1000\s*(gm|g)\b/.test(s)) {
+    return '1 Kg';
+  }
+  if (/500\s*(gm|g)|0\.5\s*kg/.test(s)) {
+    return '500 gm';
+  }
+  if (/250\s*(gm|g)|0\.25\s*kg/.test(s)) {
+    return '250 gm';
+  }
+  if (/100\s*(gm|g)|0\.1\s*kg/.test(s)) {
+    return '100 gm';
+  }
+  if (/5\s*(ltr|litre|l\b)/.test(s)) {
+    return '5 Ltr';
+  }
+  if (/1\s*(ltr|litre|l\b)/.test(s)) {
+    return '1 Ltr';
+  }
+  if (/500\s*ml/.test(s)) {
+    return '500 ml';
+  }
+  if (/250\s*ml/.test(s)) {
+    return '250 ml';
+  }
+  if (/100\s*ml/.test(s)) {
+    return '100 ml';
+  }
+  return String(raw).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Canonical Fertilizer Grade Key:
+ * Recognizes nutrient ratios and micro-elements invariants:
+ * e.g. "00:42:47 + Fe" and "0:42:47 + Fe" -> "0-42-47-fe"
+ * "0:52:34" and "00:52:34" -> "0-52-34"
+ * "0:0:50" and "00:00:50" -> "0-0-50"
+ * "12:61:0" and "12:61:00" -> "12-61-0"
+ * "Airawat® 19:19:19" and "19:19:19" -> "19-19-19"
+ * "Calcium Nitrate" and "Airawat Calcium Nitrate" -> "calciumnitrate"
+ */
+export function getCanonicalFertilizerKey(gradeOrName: any): string {
+  if (!gradeOrName) return '';
+  let s = String(gradeOrName).toLowerCase()
+    .replace(/[®™]/g, '')
+    .replace(/blackworm|airawat/g, '')
+    .replace(/^[a-z]?\s*\d+\s*[\.\-\)]\s*/i, '') // strip leading code/numbering like "A 1.", "S 1.", "1."
+    .trim();
+
+  // 1. Check for NPK Ratio e.g. 19:19:19, 00:42:47, 0:52:34, 12:61:0
+  const ratioMatch = s.match(/(\d+)\s*[:\-/]\s*(\d+)\s*[:\-/]\s*(\d+)/);
+  if (ratioMatch) {
+    const n1 = parseInt(ratioMatch[1], 10);
+    const n2 = parseInt(ratioMatch[2], 10);
+    const n3 = parseInt(ratioMatch[3], 10);
+    const ratioKey = `${n1}-${n2}-${n3}`;
+
+    // Extract micro-nutrients or trace elements
+    const elements: string[] = [];
+    if (/\b(fe|iron)\b/.test(s)) elements.push('fe');
+    if (/\b(mg|magnesium)\b/.test(s)) elements.push('mg');
+    if (/\b(zn|zinc)\b/.test(s)) elements.push('zn');
+    if (/\b(cu|copper)\b/.test(s)) elements.push('cu');
+    if (/\b(b|boron)\b/.test(s)) elements.push('b');
+    if (/\b(s|sulphur|sulfur)\b/.test(s)) elements.push('s');
+    if (/\b(combi|te|trace)\b/.test(s)) elements.push('combi');
+
+    elements.sort();
+    return elements.length > 0 ? `${ratioKey}-${elements.join('-')}` : ratioKey;
+  }
+
+  // 2. Named Fertilizer Grades
+  if (/calcium/i.test(s) && /nitrate/i.test(s)) return 'calciumnitrate';
+  if (/schoenite/i.test(s) || (/potassium/i.test(s) && /schoen/i.test(s))) return 'potassiumschoenite';
+  if (/magnesium/i.test(s) && (/sulphate/i.test(s) || /sulfate/i.test(s))) return 'magnesiumsulphate';
+  if (/nitro/i.test(s) && /king/i.test(s)) return 'nitroking';
+
+  // Fallback to strict alphanumeric
+  return s.replace(/[^a-z0-9]/g, '');
+}
+
+/**
+ * Resolves a unique canonical key for any product object
+ */
+export function getCanonicalProductKey(p: any): string {
+  if (!p) return '';
+  const gradeKey = getCanonicalFertilizerKey(p.gradeName || p.name);
+  if (gradeKey) return gradeKey;
+  if (p.code) {
+    const codeClean = String(p.code).toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (codeClean && !codeClean.startsWith('item')) return codeClean;
+  }
+  return normalizeKey(p.id || '');
+}
+
+/**
+ * Deduplicates product list so no product ever appears duplicated.
+ * Matches by invariant canonical nutrient keys & chemical names.
+ * When duplicate entries or packing rows occur, combines packings seamlessly
+ * without duplicate packing sizes or conflicting rates.
+ */
+export function deduplicateProducts<T = any>(products: T[]): T[] {
+  if (!products || !Array.isArray(products) || products.length === 0) return [];
+  const map = new Map<string, any>();
+
+  products.forEach((p: any) => {
+    if (!p) return;
+    const key = getCanonicalProductKey(p);
+    if (!key) {
+      if (p.id) map.set(p.id, p);
+      return;
+    }
+
+    // Standardize packing list for incoming item
+    const incomingPackings: any[] = [];
+    if (Array.isArray(p.packings) && p.packings.length > 0) {
+      p.packings.forEach((pk: any) => {
+        if (!pk) return;
+        const normSize = normalizePackingSize(pk.packingSize);
+        const rate = Number(pk.rate) || 0;
+        const mrp = Number(pk.mrp) || 0;
+        incomingPackings.push({ ...pk, packingSize: normSize, rate, mrp });
+      });
+    }
+
+    if (!map.has(key)) {
+      map.set(key, { ...p, packings: incomingPackings });
+    } else {
+      const existing: any = map.get(key)!;
+      const existingPackings: any[] = Array.isArray(existing.packings) ? [...existing.packings] : [];
+
+      incomingPackings.forEach((pk: any) => {
+        const pkSize = pk.packingSize;
+        const idx = existingPackings.findIndex((ep: any) => normalizePackingSize(ep?.packingSize) === pkSize);
+        if (idx >= 0) {
+          existingPackings[idx] = {
+            ...existingPackings[idx],
+            packingSize: pkSize,
+            rate: pk.rate > 0 ? pk.rate : existingPackings[idx].rate,
+            mrp: pk.mrp > 0 ? pk.mrp : existingPackings[idx].mrp,
+          };
+        } else {
+          existingPackings.push({
+            packingSize: pkSize,
+            rate: pk.rate || 0,
+            mrp: pk.mrp || 0,
+          });
+        }
+      });
+
+      const preferExistingCode = existing.code && !String(existing.code).startsWith('item_');
+      const preferIncomingId = existing.id?.startsWith('temp_');
+
+      const updatedItem: any = {
+        ...existing,
+        ...p,
+        id: preferIncomingId ? (p.id || existing.id) : (existing.id || p.id),
+        packings: existingPackings,
+        groupName: existing.groupName || p.groupName || 'Group A - Water Soluble Fertilizers',
+        brandName: existing.brandName || p.brandName || 'Airawat®',
+        code: preferExistingCode ? existing.code : (p.code || existing.code),
+        gradeName: existing.gradeName || p.gradeName,
+        hsn: existing.hsn || p.hsn,
+        gstRate: p.gstRate !== undefined ? p.gstRate : existing.gstRate,
+        orderIndex: existing.orderIndex || p.orderIndex,
+        isArchived: false,
+      };
+      map.set(key, updatedItem);
+    }
+  });
+
+  return Array.from(map.values()) as unknown as T[];
+}
+
+/**
+ * Deduplicates dealers so no dealership entry is doubled or tripled.
+ * Matches by exact ID, dealerCode, and firmName + (contactNumber or proprietorName or village).
+ * Prefers persistent Firestore documents over temp_ offline documents.
+ */
+export function deduplicateDealers<T = any>(dealers: T[]): T[] {
+  if (!dealers || !Array.isArray(dealers) || dealers.length === 0) return [];
+  const map = new Map<string, any>();
+
+  dealers.forEach((d: any) => {
+    if (!d) return;
+    const docId = d.id || '';
+    const cleanCode = (d.dealerCode || '').trim().toUpperCase();
+    const cleanFirm = normalizeKey(d.firmName);
+    const cleanContact = (d.contactNumber || '').replace(/\D/g, '').slice(-10);
+    const cleanVillage = normalizeKey(d.village);
+    const cleanProp = normalizeKey(d.proprietorName);
+
+    let key = '';
+    if (cleanFirm) {
+      key = `${cleanFirm}_${cleanContact || cleanVillage || cleanProp || 'main'}`;
+    } else if (cleanCode && cleanCode !== '-' && cleanCode !== 'NEW') {
+      key = `code_${cleanCode}`;
+    } else if (docId) {
+      key = `id_${docId}`;
+    }
+
+    if (!key) return;
+
+    if (!map.has(key)) {
+      map.set(key, { ...d });
+    } else {
+      const existing = map.get(key)!;
+      const preferIncomingId = existing.id?.startsWith('temp_') && !d.id?.startsWith('temp_');
+      const preferIncomingCode = (!existing.dealerCode || existing.dealerCode === '-' || existing.dealerCode === 'NEW') && d.dealerCode;
+
+      const merged = {
+        ...existing,
+        ...d,
+        id: preferIncomingId ? d.id : (existing.id || d.id),
+        dealerCode: preferIncomingCode ? d.dealerCode : (existing.dealerCode || d.dealerCode),
+        firmName: existing.firmName || d.firmName,
+        contactNumber: existing.contactNumber || d.contactNumber,
+        village: existing.village || d.village,
+        proprietorName: existing.proprietorName || d.proprietorName,
+        isArchived: existing.isArchived !== undefined ? (existing.isArchived && d.isArchived) : d.isArchived,
+      };
+      map.set(key, merged);
+    }
+  });
+
+  return Array.from(map.values()) as unknown as T[];
+}
+
+/**
+ * Deduplicates orders so no order is duplicated.
+ * Matches by exact ID and non-empty orderNumber.
+ */
+export function deduplicateOrders<T = any>(orders: T[]): T[] {
+  if (!orders || !Array.isArray(orders) || orders.length === 0) return [];
+  const result: T[] = [];
+  const seenIds = new Set<string>();
+  const seenOrderNums = new Set<string>();
+
+  orders.forEach((o: any) => {
+    if (!o) return;
+    const docId = o.id || '';
+    const orderNum = (o.orderNumber || '').trim().toUpperCase();
+
+    if (docId && seenIds.has(docId)) return;
+    if (orderNum && seenOrderNums.has(orderNum)) return;
+
+    if (docId) seenIds.add(docId);
+    if (orderNum) seenOrderNums.add(orderNum);
+
+    result.push(o);
+  });
+
+  return result;
+}
+
+/**
+ * Deduplicates collection entries so no receipt is doubled or tripled.
+ * Matches by ID, receiptNumber, and composite (date + dealerId + amount + collectedByUid).
+ */
+export function deduplicateCollections<T = any>(entries: T[]): T[] {
+  if (!entries || !Array.isArray(entries) || entries.length === 0) return [];
+  const result: T[] = [];
+  const seenIds = new Set<string>();
+  const seenReceipts = new Set<string>();
+  const seenComposite = new Set<string>();
+
+  entries.forEach((e: any) => {
+    if (!e) return;
+    const docId = e.id || '';
+    const receipt = (e.receiptNumber || '').trim().toUpperCase();
+    const date = (e.date || '').trim();
+    const dealerId = (e.dealerId || '').trim();
+    const amount = Number(e.amount) || 0;
+    const collector = (e.collectedByUid || e.userId || '').trim();
+
+    const composite = (date && dealerId && amount > 0)
+      ? `${date}_${dealerId}_${amount}_${collector}`
+      : '';
+
+    if (docId && seenIds.has(docId)) return;
+    if (receipt && seenReceipts.has(receipt)) return;
+    if (composite && seenComposite.has(composite)) return;
+
+    if (docId) seenIds.add(docId);
+    if (receipt) seenReceipts.add(receipt);
+    if (composite) seenComposite.add(composite);
+
+    result.push(e);
+  });
+
+  return result;
+}
+
+/**
  * Merges Firestore snapshot data with locally cached records and updates the device cache
  */
 export function mergeWithLocalData<T extends { id: string }>(
@@ -398,7 +720,13 @@ export function mergeWithLocalData<T extends { id: string }>(
     }
 
     const raw = localStorage.getItem(storageKey);
-    if (!raw) return serverItems;
+    if (!raw) {
+      if (colName === 'dealers_application' || colName === 'dealers') return deduplicateDealers(serverItems as any) as unknown as T[];
+      if (colName === 'orders') return deduplicateOrders(serverItems as any) as unknown as T[];
+      if (colName === 'collection_entries') return deduplicateCollections(serverItems as any) as unknown as T[];
+      if (colName === 'products_pricelist_v2' || colName === 'products') return deduplicateProducts(serverItems as any) as unknown as T[];
+      return serverItems;
+    }
     
     let map: Record<string, any>;
     try {
@@ -416,6 +744,31 @@ export function mergeWithLocalData<T extends { id: string }>(
       if (it && it.id) mergedMap.set(it.id, it);
     });
 
+    // Clean up temporary items from map if server already has the real document!
+    let mapMutated = false;
+    Object.keys(map).forEach((id) => {
+      if (id.startsWith('temp_')) {
+        const tempItem = map[id];
+        const hasMatch = serverItems.some((s: any) => {
+          if (s.orderNumber && tempItem.orderNumber && s.orderNumber === tempItem.orderNumber) return true;
+          if (s.dealerCode && tempItem.dealerCode && s.dealerCode === tempItem.dealerCode) return true;
+          if (s.receiptNumber && tempItem.receiptNumber && s.receiptNumber === tempItem.receiptNumber) return true;
+          if (s.firmName && tempItem.firmName && normalizeKey(s.firmName) === normalizeKey(tempItem.firmName) && s.contactNumber === tempItem.contactNumber) return true;
+          return false;
+        });
+        if (hasMatch) {
+          delete map[id];
+          mapMutated = true;
+        }
+      }
+    });
+
+    if (mapMutated) {
+      try {
+        localStorage.setItem(storageKey, JSON.stringify(map));
+      } catch {}
+    }
+
     // Then overlay/append locally saved items (retaining offline changes)
     Object.entries(map).forEach(([id, localDoc]) => {
       if (mergedMap.has(id)) {
@@ -431,7 +784,20 @@ export function mergeWithLocalData<T extends { id: string }>(
       }
     });
 
-    return Array.from(mergedMap.values());
+    let mergedList = Array.from(mergedMap.values());
+
+    // Apply collection-specific intelligent deduplication
+    if (colName === 'dealers_application' || colName === 'dealers') {
+      mergedList = deduplicateDealers(mergedList);
+    } else if (colName === 'orders') {
+      mergedList = deduplicateOrders(mergedList);
+    } else if (colName === 'collection_entries') {
+      mergedList = deduplicateCollections(mergedList);
+    } else if (colName === 'products_pricelist_v2' || colName === 'products') {
+      mergedList = deduplicateProducts(mergedList);
+    }
+
+    return mergedList as T[];
   } catch (e) {
     console.warn(`Merge error for ${colName}:`, e);
     return serverItems;

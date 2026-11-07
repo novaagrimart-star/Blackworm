@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { collection, query, where, onSnapshot } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, getDocs, limit } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { Language } from '../../lib/i18n';
 import { UserProfile, isAdmin } from '../../lib/auth';
@@ -112,48 +112,67 @@ export function buildReportRows(
   profile: UserProfile
 ): OfficerDailyReport[] {
   const { year, monthIndex, dayOfMonth, sheetMonthKey, targetMonthName } = parseDateKeys(selectedDate);
+  const userIsAdmin = isAdmin(profile);
 
-  // 1. Collect all valid officers (all employees / field staff except purely dealer or owner)
-  let officers = allUsers.filter((u) => {
-    const r = (u.role || '').toLowerCase().trim();
-    return r !== 'owner' && r !== 'dealer';
-  });
+  // 1. Role-based scoping:
+  // - Regular field officer / employee: ONLY see their own report! (User request: "युजर आहेत त्यांना फक्त त्यांचाच रिपोर्ट दिसावा सर्वांचा दिसणार नाही याची काळजी घे")
+  // - Admin / Owner: See all officers for the selected date! (User request: "ज्या तारखेचा डाटा आहे त्याच तारखेचा डाटा ऍडमिनला सर्व ऑफिसर यांचा दिसावा")
+  let officers: UserProfile[] = [];
 
-  if (officers.length === 0) {
-    officers = allUsers.filter((u) => (u.role || '').toLowerCase() !== 'owner');
-  }
-  if (officers.length === 0) {
+  if (!userIsAdmin) {
     officers = [profile];
+  } else {
+    officers = allUsers.filter((u) => {
+      const r = (u.role || '').toLowerCase().trim();
+      return r !== 'owner' && r !== 'dealer';
+    });
+
+    if (officers.length === 0) {
+      officers = allUsers.filter((u) => (u.role || '').toLowerCase() !== 'owner');
+    }
+    if (officers.length === 0) {
+      officers = [profile];
+    }
+
+    // 2. Also ensure any officer who submitted a travel sheet for this date/month is included
+    allTravelSheets.forEach((s) => {
+      const sId = (s.id || s._id || '') as string;
+      const isThisMonth = 
+        sId.includes(sheetMonthKey) ||
+        (s.yearNumber && Number(s.yearNumber) === year && (Number(s.monthIndex) === monthIndex || String(s.monthName || '').toLowerCase() === targetMonthName.toLowerCase()));
+
+      if (!isThisMonth) return;
+
+      const officerUid = s.userId || (sId.startsWith('travel_') ? sId.split('_')[1] : null);
+      if (!officerUid) return;
+
+      const alreadyInList = officers.some(o => 
+        o.uid === officerUid || 
+        (o.loginId && o.loginId.toLowerCase() === officerUid.toLowerCase()) ||
+        (o.fullName && s.officerName && o.fullName.trim().toLowerCase() === s.officerName.trim().toLowerCase())
+      );
+
+      if (!alreadyInList) {
+        officers.push({
+          uid: officerUid,
+          fullName: s.officerName || officerUid,
+          role: 'field_officer',
+          emailId: null,
+          createdAt: ''
+        });
+      }
+    });
   }
 
-  // 2. Also ensure any officer who submitted a travel sheet for this month is included even if their user record was missing or filtered
-  allTravelSheets.forEach((s) => {
-    const sId = (s.id || s._id || '') as string;
-    const matchesMonth = 
-      (s.yearNumber && Number(s.yearNumber) === year && s.monthName && s.monthName.toLowerCase() === targetMonthName.toLowerCase()) ||
-      sId.includes(sheetMonthKey);
-
-    if (!matchesMonth) return;
-
-    const officerUid = s.userId || (sId.startsWith('travel_') ? sId.split('_')[1] : null);
-    if (!officerUid) return;
-
-    const alreadyInList = officers.some(o => 
-      o.uid === officerUid || 
-      (o.loginId && o.loginId.toLowerCase() === officerUid.toLowerCase()) ||
-      (o.fullName && s.officerName && o.fullName.trim().toLowerCase() === s.officerName.trim().toLowerCase())
-    );
-
-    if (!alreadyInList) {
-      officers.push({
-        uid: officerUid,
-        fullName: s.officerName || officerUid,
-        role: 'field_officer',
-        emailId: null,
-        createdAt: ''
-      });
+  // Deduplicate officers so no officer is duplicated in the table
+  const uniqueOfficersMap = new Map<string, UserProfile>();
+  officers.forEach(o => {
+    const key = (o.uid || o.loginId || o.fullName || '').toLowerCase().trim();
+    if (!uniqueOfficersMap.has(key)) {
+      uniqueOfficersMap.set(key, o);
     }
   });
+  const uniqueOfficers = Array.from(uniqueOfficersMap.values());
 
   // Build target maps
   const yearlyTargetMap = new Map<string, any>();
@@ -170,71 +189,55 @@ export function buildReportRows(
     if (t.loginId) targetFallbackMap.set(t.loginId.toLowerCase(), t);
   });
 
-  return officers.map((officer, i) => {
-    // Robust travel sheet matching for this officer and selected month
-    let travelData: any = null;
+  return uniqueOfficers.map((officer, i) => {
+    // Collect ONLY candidate sheets that belong to THIS officer AND THIS MONTH (sheetMonthKey)
+    const candidateSheets: any[] = [];
 
-    // A. Match by exact expected doc ID: travel_${uid}_${sheetMonthKey}
-    const targetId1 = `travel_${officer.uid}_${sheetMonthKey}`;
-    travelData = allTravelSheets.find(s => (s.id === targetId1 || s._id === targetId1));
-
-    // B. Match by loginId if available
-    if (!travelData && officer.loginId) {
-      const targetId2 = `travel_${officer.loginId}_${sheetMonthKey}`;
-      travelData = allTravelSheets.find(s => (s.id === targetId2 || s._id === targetId2));
-    }
-
-    // C. Match by userId attribute + matching month/year
-    if (!travelData) {
-      travelData = allTravelSheets.find(s => {
-        const matchesUser = s.userId === officer.uid || 
-          (officer.loginId && s.userId && s.userId.toLowerCase() === officer.loginId.toLowerCase());
-        if (!matchesUser) return false;
-
-        const sId = (s.id || s._id || '') as string;
-        if (sId.includes(sheetMonthKey)) return true;
-        if (s.yearNumber && Number(s.yearNumber) === year && s.monthName && s.monthName.toLowerCase() === targetMonthName.toLowerCase()) return true;
-        return false;
-      });
-    }
-
-    // D. Match by officerName matching officer.fullName
-    if (!travelData && officer.fullName) {
-      const cleanName = officer.fullName.trim().toLowerCase();
-      travelData = allTravelSheets.find(s => {
-        if (!s.officerName) return false;
-        if (s.officerName.trim().toLowerCase() !== cleanName) return false;
-        const sId = (s.id || s._id || '') as string;
-        if (sId.includes(sheetMonthKey)) return true;
-        if (s.yearNumber && Number(s.yearNumber) === year && s.monthName && s.monthName.toLowerCase() === targetMonthName.toLowerCase()) return true;
-        return false;
-      });
-    }
-
-    // E. LocalStorage cache fallback if available
-    if (!travelData) {
-      try {
-        const cachedLocal = localStorage.getItem(`travel_sheet_${officer.uid}_${sheetMonthKey}`) ||
-                            (officer.loginId ? localStorage.getItem(`travel_sheet_${officer.loginId}_${sheetMonthKey}`) : null) ||
-                            localStorage.getItem(`travel_sheet_${officer.uid}`);
-        if (cachedLocal) {
-          travelData = JSON.parse(cachedLocal);
+    // Local storage exact month sheet has highest priority (immediate offline edits)
+    try {
+      const cachedExact = localStorage.getItem(`travel_sheet_${officer.uid}_${sheetMonthKey}`) ||
+                          (officer.loginId ? localStorage.getItem(`travel_sheet_${officer.loginId}_${sheetMonthKey}`) : null);
+      if (cachedExact) {
+        const parsed = JSON.parse(cachedExact);
+        if (parsed && Array.isArray(parsed.rows)) {
+          candidateSheets.push(parsed);
         }
-      } catch (e) {}
-    }
+      }
+    } catch (e) {}
 
-    let route = '-', openingKm = 0, closingKm = 0, dailyExpense = 0, recordedKm = 0;
-    if (travelData && Array.isArray(travelData.rows)) {
-      // Find row for this EXACT date or day number
-      const dayRow = travelData.rows.find((r: any) => {
+    allTravelSheets.forEach(s => {
+      const sId = (s.id || s._id || '') as string;
+      const cleanOfficerName = (officer.fullName || '').trim().toLowerCase();
+      const cleanSheetName = (s.officerName || '').trim().toLowerCase();
+
+      // Check if sheet belongs to this officer
+      const matchesUid = s.userId === officer.uid || sId.includes(officer.uid);
+      const matchesLogin = officer.loginId && (s.userId?.toLowerCase() === officer.loginId.toLowerCase() || sId.toLowerCase().includes(officer.loginId.toLowerCase()));
+      const matchesName = cleanOfficerName && cleanSheetName && (cleanOfficerName === cleanSheetName || cleanOfficerName.includes(cleanSheetName) || cleanSheetName.includes(cleanOfficerName));
+
+      if (!matchesUid && !matchesLogin && !matchesName) return;
+
+      // STRICT MONTH & YEAR CHECK: Sheet MUST belong to this selected month & year!
+      const matchesMonthYear = 
+        sId.includes(sheetMonthKey) ||
+        (Number(s.yearNumber) === year && (Number(s.monthIndex) === monthIndex || String(s.monthName || '').toLowerCase().includes(targetMonthName.toLowerCase()) || String(s.monthName || '').toLowerCase().includes('nov'))) ||
+        (Array.isArray(s.rows) && s.rows.some((r: any) => r && r.date && r.date.trim() === selectedDate.trim()));
+
+      if (matchesMonthYear) {
+        candidateSheets.push(s);
+      }
+    });
+
+    // Find the exact row for selectedDate
+    let dayRow: any = null;
+
+    for (const sheet of candidateSheets) {
+      if (!sheet || !Array.isArray(sheet.rows)) continue;
+
+      // 1. Direct date match (e.g. '2026-11-06')
+      let matched = sheet.rows.find((r: any) => {
         if (!r) return false;
-        // 1. Direct date match (e.g. 2026-11-05)
         if (r.date && r.date.trim() === selectedDate.trim()) return true;
-
-        // 2. Matching dayNumber
-        if (Number(r.dayNumber) === dayOfMonth) return true;
-
-        // 3. Match parsed date components (handles DD-MM-YYYY, DD/MM/YYYY, etc.)
         if (r.date && typeof r.date === 'string') {
           const parts = r.date.trim().split(/[-/]/);
           if (parts.length === 3) {
@@ -247,20 +250,46 @@ export function buildReportRows(
         return false;
       });
 
-      if (dayRow) {
-        const rawRoute = (dayRow.route || '').trim();
-        route = rawRoute || '-';
-        openingKm = Number(dayRow.openingKm) || 0;
-        closingKm = Number(dayRow.closingKm) || 0;
-        recordedKm = Number(dayRow.km) || 0;
-        dailyExpense = (Number(dayRow.amount) || 0) + (Number(dayRow.otherExpenses) || 0);
+      // 2. Day-of-month match (ONLY valid because sheet is already verified for this month!)
+      if (!matched) {
+        matched = sheet.rows.find((r: any) => r && Number(r.dayNumber) === dayOfMonth);
       }
+
+      if (matched) {
+        dayRow = matched;
+        const hasData = (matched.route && matched.route !== '-') ||
+          Number(matched.openingKm) > 0 ||
+          Number(matched.closingKm) > 0 ||
+          Number(matched.km) > 0 ||
+          Number(matched.amount) > 0 ||
+          Number(matched.otherExpenses) > 0;
+        if (hasData) {
+          break; // Found filled data for this date, stop searching!
+        }
+      }
+    }
+
+    let route = '-', openingKm = 0, closingKm = 0, dailyExpense = 0, recordedKm = 0;
+    if (dayRow) {
+      const rawRoute = (dayRow.route || '').trim();
+      route = rawRoute || '-';
+      openingKm = Number(dayRow.openingKm) || 0;
+      closingKm = Number(dayRow.closingKm) || 0;
+      recordedKm = Number(dayRow.km) || 0;
+      dailyExpense = (Number(dayRow.amount) || 0) + (Number(dayRow.otherExpenses) || 0);
     }
 
     const paymentCollection = collDocs
       .filter((d: any) => {
         const dDate = (d.date || '').trim();
-        const matchesDate = dDate === selectedDate || dDate.startsWith(selectedDate);
+        let matchesDate = dDate === selectedDate || dDate.startsWith(selectedDate);
+        if (!matchesDate && dDate) {
+          const parts = dDate.split(/[-/]/);
+          if (parts.length === 3) {
+            if (parts[0] === String(year) && Number(parts[1]) === monthIndex + 1 && Number(parts[2]) === dayOfMonth) matchesDate = true;
+            if (Number(parts[0]) === dayOfMonth && Number(parts[1]) === monthIndex + 1 && parts[2] === String(year)) matchesDate = true;
+          }
+        }
         if (!matchesDate) return false;
 
         return (
@@ -352,17 +381,10 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
   const oldTargetsRef = useRef<any[]>(reportStaticCache?.targets || []);
   const collDocsRef = useRef<any[]>([]);
 
-  // Instant Initial State: Read immediately from localStorage or memory cache (0ms latency!)
+  // Instant Initial State: Computed freshly using current user profile and cached travel rows (0ms latency!)
   const [reportData, setReportData] = useState<OfficerDailyReport[]>(() => {
     if (typeof window !== 'undefined') {
       try {
-        const cachedDaily = localStorage.getItem(`${LOCAL_STORAGE_DAILY_PREFIX}${todayDate}`);
-        if (cachedDaily) {
-          const parsed = JSON.parse(cachedDaily);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            return parsed;
-          }
-        }
         const cachedUsers = getInitialCachedUsers();
         if (cachedUsers.length > 0) {
           return buildReportRows(
@@ -370,7 +392,7 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
             getInitialCachedTravel(),
             reportStaticCache?.yearlyTargets || [],
             reportStaticCache?.targets || [],
-            [],
+            mergeWithLocalData('collection_entries', []),
             todayDate,
             profile
           );
@@ -408,10 +430,8 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
     recomputeLiveReport();
   }, [selectedDate]);
 
-  // Master Background Sync: Users, Travel Sheets, Yearly Targets (Only mounted once, zero duplicate reads on date switch!)
+  // Master Background Sync: Users, Travel Sheets, Yearly Targets & Collections (Mounted once, zero lag on date switch!)
   useEffect(() => {
-    const userIsAdmin = isAdmin(profile);
-
     // 1. Live Users Listener (Cached immediately)
     const qUsers = query(collection(db, 'users'));
     const unsubUsers = onSnapshot(qUsers, (snap) => {
@@ -431,7 +451,7 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
       setLoading(false);
     });
 
-    // 2. Live Travel Sheets Listener - Always query all travel sheets so all officers' entries are updated in real-time
+    // 2. Live Travel Sheets Listener - Query all travel sheets so all officers' entries are updated in real-time
     const qTravel = query(collection(db, 'travel_sheets'));
     const unsubTravel = onSnapshot(qTravel, (snap) => {
       const tList = snap.docs.map(d => ({ ...d.data(), id: d.id, _id: d.id }));
@@ -459,6 +479,20 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
       setLoading(false);
     });
 
+    // 4. Live Collection Entries Listener (Query recent collections with fallback to local cache)
+    const qColl = query(collection(db, 'collection_entries'), limit(500));
+    const unsubColl = onSnapshot(qColl, (snap) => {
+      const list = snap.docs.map(d => ({ ...d.data(), id: d.id }));
+      const merged = mergeWithLocalData('collection_entries', list);
+      collDocsRef.current = merged;
+      recomputeLiveReport();
+    }, (err) => {
+      console.warn('Collections live sync notice:', err);
+      const merged = mergeWithLocalData('collection_entries', collDocsRef.current);
+      collDocsRef.current = merged;
+      recomputeLiveReport();
+    });
+
     // Safety timeout: ensure loading turns off within 1.2s even on slow connection or quota exhaustion
     const safetyTimer = setTimeout(() => {
       recomputeLiveReport();
@@ -470,27 +504,66 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
       unsubUsers();
       unsubTravel();
       unsubTargets();
+      unsubColl();
     };
   }, [profile.uid]);
 
-  // Targeted Daily Collection Entries (Only queries records for the specific date selected)
-  useEffect(() => {
-    const qColl = query(collection(db, 'collection_entries'), where('date', '==', selectedDate));
-    const unsubColl = onSnapshot(qColl, (snap) => {
-      const list = snap.docs.map(d => ({ ...d.data(), id: d.id }));
-      const merged = mergeWithLocalData('collection_entries', list);
-      collDocsRef.current = merged.filter((d: any) => (d.date || '').trim() === selectedDate.trim() || (d.date && d.date.startsWith(selectedDate)));
-      recomputeLiveReport();
-    }, (err) => {
-      console.warn('Collections live sync notice:', err);
-      const merged = mergeWithLocalData('collection_entries', collDocsRef.current);
-      collDocsRef.current = merged.filter((d: any) => (d.date || '').trim() === selectedDate.trim() || (d.date && d.date.startsWith(selectedDate)));
-      recomputeLiveReport();
-      setLoading(false);
-    });
+  // Manual Refresh to fetch latest from Firestore and local cache
+  const handleRefresh = async () => {
+    setIsRefreshing(true);
+    try {
+      // 1. Fetch live travel sheets
+      try {
+        const tSnap = await getDocs(collection(db, 'travel_sheets'));
+        const tList = tSnap.docs.map(d => ({ ...d.data(), id: d.id, _id: d.id }));
+        const mergedTravel = mergeWithLocalData('travel_sheets', tList as any[]);
+        travelRef.current = mergedTravel;
+        try {
+          localStorage.setItem('blackworm_cached_travel_sheets', JSON.stringify(mergedTravel));
+        } catch (e) {}
+      } catch (e) {
+        console.warn('Manual refresh travel error:', e);
+      }
 
-    return () => unsubColl();
-  }, [selectedDate]);
+      // 2. Fetch live users
+      try {
+        const uSnap = await getDocs(collection(db, 'users'));
+        const uList = uSnap.docs.map(d => ({ ...d.data(), id: d.id, uid: d.id }));
+        const mergedUsers = mergeWithLocalData('users', uList) as unknown as UserProfile[];
+        usersRef.current = mergedUsers;
+        try {
+          localStorage.setItem('blackworm_cached_users', JSON.stringify(mergedUsers));
+        } catch (e) {}
+      } catch (e) {
+        console.warn('Manual refresh users error:', e);
+      }
+
+      // 3. Fetch live collections
+      try {
+        const cSnap = await getDocs(query(collection(db, 'collection_entries'), limit(500)));
+        const cList = cSnap.docs.map(d => ({ ...d.data(), id: d.id }));
+        const mergedColl = mergeWithLocalData('collection_entries', cList);
+        collDocsRef.current = mergedColl;
+      } catch (e) {
+        console.warn('Manual refresh collections error:', e);
+      }
+
+      // 4. Fetch live targets
+      try {
+        const tgSnap = await getDocs(collection(db, 'yearly_targets'));
+        targetsRef.current = tgSnap.docs.map(d => ({ ...d.data(), id: d.id, _id: d.id }));
+      } catch (e) {
+        console.warn('Manual refresh targets error:', e);
+      }
+
+      // 5. Recompute live report
+      recomputeLiveReport();
+    } finally {
+      setTimeout(() => {
+        setIsRefreshing(false);
+      }, 500);
+    }
+  };
 
   // Capture Report Photo directly to device gallery / download
   const handleCaptureReportPhoto = async () => {
@@ -629,6 +702,18 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
             title="आजच्या तारखेवर जा"
           >
             Today (आज)
+          </button>
+
+          {/* Manual Refresh Button */}
+          <button
+            type="button"
+            onClick={handleRefresh}
+            disabled={isRefreshing}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold bg-slate-100 hover:bg-indigo-50 text-slate-700 hover:text-indigo-600 rounded-xl transition border border-slate-200 cursor-pointer active:scale-95 disabled:opacity-60"
+            title="डेटा रिफ्रेश करा (Refresh Report Data)"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-indigo-600' : ''}`} />
+            <span>Refresh</span>
           </button>
 
           {/* Officer Submissions Count Badge */}

@@ -14,10 +14,10 @@ import {
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { softDeleteRecord, logAudit, safeFirestoreSet, mergeWithLocalData } from '../../lib/dataService';
+import { softDeleteRecord, logAudit, safeFirestoreSet, mergeWithLocalData, deduplicateOrders, deduplicateDealers, deduplicateProducts } from '../../lib/dataService';
 import { Language } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
-import { cn, toTitleCase } from '../../lib/utils';
+import { cn, toTitleCase, openExternalLinkSafely } from '../../lib/utils';
 import { OFFICIAL_REFERENCE_DATA, DynamicPriceProduct, calculateWithGst } from './PriceListView';
 import { getStandardBillingDiscount } from './SchemeView';
 import html2canvas from 'html2canvas-pro';
@@ -486,9 +486,9 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       const merged = mergeWithLocalData('orders', list);
       
       if (isLoadMore) {
-        setOrders(prev => [...prev, ...merged]);
+        setOrders(prev => deduplicateOrders([...prev, ...merged]));
       } else {
-        setOrders(merged);
+        setOrders(deduplicateOrders(merged));
       }
 
       setLastDoc(snap.docs[snap.docs.length - 1] || null);
@@ -497,7 +497,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       console.warn("Orders fetch error:", error);
       if (!isLoadMore) {
         const cached = mergeWithLocalData('orders', []);
-        setOrders(cached);
+        setOrders(deduplicateOrders(cached));
       }
     } finally {
       setIsLoadingMore(false);
@@ -562,11 +562,11 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
 
       list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
       const merged = mergeWithLocalData('orders', list);
-      setOrders(merged);
+      setOrders(deduplicateOrders(merged));
     }, (error) => {
       console.warn("orders real-time sync notice:", error);
       const cached = mergeWithLocalData('orders', []);
-      setOrders(cached);
+      setOrders(deduplicateOrders(cached));
     });
 
     return () => unsub();
@@ -604,7 +604,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       if (cached) {
         const parsed = JSON.parse(cached);
         if (Array.isArray(parsed) && parsed.length > 0) {
-          setDealers(parsed);
+          setDealers(deduplicateDealers(parsed));
         }
       }
     } catch {}
@@ -637,29 +637,30 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       });
 
       const mergedDealers = mergeWithLocalData('dealers_application', dList);
-      mergedDealers.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
-      setDealers(mergedDealers);
+      const cleanDealers = deduplicateDealers(mergedDealers);
+      cleanDealers.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
+      setDealers(cleanDealers);
       try {
-        localStorage.setItem('blackworm_all_dealers', JSON.stringify(mergedDealers));
+        localStorage.setItem('blackworm_all_dealers', JSON.stringify(cleanDealers));
       } catch {}
     }, (err) => {
       console.warn('Dealers live sync notice in OrderView:', err);
       const cached = mergeWithLocalData('dealers_application', []);
-      setDealers(cached);
+      setDealers(deduplicateDealers(cached));
     });
 
     // 2. Load & Sync Products with Firestore master_pricelist + products_pricelist_v2 + OFFICIAL_REFERENCE_DATA fallback
-    const fallbackProducts = OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
+    const fallbackProducts = deduplicateProducts(OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
       ...p,
       id: (p as any).id || `prod_ref_${idx + 1}`,
-    }));
+    })));
 
     // Listen to config/master_pricelist (Single atomic source of truth updated by Admin)
     const unsubMasterPricelist = onSnapshot(doc(db, 'config', 'master_pricelist'), (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
         if (data && Array.isArray(data.products) && data.products.length > 0) {
-          const validList = data.products.filter((p: any) => !p.isArchived);
+          const validList = deduplicateProducts(data.products.filter((p: any) => !p.isArchived));
           if (validList.length > 0) {
             setProducts(validList);
             try {
@@ -678,7 +679,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         if (cachedProducts) {
           const parsed = JSON.parse(cachedProducts);
           if (Array.isArray(parsed) && parsed.length > 0) {
-            setProducts(parsed);
+            setProducts(deduplicateProducts(parsed));
           }
         }
 
@@ -691,18 +692,19 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           }
         });
         if (pList.length > 0) {
-          pList.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
-          setProducts(pList);
+          const cleanPList = deduplicateProducts(pList);
+          cleanPList.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
+          setProducts(cleanPList);
           try {
-            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(pList));
+            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanPList));
           } catch {}
         } else {
           // If Firestore collection has no items, ensure fallback
-          setProducts((prev) => (prev && prev.length > 0 ? prev : fallbackProducts));
+          setProducts((prev) => (prev && prev.length > 0 ? deduplicateProducts(prev) : fallbackProducts));
         }
       } catch (err) {
         console.warn('Products fetch notice in OrderView:', err);
-        setProducts((prev) => (prev && prev.length > 0 ? prev : fallbackProducts));
+        setProducts((prev) => (prev && prev.length > 0 ? deduplicateProducts(prev) : fallbackProducts));
       }
     };
     loadProducts();
@@ -1166,7 +1168,7 @@ ${itemsListText}
           }
         }
 
-        window.open(waUrl, '_blank');
+        openExternalLinkSafely(waUrl);
       } catch (err: any) {
         console.error('Error sharing order photo:', err);
         const text = generateWhatsAppMessage(order);
@@ -1175,7 +1177,7 @@ ${itemsListText}
           cleanPhone && cleanPhone.length === 10
             ? `https://wa.me/91${cleanPhone}?text=${encodeURIComponent(text)}`
             : `https://wa.me/?text=${encodeURIComponent(text)}`;
-        window.open(waUrl, '_blank');
+        openExternalLinkSafely(waUrl);
       } finally {
         setIsGeneratingImage(false);
       }

@@ -523,7 +523,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     const totalExpensesAmount = subtotalAmount;
     const averageCostPerKm = totalKm > 0 ? Math.round((totalExpensesAmount / totalKm) * 100) / 100 : 0;
 
-    setSheet({
+    const updatedSheet: TravelSheetData = {
       ...sheet,
       rows: newRows,
       totalKm,
@@ -532,7 +532,23 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       subtotalAmount,
       averageCostPerKm,
       totalExpensesAmount
-    });
+    };
+
+    setSheet(updatedSheet);
+
+    // Instant local caching so Report view and tab switching see this row immediately
+    try {
+      const sheetMonthKey = `${sheet.yearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
+      const cacheKey = `travel_sheet_${sheet.userId}_${sheetMonthKey}`;
+      localStorage.setItem(cacheKey, JSON.stringify(updatedSheet));
+      localStorage.setItem(`travel_sheet_${sheet.userId}`, JSON.stringify(updatedSheet));
+      const cachedAllRaw = localStorage.getItem('blackworm_cached_travel_sheets');
+      let cachedAll: any[] = cachedAllRaw ? JSON.parse(cachedAllRaw) : [];
+      const idx = cachedAll.findIndex((s: any) => s.id === sheet.id || s._id === sheet.id);
+      if (idx >= 0) cachedAll[idx] = updatedSheet;
+      else cachedAll.push(updatedSheet);
+      localStorage.setItem('blackworm_cached_travel_sheets', JSON.stringify(cachedAll));
+    } catch {}
   };
 
   const handleRateChange = (newRate: number) => {

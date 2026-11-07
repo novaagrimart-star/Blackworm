@@ -38,3 +38,26 @@ export function toTitleCase(str: string | undefined | null): string {
     })
     .join(' ');
 }
+
+/**
+ * Safely opens external links (like WhatsApp, tel, downloads) in web and iframe environments
+ * without getting blocked by popup blockers or sandbox restrictions.
+ */
+export function openExternalLinkSafely(url: string): void {
+  if (!url) return;
+  try {
+    const link = document.createElement('a');
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  } catch (e) {
+    try {
+      window.open(url, '_blank', 'noopener,noreferrer');
+    } catch (e2) {
+      window.location.assign(url);
+    }
+  }
+}

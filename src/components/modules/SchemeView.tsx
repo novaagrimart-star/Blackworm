@@ -4,6 +4,7 @@ import { db } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { Language } from '../../lib/i18n';
 import { DynamicPriceProduct, OFFICIAL_REFERENCE_DATA, calculateWithGst } from './PriceListView';
+import { deduplicateProducts } from '../../lib/dataService';
 import { CustomDialogModal } from '../CustomDialogModal';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas-pro';
@@ -140,7 +141,8 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
       });
 
       if (list.length > 0) {
-        list.sort((a, b) => {
+        const cleanList = deduplicateProducts(list);
+        cleanList.sort((a, b) => {
           const rank = (name: string) => {
             const n = (name || '').toLowerCase();
             if (n.includes('group a')) return 1;
@@ -154,9 +156,9 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
           if (rA !== rB) return rA - rB;
           return (a.orderIndex || 0) - (b.orderIndex || 0);
         });
-        setProducts(list);
+        setProducts(cleanList);
         try {
-          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(list));
+          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanList));
         } catch {}
       } else {
         try {
@@ -164,15 +166,15 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
           if (cached) {
             const parsed = JSON.parse(cached);
             if (Array.isArray(parsed) && parsed.length > 0) {
-              setProducts(parsed);
+              setProducts(deduplicateProducts(parsed));
               return;
             }
           }
         } catch {}
-        const fallback: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
+        const fallback: DynamicPriceProduct[] = deduplicateProducts(OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
           ...item,
           id: `ref_${idx + 1}`,
-        }));
+        })));
         setProducts(fallback);
       }
     }, (err) => {

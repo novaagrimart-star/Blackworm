@@ -13,9 +13,10 @@ import {
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { logAudit, safeFirestoreSet, mergeWithLocalData } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, mergeWithLocalData, deduplicateCollections, deduplicateOrders, deduplicateDealers } from '../../lib/dataService';
 import { Language, translations } from '../../lib/i18n';
-import { cn, toTitleCase } from '../../lib/utils';
+import { cn, toTitleCase, openExternalLinkSafely } from '../../lib/utils';
+import { CustomDialogModal } from '../CustomDialogModal';
 import { useBranding } from '../../lib/branding';
 import { 
   IndianRupee, 
@@ -153,6 +154,21 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [successToast, setSuccessToast] = useState<string>('');
 
+  const [dialogConfig, setDialogConfig] = useState<{
+    isOpen: boolean;
+    type?: 'confirm' | 'alert' | 'success';
+    title?: string;
+    message: string;
+    confirmText?: string;
+    cancelText?: string;
+    onConfirm: () => void;
+    onCancel?: () => void;
+  }>({
+    isOpen: false,
+    message: '',
+    onConfirm: () => {},
+  });
+
   const printableSheetRef = useRef<HTMLDivElement>(null);
 
   // Edit Receipt Modal States
@@ -228,9 +244,9 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       const merged = mergeWithLocalData('collection_entries', list);
       
       if (isLoadMore) {
-        setCollectionEntries(prev => [...prev, ...merged]);
+        setCollectionEntries(prev => deduplicateCollections([...prev, ...merged]));
       } else {
-        setCollectionEntries(merged);
+        setCollectionEntries(deduplicateCollections(merged));
       }
 
       setLastDoc(snap.docs[snap.docs.length - 1] || null);
@@ -239,7 +255,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       console.warn("collection_entries fetch error:", error);
       if (!isLoadMore) {
         const cached = mergeWithLocalData('collection_entries', []);
-        setCollectionEntries(cached);
+        setCollectionEntries(deduplicateCollections(cached));
       }
     } finally {
       setIsLoadingMore(false);
@@ -261,11 +277,11 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       });
       list.sort((a, b) => new Date(b.createdAt || b.date || 0).getTime() - new Date(a.createdAt || a.date || 0).getTime());
       const merged = mergeWithLocalData('collection_entries', list);
-      setCollectionEntries(merged);
+      setCollectionEntries(deduplicateCollections(merged));
     }, (err) => {
       console.warn("collection_entries real-time sync notice:", err);
       const cached = mergeWithLocalData('collection_entries', []);
-      setCollectionEntries(cached);
+      setCollectionEntries(deduplicateCollections(cached));
     });
 
     // 2. Real-time Orders for standing calculations
@@ -278,11 +294,11 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       });
       oList.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
       const mergedOrders = mergeWithLocalData('orders', oList);
-      setOrders(mergedOrders);
+      setOrders(deduplicateOrders(mergedOrders));
     }, (err) => {
       console.warn("orders sync notice:", err);
       const cached = mergeWithLocalData('orders', []);
-      setOrders(cached);
+      setOrders(deduplicateOrders(cached));
     });
 
     // 3. Real-time Dealers
@@ -315,11 +331,11 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       });
       dList.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
       const mergedDealers = mergeWithLocalData('dealers_application', dList as any);
-      setDealers(mergedDealers as any);
+      setDealers(deduplicateDealers(mergedDealers as any) as any);
     }, (err) => {
       console.warn("dealers sync notice:", err);
       const cached = mergeWithLocalData('dealers_application', []);
-      setDealers(cached as any);
+      setDealers(deduplicateDealers(cached as any) as any);
     });
 
     return () => {
@@ -504,12 +520,26 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
 
     const payVal = Number(paymentAmount) || 0;
     if (payVal <= 0) {
-      alert('Please enter a valid payment amount');
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'अवैध रक्कम (Invalid Amount)',
+        message: 'कृपया वैध रक्कम भरा (Please enter a valid payment amount).',
+        confirmText: 'ठीक आहे',
+        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+      });
       return;
     }
 
     if (!selectedDealerId) {
-      alert('Please select a party/dealer');
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'डीलर निवडा (Select Party)',
+        message: 'कृपया पार्टी किंवा डीलर निवडा (Please select a party/dealer).',
+        confirmText: 'ठीक आहे',
+        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+      });
       return;
     }
 
@@ -612,10 +642,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
   };
 
   // Delete Receipt and Revert Balances
-  const handleDeleteReceipt = async (entry: CollectionRecord) => {
-    if (!isAdmin(profile)) return;
-    if (!window.confirm(`Are you sure you want to delete this payment receipt of ₹${entry.amount.toLocaleString()}? This will revert the balance on the associated orders.`)) return;
-
+  const executeDeleteReceipt = async (entry: CollectionRecord) => {
     try {
       // 1. Revert balances on orders (LIFO - Newest paid first)
       let amountToRevert = Number(entry.amount) || 0;
@@ -637,8 +664,6 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
 
         const newPaid = Math.max(0, currentPaid - revertVal);
         const newBal = currentBal + revertVal;
-        // If it was collected, and now has balance, move back to pending/delivered
-        // Simple logic: if newBal > 0 and status was 'collected', set to 'delivered' (or whatever makes sense)
         const newStatus = newBal > 0 && ord.status === 'collected' ? 'delivered' : ord.status;
 
         await updateDoc(doc(db, 'orders', ord.id), {
@@ -652,11 +677,6 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       }
 
       // 2. Delete the record
-      await updateDoc(doc(db, 'collection_entries', entry.id), {
-        isArchived: true, // Prefer soft delete if possible, but let's see if we should deleteDoc
-      });
-      // Actually, since we don't have isArchived filter in the listener, let's delete it
-      // Wait, let's just delete the doc to keep it simple as requested
       const { deleteDoc } = await import('firebase/firestore');
       await deleteDoc(doc(db, 'collection_entries', entry.id));
 
@@ -669,12 +689,30 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         profile
       );
 
-      setSuccessToast(`Receipt for ₹${entry.amount.toLocaleString()} deleted and balances reverted.`);
+      setSuccessToast(`पावती ₹${entry.amount.toLocaleString()} यशस्वीरित्या हटवली आणि बॅलन्स पूर्ववत केला.`);
       setTimeout(() => setSuccessToast(''), 4000);
     } catch (err: any) {
       console.error('Delete error:', err);
-      alert('Error deleting receipt: ' + (err.message || err));
+      setSuccessToast('पावती हटवताना त्रुटी: ' + (err.message || 'Error'));
+      setTimeout(() => setSuccessToast(''), 4000);
     }
+  };
+
+  const handleDeleteReceipt = (entry: CollectionRecord) => {
+    if (!isAdmin(profile)) return;
+    setDialogConfig({
+      isOpen: true,
+      type: 'confirm',
+      title: 'पावती हटवा (Delete Receipt)',
+      message: `तुम्हाला खात्री आहे की तुम्ही ₹${entry.amount.toLocaleString()} ची ही पावती हटवू इच्छिता? यामुळे संबंधित ऑर्डरचा बॅलन्स पूर्ववत केला जाईल.`,
+      confirmText: 'हटवा (Delete)',
+      cancelText: 'रद्द करा (Cancel)',
+      onConfirm: () => {
+        setDialogConfig(prev => ({ ...prev, isOpen: false }));
+        executeDeleteReceipt(entry);
+      },
+      onCancel: () => setDialogConfig(prev => ({ ...prev, isOpen: false }))
+    });
   };
 
   const handleOpenEditReceipt = (entry: CollectionRecord) => {
@@ -776,7 +814,8 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       setTimeout(() => setSuccessToast(''), 4000);
     } catch (err: any) {
       console.error('Update error:', err);
-      alert('Error updating receipt: ' + (err.message || err));
+      setSuccessToast('पावती अपडेट करताना त्रुटी: ' + (err.message || 'त्रुटी'));
+      setTimeout(() => setSuccessToast(''), 4000);
     } finally {
       setIsSubmitting(false);
     }
@@ -813,10 +852,10 @@ Blackworm Agritech Pvt. Ltd.`;
     
     if (cleanPhone && cleanPhone.length === 10) {
       const waUrl = `https://wa.me/91${cleanPhone}?text=${encodeURIComponent(message)}`;
-      window.open(waUrl, '_blank');
+      openExternalLinkSafely(waUrl);
     } else {
       const waUrl = `https://wa.me/?text=${encodeURIComponent(message)}`;
-      window.open(waUrl, '_blank');
+      openExternalLinkSafely(waUrl);
     }
   };
 
@@ -1682,6 +1721,9 @@ Blackworm Agritech Pvt. Ltd.`;
           </div>
         </div>
       )}
+
+      {/* Confirmation & Alert Modal */}
+      <CustomDialogModal {...dialogConfig} />
     </div>
   );
 };

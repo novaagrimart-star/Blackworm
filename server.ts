@@ -55,21 +55,15 @@ async function createServer() {
       4. BRAND & GRADE SEPARATION:
          - brandName: The brand title (usually "Airawat®" or "Blackworm")
          - gradeName: The nutrient grade or chemical name (e.g. "19:19:19", "00:42:47 + Fe", "11:44:11 + Zn", "Calcium Nitrate", "Nitro King", etc.)
-      5. MULTIPLE PACKINGS PER PRODUCT:
-         If a product grade has multiple packing sizes (e.g. "1Kg * 25 Nos" with Rate 195 and MRP 370, AND "25 Kg" with Rate 3710 and MRP 4960), group them together under the same product's "packings" array.
-      6. ALL ROWS MUST BE CAPTURED:
-         Extract every single product grade row present in the table. If there are 9 products, extract all 9. If 17 products, extract all 17.
-      
-      JSON SCHEMA FIELDS:
-      - validityDate: string (e.g., "Pricelist w.e.f 01/10/2026 to 31/10/2026")
-      - products: array of objects:
-        - groupName: string (Exact category heading from the file)
-        - code: string (Sr. No / Code, e.g., "A 1.", "A 2.", "S 1.", etc.)
-        - brandName: string (e.g., "Airawat®")
-        - gradeName: string (e.g., "19:19:19", "11:44:11 + Zn", "00:42:47 + Fe")
-        - hsn: string (HSN code, e.g., "31052000")
-        - gstRate: number (GST percentage, e.g., 5)
-        - packings: array of { packingSize: string, rate: number, mrp: number }`;
+      5. MULTIPLE PACKINGS PER PRODUCT (CRITICAL):
+         Agricultural price lists often show multiple rows for different packing sizes of the same grade (e.g., "1 Kg * 25 Nos" with Rate 195 and MRP 370 in row 1, AND "25 Kg" with Rate 3710 and MRP 4960 in row 2).
+         You MUST combine all packing sizes for the same product grade into a SINGLE product object's "packings" array.
+         NEVER create separate product items for different packing sizes of the same grade!
+      6. STRICTLY UNIQUE PRODUCTS:
+         Each unique product grade must appear only ONCE in the products array.
+      7. CLEAN GRADE NAMES:
+         Do not include brand name inside gradeName (e.g. use "19:19:19", not "Airawat 19:19:19").
+         Do not include code or Sr No inside gradeName (e.g. use "19:19:19", not "1. 19:19:19").`;
 
       const prompt = "Parse this price list image/document and return the structured JSON object with validityDate and products array. Only return JSON.";
 
@@ -152,6 +146,55 @@ async function createServer() {
 
       if (!parsedData) {
         throw lastError || new Error('Failed to parse price list after automated retries');
+      }
+
+      // Server-side robust deduplication & packing merger
+      if (Array.isArray(parsedData.products)) {
+        const dedupMap = new Map<string, any>();
+        parsedData.products.forEach((p: any) => {
+          if (!p) return;
+          const gradeClean = String(p.gradeName || '')
+            .toLowerCase()
+            .replace(/[®™]/g, '')
+            .replace(/blackworm|airawat/g, '')
+            .replace(/^[a-z]?\s*\d+\s*[\.\-\)]\s*/i, '')
+            .trim();
+          
+          let key = gradeClean.replace(/[^a-z0-9]/g, '');
+          const ratioM = gradeClean.match(/(\d+)\s*[:\-/]\s*(\d+)\s*[:\-/]\s*(\d+)/);
+          if (ratioM) {
+            const n1 = parseInt(ratioM[1], 10);
+            const n2 = parseInt(ratioM[2], 10);
+            const n3 = parseInt(ratioM[3], 10);
+            key = `${n1}-${n2}-${n3}`;
+            if (/\bfe\b/i.test(gradeClean)) key += '-fe';
+            if (/\bmg\b/i.test(gradeClean)) key += '-mg';
+            if (/\bzn\b/i.test(gradeClean)) key += '-zn';
+            if (/\bcu\b/i.test(gradeClean)) key += '-cu';
+            if (/\bs\b/i.test(gradeClean)) key += '-s';
+            if (/\bcombi\b/i.test(gradeClean)) key += '-combi';
+          }
+
+          if (!dedupMap.has(key)) {
+            dedupMap.set(key, { ...p });
+          } else {
+            const existing = dedupMap.get(key);
+            const exPackings = Array.isArray(existing.packings) ? [...existing.packings] : [];
+            const inPackings = Array.isArray(p.packings) ? p.packings : [];
+            inPackings.forEach((pk: any) => {
+              const cleanPk = String(pk.packingSize || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+              const found = exPackings.find((ep: any) => String(ep.packingSize || '').toLowerCase().replace(/[^a-z0-9]/g, '') === cleanPk);
+              if (!found) {
+                exPackings.push(pk);
+              } else if (pk.rate > 0) {
+                found.rate = pk.rate;
+                if (pk.mrp > 0) found.mrp = pk.mrp;
+              }
+            });
+            existing.packings = exPackings;
+          }
+        });
+        parsedData.products = Array.from(dedupMap.values());
       }
 
       res.json(parsedData);

@@ -17,7 +17,7 @@ import {
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { logAudit, safeFirestoreSet, mergeWithLocalData, isQuotaBlocked } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, mergeWithLocalData, isQuotaBlocked, deduplicateDealers } from '../../lib/dataService';
 import { toTitleCase } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
 import { compressImageFile } from '../../lib/imageCompression';
@@ -507,9 +507,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       const merged = mergeWithLocalData('dealers_application', list);
       
       if (isLoadMore) {
-        setDealers(prev => [...prev, ...merged]);
+        setDealers(prev => deduplicateDealers([...prev, ...merged]));
       } else {
-        setDealers(merged);
+        setDealers(deduplicateDealers(merged));
       }
 
       setLastDoc(snap.docs[snap.docs.length - 1] || null);
@@ -518,7 +518,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       console.warn("dealers_application fetch error:", error);
       if (!isLoadMore) {
         const cached = mergeWithLocalData('dealers_application', []);
-        setDealers(cached);
+        setDealers(deduplicateDealers(cached));
       }
     } finally {
       setIsLoadingMore(false);
@@ -555,7 +555,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         const timeB = new Date(b.createdAt || 0).getTime() || 0;
         return timeB - timeA;
       });
-      setDealers(merged);
+      setDealers(deduplicateDealers(merged));
     }, (error) => {
       console.warn("dealers_application real-time sync notice:", error);
       const cached = mergeWithLocalData<DealershipFormItem>('dealers_application', []);
@@ -564,7 +564,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         const numB = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
         return numB - numA;
       });
-      setDealers(cached);
+      setDealers(deduplicateDealers(cached));
     });
 
     return () => unsub();
@@ -1149,15 +1149,23 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const officerDealersCount = officerScopedDealers.length;
   const officerActiveCount = officerScopedDealers.filter((d) => d.status === 'Approved').length;
 
+  const maxCodeFormatted = useMemo(() => {
+    const maxNum = dealers.reduce((acc, d) => {
+      const n = parseInt(String(d.dealerCode || '').replace(/\D/g, ''), 10) || 0;
+      return Math.max(acc, n);
+    }, dealers.length || 70);
+    return String(maxNum).padStart(3, '0');
+  }, [dealers]);
+
   const filteredDealers = useMemo(() => {
     let list = officerScopedDealers.filter((d) => {
       const q = searchQuery.toLowerCase().trim();
       const matchQuery =
         !q ||
-        d.dealerCode.toLowerCase().includes(q) ||
-        d.firmName.toLowerCase().includes(q) ||
-        d.proprietorName.toLowerCase().includes(q) ||
-        d.village.toLowerCase().includes(q);
+        (d.dealerCode || '').toLowerCase().includes(q) ||
+        (d.firmName || '').toLowerCase().includes(q) ||
+        (d.proprietorName || '').toLowerCase().includes(q) ||
+        (d.village || '').toLowerCase().includes(q);
 
       if (activeFilter === 'active') {
         return matchQuery && d.status === 'Approved';
@@ -1274,7 +1282,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
               }`}
             >
-              {isAdmin(profile) ? `All (${Math.max(dealers.length, 48)})` : `My Forms (${officerDealersCount})`}
+              {isAdmin(profile) ? `All (${dealers.length})` : `My Forms (${officerDealersCount})`}
             </button>
             <button
               onClick={() => setActiveFilter('active')}
@@ -1321,6 +1329,19 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               </button>
             )}
 
+            {/* Re-index Serial Numbers for Admin */}
+            {isAdmin(profile) && (
+              <button
+                type="button"
+                onClick={() => reindexAllDealersSequence(true)}
+                className="bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 px-2 py-1 rounded-lg text-xs font-bold flex items-center gap-1 cursor-pointer transition shadow-2xs shrink-0"
+                title="सर्व डीलर सिरीयल नंबर सिंक करा (001 ते 070)"
+              >
+                <RefreshCw className="w-3 h-3 text-red-600" />
+                <span className="hidden sm:inline text-[11px]">सिंक सिरीयल</span>
+              </button>
+            )}
+
             {/* Deterministic Sort Order Toggle */}
             <button
               type="button"
@@ -1329,7 +1350,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               title="फॉर्म नंबर क्रमवारी बदला"
             >
               <ArrowUpDown className="w-3.5 h-3.5 text-red-600" />
-              <span>{sortOrder === 'desc' ? 'नवीन वर (058→001)' : 'पहिले वर (001→058)'}</span>
+              <span>{sortOrder === 'desc' ? `नवीन वर (${maxCodeFormatted}→001)` : `पहिले वर (001→${maxCodeFormatted})`}</span>
             </button>
           </div>
 
@@ -1415,33 +1436,42 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           {/* CARDS DISPLAY MODE */}
           {listDisplayMode === 'cards' && (
             <div className="space-y-2">
-              {filteredDealers.map((d) => (
-                <div
-                  key={d.id}
-                  onClick={() => loadDealerToForm(d, true)}
-                  className="bg-white rounded-xl border border-slate-200 hover:border-red-400 hover:shadow-xs px-3 py-2.5 sm:px-3.5 sm:py-3 transition-all cursor-pointer flex items-center gap-2.5 group relative"
-                >
-                  <span
-                    className="text-[11px] font-bold text-red-600 bg-red-50 border border-red-200 px-2 py-0.5 rounded-md uppercase tracking-wider shrink-0 font-mono"
+              {filteredDealers.map((d, index) => {
+                const displayCode = d.dealerCode ? d.dealerCode.replace(/^#/, '') : 'DEALER';
+                const rowNumber = sortOrder === 'desc' ? filteredDealers.length - index : index + 1;
+                return (
+                  <div
+                    key={d.id}
+                    onClick={() => loadDealerToForm(d, true)}
+                    className="bg-white rounded-xl border border-slate-200 hover:border-red-400 hover:shadow-xs px-3 py-2.5 sm:px-3.5 sm:py-3 transition-all cursor-pointer flex items-center gap-2.5 group relative"
                   >
-                    {d.dealerCode ? d.dealerCode.replace(/^#/, '') : 'DEALER'}
-                  </span>
-                  
-                  <div className="flex-1 min-w-0">
-                    <span
-                      className="text-xs sm:text-[13px] font-bold text-slate-900 group-hover:text-red-600 block truncate leading-tight tracking-tight"
-                    >
-                      {toTitleCase(d.firmName) || 'Unnamed Dealership'}
-                    </span>
-                    <span className="text-[10px] text-slate-500 font-semibold block truncate">
-                      {toTitleCase(d.village || d.center || '')}
-                      <span className="text-slate-700 font-bold ml-1">
-                        ({toTitleCase((d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'Officer')})
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <span className="text-[10px] font-bold text-slate-400 font-mono min-w-[24px] text-right">
+                        #{rowNumber}
                       </span>
-                    </span>
+                      <span
+                        className="text-[11px] font-bold text-red-600 bg-red-50 border border-red-200 px-2 py-0.5 rounded-md uppercase tracking-wider font-mono shadow-2xs"
+                      >
+                        {displayCode}
+                      </span>
+                    </div>
+                    
+                    <div className="flex-1 min-w-0">
+                      <span
+                        className="text-xs sm:text-[13px] font-bold text-slate-900 group-hover:text-red-600 block truncate leading-tight tracking-tight"
+                      >
+                        {toTitleCase(d.firmName) || 'Unnamed Dealership'}
+                      </span>
+                      <span className="text-[10px] text-slate-500 font-semibold block truncate">
+                        {toTitleCase(d.village || d.center || '')}
+                        <span className="text-slate-700 font-bold ml-1">
+                          ({toTitleCase((d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'Officer')})
+                        </span>
+                      </span>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
 
               {filteredDealers.length === 0 && (
                 <div className="bg-white rounded-2xl border border-dashed border-slate-300 p-8 text-center text-slate-500">
@@ -1500,10 +1530,10 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                     }}
                     disabled={isSavingDealer}
                     className="text-xs font-bold px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white flex items-center gap-1.5 shadow-sm transition cursor-pointer active:scale-95"
-                    title="Save Form"
+                    title="Save"
                   >
                     {isSavingDealer ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
-                    <span>{isSavingDealer ? 'सेव्ह करत आहे...' : 'सेव्ह करा (Save)'}</span>
+                    <span>{isSavingDealer ? 'Saving...' : 'Save'}</span>
                   </button>
                 )}
 
@@ -2059,31 +2089,6 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   </div>
                 </div>
               </div>
-
-              {/* Bottom Action Bar for Easy Mobile Saving */}
-              {isEditing && (
-                <div className="mt-4 pt-3 pb-2 border-t border-slate-200 flex flex-wrap items-center justify-end gap-3 no-print">
-                  <button
-                    type="button"
-                    onClick={() => setViewMode('list')}
-                    className="px-4 py-2.5 rounded-xl border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 text-xs font-bold transition shadow-xs active:scale-95 cursor-pointer"
-                  >
-                    मागे जा (Back)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.preventDefault();
-                      handleSave();
-                    }}
-                    disabled={isSavingDealer}
-                    className="px-6 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-black flex items-center gap-2 shadow-md transition cursor-pointer active:scale-95"
-                  >
-                    {isSavingDealer ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
-                    <span>{isSavingDealer ? 'सेव्ह करत आहे...' : 'फॉर्म सेव्ह करा (Save Form)'}</span>
-                  </button>
-                </div>
-              )}
             </form>
           </div>
         </div>

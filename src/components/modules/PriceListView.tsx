@@ -17,10 +17,9 @@ import {
   CheckCircle2, 
   RotateCcw, 
   X, 
-  Eye,
   Check
 } from 'lucide-react';
-import { logAudit } from '../../lib/dataService';
+import { logAudit, deduplicateProducts, getCanonicalProductKey, normalizePackingSize } from '../../lib/dataService';
 import * as XLSX from 'xlsx';
 
 export interface PackingOption {
@@ -284,12 +283,12 @@ export const getInitialCachedProducts = (): DynamicPriceProduct[] => {
     const raw = localStorage.getItem('blackworm_cached_pricelist');
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      if (Array.isArray(parsed) && parsed.length > 0) return deduplicateProducts(parsed);
     }
     const masterRaw = localStorage.getItem('blackworm_master_pricelist');
     if (masterRaw) {
       const parsed = JSON.parse(masterRaw);
-      if (parsed && Array.isArray(parsed.products) && parsed.products.length > 0) return parsed.products;
+      if (parsed && Array.isArray(parsed.products) && parsed.products.length > 0) return deduplicateProducts(parsed.products);
     }
   } catch (e) {}
   return [];
@@ -555,52 +554,63 @@ export function mergeUploadedProducts(
   let newAddedCount = 0;
   let priceUpdatedCount = 0;
 
+  // Clean and deduplicate current products
+  const baseProducts = currentProducts && currentProducts.length > 0 
+    ? currentProducts 
+    : OFFICIAL_REFERENCE_DATA.map((p, idx) => ({ ...p, id: `ref_${idx + 1}` }));
+  const cleanCurrent = deduplicateProducts(baseProducts);
+  const cleanUploaded = deduplicateProducts(uploadedProducts);
+
   const resultMap = new Map<string, DynamicPriceProduct>();
-  currentProducts.forEach(p => {
-    resultMap.set(p.id, { ...p, packings: [...(p.packings || []).map(pk => ({ ...pk }))] });
+  cleanCurrent.forEach(p => {
+    const key = getCanonicalProductKey(p);
+    resultMap.set(key, { ...p, packings: [...(p.packings || []).map(pk => ({ ...pk }))] });
   });
 
-  uploadedProducts.forEach((up, upIdx) => {
-    let matchedId: string | null = null;
-    const upNorm = normStr(up.gradeName);
+  cleanUploaded.forEach((up, upIdx) => {
+    const upKey = getCanonicalProductKey(up);
+    let matchedKey: string | null = null;
 
-    // Exact matching ONLY - prevents "Calcium Nitrate" colliding with "Calcium Nitrate + Boron"
-    for (const [id, cur] of resultMap.entries()) {
-      const curNorm = normStr(cur.gradeName);
-      if (curNorm === upNorm) {
-        matchedId = id;
-        break;
-      }
-      // Exact code match in the same group and matching first word
-      if (cur.code && up.code && 
-          cur.code.trim().toLowerCase() === up.code.trim().toLowerCase() && 
-          cur.groupName.trim().toLowerCase() === up.groupName.trim().toLowerCase() &&
-          curNorm === upNorm) {
-        matchedId = id;
-        break;
+    if (resultMap.has(upKey)) {
+      matchedKey = upKey;
+    } else {
+      // Fallback matching: normalized code in the same category
+      for (const [key, cur] of resultMap.entries()) {
+        const curCode = (cur.code || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const upCode = (up.code || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const sameGroup = cur.groupName.toLowerCase().replace(/[^a-z]/g, '') === up.groupName.toLowerCase().replace(/[^a-z]/g, '');
+        if (curCode && upCode && curCode === upCode && sameGroup) {
+          matchedKey = key;
+          break;
+        }
       }
     }
 
-    if (matchedId) {
+    if (matchedKey) {
       // Existing product found -> UPDATE prices and packings!
-      const existing = resultMap.get(matchedId)!;
+      const existing = resultMap.get(matchedKey)!;
       let hasPriceChange = false;
 
       (up.packings || []).forEach(upPk => {
-        const existingPkIdx = existing.packings.findIndex(p => normStr(p.packingSize) === normStr(upPk.packingSize));
+        const cleanSize = normalizePackingSize(upPk.packingSize);
+        const existingPkIdx = existing.packings.findIndex(p => normalizePackingSize(p.packingSize) === cleanSize);
         if (existingPkIdx >= 0) {
           const oldPk = existing.packings[existingPkIdx];
-          if (oldPk.rate !== upPk.rate || oldPk.mrp !== upPk.mrp) {
+          if ((upPk.rate > 0 && oldPk.rate !== upPk.rate) || (upPk.mrp > 0 && oldPk.mrp !== upPk.mrp)) {
             hasPriceChange = true;
           }
           existing.packings[existingPkIdx] = {
-            packingSize: upPk.packingSize,
+            packingSize: cleanSize,
             rate: upPk.rate > 0 ? upPk.rate : oldPk.rate,
             mrp: upPk.mrp > 0 ? upPk.mrp : oldPk.mrp,
           };
         } else {
           // New packing size added to existing product!
-          existing.packings.push({ ...upPk });
+          existing.packings.push({
+            packingSize: cleanSize,
+            rate: upPk.rate,
+            mrp: upPk.mrp
+          });
           hasPriceChange = true;
         }
       });
@@ -621,7 +631,7 @@ export function mergeUploadedProducts(
       // NEW PRODUCT ADDED!
       newAddedCount++;
       const newId = `prod_${Date.now()}_${upIdx + 1}`;
-      resultMap.set(newId, {
+      resultMap.set(upKey || newId, {
         ...up,
         id: newId,
         orderIndex: resultMap.size + 1,
@@ -630,7 +640,7 @@ export function mergeUploadedProducts(
     }
   });
 
-  const merged = Array.from(resultMap.values());
+  const merged = deduplicateProducts(Array.from(resultMap.values()));
   return { merged, newAddedCount, priceUpdatedCount };
 }
 
@@ -642,26 +652,26 @@ export async function savePriceListPermanently(
   validityDate?: string,
   currentProducts: DynamicPriceProduct[] = []
 ): Promise<{ success: boolean; count: number }> {
-  if (!newProducts || newProducts.length === 0) {
+  const cleanProducts = deduplicateProducts(newProducts);
+  if (!cleanProducts || cleanProducts.length === 0) {
     throw new Error('प्रॉडक्ट्स लिस्ट रिकामी आहे. कोणतीही माहिती सेव्ह केली गेली नाही.');
   }
 
   // 1. Instant local caching for 0ms refresh / offline / mobile sync
   try {
-    localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(newProducts));
+    localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanProducts));
     localStorage.setItem('blackworm_master_pricelist', JSON.stringify({
-      products: newProducts,
+      products: cleanProducts,
       validityDate: validityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
       updatedAt: new Date().toISOString(),
       updatedByUid: profile.uid,
       updatedByName: profile.fullName || 'Admin',
       isCustomUploaded: true,
-      totalProducts: newProducts.length,
+      totalProducts: cleanProducts.length,
     }));
   } catch (e) {
     console.warn('Local storage write notice:', e);
   }
-
   // 2. Automated Permanent Backup of previous state
   try {
     const backupId = `backup_${Date.now()}`;
@@ -681,13 +691,13 @@ export async function savePriceListPermanently(
 
   // 3. Save to Master Document config/master_pricelist (Single atomic source of truth)
   await setDoc(doc(db, 'config', 'master_pricelist'), {
-    products: newProducts,
+    products: cleanProducts,
     validityDate: validityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
     updatedAt: new Date().toISOString(),
     updatedByUid: profile.uid,
     updatedByName: profile.fullName || 'Admin',
     isCustomUploaded: true,
-    totalProducts: newProducts.length,
+    totalProducts: cleanProducts.length,
     source: sourceLabel,
   }, { merge: true });
 
@@ -703,8 +713,8 @@ export async function savePriceListPermanently(
   // 4. Batch Upsert products into products_pricelist_v2 in chunks of 400 (Ultra fast atomic commits)
   try {
     const BATCH_SIZE = 400;
-    for (let i = 0; i < newProducts.length; i += BATCH_SIZE) {
-      const chunk = newProducts.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < cleanProducts.length; i += BATCH_SIZE) {
+      const chunk = cleanProducts.slice(i, i + BATCH_SIZE);
       const batch = writeBatch(db);
       chunk.forEach(item => {
         const itemRef = doc(db, 'products_pricelist_v2', item.id);
@@ -720,14 +730,17 @@ export async function savePriceListPermanently(
     console.warn('Batch upsert products notice:', upsertErr);
   }
 
-  // 5. Soft-archive any products from previous list that are not in new list
+  // 5. Soft-archive any duplicate or superseded products in products_pricelist_v2
   try {
-    const newIds = new Set(newProducts.map(p => p.id));
+    const cleanIds = new Set(cleanProducts.map(p => p.id));
+    const cleanCanonicalKeys = new Set(cleanProducts.map(p => getCanonicalProductKey(p)));
     const oldSnap = await getDocs(collection(db, 'products_pricelist_v2'));
     const archiveBatch = writeBatch(db);
     let count = 0;
     oldSnap.forEach(d => {
-      if (!newIds.has(d.id)) {
+      const data = d.data();
+      const dKey = getCanonicalProductKey(data);
+      if (!cleanIds.has(d.id) && (!data.isArchived || cleanCanonicalKeys.has(dKey))) {
         archiveBatch.update(d.ref, { isArchived: true, archivedAt: new Date().toISOString() });
         count++;
       }
@@ -780,7 +793,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
     try {
       const masterSnap = await getDoc(doc(db, 'config', 'master_pricelist'));
       if (masterSnap.exists() && Array.isArray(masterSnap.data()?.products) && masterSnap.data().products.length > 0) {
-        const validList = masterSnap.data().products.filter((p: any) => !p.isArchived);
+        const validList = deduplicateProducts(masterSnap.data().products.filter((p: any) => !p.isArchived));
         setProducts(validList);
         try {
           localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(validList));
@@ -793,9 +806,10 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
           if (!data.isArchived) pList.push({ ...data, id: d.id });
         });
         if (pList.length > 0) {
-          setProducts(pList);
+          const cleanPList = deduplicateProducts(pList);
+          setProducts(cleanPList);
           try {
-            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(pList));
+            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanPList));
           } catch {}
         }
       }
@@ -803,6 +817,34 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       console.warn('Manual refresh notice:', e);
     } finally {
       setTimeout(() => setIsRefreshing(false), 400);
+    }
+  };
+
+  const [isCleaning, setIsCleaning] = useState<boolean>(false);
+  const handleCleanDuplicates = async () => {
+    setIsCleaning(true);
+    try {
+      const cleanList = deduplicateProducts(products);
+      await savePriceListPermanently(
+        cleanList,
+        'Manual Deduplication & Cleanup',
+        profile,
+        validityDate,
+        products
+      );
+      setProducts(cleanList);
+      setDialogConfig({
+        isOpen: true,
+        type: 'success',
+        title: 'प्राईस लिस्ट स्वच्छ झाली (Cleaned)',
+        message: `प्राईस लिस्ट पूर्णपणे तपासली गेली आहे:\n• एकूण युनिक प्रॉडक्ट्स: ${cleanList.length}\n• सर्व डबल/डुप्लिकेट प्रॉडक्ट्स हटवण्यात आले आहेत.\n• सर्व दर (Rates) आणि एमआरपी (MRP) सुरक्षित आहेत.`,
+        confirmText: 'ठीक आहे',
+        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+      });
+    } catch (e: any) {
+      console.error('Clean duplicates error:', e);
+    } finally {
+      setIsCleaning(false);
     }
   };
 
@@ -854,12 +896,16 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
         if (data && Array.isArray(data.products) && data.products.length > 0) {
+          const clean = deduplicateProducts(data.products);
           try {
-            localStorage.setItem('blackworm_master_pricelist', JSON.stringify(data));
-            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(data.products));
+            localStorage.setItem('blackworm_master_pricelist', JSON.stringify({ ...data, products: clean }));
+            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(clean));
           } catch {}
-          setProducts(data.products);
+          setProducts(clean);
           if (data.validityDate) setValidityDate(data.validityDate);
+          if (clean.length < data.products.length && isAdmin(profile)) {
+            savePriceListPermanently(clean, 'Auto Deduplication Self-Healing', profile, data.validityDate, data.products).catch(() => {});
+          }
         }
       }
     }, (err) => {
@@ -878,8 +924,8 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       });
 
       if (list.length > 0) {
-        // Sort products by orderIndex or group and code
-        list.sort((a, b) => {
+        const cleanList = deduplicateProducts(list);
+        cleanList.sort((a, b) => {
           if (a.groupName !== b.groupName) {
             if (a.groupName.includes('Group A')) return -1;
             if (b.groupName.includes('Group A')) return 1;
@@ -889,9 +935,9 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
           }
           return (a.orderIndex || 0) - (b.orderIndex || 0);
         });
-        setProducts(list);
+        setProducts(cleanList);
         try {
-          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(list));
+          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanList));
         } catch {}
       } else {
         // Collection returned 0 items: NEVER auto-wipe!
@@ -1182,12 +1228,17 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
             gradeName: item.gradeName || '',
             hsn: item.hsn || '31052000',
             gstRate: Number(item.gstRate) || 5,
-            packings: item.packings || [],
+            packings: (item.packings || []).map((pk: any) => ({
+              packingSize: normalizePackingSize(pk.packingSize),
+              rate: Number(pk.rate) || 0,
+              mrp: Number(pk.mrp) || 0,
+            })),
             orderIndex: idx + 1,
             isArchived: false,
             id: cleanId,
           };
         });
+        uploadedProducts = deduplicateProducts(uploadedProducts);
       }
 
       if (!uploadedProducts || uploadedProducts.length === 0) {
@@ -1311,11 +1362,22 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
             <button
               type="button"
               onClick={handleManualRefresh}
-              disabled={isRefreshing}
+              disabled={isRefreshing || isCleaning}
               title="रीफ्रेश करा (Refresh Price List)"
               className="p-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-lg border border-emerald-200 transition shadow-2xs cursor-pointer active:scale-95 disabled:opacity-50 flex items-center justify-center shrink-0"
             >
               <RefreshCw className={cn("w-3.5 h-3.5", isRefreshing && "animate-spin")} />
+            </button>
+
+            {/* Clean Duplicates Button */}
+            <button
+              type="button"
+              onClick={handleCleanDuplicates}
+              disabled={isCleaning || isRefreshing}
+              title="सर्व डबल डेटा हटवून लिस्ट स्वच्छ करा (Remove Duplicates)"
+              className="p-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg border border-indigo-200 transition shadow-2xs cursor-pointer active:scale-95 disabled:opacity-50 flex items-center justify-center shrink-0"
+            >
+              {isCleaning ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ShieldCheck className="w-3.5 h-3.5" />}
             </button>
             <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
               <span>कंपनी प्राईस</span>
