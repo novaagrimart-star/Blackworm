@@ -1,10 +1,10 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { collection, query, onSnapshot, doc, setDoc } from 'firebase/firestore';
-import { db } from '../../firebase';
+import React, { useState, useRef, useMemo } from 'react';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { Language } from '../../lib/i18n';
 import { DynamicPriceProduct, OFFICIAL_REFERENCE_DATA, calculateWithGst } from './PriceListView';
-import { deduplicateProducts } from '../../lib/dataService';
+import { deduplicateProducts, safeFirestoreSet } from '../../lib/dataService';
+import { useSharedMasterPricelist, useSharedSchemeDiscounts } from '../../lib/realtimeStore';
+import { useBranding } from '../../lib/branding';
 import { CustomDialogModal } from '../CustomDialogModal';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas-pro';
@@ -32,11 +32,43 @@ interface Props {
  * - Group C (Plant Growth Regulators / PGR): 20%
  */
 export const getStandardBillingDiscount = (groupName: string): number => {
-  const g = (groupName || '').toLowerCase();
-  if (g.includes('group b') || g.includes('micronutrient')) return 10;
-  if (g.includes('group c') || g.includes('growth regulator') || g.includes('pgr')) return 20;
-  if (g.includes('group a') || g.includes('water soluble')) return 0;
-  if (g.includes('specialty')) return 0;
+  const g = (groupName || '').toLowerCase().trim();
+  if (g.includes('specialty') || g.includes('speciality') || g.includes('स्पेशालिटी')) return 0;
+  if (g.includes('group a') || g.includes('group-a') || g.includes('water soluble')) return 0;
+  if (
+    g.includes('group b') ||
+    g.includes('group-b') ||
+    g.includes('b group') ||
+    g.includes('b-group') ||
+    g.includes('gr. b') ||
+    g.includes('gr b') ||
+    g === 'b' ||
+    /^b\s*[-–:]/.test(g) ||
+    g.includes('micronutrient') ||
+    g.includes('micro') ||
+    g.includes('ग्रुप ब') ||
+    g.includes('गट ब')
+  ) {
+    return 10;
+  }
+  if (
+    g.includes('group c') ||
+    g.includes('group-c') ||
+    g.includes('c group') ||
+    g.includes('c-group') ||
+    g.includes('gr. c') ||
+    g.includes('gr c') ||
+    g === 'c' ||
+    /^c\s*[-–:]/.test(g) ||
+    g.includes('growth regulator') ||
+    g.includes('plant growth') ||
+    g.includes('pgr') ||
+    g.includes('stimulant') ||
+    g.includes('ग्रुप क') ||
+    g.includes('गट क')
+  ) {
+    return 20;
+  }
   return 0;
 };
 
@@ -46,29 +78,21 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
   const userIsAdmin = isAdmin(profile);
   const printableRef = useRef<HTMLDivElement>(null);
 
-  const [products, setProducts] = useState<DynamicPriceProduct[]>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const cached = localStorage.getItem('blackworm_cached_pricelist');
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-        }
-      } catch {}
+  const { logoUrl, logoSize } = useBranding();
+  const { products: sharedMasterProducts } = useSharedMasterPricelist();
+  const { discounts: extraDiscounts, setDiscountsOptimistic } = useSharedSchemeDiscounts();
+
+  const products = useMemo<DynamicPriceProduct[]>(() => {
+    if (sharedMasterProducts && sharedMasterProducts.length > 0) {
+      return deduplicateProducts(sharedMasterProducts);
     }
-    return [];
-  });
-  const [logoUrl, setLogoUrl] = useState<string>('');
-  const [logoSize, setLogoSize] = useState<number>(75);
-  
-  // Extra Scheme Discount percentages mapped by groupName: { [groupName]: extraDiscountPercent }
-  const [extraDiscounts, setExtraDiscounts] = useState<Record<string, number>>(() => {
-    try {
-      const saved = localStorage.getItem(LOCAL_STORAGE_GROUP_DISCOUNTS_KEY);
-      if (saved) return JSON.parse(saved);
-    } catch (e) {}
-    return {};
-  });
+    return deduplicateProducts(
+      OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
+        ...item,
+        id: (item as any).id || `ref_${idx + 1}`,
+      }))
+    );
+  }, [sharedMasterProducts]);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedGroup, setSelectedGroup] = useState<string>('ALL');
@@ -91,114 +115,6 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
     onConfirm: () => {},
   });
 
-  // 1. Fetch Branding
-  useEffect(() => {
-    const unsubBranding = onSnapshot(doc(db, 'config', 'branding'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        setLogoUrl(data.logoUrl || '');
-        setLogoSize(data.logoSize || 75);
-      }
-    }, (err) => {
-      console.warn('Scheme branding live sync notice:', err);
-    });
-
-    return () => unsubBranding();
-  }, []);
-
-  // 2. Fetch Extra Scheme Discounts from Firestore
-  useEffect(() => {
-    const unsubDiscounts = onSnapshot(doc(db, 'config', 'schemes_extra_discounts'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        if (data && data.discounts) {
-          setExtraDiscounts(prev => {
-            const merged = { ...prev, ...data.discounts };
-            try {
-              localStorage.setItem(LOCAL_STORAGE_GROUP_DISCOUNTS_KEY, JSON.stringify(merged));
-            } catch (e) {}
-            return merged;
-          });
-        }
-      }
-    }, (err) => {
-      console.warn('Scheme discounts live sync notice:', err);
-    });
-
-    return () => unsubDiscounts();
-  }, []);
-
-  // 3. Real-time Products listener from products_pricelist_v2
-  useEffect(() => {
-    const q = query(collection(db, 'products_pricelist_v2'));
-    const unsub = onSnapshot(q, (snap) => {
-      const list: DynamicPriceProduct[] = [];
-      snap.forEach((docSnap) => {
-        const data = docSnap.data() as DynamicPriceProduct;
-        if (!data.isArchived) {
-          list.push({ ...data, id: docSnap.id });
-        }
-      });
-
-      if (list.length > 0) {
-        const cleanList = deduplicateProducts(list);
-        cleanList.sort((a, b) => {
-          const rank = (name: string) => {
-            const n = (name || '').toLowerCase();
-            if (n.includes('group a')) return 1;
-            if (n.includes('specialty')) return 2;
-            if (n.includes('group b')) return 3;
-            if (n.includes('group c')) return 4;
-            return 5;
-          };
-          const rA = rank(a.groupName);
-          const rB = rank(b.groupName);
-          if (rA !== rB) return rA - rB;
-          return (a.orderIndex || 0) - (b.orderIndex || 0);
-        });
-        setProducts(cleanList);
-        try {
-          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanList));
-        } catch {}
-      } else {
-        try {
-          const cached = localStorage.getItem('blackworm_cached_pricelist');
-          if (cached) {
-            const parsed = JSON.parse(cached);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              setProducts(deduplicateProducts(parsed));
-              return;
-            }
-          }
-        } catch {}
-        const fallback: DynamicPriceProduct[] = deduplicateProducts(OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
-          ...item,
-          id: `ref_${idx + 1}`,
-        })));
-        setProducts(fallback);
-      }
-    }, (err) => {
-      console.warn('Scheme products live sync notice:', err);
-      try {
-        const cached = localStorage.getItem('blackworm_cached_pricelist');
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            setProducts(parsed);
-            return;
-          }
-        }
-      } catch {}
-      const fallback: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
-        ...item,
-        id: `ref_${idx + 1}`,
-      }));
-      setProducts(fallback);
-    });
-
-    return () => unsub();
-  }, []);
-
   // Get current extra scheme discount for a group (default 0%)
   const getGroupExtraDiscount = (groupName: string): number => {
     if (extraDiscounts[groupName] !== undefined) {
@@ -210,28 +126,27 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
   // Handle changing group extra discount
   const handleGroupDiscountChange = (groupName: string, valStr: string) => {
     const parsed = valStr === '' ? 0 : Math.max(0, Math.min(100, Number(valStr) || 0));
-    setExtraDiscounts(prev => {
-      const updated = {
-        ...prev,
-        [groupName]: parsed,
-      };
-      try {
-        localStorage.setItem(LOCAL_STORAGE_GROUP_DISCOUNTS_KEY, JSON.stringify(updated));
-      } catch (e) {}
-      return updated;
-    });
+    setDiscountsOptimistic((prev) => ({
+      ...prev,
+      [groupName]: parsed,
+    }));
   };
 
-  // Save changes to Firestore
+  // Save changes across Primary, Secondary & Local Vault
   const handleSaveDiscounts = async () => {
     setSaving(true);
     try {
-      await setDoc(doc(db, 'config', 'schemes_extra_discounts'), {
-        discounts: extraDiscounts,
-        updatedAt: new Date().toISOString(),
-        updatedBy: profile.uid,
-        updatedByName: profile.fullName || 'Admin',
-      }, { merge: true });
+      await safeFirestoreSet(
+        'config',
+        'schemes_extra_discounts',
+        {
+          discounts: extraDiscounts,
+          updatedAt: new Date().toISOString(),
+          updatedBy: profile.uid,
+          updatedByName: profile.fullName || 'Admin',
+        },
+        { merge: true }
+      );
 
       setShowSuccessToast(true);
       setTimeout(() => setShowSuccessToast(false), 3000);
@@ -260,10 +175,20 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
       confirmText: 'Reset',
       cancelText: 'Cancel',
       onConfirm: async () => {
-        setExtraDiscounts({});
+        setDiscountsOptimistic(() => ({}));
         try {
           localStorage.removeItem(LOCAL_STORAGE_GROUP_DISCOUNTS_KEY);
-          await setDoc(doc(db, 'config', 'schemes_extra_discounts'), { discounts: {} }, { merge: true });
+          await safeFirestoreSet(
+            'config',
+            'schemes_extra_discounts',
+            {
+              discounts: {},
+              updatedAt: new Date().toISOString(),
+              updatedBy: profile.uid,
+              updatedByName: profile.fullName || 'Admin',
+            },
+            { merge: false }
+          );
         } catch (e) {}
         setDialogConfig(prev => ({ ...prev, isOpen: false }));
       },
@@ -271,26 +196,206 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
     });
   };
 
-  // PDF Export
+  // PDF Export (Full width + clean multi-page A4 slicing without cutting rows or horizontal clipping)
   const handleDownloadPdf = async () => {
     if (!printableRef.current) return;
+    let offscreenHost: HTMLDivElement | null = null;
     try {
       setIsGeneratingPdf(true);
-      const element = printableRef.current;
-      const canvas = await html2canvas(element, {
-        scale: 2,
-        useCORS: true,
-        backgroundColor: '#ffffff',
+      const sourceEl = printableRef.current;
+
+      const CAPTURE_WIDTH = 920;
+      const CONTENT_WIDTH_MM = 196; // 210mm A4 - 14mm horizontal margin
+      const CONTENT_HEIGHT_MM = 283; // 297mm A4 - 14mm vertical margin
+      const MAX_PAGE_HEIGHT_PX = Math.floor(CAPTURE_WIDTH * (CONTENT_HEIGHT_MM / CONTENT_WIDTH_MM));
+
+      offscreenHost = document.createElement('div');
+      offscreenHost.style.position = 'fixed';
+      offscreenHost.style.left = '-99999px';
+      offscreenHost.style.top = '0';
+      offscreenHost.style.width = `${CAPTURE_WIDTH}px`;
+      offscreenHost.style.backgroundColor = '#ffffff';
+      offscreenHost.style.zIndex = '-1';
+      offscreenHost.style.pointerEvents = 'none';
+
+      const clone = sourceEl.cloneNode(true) as HTMLDivElement;
+      clone.style.width = `${CAPTURE_WIDTH}px`;
+      clone.style.maxWidth = `${CAPTURE_WIDTH}px`;
+      clone.style.minWidth = `${CAPTURE_WIDTH}px`;
+      clone.style.overflow = 'visible';
+      clone.style.margin = '0';
+      clone.style.padding = '24px';
+      clone.style.border = 'none';
+      clone.style.borderRadius = '0';
+      clone.style.boxShadow = 'none';
+      clone.style.boxSizing = 'border-box';
+      clone.style.backgroundColor = '#ffffff';
+
+      // Ensure desktop horizontal header layout even on mobile viewports
+      const companyHeader = clone.querySelector('[data-scheme-company-header="true"]') as HTMLElement | null;
+      if (companyHeader) {
+        companyHeader.style.display = 'flex';
+        companyHeader.style.flexDirection = 'row';
+        companyHeader.style.alignItems = 'flex-start';
+        companyHeader.style.justifyContent = 'space-between';
+      }
+      const companyText = clone.querySelector('[data-scheme-company-text="true"]') as HTMLElement | null;
+      if (companyText) {
+        companyText.style.textAlign = 'right';
+      }
+
+      // Unclip horizontal scroll containers inside the clone
+      const scrollWrapper = clone.querySelector('[data-scheme-scroll="true"]') as HTMLElement | null;
+      if (scrollWrapper) {
+        scrollWrapper.style.overflow = 'visible';
+        scrollWrapper.style.width = '100%';
+      }
+      const scrollInner = clone.querySelector('[data-scheme-scroll-inner="true"]') as HTMLElement | null;
+      if (scrollInner) {
+        scrollInner.style.minWidth = '100%';
+        scrollInner.style.width = '100%';
+      }
+
+      // Replace number inputs with static text badges so html2canvas never clips input values
+      const inputs = clone.querySelectorAll('input');
+      inputs.forEach((input) => {
+        const badge = document.createElement('span');
+        badge.textContent = input.value || '0';
+        badge.style.display = 'inline-block';
+        badge.style.minWidth = '44px';
+        badge.style.padding = '2px 8px';
+        badge.style.backgroundColor = '#ffffff';
+        badge.style.color = '#0f172a';
+        badge.style.border = '1px solid #6ee7b7';
+        badge.style.borderRadius = '4px';
+        badge.style.fontWeight = '900';
+        badge.style.fontSize = '12px';
+        badge.style.textAlign = 'center';
+        badge.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, monospace';
+        input.parentNode?.replaceChild(badge, input);
       });
-      const imgData = canvas.toDataURL('image/jpeg', 0.95);
-      const pdf = new jsPDF('p', 'mm', 'a4');
-      const pdfWidth = pdf.internal.pageSize.getWidth();
-      const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
-      pdf.addImage(imgData, 'JPEG', 0, 0, pdfWidth, pdfHeight);
-      pdf.save('Blackworm_Schemes.pdf');
+
+      offscreenHost.appendChild(clone);
+      document.body.appendChild(offscreenHost);
+
+      // Wait for cloned images and layout frames to settle
+      const imgs = Array.from(clone.querySelectorAll('img'));
+      await Promise.all(
+        imgs.map((img) => {
+          if (img.complete) return Promise.resolve();
+          return new Promise<void>((res) => {
+            img.onload = () => res();
+            img.onerror = () => res();
+          });
+        })
+      );
+      await new Promise<void>((res) => requestAnimationFrame(() => requestAnimationFrame(() => res())));
+
+      const cloneRect = clone.getBoundingClientRect();
+      const totalHeight = Math.ceil(clone.scrollHeight);
+
+      // Collect safe vertical cut points (section tops, 2nd+ product starts so thead isn't orphaned, and signature footer)
+      const breakSet = new Set<number>();
+      clone.querySelectorAll('[data-scheme-section="true"]').forEach((sectionEl) => {
+        const top = Math.floor(sectionEl.getBoundingClientRect().top - cloneRect.top) - 3;
+        if (top > 20) breakSet.add(top);
+
+        const productRows = sectionEl.querySelectorAll('tr[data-product-start="true"]');
+        productRows.forEach((rowEl, rIdx) => {
+          // Keep the 1st product attached to the group banner + table thead
+          if (rIdx === 0) return;
+          const rowTop = Math.floor(rowEl.getBoundingClientRect().top - cloneRect.top) - 1;
+          if (rowTop > 20) breakSet.add(rowTop);
+        });
+      });
+
+      const footerEl = clone.querySelector('[data-scheme-footer="true"]');
+      if (footerEl) {
+        const footerTop = Math.floor(footerEl.getBoundingClientRect().top - cloneRect.top) - 6;
+        if (footerTop > 20) breakSet.add(footerTop);
+      }
+
+      const breakPoints = Array.from(breakSet).sort((a, b) => a - b);
+
+      const slices: { startY: number; endY: number }[] = [];
+      let currStart = 0;
+      while (currStart < totalHeight - 2) {
+        const maxEnd = currStart + MAX_PAGE_HEIGHT_PX;
+        if (totalHeight <= maxEnd) {
+          slices.push({ startY: currStart, endY: totalHeight });
+          break;
+        }
+        let bestCut = -1;
+        for (const bp of breakPoints) {
+          if (bp > currStart + 100 && bp <= maxEnd) {
+            bestCut = bp;
+          }
+        }
+        if (bestCut === -1) {
+          bestCut = Math.min(totalHeight, maxEnd);
+        }
+        slices.push({ startY: currStart, endY: bestCut });
+        currStart = bestCut;
+      }
+
+      const captureScale = totalHeight > 6500 ? Math.max(1.25, Math.min(2, 13000 / totalHeight)) : 2;
+      const canvas = await html2canvas(clone, {
+        scale: captureScale,
+        useCORS: true,
+        allowTaint: false,
+        backgroundColor: '#ffffff',
+        width: CAPTURE_WIDTH,
+        height: totalHeight,
+        windowWidth: 1200,
+        scrollX: 0,
+        scrollY: 0,
+        logging: false,
+      });
+
+      const scaleY = canvas.height / totalHeight;
+      const pdf = new jsPDF({
+        orientation: 'portrait',
+        unit: 'mm',
+        format: 'a4',
+        compress: true,
+      });
+
+      slices.forEach((slice, idx) => {
+        const srcY = Math.max(0, Math.round(slice.startY * scaleY));
+        const srcH = Math.max(1, Math.min(canvas.height - srcY, Math.round((slice.endY - slice.startY) * scaleY)));
+
+        const pageCanvas = document.createElement('canvas');
+        pageCanvas.width = canvas.width;
+        pageCanvas.height = srcH;
+        const ctx = pageCanvas.getContext('2d');
+        if (ctx) {
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
+          ctx.drawImage(canvas, 0, srcY, canvas.width, srcH, 0, 0, canvas.width, srcH);
+        }
+
+        const sliceImgData = pageCanvas.toDataURL('image/jpeg', 0.95);
+        const sliceHeightMm = (srcH * CONTENT_WIDTH_MM) / canvas.width;
+
+        if (idx > 0) pdf.addPage();
+        pdf.addImage(sliceImgData, 'JPEG', 7, 7, CONTENT_WIDTH_MM, sliceHeightMm);
+      });
+
+      const groupSlugMap: Record<string, string> = {
+        ALL: 'All_Groups',
+        GROUP_A: 'Group_A',
+        SPECIALTY: 'Specialty',
+        GROUP_B: 'Group_B',
+        GROUP_C: 'Group_C',
+      };
+      const fileSuffix = groupSlugMap[selectedGroup] || 'All_Groups';
+      pdf.save(`Blackworm_Schemes_${fileSuffix}.pdf`);
     } catch (err) {
       console.error('PDF error:', err);
     } finally {
+      if (offscreenHost && offscreenHost.parentNode) {
+        offscreenHost.parentNode.removeChild(offscreenHost);
+      }
       setIsGeneratingPdf(false);
     }
   };
@@ -438,7 +543,7 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
       {/* ========================================================================= */}
       <div 
         ref={printableRef}
-        className="bg-white p-4 sm:p-7 rounded-2xl border border-slate-300 shadow-sm print:border-none print:shadow-none print:p-0 max-w-5xl mx-auto overflow-hidden"
+        className="bg-white p-4 sm:p-7 rounded-2xl border border-slate-300 shadow-sm print:border-none print:shadow-none print:p-0 print:overflow-visible max-w-5xl mx-auto overflow-hidden"
       >
         {/* Top Header: !! Shri !! */}
         <div className="text-center mb-1">
@@ -448,7 +553,10 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
         </div>
 
         {/* Company Header: Logo Left, Full Company Details Right */}
-        <div className="flex flex-col sm:flex-row items-center sm:items-start justify-between gap-4 pb-4 border-b border-slate-200">
+        <div
+          data-scheme-company-header="true"
+          className="flex flex-col sm:flex-row items-center sm:items-start justify-between gap-4 pb-4 border-b border-slate-200"
+        >
           {/* Logo Left */}
           <div className="shrink-0 flex items-center justify-center">
             {logoUrl ? (
@@ -472,7 +580,10 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
           </div>
 
           {/* Company Text Right */}
-          <div className="text-center sm:text-right flex-1 min-w-0">
+          <div
+            data-scheme-company-text="true"
+            className="text-center sm:text-right flex-1 min-w-0"
+          >
             <h1 className="text-xl sm:text-2xl font-black text-black tracking-tight uppercase leading-tight font-sans">
               BLACKWORM AGRITECH PVT LTD
             </h1>
@@ -500,16 +611,21 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
         {/* Group Headings and Product Tables scroll together seamlessly!             */}
         {/* ========================================================================= */}
         <div 
-          className="overflow-x-auto w-full scroll-smooth"
+          data-scheme-scroll="true"
+          className="overflow-x-auto print:overflow-visible w-full scroll-smooth"
           style={{ WebkitOverflowScrolling: 'touch' }}
         >
-          <div className="min-w-[650px] space-y-6 mt-4">
+          <div data-scheme-scroll-inner="true" className="min-w-[650px] print:min-w-full space-y-6 mt-4">
             {groupedProducts.map((section) => {
               const billingDisc = section.billingDiscount;
               const extraDisc = section.extraDiscount;
 
               return (
-                <div key={section.groupName} className="border-2 border-black rounded-lg overflow-hidden">
+                <div
+                  key={section.groupName}
+                  data-scheme-section="true"
+                  className="border-2 border-black rounded-lg overflow-hidden"
+                >
                   {/* Category Header Row - Inside the scroll container so it moves together */}
                   <div className="bg-emerald-800 text-white p-2.5 px-3 flex items-center justify-between gap-3 border-b-2 border-black">
                     <div className="flex items-center gap-2 flex-wrap">
@@ -585,7 +701,8 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
                           return (
                             <tr
                               key={`${prod.id}_${pk.packingSize}`}
-                              className={`border-black ${isLastSubRow ? 'border-b-2' : 'border-b'} hover:bg-slate-50/60 transition-colors`}
+                              data-product-start={pkIdx === 0 ? 'true' : undefined}
+                              className={`border-black ${isLastSubRow ? 'border-b-2' : 'border-b'} hover:bg-slate-50/60 transition-colors print:break-inside-avoid`}
                             >
                               {/* 1. Sr No (Span across all packing sub-rows) */}
                               {pkIdx === 0 && (
@@ -665,7 +782,10 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
         </div>
 
         {/* Footer Signatures */}
-        <div className="mt-8 pt-4 border-t border-slate-300 flex justify-between items-end">
+        <div
+          data-scheme-footer="true"
+          className="mt-8 pt-4 border-t border-slate-300 flex justify-between items-end print:break-inside-avoid"
+        >
           <div className="text-center w-36 sm:w-44">
             <div className="h-7 border-b-2 border-slate-400 mb-1"></div>
             <p className="text-[10px] sm:text-[11px] font-black uppercase text-slate-500">Sales Manager Signature</p>

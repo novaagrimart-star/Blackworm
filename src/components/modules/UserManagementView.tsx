@@ -1,8 +1,11 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { collection, query, onSnapshot, doc, setDoc, deleteDoc } from 'firebase/firestore';
+import { collection, query, onSnapshot, doc, setDoc } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import { logAudit, syncOfficerDetailsEverywhere, safeFirestoreSet, mergeWithLocalData } from '../../lib/dataService';
+import { logAudit, syncOfficerDetailsEverywhere, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, getLocalDateStr, mergeWithLocalData, isQuotaBlocked } from '../../lib/dataService';
+import { useSharedUsers } from '../../lib/realtimeStore';
+import { useBranding } from '../../lib/branding';
+import { subscribeSecondaryCollection } from '../../lib/secondaryDb';
 import { toTitleCase } from '../../lib/utils';
 import { compressImageFile } from '../../lib/imageCompression';
 import { Language, translations } from '../../lib/i18n';
@@ -186,13 +189,8 @@ interface Props {
 
 export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUpdate }) => {
   const t = translations[lang];
-  const [users, setUsers] = useState<DetailedUserProfile[]>(() => {
-    try {
-      const merged = mergeWithLocalData('users', []) as DetailedUserProfile[];
-      if (merged && merged.length > 0) return merged;
-    } catch {}
-    return [];
-  });
+  const { users: sharedUsers, setUsersOptimistic } = useSharedUsers();
+  const users = sharedUsers as DetailedUserProfile[];
   const [viewMode, setViewMode] = useState<'list' | 'form'>('list');
   const [activeFilter, setActiveFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -217,7 +215,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const [stateName, setStateName] = useState('Maharashtra');
   const [pinCode, setPinCode] = useState('');
   const [dateOfBirth, setDateOfBirth] = useState('');
-  const [joiningDate, setJoiningDate] = useState(new Date().toISOString().slice(0, 10));
+  const [joiningDate, setJoiningDate] = useState(getLocalDateStr());
   const [aadhaarNo, setAadhaarNo] = useState('');
   const [panNo, setPanNo] = useState('');
   const [loginId, setLoginId] = useState('');
@@ -234,9 +232,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const [hasSecurityCheque, setHasSecurityCheque] = useState(false);
   const [securityChequeNumber, setSecurityChequeNumber] = useState('');
 
-  // Branding
-  const [logoUrl, setLogoUrl] = useState<string>('');
-  const [logoSize, setLogoSize] = useState<number>(80);
+  // Branding (shared singleton hook)
+  const { logoUrl, logoSize } = useBranding();
 
   // Approval requests state for Admin
   const [pendingRequests, setPendingRequests] = useState<any[]>([]);
@@ -251,56 +248,32 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const printableUserFormRef = useRef<HTMLDivElement>(null);
   const hasAutoOpenedRef = useRef(false);
 
+  const userFormHistoryPushedRef = useRef(false);
+
   // Mobile Hardware / Navigation Back Button Integration
   useEffect(() => {
     if (viewMode === 'form') {
-      window.history.pushState({ tab: 'user', userFormOpen: true }, '');
+      if (!userFormHistoryPushedRef.current) {
+        window.history.pushState({ tab: 'user', userFormOpen: true }, '');
+        userFormHistoryPushedRef.current = true;
+      }
       const handlePopState = () => {
+        userFormHistoryPushedRef.current = false;
         setViewMode('list');
       };
       window.addEventListener('popstate', handlePopState);
       return () => {
         window.removeEventListener('popstate', handlePopState);
       };
+    } else if (userFormHistoryPushedRef.current) {
+      userFormHistoryPushedRef.current = false;
+      if (window.history.state?.userFormOpen) {
+        window.history.back();
+      }
     }
   }, [viewMode]);
 
-  // Real-time listener for all users
-  useEffect(() => {
-    const q = query(collection(db, 'users'));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const list: DetailedUserProfile[] = [];
-      snapshot.forEach((docSnap) => {
-        const u = docSnap.data() as DetailedUserProfile;
-        list.push({ ...u, uid: docSnap.id });
-      });
-
-      const merged = mergeWithLocalData('users', list.map(u => ({ ...u, id: u.uid }))) as DetailedUserProfile[];
-
-      // Sort users: Owner (#1) first, followed by ascending user code number, then by full name
-      merged.sort((a, b) => {
-        const aCode = (a.userCode ? String(a.userCode) : '').replace(/\D/g, '');
-        const bCode = (b.userCode ? String(b.userCode) : '').replace(/\D/g, '');
-        const aNum = parseInt(aCode, 10);
-        const bNum = parseInt(bCode, 10);
-        if (!isNaN(aNum) && !isNaN(bNum) && aNum !== bNum) {
-          return aNum - bNum;
-        }
-        if (a.role === 'owner' && b.role !== 'owner') return -1;
-        if (b.role === 'owner' && a.role !== 'owner') return 1;
-        return (a.fullName || '').localeCompare(b.fullName || '');
-      });
-
-      setUsers(merged);
-    }, (error) => {
-      console.warn("Users firestore notice (fallback to local cache):", error);
-      const merged = mergeWithLocalData('users', []) as DetailedUserProfile[];
-      if (merged.length > 0) {
-        setUsers(merged);
-      }
-    });
-    return () => unsubscribe();
-  }, [profile]);
+  // Users are provided in real-time by shared useSharedUsers() singleton channel above.
 
   // Auto-open own form for non-admin users so they immediately see only their own form on initial mount
   useEffect(() => {
@@ -328,43 +301,47 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
     }
   }, [profile, users, viewMode]);
 
-  // Branding listener
+  // Pending profile update requests listener (Primary + Secondary DB)
   useEffect(() => {
-    const unsubBranding = onSnapshot(doc(db, 'config', 'branding'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        setLogoUrl(data.logoUrl || '');
-        setLogoSize(data.logoSize || 80);
-      }
-    }, (err) => {
-      console.warn('UserManagement branding sync notice:', err);
-    });
-    return () => unsubBranding();
-  }, []);
-
-  // Pending profile update requests listener
-  useEffect(() => {
-    const qReq = query(collection(db, 'user_approval_requests'));
-    const unsub = onSnapshot(qReq, (snap) => {
-      const list: any[] = [];
-      snap.forEach((d) => {
-        const data = d.data();
-        if (data.status === 'pending') {
-          list.push({ ...data, id: d.id });
-        }
-      });
-      list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    const reqMap = new Map<string, any>();
+    const syncList = () => {
+      const list = Array.from(reqMap.values())
+        .filter((d) => d && d.status === 'pending')
+        .sort((a, b) => toTimestampMs(b.createdAt) - toTimestampMs(a.createdAt));
       setPendingRequests(list);
-    }, (err) => {
-      console.warn('UserManagement approval requests sync notice:', err);
+    };
+
+    const unsubSec = subscribeSecondaryCollection('user_approval_requests', (events) => {
+      events.forEach((evt) => {
+        if (evt.deleted) reqMap.delete(evt.id);
+        else if (evt.doc) reqMap.set(evt.id, { ...evt.doc, id: evt.id });
+      });
+      syncList();
     });
-    return () => unsub();
+
+    let unsub: (() => void) | null = null;
+    if (!isQuotaBlocked()) {
+      const qReq = query(collection(db, 'user_approval_requests'));
+      unsub = onSnapshot(qReq, (snap) => {
+        reqMap.clear();
+        snap.forEach((d) => {
+          reqMap.set(d.id, { ...d.data(), id: d.id });
+        });
+        syncList();
+      }, (err) => {
+        console.warn('UserManagement approval requests sync notice:', err);
+      });
+    }
+    return () => {
+      unsubSec();
+      if (unsub) unsub();
+    };
   }, []);
 
   const handleApproveRequest = async (req: any) => {
     setActionLoading(req.id);
     try {
-      await setDoc(doc(db, 'users', req.targetUserId), {
+      await safeFirestoreSet('users', req.targetUserId, {
         ...req.proposedData,
         updatedAt: new Date().toISOString(),
       }, { merge: true });
@@ -386,7 +363,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
         console.warn('Sync error on approval:', syncErr);
       }
 
-      await setDoc(doc(db, 'user_approval_requests', req.id), {
+      await safeFirestoreSet('user_approval_requests', req.id, {
         status: 'approved',
         approvedAt: new Date().toISOString(),
         approvedByUid: profile.uid,
@@ -425,7 +402,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const handleRejectRequest = async (req: any) => {
     setActionLoading(req.id);
     try {
-      await setDoc(doc(db, 'user_approval_requests', req.id), {
+      await safeFirestoreSet('user_approval_requests', req.id, {
         status: 'rejected',
         rejectedAt: new Date().toISOString(),
         rejectedByUid: profile.uid,
@@ -494,7 +471,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
     setStateName('Maharashtra');
     setPinCode('');
     setDateOfBirth('');
-    setJoiningDate(new Date().toISOString().slice(0, 10));
+    setJoiningDate(getLocalDateStr());
     setAadhaarNo('');
     setPanNo('');
     setLoginId('');
@@ -678,8 +655,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
       // 1. Direct safe save with local backup (guarantees zero data loss)
       const saveRes = await safeFirestoreSet('users', uid, payload, { merge: true });
 
-      // 2. Immediately update in-memory state in UserManagementView
-      setUsers((prev) => {
+      // 2. Immediately update shared in-memory state across app
+      setUsersOptimistic((prev) => {
         const idx = prev.findIndex((u) => u.uid === uid);
         if (idx >= 0) {
           const updated = [...prev];
@@ -816,10 +793,12 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
       onConfirm: async () => {
         setDialogConfig(prev => ({ ...prev, isOpen: false }));
         try {
-          await deleteDoc(doc(db, 'users', uid));
+          setUsersOptimistic((prev) => prev.filter((u) => u.uid !== uid));
           if (currentUid === uid) {
             setViewMode('list');
           }
+          await safeFirestoreDelete('users', uid, { softDelete: true, user: profile });
+          await logAudit('DELETE', 'users', uid, `Deleted user profile for ${name}`, profile);
         } catch (err: any) {
           setDialogConfig({
             isOpen: true,

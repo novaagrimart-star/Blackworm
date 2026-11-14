@@ -1,10 +1,9 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { collection, query, where, onSnapshot, getDocs, limit } from 'firebase/firestore';
-import { db } from '../../firebase';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Language } from '../../lib/i18n';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { toTitleCase } from '../../lib/utils';
-import { mergeWithLocalData } from '../../lib/dataService';
+import { mergeWithLocalData, triggerBlobDownload, startBackgroundSync } from '../../lib/dataService';
+import { useSharedUsers, useSharedTravelSheets, useSharedYearlyTargets, useSharedCollectionEntries } from '../../lib/realtimeStore';
 import html2canvas from 'html2canvas-pro';
 import { 
   BarChart3, 
@@ -89,7 +88,10 @@ export function formatReportDisplayDate(dateStr: string): string {
 }
 
 export function parseDateKeys(dateStr: string) {
-  const [yStr, mStr, dStr] = dateStr.split('-');
+  const safeStr = /^\d{4}-\d{2}-\d{2}$/.test(String(dateStr || '').trim())
+    ? dateStr.trim()
+    : getTodayLocalDate();
+  const [yStr, mStr, dStr] = safeStr.split('-');
   const year = parseInt(yStr, 10);
   const monthIndex = parseInt(mStr, 10) - 1;
   const dayOfMonth = parseInt(dStr, 10);
@@ -211,8 +213,15 @@ export function buildReportRows(
       const cleanSheetName = (s.officerName || '').trim().toLowerCase();
 
       // Check if sheet belongs to this officer
-      const matchesUid = s.userId === officer.uid || sId.includes(officer.uid);
-      const matchesLogin = officer.loginId && (s.userId?.toLowerCase() === officer.loginId.toLowerCase() || sId.toLowerCase().includes(officer.loginId.toLowerCase()));
+      const matchesUid =
+        s.userId === officer.uid ||
+        sId === `travel_${officer.uid}_${sheetMonthKey}` ||
+        sId.startsWith(`travel_${officer.uid}_`);
+      const matchesLogin = officer.loginId && (
+        s.userId?.toLowerCase() === officer.loginId.toLowerCase() ||
+        sId.toLowerCase() === `travel_${officer.loginId.toLowerCase()}_${sheetMonthKey}` ||
+        sId.toLowerCase().startsWith(`travel_${officer.loginId.toLowerCase()}_`)
+      );
       const matchesName = cleanOfficerName && cleanSheetName && (cleanOfficerName === cleanSheetName || cleanOfficerName.includes(cleanSheetName) || cleanSheetName.includes(cleanOfficerName));
 
       if (!matchesUid && !matchesLogin && !matchesName) return;
@@ -374,194 +383,50 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
   const [selectedDate, setSelectedDate] = useState(todayDate);
   const printableSheetRef = useRef<HTMLDivElement>(null);
 
-  // In-memory collections state for live reactive updates with immediate cache pre-fill
-  const usersRef = useRef<UserProfile[]>(getInitialCachedUsers());
-  const travelRef = useRef<any[]>(getInitialCachedTravel());
-  const targetsRef = useRef<any[]>(reportStaticCache?.yearlyTargets || []);
-  const oldTargetsRef = useRef<any[]>(reportStaticCache?.targets || []);
-  const collDocsRef = useRef<any[]>([]);
+  const { users, loaded: usersLoaded } = useSharedUsers();
+  const { travelSheets } = useSharedTravelSheets();
+  const { yearlyTargets, refreshAllYearlyTargetsFromServer } = useSharedYearlyTargets();
+  const { collectionEntries } = useSharedCollectionEntries();
 
-  // Instant Initial State: Computed freshly using current user profile and cached travel rows (0ms latency!)
-  const [reportData, setReportData] = useState<OfficerDailyReport[]>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const cachedUsers = getInitialCachedUsers();
-        if (cachedUsers.length > 0) {
-          return buildReportRows(
-            cachedUsers,
-            getInitialCachedTravel(),
-            reportStaticCache?.yearlyTargets || [],
-            reportStaticCache?.targets || [],
-            mergeWithLocalData('collection_entries', []),
-            todayDate,
-            profile
-          );
-        }
-      } catch (e) {}
-    }
-    return [];
-  });
-
-  const [loading, setLoading] = useState(() => reportData.length === 0);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isCapturingPhoto, setIsCapturingPhoto] = useState(false);
   const [photoSavedToast, setPhotoSavedToast] = useState(false);
 
-  // Helper to re-compute rows live whenever any collection fires an update
-  const recomputeLiveReport = () => {
+  const reportData = useMemo<OfficerDailyReport[]>(() => {
+    const activeDate = /^\d{4}-\d{2}-\d{2}$/.test(String(selectedDate || '').trim())
+      ? selectedDate
+      : getTodayLocalDate();
+    const resolvedUsers = users.length > 0 ? users : getInitialCachedUsers();
+    const resolvedTravel = travelSheets.length > 0 ? travelSheets : getInitialCachedTravel();
+    const resolvedTargets = yearlyTargets.length > 0 ? yearlyTargets : (reportStaticCache?.yearlyTargets || []);
+
     const rows = buildReportRows(
-      usersRef.current,
-      travelRef.current,
-      targetsRef.current,
-      oldTargetsRef.current,
-      collDocsRef.current,
-      selectedDate,
+      resolvedUsers,
+      resolvedTravel,
+      resolvedTargets,
+      reportStaticCache?.targets || [],
+      collectionEntries,
+      activeDate,
       profile
     );
-    setReportData(rows);
-    setLoading(false);
     try {
-      localStorage.setItem(`${LOCAL_STORAGE_DAILY_PREFIX}${selectedDate}`, JSON.stringify(rows));
-    } catch (e) {}
-  };
+      localStorage.setItem(`${LOCAL_STORAGE_DAILY_PREFIX}${activeDate}`, JSON.stringify(rows));
+    } catch {}
+    return rows;
+  }, [users, travelSheets, yearlyTargets, collectionEntries, selectedDate, profile]);
 
-  // Recompute rows whenever selectedDate changes
-  useEffect(() => {
-    recomputeLiveReport();
-  }, [selectedDate]);
+  const loading = !usersLoaded && reportData.length === 0;
 
-  // Master Background Sync: Users, Travel Sheets, Yearly Targets & Collections (Mounted once, zero lag on date switch!)
-  useEffect(() => {
-    // 1. Live Users Listener (Cached immediately)
-    const qUsers = query(collection(db, 'users'));
-    const unsubUsers = onSnapshot(qUsers, (snap) => {
-      const uList = snap.docs.map(d => ({ ...d.data(), id: d.id, uid: d.id }));
-      const mergedUsers = mergeWithLocalData('users', uList) as unknown as UserProfile[];
-      usersRef.current = mergedUsers;
-      try {
-        localStorage.setItem('blackworm_cached_users', JSON.stringify(mergedUsers));
-      } catch (e) {}
-      recomputeLiveReport();
-    }, (err) => {
-      console.warn('Users live sync notice:', err);
-      const currentWithIds = (usersRef.current || []).map((u: any) => ({ ...u, id: u.uid || u.id }));
-      const mergedUsers = mergeWithLocalData('users', currentWithIds) as unknown as UserProfile[];
-      usersRef.current = mergedUsers;
-      recomputeLiveReport();
-      setLoading(false);
-    });
-
-    // 2. Live Travel Sheets Listener - Query all travel sheets so all officers' entries are updated in real-time
-    const qTravel = query(collection(db, 'travel_sheets'));
-    const unsubTravel = onSnapshot(qTravel, (snap) => {
-      const tList = snap.docs.map(d => ({ ...d.data(), id: d.id, _id: d.id }));
-      const mergedTravel = mergeWithLocalData('travel_sheets', tList as any[]);
-      travelRef.current = mergedTravel;
-      try {
-        localStorage.setItem('blackworm_cached_travel_sheets', JSON.stringify(mergedTravel));
-      } catch (e) {}
-      recomputeLiveReport();
-    }, (err) => {
-      console.warn('Travel live sync notice:', err);
-      const mergedTravel = mergeWithLocalData('travel_sheets', travelRef.current as any[]);
-      travelRef.current = mergedTravel;
-      recomputeLiveReport();
-      setLoading(false);
-    });
-
-    // 3. Live Yearly Targets Listener - Query all targets for all officers
-    const qTargets = query(collection(db, 'yearly_targets'));
-    const unsubTargets = onSnapshot(qTargets, (snap) => {
-      targetsRef.current = snap.docs.map(d => ({ ...d.data(), id: d.id, _id: d.id }));
-      recomputeLiveReport();
-    }, (err) => {
-      console.warn('Targets live sync notice:', err);
-      setLoading(false);
-    });
-
-    // 4. Live Collection Entries Listener (Query recent collections with fallback to local cache)
-    const qColl = query(collection(db, 'collection_entries'), limit(500));
-    const unsubColl = onSnapshot(qColl, (snap) => {
-      const list = snap.docs.map(d => ({ ...d.data(), id: d.id }));
-      const merged = mergeWithLocalData('collection_entries', list);
-      collDocsRef.current = merged;
-      recomputeLiveReport();
-    }, (err) => {
-      console.warn('Collections live sync notice:', err);
-      const merged = mergeWithLocalData('collection_entries', collDocsRef.current);
-      collDocsRef.current = merged;
-      recomputeLiveReport();
-    });
-
-    // Safety timeout: ensure loading turns off within 1.2s even on slow connection or quota exhaustion
-    const safetyTimer = setTimeout(() => {
-      recomputeLiveReport();
-      setLoading(false);
-    }, 1200);
-
-    return () => {
-      clearTimeout(safetyTimer);
-      unsubUsers();
-      unsubTravel();
-      unsubTargets();
-      unsubColl();
-    };
-  }, [profile.uid]);
-
-  // Manual Refresh to fetch latest from Firestore and local cache
+  // Lightweight manual refresh: flush pending queue + optionally pull server yearly targets without full 4-collection re-fetch
   const handleRefresh = async () => {
     setIsRefreshing(true);
     try {
-      // 1. Fetch live travel sheets
-      try {
-        const tSnap = await getDocs(collection(db, 'travel_sheets'));
-        const tList = tSnap.docs.map(d => ({ ...d.data(), id: d.id, _id: d.id }));
-        const mergedTravel = mergeWithLocalData('travel_sheets', tList as any[]);
-        travelRef.current = mergedTravel;
-        try {
-          localStorage.setItem('blackworm_cached_travel_sheets', JSON.stringify(mergedTravel));
-        } catch (e) {}
-      } catch (e) {
-        console.warn('Manual refresh travel error:', e);
-      }
-
-      // 2. Fetch live users
-      try {
-        const uSnap = await getDocs(collection(db, 'users'));
-        const uList = uSnap.docs.map(d => ({ ...d.data(), id: d.id, uid: d.id }));
-        const mergedUsers = mergeWithLocalData('users', uList) as unknown as UserProfile[];
-        usersRef.current = mergedUsers;
-        try {
-          localStorage.setItem('blackworm_cached_users', JSON.stringify(mergedUsers));
-        } catch (e) {}
-      } catch (e) {
-        console.warn('Manual refresh users error:', e);
-      }
-
-      // 3. Fetch live collections
-      try {
-        const cSnap = await getDocs(query(collection(db, 'collection_entries'), limit(500)));
-        const cList = cSnap.docs.map(d => ({ ...d.data(), id: d.id }));
-        const mergedColl = mergeWithLocalData('collection_entries', cList);
-        collDocsRef.current = mergedColl;
-      } catch (e) {
-        console.warn('Manual refresh collections error:', e);
-      }
-
-      // 4. Fetch live targets
-      try {
-        const tgSnap = await getDocs(collection(db, 'yearly_targets'));
-        targetsRef.current = tgSnap.docs.map(d => ({ ...d.data(), id: d.id, _id: d.id }));
-      } catch (e) {
-        console.warn('Manual refresh targets error:', e);
-      }
-
-      // 5. Recompute live report
-      recomputeLiveReport();
+      await startBackgroundSync();
+      await refreshAllYearlyTargetsFromServer();
     } finally {
       setTimeout(() => {
         setIsRefreshing(false);
-      }, 500);
+      }, 450);
     }
   };
 
@@ -601,13 +466,7 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
         }
 
         // Direct browser file download straight to Gallery / Downloads
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = fileName;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        URL.revokeObjectURL(link.href);
+        triggerBlobDownload(blob, fileName);
         setPhotoSavedToast(true);
         setTimeout(() => setPhotoSavedToast(false), 3000);
       }
@@ -620,8 +479,10 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
 
   const handlePrevDay = () => {
     try {
-      const [y, m, d] = selectedDate.split('-').map(Number);
+      const baseDate = /^\d{4}-\d{2}-\d{2}$/.test(selectedDate) ? selectedDate : getTodayLocalDate();
+      const [y, m, d] = baseDate.split('-').map(Number);
       const curr = new Date(y, m - 1, d);
+      if (isNaN(curr.getTime())) return;
       curr.setDate(curr.getDate() - 1);
       const newY = curr.getFullYear();
       const newM = String(curr.getMonth() + 1).padStart(2, '0');
@@ -632,8 +493,10 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
 
   const handleNextDay = () => {
     try {
-      const [y, m, d] = selectedDate.split('-').map(Number);
+      const baseDate = /^\d{4}-\d{2}-\d{2}$/.test(selectedDate) ? selectedDate : getTodayLocalDate();
+      const [y, m, d] = baseDate.split('-').map(Number);
       const curr = new Date(y, m - 1, d);
+      if (isNaN(curr.getTime())) return;
       curr.setDate(curr.getDate() + 1);
       const newY = curr.getFullYear();
       const newM = String(curr.getMonth() + 1).padStart(2, '0');

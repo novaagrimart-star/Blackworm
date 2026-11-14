@@ -6,21 +6,23 @@ import { Dashboard } from './components/Dashboard';
 import { Login } from './components/Login';
 import { Language } from './lib/i18n';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { startBackgroundSync } from './lib/dataService';
+import { startBackgroundSync, isQuotaBlocked, setQuotaBlocked, trackFirestoreUsage } from './lib/dataService';
+import { subscribeSecondaryCollection } from './lib/secondaryDb';
 
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(() => {
-    const saved = localStorage.getItem('blackworm_user_profile');
-    if (saved) {
-      try {
+    try {
+      const saved = localStorage.getItem('blackworm_user_profile');
+      if (saved) {
         const parsed = JSON.parse(saved);
         if (parsed && typeof parsed === 'object' && parsed.uid) {
           return parsed;
         }
-      } catch (e) {
-        console.error('Failed to parse saved profile:', e);
+        localStorage.removeItem('blackworm_user_profile');
       }
-      localStorage.removeItem('blackworm_user_profile');
+    } catch (e) {
+      console.error('Failed to parse saved profile:', e);
+      try { localStorage.removeItem('blackworm_user_profile'); } catch {}
     }
     return null;
   });
@@ -32,32 +34,59 @@ export default function App() {
     startBackgroundSync();
   }, []);
 
-  // Live real-time listener for current logged-in user profile changes
+  // Live real-time listener for current logged-in user profile changes (Primary + Secondary DB)
   useEffect(() => {
-    if (!profile?.uid) return;
-    const unsub = onSnapshot(
-      doc(db, 'users', profile.uid),
-      (snap) => {
-        if (snap.exists()) {
-          const freshData = snap.data();
-          const merged: UserProfile = {
-            ...profile,
-            ...freshData,
-            uid: profile.uid,
-          } as UserProfile;
-          setProfile(merged);
-          try {
-            localStorage.setItem('blackworm_user_profile', JSON.stringify(merged));
-          } catch (e) {
-            console.warn('Failed to update localStorage profile:', e);
-          }
+    const currentUid = profile?.uid;
+    if (!currentUid) return;
+
+    const applyFreshProfile = (freshData: Record<string, any>) => {
+      setProfile((prev) => {
+        const merged: UserProfile = {
+          ...(prev || {}),
+          ...freshData,
+          uid: currentUid,
+        } as UserProfile;
+        try {
+          localStorage.setItem('blackworm_user_profile', JSON.stringify(merged));
+        } catch (e) {
+          console.warn('Failed to update localStorage profile:', e);
         }
-      },
-      (err) => {
-        console.warn('Real-time profile listener error:', err);
-      }
-    );
-    return () => unsub();
+        return merged;
+      });
+    };
+
+    const unsubSec = subscribeSecondaryCollection('users', (events) => {
+      events.forEach((evt) => {
+        if (evt.id === currentUid && evt.doc && !evt.deleted) {
+          applyFreshProfile(evt.doc);
+        }
+      });
+    });
+
+    let unsubFb: (() => void) | null = null;
+    if (!isQuotaBlocked()) {
+      unsubFb = onSnapshot(
+        doc(db, 'users', currentUid),
+        (snap) => {
+          trackFirestoreUsage('read', 1);
+          if (snap.exists()) {
+            applyFreshProfile(snap.data());
+          }
+        },
+        (err) => {
+          const msg = String(err?.message || '').toLowerCase();
+          if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+            setQuotaBlocked(15 * 60 * 1000);
+          }
+          console.warn('Real-time profile listener error:', err);
+        }
+      );
+    }
+
+    return () => {
+      unsubSec();
+      if (unsubFb) unsubFb();
+    };
   }, [profile?.uid]);
 
   const handleUpdateProfile = (updatedProfile: UserProfile) => {
@@ -77,12 +106,16 @@ export default function App() {
 
   const handleLoginSuccess = (userProfile: UserProfile) => {
     setProfile(userProfile);
-    localStorage.setItem('blackworm_user_profile', JSON.stringify(userProfile));
+    try {
+      localStorage.setItem('blackworm_user_profile', JSON.stringify(userProfile));
+    } catch {}
   };
 
   const handleLogout = () => {
     setProfile(null);
-    localStorage.removeItem('blackworm_user_profile');
+    try {
+      localStorage.removeItem('blackworm_user_profile');
+    } catch {}
   };
 
   return (

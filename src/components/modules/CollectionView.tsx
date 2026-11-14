@@ -1,19 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { 
-  collection, 
-  query, 
-  where,
-  orderBy,
-  limit,
-  onSnapshot, 
-  doc, 
-  getDocs,
-  updateDoc,
-  startAfter
-} from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { logAudit, safeFirestoreSet, mergeWithLocalData, deduplicateCollections, deduplicateOrders, deduplicateDealers } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, getLocalDateStr } from '../../lib/dataService';
+import { useSharedCollectionEntries, useSharedOrders, useSharedDealers } from '../../lib/realtimeStore';
 import { Language, translations } from '../../lib/i18n';
 import { cn, toTitleCase, openExternalLinkSafely } from '../../lib/utils';
 import { CustomDialogModal } from '../CustomDialogModal';
@@ -105,6 +93,7 @@ interface CollectionRecord {
   collectedByName?: string;
   createdAt: string;
   updatedAt?: string;
+  isArchived?: boolean;
 }
 
 interface DealerStandingItem {
@@ -128,19 +117,41 @@ interface Props {
 
 export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
   const { logoUrl } = useBranding();
-  const [orders, setOrders] = useState<OrderItem[]>([]);
-  const [dealers, setDealers] = useState<SavedDealer[]>([]);
-  const [collectionEntries, setCollectionEntries] = useState<CollectionRecord[]>([]);
+  const { orders: rawSharedOrders, setOrdersOptimistic } = useSharedOrders();
+  const { dealers: rawSharedDealers } = useSharedDealers();
+  const { collectionEntries: rawSharedCollections, setCollectionsOptimistic } = useSharedCollectionEntries();
+
+  const orders = rawSharedOrders as OrderItem[];
+  const dealers = useMemo<SavedDealer[]>(
+    () =>
+      [...rawSharedDealers]
+        .map((data: any) => ({
+          id: data.id,
+          firmName: data.firmName || 'Unnamed Firm',
+          proprietorName: data.proprietorName || '',
+          dealerCode: data.dealerCode || '',
+          contactNumber: data.contactNumber || '',
+          village: data.village || data.center || '',
+          district: data.district || '',
+          isArchived: data.isArchived || false,
+          createdByUid: data.createdByUid || data.created_by_user_id,
+          created_by_user_id: data.created_by_user_id,
+          createdByName: data.createdByName || data.created_by_name,
+          created_by_name: data.created_by_name,
+          officerName: data.officerName,
+          loginId: data.loginId,
+          userCode: data.userCode,
+          userId: data.userId,
+          ownerId: data.ownerId,
+        }))
+        .sort((a, b) => (a.firmName || '').localeCompare(b.firmName || '')),
+    [rawSharedDealers]
+  );
+  const collectionEntries = rawSharedCollections as CollectionRecord[];
   const [search, setSearch] = useState('');
   const [activeTab, setActiveTab] = useState<'sheet' | 'receipts' | 'orders'>('sheet');
   const [sortBy, setSortBy] = useState<'standing_desc' | 'standing_asc' | 'name_asc'>('standing_desc');
   const [filterStandingOnly, setFilterStandingOnly] = useState<boolean>(true);
-
-  // Pagination states for Receipts
-  const [lastDoc, setLastDoc] = useState<any>(null);
-  const [hasMore, setHasMore] = useState(true);
-  const [isLoadingMore, setIsLoadingMore] = useState(false);
-  const PAGE_SIZE = 30;
 
   // Receive Payment Modal States
   const [showReceivePaymentModal, setShowReceivePaymentModal] = useState<boolean>(false);
@@ -149,7 +160,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
   const [paymentAmount, setPaymentAmount] = useState<string>('');
   const [referenceNo, setReferenceNo] = useState<string>('');
   const [bankName, setBankName] = useState<string>('');
-  const [paymentDate, setPaymentDate] = useState<string>(new Date().toISOString().slice(0, 10));
+  const [paymentDate, setPaymentDate] = useState<string>(getLocalDateStr());
   const [remarks, setRemarks] = useState<string>('');
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [successToast, setSuccessToast] = useState<string>('');
@@ -182,186 +193,44 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
   const [editRemarks, setEditRemarks] = useState<string>('');
 
   // Mobile back button integration
+  const modalHistoryPushedRef = useRef(false);
+  const anyModalOpen = showReceivePaymentModal || showEditReceiptModal;
   useEffect(() => {
-    if (showReceivePaymentModal) {
-      window.history.pushState({ tab: 'collection', modalOpen: true }, '');
+    if (anyModalOpen) {
+      if (!modalHistoryPushedRef.current) {
+        window.history.pushState({ tab: 'collection', modalOpen: true }, '');
+        modalHistoryPushedRef.current = true;
+      }
       const handlePopState = () => {
+        modalHistoryPushedRef.current = false;
         setShowReceivePaymentModal(false);
+        setShowEditReceiptModal(false);
       };
       window.addEventListener('popstate', handlePopState);
       return () => {
         window.removeEventListener('popstate', handlePopState);
       };
+    } else if (modalHistoryPushedRef.current) {
+      modalHistoryPushedRef.current = false;
+      if (window.history.state?.modalOpen) {
+        window.history.back();
+      }
     }
-  }, [showReceivePaymentModal]);
+  }, [anyModalOpen]);
 
-  const loadReceipts = async (isLoadMore = false) => {
-    if (isLoadingMore || (isLoadMore && !hasMore)) return;
-    setIsLoadingMore(true);
+  // Collection entries, orders, and dealers are provided in real-time by shared realtimeStore channels (Dual-DB synced)
 
-    try {
-      let q = query(
-        collection(db, 'collection_entries'),
-        orderBy('createdAt', 'desc'),
-        limit(PAGE_SIZE)
-      );
-
-      if (!isAdmin(profile)) {
-        q = query(
-          collection(db, 'collection_entries'),
-          where('collectedByUid', '==', profile.uid),
-          orderBy('createdAt', 'desc'),
-          limit(PAGE_SIZE)
-        );
-      }
-
-      if (isLoadMore && lastDoc) {
-        if (!isAdmin(profile)) {
-          q = query(
-            collection(db, 'collection_entries'),
-            where('collectedByUid', '==', profile.uid),
-            orderBy('createdAt', 'desc'),
-            startAfter(lastDoc),
-            limit(PAGE_SIZE)
-          );
-        } else {
-          q = query(
-            collection(db, 'collection_entries'),
-            orderBy('createdAt', 'desc'),
-            startAfter(lastDoc),
-            limit(PAGE_SIZE)
-          );
-        }
-      }
-
-      const snap = await getDocs(q);
-      const list: CollectionRecord[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as CollectionRecord;
-        list.push({ ...data, id: d.id });
-      });
-
-      const merged = mergeWithLocalData('collection_entries', list);
-      
-      if (isLoadMore) {
-        setCollectionEntries(prev => deduplicateCollections([...prev, ...merged]));
-      } else {
-        setCollectionEntries(deduplicateCollections(merged));
-      }
-
-      setLastDoc(snap.docs[snap.docs.length - 1] || null);
-      setHasMore(snap.docs.length === PAGE_SIZE);
-    } catch (error) {
-      console.warn("collection_entries fetch error:", error);
-      if (!isLoadMore) {
-        const cached = mergeWithLocalData('collection_entries', []);
-        setCollectionEntries(deduplicateCollections(cached));
-      }
-    } finally {
-      setIsLoadingMore(false);
-    }
-  };
-
-  useEffect(() => {
-    // 1. Real-time receipts (collection_entries)
-    const receiptsQ = query(
-      collection(db, 'collection_entries'),
-      limit(500)
-    );
-
-    const unsubReceipts = onSnapshot(receiptsQ, (snap) => {
-      const list: CollectionRecord[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as CollectionRecord;
-        list.push({ ...data, id: d.id });
-      });
-      list.sort((a, b) => new Date(b.createdAt || b.date || 0).getTime() - new Date(a.createdAt || a.date || 0).getTime());
-      const merged = mergeWithLocalData('collection_entries', list);
-      setCollectionEntries(deduplicateCollections(merged));
-    }, (err) => {
-      console.warn("collection_entries real-time sync notice:", err);
-      const cached = mergeWithLocalData('collection_entries', []);
-      setCollectionEntries(deduplicateCollections(cached));
-    });
-
-    // 2. Real-time Orders for standing calculations
-    const ordersQ = query(collection(db, 'orders'), limit(500));
-    const unsubOrders = onSnapshot(ordersQ, (snap) => {
-      const oList: OrderItem[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as OrderItem;
-        if (!data.isArchived) oList.push({ ...data, id: d.id });
-      });
-      oList.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-      const mergedOrders = mergeWithLocalData('orders', oList);
-      setOrders(deduplicateOrders(mergedOrders));
-    }, (err) => {
-      console.warn("orders sync notice:", err);
-      const cached = mergeWithLocalData('orders', []);
-      setOrders(deduplicateOrders(cached));
-    });
-
-    // 3. Real-time Dealers
-    const dealersQ = query(collection(db, 'dealers_application'), limit(500));
-    const unsubDealers = onSnapshot(dealersQ, (snap) => {
-      const dList: SavedDealer[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as any;
-        if (!data.isArchived) {
-          dList.push({
-            id: d.id,
-            firmName: data.firmName || 'Unnamed Firm',
-            proprietorName: data.proprietorName || '',
-            dealerCode: data.dealerCode || '',
-            contactNumber: data.contactNumber || '',
-            village: data.village || data.center || '',
-            district: data.district || '',
-            isArchived: data.isArchived || false,
-            createdByUid: data.createdByUid || data.created_by_user_id,
-            created_by_user_id: data.created_by_user_id,
-            createdByName: data.createdByName || data.created_by_name,
-            created_by_name: data.created_by_name,
-            officerName: data.officerName,
-            loginId: data.loginId,
-            userCode: data.userCode,
-            userId: data.userId,
-            ownerId: data.ownerId
-          });
-        }
-      });
-      dList.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
-      const mergedDealers = mergeWithLocalData('dealers_application', dList as any);
-      setDealers(deduplicateDealers(mergedDealers as any) as any);
-    }, (err) => {
-      console.warn("dealers sync notice:", err);
-      const cached = mergeWithLocalData('dealers_application', []);
-      setDealers(deduplicateDealers(cached as any) as any);
-    });
-
-    return () => {
-      unsubReceipts();
-      unsubOrders();
-      unsubDealers();
-    };
-  }, [profile]);
-
-  // User-wise Data Security: isolate officers while preserving Admin/Owner full visibility
-  const accessibleDealers = useMemo(() => {
-    if (isAdmin(profile)) return dealers;
-    const userDealers = dealers.filter(d => isUserRecord(d, profile));
-    return userDealers.length > 0 ? userDealers : dealers;
-  }, [dealers, profile]);
+  // All authorized employees & admins can view/collect for all registered company dealers (including Amir Nanavare's dealers)
+  const accessibleDealers = dealers;
 
   const accessibleOrders = useMemo(() => {
     if (isAdmin(profile)) return orders;
-    const userOrders = orders.filter(o => isUserRecord(o, profile));
-    return userOrders.length > 0 ? userOrders : orders;
+    return orders.filter(o => isUserRecord(o, profile));
   }, [orders, profile]);
 
   const accessibleCollectionEntries = useMemo(() => {
     if (isAdmin(profile)) return collectionEntries;
-    const userEntries = collectionEntries.filter(e => isUserRecord(e, profile));
-    return userEntries.length > 0 ? userEntries : collectionEntries;
+    return collectionEntries.filter(e => isUserRecord(e, profile));
   }, [collectionEntries, profile]);
 
   // Calculate Standing Amounts per Dealer strictly within authorized scope
@@ -499,7 +368,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
     setReferenceNo('');
     setBankName('');
     setRemarks('');
-    setPaymentDate(new Date().toISOString().slice(0, 10));
+    setPaymentDate(getLocalDateStr());
     setShowReceivePaymentModal(true);
   };
 
@@ -551,13 +420,13 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
     try {
       // 1. Distribute across oldest pending orders (FIFO)
       let remainingPayment = payVal;
-      const dealerOrders = orders
+      const dealerOrders = accessibleOrders
         .filter(o => {
           const match = (o.dealerName || '').trim().toUpperCase() === firmName.trim().toUpperCase() ||
                         (o.dealerId && dealerObj?.id && o.dealerId === dealerObj.id);
           return match && o.balanceAmount > 0;
         })
-        .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+        .sort((a, b) => toTimestampMs(a.createdAt) - toTimestampMs(b.createdAt));
 
       for (const ord of dealerOrders) {
         if (remainingPayment <= 0) break;
@@ -590,9 +459,12 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       }
 
       // 2. Create receipt in collection_entries
-      const colEntryRef = doc(collection(db, 'collection_entries'));
+      const entryId =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `col_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
       const newEntry: CollectionRecord = {
-        id: colEntryRef.id,
+        id: entryId,
         dealerId: dealerObj?.id || '',
         dealerName: firmName,
         dealerCode: dealerCode,
@@ -607,12 +479,11 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         createdAt: new Date().toISOString()
       };
 
-      const entryId = colEntryRef.id;
       const fullEntry = { ...newEntry, id: entryId };
       const saveRes = await safeFirestoreSet('collection_entries', entryId, fullEntry);
 
-      // Immediately add to in-memory state
-      setCollectionEntries((prev) => [fullEntry, ...prev]);
+      // Immediately add to shared state
+      setCollectionsOptimistic((prev) => [fullEntry, ...prev]);
 
       // 3. Audit Log
       try {
@@ -647,13 +518,13 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       // 1. Revert balances on orders (LIFO - Newest paid first)
       let amountToRevert = Number(entry.amount) || 0;
       
-      const dealerOrders = orders
+      const dealerOrders = accessibleOrders
         .filter(o => {
           const match = (o.dealerName || '').trim().toUpperCase() === entry.dealerName.trim().toUpperCase() ||
                         (o.dealerId && entry.dealerId && o.dealerId === entry.dealerId);
           return match && o.paidAmount > 0;
         })
-        .sort((a, b) => (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || ''));
+        .sort((a, b) => toTimestampMs(b.updatedAt || b.createdAt) - toTimestampMs(a.updatedAt || a.createdAt));
 
       for (const ord of dealerOrders) {
         if (amountToRevert <= 0) break;
@@ -666,19 +537,20 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         const newBal = currentBal + revertVal;
         const newStatus = newBal > 0 && ord.status === 'collected' ? 'delivered' : ord.status;
 
-        await updateDoc(doc(db, 'orders', ord.id), {
+        await safeFirestoreSet('orders', ord.id, {
           paidAmount: newPaid,
           balanceAmount: newBal,
           status: newStatus,
           updatedAt: new Date().toISOString()
-        });
+        }, { merge: true });
+        setOrdersOptimistic(prev => prev.map(o => o.id === ord.id ? { ...o, paidAmount: newPaid, balanceAmount: newBal, status: newStatus } : o));
 
         amountToRevert -= revertVal;
       }
 
-      // 2. Delete the record
-      const { deleteDoc } = await import('firebase/firestore');
-      await deleteDoc(doc(db, 'collection_entries', entry.id));
+      // 2. Soft-delete the record & purge local caches
+      await safeFirestoreDelete('collection_entries', entry.id, { softDelete: true, user: profile });
+      setCollectionsOptimistic(prev => prev.filter(e => e.id !== entry.id));
 
       // 3. Audit Log
       await logAudit(
@@ -722,7 +594,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
     setEditPaymentMode(entry.paymentMode || 'Cash');
     setEditReferenceNo(entry.referenceNo || '');
     setEditBankName(entry.bankName || '');
-    setEditDate(entry.date || new Date().toISOString().slice(0, 10));
+    setEditDate(entry.date || getLocalDateStr());
     setEditRemarks(entry.notes || '');
     setShowEditReceiptModal(true);
   };
@@ -733,6 +605,17 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
 
     const oldVal = Number(editingReceipt.amount) || 0;
     const newVal = Number(editAmount) || 0;
+    if (newVal <= 0) {
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'अवैध रक्कम (Invalid Amount)',
+        message: 'कृपया शून्यापेक्षा जास्त वैध रक्कम भरा.',
+        confirmText: 'ठीक आहे',
+        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+      });
+      return;
+    }
     const diff = newVal - oldVal;
 
     setIsSubmitting(true);
@@ -742,46 +625,53 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         if (diff > 0) {
           // Additional payment - FIFO
           let remaining = diff;
-          const dealerOrders = orders
+          const dealerOrders = accessibleOrders
             .filter(o => {
               const match = (o.dealerName || '').trim().toUpperCase() === editingReceipt.dealerName.trim().toUpperCase() ||
                             (o.dealerId && editingReceipt.dealerId && o.dealerId === editingReceipt.dealerId);
               return match && o.balanceAmount > 0;
             })
-            .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+            .sort((a, b) => toTimestampMs(a.createdAt) - toTimestampMs(b.createdAt));
 
           for (const ord of dealerOrders) {
             if (remaining <= 0) break;
             const deduction = Math.min(remaining, ord.balanceAmount);
-            await updateDoc(doc(db, 'orders', ord.id), {
-              paidAmount: ord.paidAmount + deduction,
-              balanceAmount: ord.balanceAmount - deduction,
-              status: (ord.balanceAmount - deduction) <= 0 ? 'collected' : ord.status,
+            const newPaid = ord.paidAmount + deduction;
+            const newBal = ord.balanceAmount - deduction;
+            const newStatus = newBal <= 0 ? 'collected' : ord.status;
+            await safeFirestoreSet('orders', ord.id, {
+              paidAmount: newPaid,
+              balanceAmount: newBal,
+              status: newStatus,
               updatedAt: new Date().toISOString()
-            });
+            }, { merge: true });
+            setOrdersOptimistic(prev => prev.map(o => o.id === ord.id ? { ...o, paidAmount: newPaid, balanceAmount: newBal, status: newStatus } : o));
             remaining -= deduction;
           }
         } else {
           // Reduced payment - LIFO
           let toRevert = Math.abs(diff);
-          const dealerOrders = orders
+          const dealerOrders = accessibleOrders
             .filter(o => {
               const match = (o.dealerName || '').trim().toUpperCase() === editingReceipt.dealerName.trim().toUpperCase() ||
                             (o.dealerId && editingReceipt.dealerId && o.dealerId === editingReceipt.dealerId);
               return match && o.paidAmount > 0;
             })
-            .sort((a, b) => (b.updatedAt || b.createdAt || '').localeCompare(a.updatedAt || a.createdAt || ''));
+            .sort((a, b) => toTimestampMs(b.updatedAt || b.createdAt) - toTimestampMs(a.updatedAt || a.createdAt));
 
           for (const ord of dealerOrders) {
             if (toRevert <= 0) break;
             const revertVal = Math.min(toRevert, ord.paidAmount);
+            const newPaid = ord.paidAmount - revertVal;
             const newBal = ord.balanceAmount + revertVal;
-            await updateDoc(doc(db, 'orders', ord.id), {
-              paidAmount: ord.paidAmount - revertVal,
+            const newStatus = newBal > 0 && ord.status === 'collected' ? 'delivered' : ord.status;
+            await safeFirestoreSet('orders', ord.id, {
+              paidAmount: newPaid,
               balanceAmount: newBal,
-              status: newBal > 0 && ord.status === 'collected' ? 'delivered' : ord.status,
+              status: newStatus,
               updatedAt: new Date().toISOString()
-            });
+            }, { merge: true });
+            setOrdersOptimistic(prev => prev.map(o => o.id === ord.id ? { ...o, paidAmount: newPaid, balanceAmount: newBal, status: newStatus } : o));
             toRevert -= revertVal;
           }
         }
@@ -799,7 +689,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         updatedAt: new Date().toISOString()
       };
       await safeFirestoreSet('collection_entries', editingReceipt.id, updatedReceiptPayload, { merge: true });
-      setCollectionEntries(prev => prev.map(e => e.id === editingReceipt.id ? { ...e, ...updatedReceiptPayload } : e));
+      setCollectionsOptimistic(prev => prev.map(e => e.id === editingReceipt.id ? { ...e, ...updatedReceiptPayload } : e));
 
       await logAudit(
         'UPDATE',
@@ -1252,7 +1142,7 @@ Blackworm Agritech Pvt. Ltd.`;
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 font-medium">
-                {collectionEntries.map((entry, idx) => (
+                {accessibleCollectionEntries.map((entry, idx) => (
                   <tr key={entry.id} className="hover:bg-slate-50/80 transition">
                     <td className="p-2.5 text-center font-mono font-bold text-slate-400">
                       {idx + 1}
@@ -1309,7 +1199,7 @@ Blackworm Agritech Pvt. Ltd.`;
 
                 {accessibleCollectionEntries.length === 0 && (
                   <tr>
-                    <td colSpan={7} className="p-8 text-center text-slate-400 font-medium">
+                    <td colSpan={isAdmin(profile) ? 8 : 7} className="p-8 text-center text-slate-400 font-medium">
                       No payment receipts recorded yet. Click "Receive Payment" to add one.
                     </td>
                   </tr>

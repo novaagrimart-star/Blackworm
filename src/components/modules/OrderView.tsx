@@ -1,20 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { 
-  collection, 
-  query, 
-  where,
-  orderBy,
-  limit,
-  onSnapshot, 
-  doc, 
-  getDocs,
-  updateDoc,
-  deleteDoc,
-  startAfter
-} from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { softDeleteRecord, logAudit, safeFirestoreSet, mergeWithLocalData, deduplicateOrders, deduplicateDealers, deduplicateProducts } from '../../lib/dataService';
+import { softDeleteRecord, logAudit, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, formatDisplayDate, triggerBlobDownload, deduplicateProducts } from '../../lib/dataService';
+import { useSharedOrders, useSharedDealers, useSharedUsers, useSharedMasterPricelist } from '../../lib/realtimeStore';
 import { Language } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
 import { cn, toTitleCase, openExternalLinkSafely } from '../../lib/utils';
@@ -35,7 +22,7 @@ import {
   MapPin, 
   User, 
   Check, 
-  Eye, 
+  Download,
   Building2,
   Sparkles,
   Camera,
@@ -129,6 +116,313 @@ export const getCleanGradeName = (prod?: {
   return raw || (grade || name || brand || '').trim();
 };
 
+export const isGroupBOrC = (
+  prod?: {
+    groupName?: string;
+    code?: string;
+    brandName?: string;
+    gradeName?: string;
+    productName?: string;
+  } | null
+): boolean => {
+  if (!prod) return false;
+  const g = (prod.groupName || '').toLowerCase().trim();
+  const c = (prod.code || '').toLowerCase().trim();
+  const text = `${prod.brandName || ''} ${prod.gradeName || ''} ${prod.productName || ''}`.toLowerCase();
+
+  // Never misclassify explicit Group A or Specialty products
+  if (
+    g.includes('group a') ||
+    g.includes('group-a') ||
+    g.includes('a group') ||
+    g.includes('water soluble') ||
+    g.includes('specialty') ||
+    g.includes('speciality') ||
+    g.includes('स्पेशालिटी') ||
+    /^a[\s._\-]*\d/.test(c) ||
+    /^s[\s._\-]*\d/.test(c)
+  ) {
+    return false;
+  }
+
+  if (
+    g.includes('group b') ||
+    g.includes('group-b') ||
+    g.includes('b group') ||
+    g.includes('b-group') ||
+    g.includes('gr. b') ||
+    g.includes('gr b') ||
+    g === 'b' ||
+    /^b\s*[-–:]/.test(g) ||
+    g.includes('micronutrient') ||
+    g.includes('micro nutrient') ||
+    g.includes('micro') ||
+    g.includes('ग्रुप ब') ||
+    g.includes('गट ब') ||
+    g.includes('group c') ||
+    g.includes('group-c') ||
+    g.includes('c group') ||
+    g.includes('c-group') ||
+    g.includes('gr. c') ||
+    g.includes('gr c') ||
+    g === 'c' ||
+    /^c\s*[-–:]/.test(g) ||
+    g.includes('growth regulator') ||
+    g.includes('plant growth') ||
+    g.includes('pgr') ||
+    g.includes('stimulant') ||
+    g.includes('ग्रुप क') ||
+    g.includes('गट क') ||
+    /^b[\s._\-]*\d/.test(c) ||
+    /^c[\s._\-]*\d/.test(c)
+  ) {
+    return true;
+  }
+
+  // Known Specialty / Group A grade signatures must not match known B/C brand fallback
+  const isKnownSpecialtyOrAGrade =
+    /\d+\s*[:\-/]\s*\d+\s*[:\-/]\s*\d+/.test(text) ||
+    /calcium\s*nitrate|potassium\s*schoenite|magnesium\s*sulph|nitro\s*king/i.test(text);
+  if (isKnownSpecialtyOrAGrade) return false;
+
+  return (
+    /microgrip|bw\s*combi|nutrijet|biovins2|4\s*star|black\s*gold|aminox|fulvi\s*grow|siliboost|megaenergeol|strange|uv\s*guard|neemaza|v-lin|blackelp|blackworm\s*sulphur|bullet|phantom|fungifight|whitewash|kick|drona|sparsh|nutri\s*excel|nutriva|nutrizen|zingo|pomag|blow\s*-|vam|fenzo|blackworm\s*cmb|vermiwash/i.test(
+      text
+    )
+  );
+};
+
+export const isSpecialtyGroup = (
+  prod?: { groupName?: string; code?: string; gradeName?: string; productName?: string } | null
+): boolean => {
+  if (!prod) return false;
+  if (isGroupBOrC(prod)) return false;
+  const g = (prod.groupName || '').toLowerCase().trim();
+  const c = (prod.code || '').toLowerCase().trim();
+  if (
+    g.includes('specialty') ||
+    g.includes('speciality') ||
+    g.includes('special ') ||
+    g === 'special' ||
+    g.includes('स्पेशालिटी') ||
+    g.includes('स्पेशल') ||
+    /^s\s*\d/.test(c)
+  ) {
+    return true;
+  }
+  const name = `${prod.gradeName || ''} ${prod.productName || ''}`.toLowerCase();
+  return (
+    /0?0\s*:\s*42\s*:\s*47/.test(name) ||
+    /0?0\s*:\s*60\s*:\s*20/.test(name) ||
+    /0?0\s*:\s*55\s*:\s*18/.test(name) ||
+    /0?0\s*:\s*0?9\s*:\s*46/.test(name) ||
+    /0?0\s*:\s*33\s*:\s*65/.test(name) ||
+    /36\s*:\s*10\s*:\s*10/.test(name) ||
+    /11\s*:\s*44\s*:\s*11/.test(name) ||
+    /nitro\s*king/.test(name)
+  );
+};
+
+export const isOneKgPacking = (packingSize: string): boolean => {
+  const raw = (packingSize || '').toLowerCase().trim();
+  if (!raw) return false;
+  return /^(?:1(?:\.0+)?\s*(?:kg|kilo)\b|1(?:\.0+)?kg(?:[*x×/(\-0-9]|$)|1000\s*g(?:m|ram)?\b)/i.test(raw);
+};
+
+export const isBoxPackingOrder = (
+  packingSize: string,
+  prod?: { groupName?: string; code?: string; brandName?: string; gradeName?: string; productName?: string } | null
+): boolean => {
+  if (isGroupBOrC(prod)) return true;
+  if (isSpecialtyGroup(prod) && isOneKgPacking(packingSize)) return true;
+  return false;
+};
+
+/**
+ * Number of individual packs inside 1 shipper Box:
+ * - Specialty Grades 1 Kg: 25 Nos per Box (2.5 Kg remains 1 Nos.)
+ * - Group B & Group C: matches official company 10 Ltr / 10 Kg / 20 Kg carton structure.
+ */
+export const getBoxPackCount = (
+  packingSize: string,
+  prod?: { groupName?: string; code?: string; brandName?: string; gradeName?: string; productName?: string } | null
+): number => {
+  const raw = (packingSize || '').trim();
+  const explicitMatch = raw.match(/[*x×]\s*(\d+)\s*(?:nos|n0s|ns|pcs|pc)\b/i);
+
+  if (isSpecialtyGroup(prod)) {
+    if (isOneKgPacking(raw)) {
+      if (explicitMatch && Number(explicitMatch[1]) > 0) {
+        return Number(explicitMatch[1]);
+      }
+      return 25;
+    }
+    return 1;
+  }
+
+  if (!isGroupBOrC(prod)) return 1;
+  if (explicitMatch && Number(explicitMatch[1]) > 0) {
+    return Number(explicitMatch[1]);
+  }
+  const norm = raw.toLowerCase().replace(/\s+/g, '');
+  if (
+    norm.includes('bucket') ||
+    norm.includes('10ltr') ||
+    /(?:^|[^\d.])10(?:\.0+)?l(?:it(?:re|er)?)?(?:$|[^a-z])/.test(norm) ||
+    norm.includes('20ltr') ||
+    norm.includes('20kg') ||
+    norm.includes('25kg') ||
+    norm.includes('50kg')
+  ) {
+    return 1;
+  }
+  if (norm.includes('10kg')) return 5;
+  if (norm.includes('250ml') || norm.includes('250gm') || norm.includes('250g')) return 40;
+  if (norm.includes('500ml') || norm.includes('500gm') || norm.includes('500g')) return 20;
+  if (norm.includes('100ml') || norm.includes('100gm') || norm.includes('100g')) return 50;
+  if (/(?:^|[^\d.])50(?:\.0+)?(?:ml|gm|g)\b/.test(norm)) return 100;
+  if (norm.includes('2.5ltr') || norm.includes('2.5l') || norm.includes('2.5kg')) return 4;
+  if (norm.includes('5ltr') || /(?:^|[^\d.])5(?:\.0+)?l(?:it(?:re|er)?)?(?:$|[^a-z])/.test(norm) || norm.includes('5kg')) return 2;
+  if (norm.includes('2kg') || norm.includes('2ltr') || /(?:^|[^\d.])2(?:\.0+)?l(?:it(?:re|er)?)?(?:$|[^a-z])/.test(norm)) return 10;
+  if (
+    norm.includes('1ltr') ||
+    /(?:^|[^\d.])1(?:\.0+)?l(?:it(?:re|er)?)?(?:$|[^a-z])/.test(norm) ||
+    /(?:^|[^\d.])1(?:\.0+)?kg/.test(norm) ||
+    norm.includes('1000ml') ||
+    norm.includes('1000gm')
+  ) {
+    return 10;
+  }
+  return 1;
+};
+
+export const getOrderLineUnit = (item?: Partial<OrderProductLine> | null): 'Box' | 'Nos.' => {
+  if (item?.unit === 'Box') return 'Box';
+  if (!item?.unit && isGroupBOrC(item)) return 'Box';
+  if (item?.unit === 'Nos.') {
+    if (isGroupBOrC(item) && ((Number(item?.pcsPerBox) || 1) > 1 || getBoxPackCount(item?.packingSize || '', item) === 1)) {
+      return 'Box';
+    }
+    return 'Nos.';
+  }
+  // Legacy historical orders (Group A / Specialty) stored before Box unit support used Nos. counts directly
+  return 'Nos.';
+};
+
+export const resolveOrderLineForBox = (
+  item: OrderProductLine,
+  matchedProd?: {
+    groupName?: string;
+    code?: string;
+    brandName?: string;
+    gradeName?: string;
+    productName?: string;
+    packings?: Array<{ packingSize: string; rate: number; mrp?: number }>;
+    gstRate?: number;
+  } | null
+): OrderProductLine => {
+  const prodRef = {
+    groupName: item.groupName || matchedProd?.groupName || '',
+    code: matchedProd?.code || '',
+    brandName: item.brandName || matchedProd?.brandName || '',
+    gradeName: item.gradeName || matchedProd?.gradeName || '',
+    productName: item.productName || '',
+  };
+
+  if (!isGroupBOrC(prodRef)) {
+    return {
+      ...item,
+      unit: getOrderLineUnit(item),
+      pcsPerBox: Number(item.pcsPerBox) || 1,
+    };
+  }
+
+  const expectedPcs = getBoxPackCount(item.packingSize || '', prodRef);
+  const currentPcs = Number(item.pcsPerBox) || 1;
+  const effectivePcs = currentPcs > 1 ? currentPcs : expectedPcs;
+  const qty = Math.max(1, Number(item.quantity) || 1);
+  const rate = Number(item.rate) || 0;
+  const disc = Math.max(0, Number(item.discount) || 0);
+  const resolvedGroup = item.groupName || matchedProd?.groupName || '';
+
+  if (item.unit === 'Box' || !item.unit || currentPcs > 1 || expectedPcs <= 1) {
+    return {
+      ...item,
+      groupName: resolvedGroup,
+      unit: 'Box',
+      pcsPerBox: effectivePcs,
+    };
+  }
+
+  if (matchedProd && matchedProd.packings && matchedProd.packings.length > 0) {
+    const pk = matchedProd.packings.find((p) => p.packingSize === item.packingSize) || matchedProd.packings[0];
+    const withGst = calculateWithGst(pk.rate, matchedProd.gstRate || 5);
+    const billingDisc = getStandardBillingDiscount(resolvedGroup);
+    const singleUnitRate = Math.round(withGst * (1 - billingDisc / 100) * 100) / 100;
+    const expectedBoxRate = Math.round(singleUnitRate * expectedPcs * 100) / 100;
+
+    if (Math.abs(rate - expectedBoxRate) <= Math.abs(rate - singleUnitRate)) {
+      return {
+        ...item,
+        groupName: resolvedGroup,
+        unit: 'Box',
+        pcsPerBox: expectedPcs,
+      };
+    }
+  }
+
+  if (qty >= expectedPcs && qty % expectedPcs === 0) {
+    const convertedBoxes = qty / expectedPcs;
+    const convertedBoxRate = Math.round(rate * expectedPcs * 100) / 100;
+    const preservedSub =
+      item.subtotal !== undefined
+        ? Math.max(0, Number(item.subtotal) || 0)
+        : Math.max(0, convertedBoxRate * convertedBoxes - disc);
+    return {
+      ...item,
+      groupName: resolvedGroup,
+      unit: 'Box',
+      pcsPerBox: expectedPcs,
+      quantity: convertedBoxes,
+      rate: convertedBoxRate,
+      subtotal: preservedSub,
+    };
+  }
+
+  return {
+    ...item,
+    groupName: resolvedGroup,
+    unit: getOrderLineUnit(item),
+    pcsPerBox: currentPcs,
+  };
+};
+
+export const formatOrderTotalQuantity = (
+  items?: Partial<OrderProductLine>[],
+  fallbackTotal?: number
+): string => {
+  if (!items || items.length === 0) {
+    return `${fallbackTotal || 0} Nos.`;
+  }
+  let boxTotal = 0;
+  let nosTotal = 0;
+  items.forEach((it) => {
+    const q = Number(it.quantity) || 0;
+    if (getOrderLineUnit(it) === 'Box') {
+      boxTotal += q;
+    } else {
+      nosTotal += q;
+    }
+  });
+  if (boxTotal > 0 && nosTotal > 0) {
+    return `${boxTotal} Box, ${nosTotal} Nos.`;
+  }
+  if (boxTotal > 0) {
+    return `${boxTotal} Box`;
+  }
+  return `${nosTotal} Nos.`;
+};
+
 export interface OrderProductLine {
   productId: string;
   productName: string;
@@ -136,6 +430,8 @@ export interface OrderProductLine {
   gradeName?: string;
   groupName?: string;
   packingSize: string;
+  unit?: 'Box' | 'Nos.';
+  pcsPerBox?: number;
   rate: number;
   quantity: number;
   discount?: number;
@@ -233,67 +529,106 @@ interface Props {
 }
 
 export const OrderView: React.FC<Props> = ({ profile }) => {
-  const [orders, setOrders] = useState<OrderItem[]>(() => {
-    try {
-      const cached = mergeWithLocalData('orders', []);
-      if (cached && cached.length > 0) return cached as any;
-    } catch {}
-    return [];
-  });
-  const [dealers, setDealers] = useState<SavedDealer[]>(() => {
-    try {
-      const rawLocal = localStorage.getItem('blackworm_local_dealers_application');
-      if (rawLocal) {
-        const parsed = JSON.parse(rawLocal);
-        const list = Object.values(parsed).filter((d: any) => !d.isArchived);
-        if (list.length > 0) return list as any;
-      }
-      const cached = localStorage.getItem('blackworm_all_dealers');
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-    } catch {}
-    return [];
-  });
-  const [officers, setOfficers] = useState<{ uid: string; fullName: string; loginId?: string; userCode?: string }[]>(() => {
-    try {
-      const cached = localStorage.getItem('blackworm_cached_users');
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        return parsed.filter((u: any) => u.role !== 'dealer' && u.role !== 'owner');
-      }
-    } catch {}
-    return [];
-  });
+  const { orders: rawSharedOrders, setOrdersOptimistic } = useSharedOrders();
+  const { dealers: rawSharedDealers } = useSharedDealers();
+  const { fieldOfficers: sharedOfficers } = useSharedUsers();
+  const { products: sharedMasterProducts } = useSharedMasterPricelist();
+
+  const orders = useMemo<OrderItem[]>(() => {
+    return rawSharedOrders.map((data: any) => {
+      const cleanedItems = (data.items || []).map((it: any) => {
+        const cleanName = getCleanGradeName(it);
+        return {
+          ...it,
+          productName: cleanName,
+          gradeName: cleanName,
+        };
+      });
+      return {
+        id: data.id,
+        orderNumber: data.orderNumber || `BW-${String(data.id || '').slice(-6)}`,
+        cropName: data.cropName || '',
+        dealerId: data.dealerId || '',
+        dealerName: data.dealerName || 'General Dealer',
+        dealerCode: data.dealerCode || '',
+        dealerContact: data.dealerContact || '',
+        dealerVillage: data.dealerVillage || '',
+        dealerDistrict: data.dealerDistrict || '',
+        farmerName: data.farmerName || '',
+        items: cleanedItems,
+        totalQuantity: data.totalQuantity || (data.items?.reduce((a: number, b: any) => a + (b.quantity || 0), 0) || 0),
+        grossAmount: Number(data.grossAmount) || 0,
+        discountAmount: Number(data.discountAmount) || 0,
+        totalAmount: Number(data.totalAmount) || 0,
+        paidAmount: Number(data.paidAmount) || 0,
+        balanceAmount: Number(data.balanceAmount ?? data.totalAmount) || 0,
+        paymentMode: data.paymentMode || 'Credit',
+        status: data.status || 'pending_approval',
+        approvedBy: data.approvedBy,
+        approvedAt: data.approvedAt,
+        dispatchedAt: data.dispatchedAt,
+        dispatchNote: data.dispatchNote,
+        deliveredAt: data.deliveredAt,
+        ownerId: data.ownerId || '',
+        userId: data.userId,
+        loginId: data.loginId,
+        userCode: data.userCode,
+        createdByName: data.createdByName || 'User',
+        createdAt: data.createdAt || new Date().toISOString(),
+        isArchived: data.isArchived || false,
+      };
+    });
+  }, [rawSharedOrders]);
+
+  const dealers = useMemo<SavedDealer[]>(() => {
+    return [...rawSharedDealers]
+      .map((data: any) => ({
+        id: data.id,
+        firmName: data.firmName || 'Unnamed Firm',
+        proprietorName: data.proprietorName || '',
+        contactNumber: data.contactNumber || '',
+        dealerCode: data.dealerCode || '',
+        village: data.village || '',
+        district: data.district || '',
+        created_by_user_id: data.created_by_user_id || data.createdByUid || data.userId || data.ownerId,
+        created_by_name: data.created_by_name || data.officerName,
+        createdByUid: data.createdByUid || data.created_by_user_id || data.userId,
+        userId: data.userId || data.created_by_user_id,
+        ownerId: data.ownerId,
+        loginId: data.loginId,
+        userCode: data.userCode,
+        officerName: data.officerName || data.created_by_name,
+        assignedOfficerUid: data.assignedOfficerUid,
+      }))
+      .sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
+  }, [rawSharedDealers]);
+
+  const officers = useMemo(
+    () =>
+      sharedOfficers.map((u) => ({
+        uid: u.uid,
+        fullName: u.fullName || u.loginId || u.uid,
+        loginId: u.loginId,
+        userCode: u.userCode,
+      })),
+    [sharedOfficers]
+  );
+
   const [selectedOfficerFilter, setSelectedOfficerFilter] = useState<string>('all');
-  const [products, setProducts] = useState<DynamicPriceProduct[]>(() => {
-    if (typeof window !== 'undefined') {
-      try {
-        const cached = localStorage.getItem('blackworm_cached_pricelist');
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-        }
-        const masterRaw = localStorage.getItem('blackworm_master_pricelist');
-        if (masterRaw) {
-          const parsed = JSON.parse(masterRaw);
-          if (parsed && Array.isArray(parsed.products) && parsed.products.length > 0) {
-            return parsed.products;
-          }
-        }
-      } catch {}
+
+  const products = useMemo<DynamicPriceProduct[]>(() => {
+    if (sharedMasterProducts && sharedMasterProducts.length > 0) {
+      return deduplicateProducts(sharedMasterProducts);
     }
-    return OFFICIAL_REFERENCE_DATA.map((p, idx) => ({ ...p, id: (p as any).id || `prod_ref_${idx + 1}` }));
-  });
+    return deduplicateProducts(
+      OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
+        ...p,
+        id: (p as any).id || `prod_ref_${idx + 1}`,
+      }))
+    );
+  }, [sharedMasterProducts]);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('pending');
-
-  // Pagination states for Orders
-  const [lastDoc, setLastDoc] = useState<any>(null);
-  const [hasMore, setHasMore] = useState(true);
-  const [isLoadingMore, setIsLoadingMore] = useState(false);
-  const PAGE_SIZE = 20;
   
   // Modals state
   const [showNewOrderModal, setShowNewOrderModal] = useState(false);
@@ -303,7 +638,9 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   // Photo generation state
   const [capturingOrder, setCapturingOrder] = useState<OrderItem | null>(null);
   const [isGeneratingImage, setIsGeneratingImage] = useState(false);
+  const [downloadingOrderId, setDownloadingOrderId] = useState<string | null>(null);
   const receiptCaptureRef = useRef<HTMLDivElement>(null);
+  const orderModalScrollRef = useRef<HTMLDivElement>(null);
 
   // New Order Form State
   const [selectedDealer, setSelectedDealer] = useState<SavedDealer | null>(null);
@@ -320,6 +657,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   const [discountType, setDiscountType] = useState<'percent' | 'flat'>('percent');
   const [orderDiscount, setOrderDiscount] = useState<number | string>('');
   const [orderItems, setOrderItems] = useState<OrderProductLine[]>([]);
+  const [itemQtyDrafts, setItemQtyDrafts] = useState<Record<number, string>>({});
   const [copiedOrderId, setCopiedOrderId] = useState<string | null>(null);
   const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
   const [productCategoryFilter, setProductCategoryFilter] = useState('all');
@@ -336,17 +674,20 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     setItemDiscount('');
     setOrderDiscount('');
     setOrderItems([]);
+    setItemQtyDrafts({});
     setEditingOrderId(null);
     setFormError(null);
   };
 
-  const handleOpenEditOrder = (order: OrderItem) => {
+  const canUserEditOrder = (order: OrderItem): boolean => {
     const isPending = order.status === 'pending_approval' || order.status === 'pending';
-    const canEdit = isPending 
-      ? (order.userId === profile.uid || isUserRecord(order, profile) || isAdmin(profile)) 
+    return isPending
+      ? (order.userId === profile.uid || isUserRecord(order, profile) || isAdmin(profile))
       : isAdmin(profile);
+  };
 
-    if (!canEdit) {
+  const handleOpenEditOrder = (order: OrderItem) => {
+    if (!canUserEditOrder(order)) {
       setDialogConfig({
         isOpen: true,
         type: 'alert',
@@ -358,6 +699,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       return;
     }
 
+    setSelectedOrderDetails(null);
     setEditingOrderId(order.id);
     const foundDealer = dealers.find((d) => d.id === order.dealerId) || {
       id: order.dealerId || 'dealer_custom',
@@ -370,19 +712,57 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     };
     setSelectedDealer(foundDealer);
 
-    setOrderItems(order.items || []);
-    setOrderDiscount(order.discountAmount ? String(order.discountAmount) : '');
+    const clonedItems: OrderProductLine[] = (order.items || []).map((it) => {
+      const rate = Number(it.rate) || 0;
+      const qty = Math.max(1, Number(it.quantity) || 1);
+      const disc = Math.max(0, Number(it.discount) || 0);
+      const sub = it.subtotal !== undefined ? Math.max(0, Number(it.subtotal) || 0) : Math.max(0, rate * qty - disc);
+      const baseLine: OrderProductLine = {
+        ...it,
+        unit: getOrderLineUnit(it),
+        pcsPerBox: Number(it.pcsPerBox) || 1,
+        rate,
+        quantity: qty,
+        discount: disc,
+        discountPercent: Number(it.discountPercent) || 0,
+        subtotal: sub,
+      };
+      const matchedProd = findProductForOrderItem(baseLine);
+      return resolveOrderLineForBox(baseLine, matchedProd);
+    });
+
+    const itemsDiscSum = clonedItems.reduce((acc, it) => acc + (Number(it.discount) || 0), 0);
+    const totalOrderDisc = Math.max(0, Number(order.discountAmount) || 0);
+    const extraDisc = Math.max(0, Math.round((totalOrderDisc - itemsDiscSum) * 100) / 100);
+
+    setOrderItems(clonedItems);
+    setItemQtyDrafts({});
+    setOrderDiscount(extraDisc > 0 ? String(extraDisc) : '');
     setSelectedProduct(null);
     setProductSearchQuery('');
+    setSelectedPacking('');
+    setItemRate(0);
+    setItemQuantity(1);
+    setItemDiscount('');
     setFormError(null);
     setShowNewOrderModal(true);
+
+    requestAnimationFrame(() => {
+      orderModalScrollRef.current?.scrollTo({ top: 0, behavior: 'auto' });
+    });
   };
 
   // Mobile back button integration for modals
+  const modalHistoryPushedRef = useRef(false);
+  const anyOrderModalOpen = Boolean(showNewOrderModal || selectedOrderDetails || successOrder);
   useEffect(() => {
-    if (showNewOrderModal || selectedOrderDetails || successOrder) {
-      window.history.pushState({ tab: 'order', orderModalOpen: true }, '');
+    if (anyOrderModalOpen) {
+      if (!modalHistoryPushedRef.current) {
+        window.history.pushState({ tab: 'order', orderModalOpen: true }, '');
+        modalHistoryPushedRef.current = true;
+      }
       const handlePopState = () => {
+        modalHistoryPushedRef.current = false;
         setShowNewOrderModal(false);
         setSelectedOrderDetails(null);
         setSuccessOrder(null);
@@ -391,338 +771,20 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       return () => {
         window.removeEventListener('popstate', handlePopState);
       };
+    } else if (modalHistoryPushedRef.current) {
+      modalHistoryPushedRef.current = false;
+      if (window.history.state?.orderModalOpen) {
+        window.history.back();
+      }
     }
-  }, [showNewOrderModal, selectedOrderDetails, successOrder]);
+  }, [anyOrderModalOpen]);
 
-  const loadOrders = async (isLoadMore = false) => {
-    if (isLoadingMore || (isLoadMore && !hasMore)) return;
-    setIsLoadingMore(true);
+  // Orders, dealers, officers, and master pricelist are subscribed once globally via realtimeStore.ts (Dual-DB synced)
 
-    try {
-      let q = query(
-        collection(db, 'orders'),
-        orderBy('createdAt', 'desc'),
-        limit(PAGE_SIZE)
-      );
-
-      if (!isAdmin(profile)) {
-        q = query(
-          collection(db, 'orders'),
-          where('userId', '==', profile.uid),
-          orderBy('createdAt', 'desc'),
-          limit(PAGE_SIZE)
-        );
-      }
-
-      if (isLoadMore && lastDoc) {
-        if (!isAdmin(profile)) {
-          q = query(
-            collection(db, 'orders'),
-            where('userId', '==', profile.uid),
-            orderBy('createdAt', 'desc'),
-            startAfter(lastDoc),
-            limit(PAGE_SIZE)
-          );
-        } else {
-          q = query(
-            collection(db, 'orders'),
-            orderBy('createdAt', 'desc'),
-            startAfter(lastDoc),
-            limit(PAGE_SIZE)
-          );
-        }
-      }
-
-      const snap = await getDocs(q);
-      const list: OrderItem[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as any;
-        if (!data.isArchived) {
-          const cleanedItems = (data.items || []).map((it: any) => {
-            const cleanName = getCleanGradeName(it);
-            return {
-              ...it,
-              productName: cleanName,
-              gradeName: cleanName,
-            };
-          });
-
-          list.push({
-            id: d.id,
-            orderNumber: data.orderNumber || `BW-${d.id.slice(-6)}`,
-            cropName: data.cropName || '',
-            dealerId: data.dealerId || '',
-            dealerName: data.dealerName || 'General Dealer',
-            dealerCode: data.dealerCode || '',
-            dealerContact: data.dealerContact || '',
-            dealerVillage: data.dealerVillage || '',
-            dealerDistrict: data.dealerDistrict || '',
-            farmerName: data.farmerName || '',
-            items: cleanedItems,
-            totalQuantity: data.totalQuantity || (data.items?.reduce((a: number, b: any) => a + (b.quantity || 0), 0) || 0),
-            grossAmount: Number(data.grossAmount) || 0,
-            discountAmount: Number(data.discountAmount) || 0,
-            totalAmount: Number(data.totalAmount) || 0,
-            paidAmount: Number(data.paidAmount) || 0,
-            balanceAmount: Number(data.balanceAmount ?? data.totalAmount) || 0,
-            paymentMode: data.paymentMode || 'Credit',
-            status: data.status || 'pending_approval',
-            approvedBy: data.approvedBy,
-            approvedAt: data.approvedAt,
-            dispatchedAt: data.dispatchedAt,
-            dispatchNote: data.dispatchNote,
-            deliveredAt: data.deliveredAt,
-            ownerId: data.ownerId || '',
-            userId: data.userId,
-            loginId: data.loginId,
-            userCode: data.userCode,
-            createdByName: data.createdByName || 'User',
-            createdAt: data.createdAt || new Date().toISOString(),
-            isArchived: data.isArchived || false,
-          });
-        }
-      });
-
-      const merged = mergeWithLocalData('orders', list);
-      
-      if (isLoadMore) {
-        setOrders(prev => deduplicateOrders([...prev, ...merged]));
-      } else {
-        setOrders(deduplicateOrders(merged));
-      }
-
-      setLastDoc(snap.docs[snap.docs.length - 1] || null);
-      setHasMore(snap.docs.length === PAGE_SIZE);
-    } catch (error) {
-      console.warn("Orders fetch error:", error);
-      if (!isLoadMore) {
-        const cached = mergeWithLocalData('orders', []);
-        setOrders(deduplicateOrders(cached));
-      }
-    } finally {
-      setIsLoadingMore(false);
-    }
-  };
-
-  useEffect(() => {
-    const q = query(
-      collection(db, 'orders'),
-      limit(500)
-    );
-
-    const unsub = onSnapshot(q, (snap) => {
-      const list: OrderItem[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as any;
-        if (!data.isArchived) {
-          const cleanedItems = (data.items || []).map((it: any) => {
-            const cleanName = getCleanGradeName(it);
-            return {
-              ...it,
-              productName: cleanName,
-              gradeName: cleanName,
-            };
-          });
-
-          list.push({
-            id: d.id,
-            orderNumber: data.orderNumber || `BW-${d.id.slice(-6)}`,
-            cropName: data.cropName || '',
-            dealerId: data.dealerId || '',
-            dealerName: data.dealerName || 'General Dealer',
-            dealerCode: data.dealerCode || '',
-            dealerContact: data.dealerContact || '',
-            dealerVillage: data.dealerVillage || '',
-            dealerDistrict: data.dealerDistrict || '',
-            farmerName: data.farmerName || '',
-            items: cleanedItems,
-            totalQuantity: data.totalQuantity || (data.items?.reduce((a: number, b: any) => a + (b.quantity || 0), 0) || 0),
-            grossAmount: Number(data.grossAmount) || 0,
-            discountAmount: Number(data.discountAmount) || 0,
-            totalAmount: Number(data.totalAmount) || 0,
-            paidAmount: Number(data.paidAmount) || 0,
-            balanceAmount: Number(data.balanceAmount ?? data.totalAmount) || 0,
-            paymentMode: data.paymentMode || 'Credit',
-            status: data.status || 'pending_approval',
-            approvedBy: data.approvedBy,
-            approvedAt: data.approvedAt,
-            dispatchedAt: data.dispatchedAt,
-            dispatchNote: data.dispatchNote,
-            deliveredAt: data.deliveredAt,
-            ownerId: data.ownerId || '',
-            userId: data.userId,
-            loginId: data.loginId,
-            userCode: data.userCode,
-            createdByName: data.createdByName || 'User',
-            createdAt: data.createdAt || new Date().toISOString(),
-            isArchived: data.isArchived || false,
-          });
-        }
-      });
-
-      list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-      const merged = mergeWithLocalData('orders', list);
-      setOrders(deduplicateOrders(merged));
-    }, (error) => {
-      console.warn("orders real-time sync notice:", error);
-      const cached = mergeWithLocalData('orders', []);
-      setOrders(deduplicateOrders(cached));
-    });
-
-    return () => unsub();
-  }, [profile]);
-
-  // Listen to users for officer filter
-  useEffect(() => {
-    const unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
-      const uList: { uid: string; fullName: string; loginId?: string; userCode?: string }[] = [];
-      snap.forEach((d) => {
-        const u = d.data();
-        if (u.role !== 'dealer' && u.role !== 'owner') {
-          uList.push({
-            uid: d.id,
-            fullName: u.fullName || u.loginId || d.id,
-            loginId: u.loginId,
-            userCode: u.userCode,
-          });
-        }
-      });
-      uList.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
-      setOfficers(uList);
-    }, (err) => {
-      console.warn('Users sync notice in OrderView:', err);
-    });
-
-    return () => unsubUsers();
-  }, []);
-
-  // Real-time Dealers listener with officer attribution and local storage merging
-  useEffect(() => {
-    // 1. Initial cached dealers
-    try {
-      const cached = localStorage.getItem('blackworm_all_dealers');
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setDealers(deduplicateDealers(parsed));
-        }
-      }
-    } catch {}
-
-    const qDealers = query(collection(db, 'dealers_application'), limit(500));
-    const unsubDealers = onSnapshot(qDealers, (snap) => {
-      const dList: SavedDealer[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as any;
-        if (!data.isArchived) {
-          dList.push({
-            id: d.id,
-            firmName: data.firmName || 'Unnamed Firm',
-            proprietorName: data.proprietorName || '',
-            contactNumber: data.contactNumber || '',
-            dealerCode: data.dealerCode || '',
-            village: data.village || '',
-            district: data.district || '',
-            created_by_user_id: data.created_by_user_id || data.createdByUid || data.userId || data.ownerId,
-            created_by_name: data.created_by_name || data.officerName,
-            createdByUid: data.createdByUid || data.created_by_user_id || data.userId,
-            userId: data.userId || data.created_by_user_id,
-            ownerId: data.ownerId,
-            loginId: data.loginId,
-            userCode: data.userCode,
-            officerName: data.officerName || data.created_by_name,
-            assignedOfficerUid: data.assignedOfficerUid,
-          });
-        }
-      });
-
-      const mergedDealers = mergeWithLocalData('dealers_application', dList);
-      const cleanDealers = deduplicateDealers(mergedDealers);
-      cleanDealers.sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
-      setDealers(cleanDealers);
-      try {
-        localStorage.setItem('blackworm_all_dealers', JSON.stringify(cleanDealers));
-      } catch {}
-    }, (err) => {
-      console.warn('Dealers live sync notice in OrderView:', err);
-      const cached = mergeWithLocalData('dealers_application', []);
-      setDealers(deduplicateDealers(cached));
-    });
-
-    // 2. Load & Sync Products with Firestore master_pricelist + products_pricelist_v2 + OFFICIAL_REFERENCE_DATA fallback
-    const fallbackProducts = deduplicateProducts(OFFICIAL_REFERENCE_DATA.map((p, idx) => ({
-      ...p,
-      id: (p as any).id || `prod_ref_${idx + 1}`,
-    })));
-
-    // Listen to config/master_pricelist (Single atomic source of truth updated by Admin)
-    const unsubMasterPricelist = onSnapshot(doc(db, 'config', 'master_pricelist'), (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        if (data && Array.isArray(data.products) && data.products.length > 0) {
-          const validList = deduplicateProducts(data.products.filter((p: any) => !p.isArchived));
-          if (validList.length > 0) {
-            setProducts(validList);
-            try {
-              localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(validList));
-            } catch {}
-          }
-        }
-      }
-    }, (err) => {
-      console.warn('Master pricelist live sync notice in OrderView:', err);
-    });
-
-    const loadProducts = async () => {
-      try {
-        const cachedProducts = localStorage.getItem('blackworm_cached_pricelist');
-        if (cachedProducts) {
-          const parsed = JSON.parse(cachedProducts);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            setProducts(deduplicateProducts(parsed));
-          }
-        }
-
-        const prodSnap = await getDocs(query(collection(db, 'products_pricelist_v2'), limit(300)));
-        const pList: DynamicPriceProduct[] = [];
-        prodSnap.forEach((d) => {
-          const data = d.data() as any;
-          if (!data.isArchived) {
-            pList.push({ ...data, id: d.id });
-          }
-        });
-        if (pList.length > 0) {
-          const cleanPList = deduplicateProducts(pList);
-          cleanPList.sort((a, b) => (a.orderIndex || 999) - (b.orderIndex || 999));
-          setProducts(cleanPList);
-          try {
-            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanPList));
-          } catch {}
-        } else {
-          // If Firestore collection has no items, ensure fallback
-          setProducts((prev) => (prev && prev.length > 0 ? deduplicateProducts(prev) : fallbackProducts));
-        }
-      } catch (err) {
-        console.warn('Products fetch notice in OrderView:', err);
-        setProducts((prev) => (prev && prev.length > 0 ? deduplicateProducts(prev) : fallbackProducts));
-      }
-    };
-    loadProducts();
-
-    return () => {
-      unsubDealers();
-      unsubMasterPricelist();
-    };
-  }, []);
-
-  // Strict Scoped Dealers:
-  // - Officer Login: ONLY see dealers registered by this logged-in officer!
-  // - Admin Login: If an officer filter is selected, filter to only that officer's registered dealers!
+  // All authorized employees and admins can place orders for any registered company dealer;
+  // when an Admin filters by a specific officer, scope to that officer's dealers.
   const scopedDealers = useMemo(() => {
-    if (!isAdmin(profile)) {
-      return dealers.filter((d) => isDealerRegisteredByOfficer(d, profile));
-    }
-    if (selectedOfficerFilter !== 'all') {
+    if (isAdmin(profile) && selectedOfficerFilter !== 'all') {
       const targetOff = officers.find((o) => o.uid === selectedOfficerFilter);
       if (targetOff) {
         return dealers.filter((d) => isDealerRegisteredByOfficer(d, targetOff));
@@ -770,14 +832,27 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     });
   }, [products, productCategoryFilter, productSearchQuery]);
 
-  // Helper to compute Rate with GST and Standard Billing Discount:
+  // Helper to compute single-pack Rate with GST and Standard Billing Discount:
   // Group A: 0%, Specialty: 0%, Group B: 10%, Group C: 20%
-  const computeProductRate = (prod: DynamicPriceProduct, packingSize: string): number => {
+  const computeProductUnitRate = (prod: DynamicPriceProduct, packingSize: string): number => {
     if (!prod.packings || prod.packings.length === 0) return 0;
     const pk = prod.packings.find((p) => p.packingSize === packingSize) || prod.packings[0];
     const baseWithGst = calculateWithGst(pk.rate, prod.gstRate || 5);
-    const billingDisc = getStandardBillingDiscount(prod.groupName || '');
+    let billingDisc = getStandardBillingDiscount(prod.groupName || '');
+    if (billingDisc === 0 && isGroupBOrC(prod)) {
+      const c = (prod.code || '').toLowerCase().trim();
+      if (/^c[\s._\-]*\d/.test(c)) billingDisc = 20;
+      else if (/^b[\s._\-]*\d/.test(c)) billingDisc = 10;
+    }
     return Math.round(baseWithGst * (1 - billingDisc / 100) * 100) / 100;
+  };
+
+  // For Group B & Group C, 1 order unit = 1 Box (unitRate * pcsPerBox).
+  // For Group A & Specialty, 1 order unit = 1 Nos. (unitRate).
+  const computeProductRate = (prod: DynamicPriceProduct, packingSize: string): number => {
+    const unitRate = computeProductUnitRate(prod, packingSize);
+    const pcs = getBoxPackCount(packingSize, prod);
+    return Math.round(unitRate * pcs * 100) / 100;
   };
 
   // When a product is selected, auto-select its first packing size and compute rate with GST & billing discount
@@ -816,6 +891,8 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     const discountAmt = discountType === 'percent' ? Math.round((baseTotal * disc) / 100) : disc;
     const subtotal = Math.max(0, baseTotal - discountAmt);
     const cleanName = getCleanGradeName(selectedProduct);
+    const unit: 'Box' | 'Nos.' = isBoxPackingOrder(packing, selectedProduct) ? 'Box' : 'Nos.';
+    const pcsPerBox = getBoxPackCount(packing, selectedProduct);
 
     const newLine: OrderProductLine = {
       productId: selectedProduct.id || `prod_${Date.now()}`,
@@ -824,6 +901,8 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       gradeName: cleanName,
       groupName: selectedProduct.groupName || '',
       packingSize: packing,
+      unit,
+      pcsPerBox,
       rate,
       quantity: qty,
       discount: discountAmt > 0 ? discountAmt : 0,
@@ -842,8 +921,118 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     setItemDiscount('');
   };
 
+  // Match catalog product for an existing order item (enables inline packing/rate editing)
+  const findProductForOrderItem = (item: OrderProductLine): DynamicPriceProduct | undefined => {
+    if (item.productId) {
+      const byId = products.find((p) => p.id === item.productId);
+      if (byId) return byId;
+    }
+    const targetName = (item.gradeName || item.productName || '').toLowerCase().trim();
+    if (!targetName) return undefined;
+    return products.find((p) => {
+      const clean = getCleanGradeName(p).toLowerCase().trim();
+      const grade = (p.gradeName || '').toLowerCase().trim();
+      return clean === targetName || grade === targetName;
+    });
+  };
+
+  // Inline update handlers for items already in orderItems (critical for Edit Order)
+  const handleUpdateOrderItemQty = (index: number, nextQty: number) => {
+    const qty = Math.max(1, Number(nextQty) || 1);
+    setOrderItems((prev) =>
+      prev.map((it, idx) => {
+        if (idx !== index) return it;
+        const baseTotal = (Number(it.rate) || 0) * qty;
+        const pct = Number(it.discountPercent) || 0;
+        const nextDisc = pct > 0 ? Math.round((baseTotal * pct) / 100) : Math.max(0, Number(it.discount) || 0);
+        return {
+          ...it,
+          quantity: qty,
+          discount: nextDisc,
+          subtotal: Math.max(0, Math.round((baseTotal - nextDisc) * 100) / 100),
+        };
+      })
+    );
+  };
+
+  const handleUpdateOrderItemRate = (index: number, nextRate: number) => {
+    const rate = Math.max(0, Number(nextRate) || 0);
+    setOrderItems((prev) =>
+      prev.map((it, idx) => {
+        if (idx !== index) return it;
+        const qty = Math.max(1, Number(it.quantity) || 1);
+        const baseTotal = rate * qty;
+        const pct = Number(it.discountPercent) || 0;
+        const nextDisc = pct > 0 ? Math.round((baseTotal * pct) / 100) : Math.max(0, Number(it.discount) || 0);
+        return {
+          ...it,
+          rate,
+          discount: nextDisc,
+          subtotal: Math.max(0, Math.round((baseTotal - nextDisc) * 100) / 100),
+        };
+      })
+    );
+  };
+
+  const handleUpdateOrderItemDiscount = (index: number, nextDisc: number) => {
+    const disc = Math.max(0, Number(nextDisc) || 0);
+    setOrderItems((prev) =>
+      prev.map((it, idx) => {
+        if (idx !== index) return it;
+        const qty = Math.max(1, Number(it.quantity) || 1);
+        const baseTotal = (Number(it.rate) || 0) * qty;
+        return {
+          ...it,
+          discount: disc,
+          discountPercent: 0,
+          subtotal: Math.max(0, Math.round((baseTotal - disc) * 100) / 100),
+        };
+      })
+    );
+  };
+
+  const handleUpdateOrderItemPacking = (index: number, newPacking: string) => {
+    setOrderItems((prev) =>
+      prev.map((it, idx) => {
+        if (idx !== index) return it;
+        const matchedProd = findProductForOrderItem(it);
+        const prodForCalc = matchedProd || {
+          groupName: it.groupName || '',
+          code: '',
+          gradeName: it.gradeName || '',
+          productName: it.productName || '',
+        };
+        const nextUnit: 'Box' | 'Nos.' = isBoxPackingOrder(newPacking, prodForCalc) ? 'Box' : 'Nos.';
+        const nextPcs = getBoxPackCount(newPacking, prodForCalc);
+        const nextRate = matchedProd ? computeProductRate(matchedProd, newPacking) : Number(it.rate) || 0;
+        const qty = Math.max(1, Number(it.quantity) || 1);
+        const baseTotal = nextRate * qty;
+        const pct = Number(it.discountPercent) || 0;
+        const nextDisc = pct > 0 ? Math.round((baseTotal * pct) / 100) : Math.max(0, Number(it.discount) || 0);
+        return {
+          ...it,
+          packingSize: newPacking,
+          unit: nextUnit,
+          pcsPerBox: nextPcs,
+          rate: nextRate,
+          discount: nextDisc,
+          subtotal: Math.max(0, Math.round((baseTotal - nextDisc) * 100) / 100),
+        };
+      })
+    );
+  };
+
   // Remove Item from Order list
   const handleRemoveItem = (index: number) => {
+    setItemQtyDrafts((prev) => {
+      const next: Record<number, string> = {};
+      Object.entries(prev).forEach(([k, v]) => {
+        const ki = Number(k);
+        if (ki < index) next[ki] = v;
+        else if (ki > index) next[ki - 1] = v;
+      });
+      return next;
+    });
     setOrderItems((prev) => prev.filter((_, i) => i !== index));
   };
 
@@ -863,7 +1052,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     // 1. Resolve Dealer
     let dealerToUse = selectedDealer;
     if (!dealerToUse && dealerSearchQuery.trim()) {
-      const match = dealers.find(
+      const match = scopedDealers.find(
         (d) => d.firmName.toLowerCase() === dealerSearchQuery.trim().toLowerCase()
       );
       if (match) {
@@ -899,6 +1088,8 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       const discountAmt = discountType === 'percent' ? Math.round((baseTotal * disc) / 100) : disc;
       const subtotal = Math.max(0, baseTotal - discountAmt);
       const cleanName = getCleanGradeName(selectedProduct);
+      const unit: 'Box' | 'Nos.' = isBoxPackingOrder(packing, selectedProduct) ? 'Box' : 'Nos.';
+      const pcsPerBox = getBoxPackCount(packing, selectedProduct);
 
       const newLine: OrderProductLine = {
         productId: selectedProduct.id || `prod_${Date.now()}`,
@@ -907,6 +1098,8 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         gradeName: cleanName,
         groupName: selectedProduct.groupName || '',
         packingSize: packing,
+        unit,
+        pcsPerBox,
         rate,
         quantity: qty,
         discount: discountAmt > 0 ? discountAmt : 0,
@@ -934,19 +1127,25 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       const totalBags = currentItems.reduce((acc, item) => acc + (Number(item.quantity) || 0), 0);
 
       // Strictly ensure ZERO undefined values for Firestore serialization
-      const sanitizedItems = currentItems.map(it => ({
-        productId: it.productId || '',
-        productName: it.productName || '',
-        brandName: it.brandName || '',
-        gradeName: it.gradeName || '',
-        groupName: it.groupName || '',
-        packingSize: it.packingSize || 'Standard',
-        rate: Number(it.rate) || 0,
-        quantity: Number(it.quantity) || 1,
-        discount: Number(it.discount) || 0,
-        discountPercent: Number(it.discountPercent) || 0,
-        subtotal: Number(it.subtotal) || 0,
-      }));
+      const sanitizedItems = currentItems.map((rawItem) => {
+        const matchedProd = findProductForOrderItem(rawItem);
+        const it = resolveOrderLineForBox(rawItem, matchedProd);
+        return {
+          productId: it.productId || '',
+          productName: it.productName || '',
+          brandName: it.brandName || '',
+          gradeName: it.gradeName || '',
+          groupName: it.groupName || '',
+          packingSize: it.packingSize || 'Standard',
+          unit: getOrderLineUnit(it),
+          pcsPerBox: Number(it.pcsPerBox) || 1,
+          rate: Number(it.rate) || 0,
+          quantity: Number(it.quantity) || 1,
+          discount: Number(it.discount) || 0,
+          discountPercent: Number(it.discountPercent) || 0,
+          subtotal: Number(it.subtotal) || 0,
+        };
+      });
 
       // If editing an existing order
       if (editingOrderId) {
@@ -972,8 +1171,8 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
 
         const saveRes = await safeFirestoreSet('orders', editingOrderId, updatedOrderPayload, { merge: true });
 
-        // Immediately update in-memory orders
-        setOrders((prev) => {
+        // Immediately update shared in-memory orders
+        setOrdersOptimistic((prev) => {
           const idx = prev.findIndex((o) => o.id === editingOrderId);
           if (idx >= 0) {
             const updated = [...prev];
@@ -1045,8 +1244,8 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
 
       const saveRes = await safeFirestoreSet('orders', orderId, newOrder);
 
-      // Immediately add to in-memory orders
-      setOrders((prev) => [newOrder, ...prev]);
+      // Immediately add to shared in-memory orders
+      setOrdersOptimistic((prev) => [newOrder, ...prev]);
 
       try {
         await logAudit(
@@ -1077,12 +1276,13 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   // WhatsApp & Clipboard Message Generator strictly formatted as requested:
   // Dealer, Proprietor Name, Contact Number, Location, and Order Quantity (No Blackworm title, no booking details, no order number, no date)
   const generateWhatsAppMessage = (order: OrderItem) => {
+    const resolvedItems = (order.items || []).map((it) => resolveOrderLineForBox(it, findProductForOrderItem(it)));
     let itemsListText = '';
-    if (order.items && order.items.length > 0) {
-      itemsListText = order.items
+    if (resolvedItems.length > 0) {
+      itemsListText = resolvedItems
         .map(
           (it, idx) =>
-            `${idx + 1}. *${it.productName}* (${it.packingSize}) - *${it.quantity} Nos.*`
+            `${idx + 1}. *${it.productName}* (${it.packingSize}) - *${it.quantity} ${getOrderLineUnit(it)}*`
         )
         .join('\n');
     } else {
@@ -1090,6 +1290,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     }
 
     const locationStr = [order.dealerVillage, order.dealerDistrict].filter(Boolean).join(', ');
+    const totalQtyDisplay = formatOrderTotalQuantity(resolvedItems, order.totalQuantity);
 
     const message = `*Dealer:* ${order.dealerName}
 *Proprietor Name:* ${order.farmerName || '-'}
@@ -1099,20 +1300,36 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
 *Order Quantity:*
 ${itemsListText}
 
-*Total Quantity:* *${order.totalQuantity} Nos.*`;
+*Total Quantity:* *${totalQtyDisplay}*`;
 
     return message;
   };
 
   // Copy Order Text to Clipboard for WhatsApp
   const handleCopyOrderText = async (order: OrderItem) => {
+    const text = generateWhatsAppMessage(order);
     try {
-      const text = generateWhatsAppMessage(order);
       await navigator.clipboard.writeText(text);
       setCopiedOrderId(order.id);
       setTimeout(() => setCopiedOrderId(null), 2500);
-    } catch (e) {
-      console.error('Error copying order text:', e);
+    } catch {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const copied = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (copied) {
+          setCopiedOrderId(order.id);
+          setTimeout(() => setCopiedOrderId(null), 2500);
+        }
+      } catch (e) {
+        console.error('Error copying order text:', e);
+      }
     }
   };
 
@@ -1157,11 +1374,7 @@ ${itemsListText}
             } else {
               // Desktop or browser without files sharing:
               // Download image cleanly for user
-              const link = document.createElement('a');
-              link.href = URL.createObjectURL(blob);
-              link.download = fileName;
-              link.click();
-              URL.revokeObjectURL(link.href);
+              triggerBlobDownload(blob, fileName);
               setIsGeneratingImage(false);
               return;
             }
@@ -1184,6 +1397,61 @@ ${itemsListText}
     }, 150);
   };
 
+  // Direct Order Image Download to Device / Gallery (without Share popup)
+  const handleDownloadOrderImage = async (order: OrderItem) => {
+    if (downloadingOrderId) return;
+    setDownloadingOrderId(order.id);
+    setCapturingOrder(order);
+
+    try {
+      await new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 140)))
+      );
+
+      if (!receiptCaptureRef.current) {
+        throw new Error('Receipt container not ready');
+      }
+
+      const canvas = await html2canvas(receiptCaptureRef.current, {
+        scale: 2.5,
+        useCORS: true,
+        backgroundColor: '#ffffff',
+        logging: false,
+      });
+
+      const safeDealer = (order.dealerName || 'Order')
+        .replace(/[^a-zA-Z0-9]+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 30);
+      const fileName = `${safeDealer || 'Order'}_${order.orderNumber}.png`;
+
+      const blob = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob((b) => resolve(b), 'image/png')
+      );
+
+      const link = document.createElement('a');
+      let objectUrl: string | null = null;
+      if (blob) {
+        objectUrl = URL.createObjectURL(blob);
+        link.href = objectUrl;
+      } else {
+        link.href = canvas.toDataURL('image/png');
+      }
+      link.download = fileName;
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      if (objectUrl) {
+        setTimeout(() => URL.revokeObjectURL(objectUrl!), 1500);
+      }
+    } catch (err) {
+      console.error('Error downloading order image:', err);
+    } finally {
+      setDownloadingOrderId(null);
+    }
+  };
+
   // Workflow Action 1: Approve Order & Move to Complete
   const handleApproveOrder = async (order: OrderItem) => {
     if (!isAdmin(profile)) return;
@@ -1197,16 +1465,12 @@ ${itemsListText}
       updatedAt: new Date().toISOString(),
     };
 
-    // Update state immediately
-    setOrders((prev) =>
+    // Update shared state immediately
+    setOrdersOptimistic((prev) =>
       prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
     );
 
-    try {
-      await updateDoc(doc(db, 'orders', order.id), updatedData);
-    } catch {
-      await safeFirestoreSet('orders', order.id, updatedData, { merge: true });
-    }
+    await safeFirestoreSet('orders', order.id, updatedData, { merge: true });
 
     await logAudit(
       'UPDATE',
@@ -1232,7 +1496,10 @@ ${itemsListText}
       updatedAt: new Date().toISOString(),
     };
 
-    await updateDoc(doc(db, 'orders', order.id), updatedData);
+    setOrdersOptimistic((prev) =>
+      prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
+    );
+    await safeFirestoreSet('orders', order.id, updatedData, { merge: true });
     await logAudit(
       'UPDATE',
       'orders',
@@ -1289,21 +1556,16 @@ ${itemsListText}
       cancelText: 'Cancel',
       onConfirm: async () => {
         setDialogConfig((prev) => ({ ...prev, isOpen: false }));
-        // Instantly remove from local state for immediate visual response
-        setOrders((prev) => prev.filter((o) => o.id !== order.id));
+        // Instantly remove from shared local state for immediate visual response
+        setOrdersOptimistic((prev) => prev.filter((o) => o.id !== order.id));
         if (selectedOrderDetails?.id === order.id) {
           setSelectedOrderDetails(null);
         }
         try {
-          await deleteDoc(doc(db, 'orders', order.id));
+          await safeFirestoreDelete('orders', order.id, { softDelete: true, user: profile });
           await logAudit('DELETE', 'orders', order.id, `Deleted order ${order.orderNumber} for ${order.dealerName}`, profile);
         } catch (err) {
-          console.error('Delete error, trying soft delete fallback:', err);
-          try {
-            await updateDoc(doc(db, 'orders', order.id), { isArchived: true });
-          } catch (e2) {
-            console.error('Soft delete error:', e2);
-          }
+          console.error('Soft delete error:', err);
         }
       },
       onCancel: () => setDialogConfig((prev) => ({ ...prev, isOpen: false })),
@@ -1370,9 +1632,8 @@ ${itemsListText}
         </h2>
         <button
           onClick={() => {
+            resetNewOrderForm();
             setShowNewOrderModal(true);
-            setSelectedDealer(null);
-            setOrderItems([]);
           }}
           className="flex items-center justify-center gap-1.5 bg-purple-600 hover:bg-purple-700 text-white px-3 py-1.5 rounded-xl text-xs font-bold transition shadow-xs cursor-pointer active:scale-95"
         >
@@ -1403,7 +1664,7 @@ ${itemsListText}
               className="px-2.5 py-1.5 rounded-xl border border-purple-200 bg-purple-50 text-purple-900 text-xs font-bold focus:outline-none focus:ring-2 focus:ring-purple-500 shadow-xs cursor-pointer"
               title="Filter by Officer"
             >
-              <option value="all">सर्व ऑफिसर्स (All Officers)</option>
+              <option value="all">All Officers</option>
               {officers.map((off) => {
                 const offOrdersCount = orders.filter((o) => isUserRecord(o, off as any)).length;
                 return (
@@ -1483,9 +1744,14 @@ ${itemsListText}
                 <div className="flex justify-between items-start gap-1.5">
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5 flex-wrap">
-                      <span className="font-mono text-xs font-black text-purple-700 bg-purple-50 border border-purple-200 px-2 py-0.5 rounded-md">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedOrderDetails(o)}
+                        className="font-mono text-xs font-black text-purple-700 bg-purple-50 hover:bg-purple-100 border border-purple-200 px-2 py-0.5 rounded-md transition cursor-pointer"
+                        title="View Order Details"
+                      >
                         {o.orderNumber}
-                      </span>
+                      </button>
                       {o.dealerCode && (
                         <span className="text-[9.5px] font-bold text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded font-mono">
                           Code: {o.dealerCode}
@@ -1554,31 +1820,40 @@ ${itemsListText}
                 </div>
 
                 {/* Items Preview */}
-                <div className="bg-slate-50 rounded-xl p-2 text-xs border border-slate-100 space-y-1">
-                  <div className="flex justify-between items-center text-[9.5px] font-black text-slate-500 uppercase tracking-wider pb-0.5 border-b border-slate-200/60">
-                    <span>Order Items</span>
-                    <span>{o.items?.length || 1} Items</span>
-                  </div>
-                  {o.items && o.items.length > 0 ? (
-                    <div className="space-y-0.5 pt-0.5">
-                      {o.items.slice(0, 2).map((it, idx) => (
-                        <div key={idx} className="flex justify-between items-center text-[10.5px] font-semibold text-slate-700">
-                          <span className="truncate pr-2 font-bold text-sky-700">• {it.gradeName || it.productName} ({it.packingSize})</span>
-                          <span className="shrink-0 font-mono text-slate-900 font-bold">
-                            {it.quantity} x ₹{it.rate} = ₹{it.subtotal.toLocaleString()}
-                          </span>
+                {(() => {
+                  const resolvedCardItems = (o.items || []).map((it) =>
+                    resolveOrderLineForBox(it, findProductForOrderItem(it))
+                  );
+                  return (
+                    <div className="bg-slate-50 rounded-xl p-2 text-xs border border-slate-100 space-y-1">
+                      <div className="flex justify-between items-center text-[9.5px] font-black text-slate-500 uppercase tracking-wider pb-0.5 border-b border-slate-200/60">
+                        <span>Order Items</span>
+                        <span>
+                          {resolvedCardItems.length || 1} Items • {formatOrderTotalQuantity(resolvedCardItems, o.totalQuantity)}
+                        </span>
+                      </div>
+                      {resolvedCardItems.length > 0 ? (
+                        <div className="space-y-0.5 pt-0.5">
+                          {resolvedCardItems.slice(0, 2).map((it, idx) => (
+                            <div key={idx} className="flex justify-between items-center text-[10.5px] font-semibold text-slate-700">
+                              <span className="truncate pr-2 font-bold text-sky-700">• {it.gradeName || it.productName} ({it.packingSize})</span>
+                              <span className="shrink-0 font-mono text-slate-900 font-bold">
+                                {it.quantity} {getOrderLineUnit(it)} x ₹{it.rate} = ₹{it.subtotal.toLocaleString()}
+                              </span>
+                            </div>
+                          ))}
+                          {resolvedCardItems.length > 2 && (
+                            <p className="text-[9.5px] font-bold text-purple-600 text-right">
+                              + {resolvedCardItems.length - 2} more items...
+                            </p>
+                          )}
                         </div>
-                      ))}
-                      {o.items.length > 2 && (
-                        <p className="text-[9.5px] font-bold text-purple-600 text-right">
-                          + {o.items.length - 2} more items...
-                        </p>
+                      ) : (
+                        <div className="text-[10.5px] font-medium text-slate-600">Standard Order Items</div>
                       )}
                     </div>
-                  ) : (
-                    <div className="text-[10.5px] font-medium text-slate-600">Standard Order Items</div>
-                  )}
-                </div>
+                  );
+                })()}
 
                 {/* Ultra-Compact Bill & Payment Bar */}
                 <div className="flex items-center justify-between px-2.5 py-1 bg-purple-50/50 rounded-lg border border-purple-100 text-[10.5px]">
@@ -1630,23 +1905,28 @@ ${itemsListText}
                     )}
                   </button>
 
-                  {/* View Details Modal Trigger */}
+                  {/* Direct Download Order Image to Gallery */}
                   <button
-                    onClick={() => setSelectedOrderDetails(o)}
-                    className="p-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded transition cursor-pointer active:scale-95 shrink-0"
-                    title="View Details"
+                    onClick={() => handleDownloadOrderImage(o)}
+                    disabled={downloadingOrderId !== null}
+                    className="p-1 bg-purple-50 hover:bg-purple-100 text-purple-700 rounded transition cursor-pointer active:scale-95 shrink-0 disabled:opacity-50"
+                    title="Download Order Image"
                   >
-                    <Eye className="w-3.5 h-3.5" />
+                    {downloadingOrderId === o.id ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Download className="w-3.5 h-3.5" />
+                    )}
                   </button>
 
                   {/* Workflow Stage 1: Approve Order & Move to Complete */}
                   {isPending && isAdmin(profile) && (
                     <button
                       onClick={() => handleApproveOrder(o)}
-                      className="p-1 px-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-[10px] font-bold transition shadow-2xs cursor-pointer active:scale-95 flex items-center gap-1"
+                      className="px-1.5 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-[8.5px] leading-none font-bold transition shadow-2xs cursor-pointer active:scale-95 flex items-center gap-0.5 shrink-0"
                       title="Approve Order (Move to Complete)"
                     >
-                      <Check className="w-3 h-3 stroke-[3]" />
+                      <Check className="w-2.5 h-2.5 stroke-[3]" />
                       <span>Approve</span>
                     </button>
                   )}
@@ -1667,10 +1947,10 @@ ${itemsListText}
                   {((isPending && (o.userId === profile.uid || isUserRecord(o, profile) || isAdmin(profile))) || (!isPending && isAdmin(profile))) && (
                     <button
                       onClick={() => handleOpenEditOrder(o)}
-                      className="p-1 px-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded transition cursor-pointer active:scale-95 shrink-0 flex items-center gap-1 text-[10px] font-bold border border-amber-200"
+                      className="px-1.5 py-0.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded transition cursor-pointer active:scale-95 shrink-0 flex items-center gap-0.5 text-[8.5px] leading-none font-bold border border-amber-200"
                       title="Edit Order (ऑर्डर दुरुस्त करा)"
                     >
-                      <Edit3 className="w-3 h-3 text-amber-600" />
+                      <Edit3 className="w-2.5 h-2.5 text-amber-600" />
                       <span>Edit</span>
                     </button>
                   )}
@@ -1717,6 +1997,20 @@ ${itemsListText}
             className="w-[420px] bg-white p-5 border-2 border-slate-900 rounded-2xl font-sans text-slate-900 space-y-3"
             style={{ width: '420px' }}
           >
+            {/* Header Bar: Company, Order No & Date */}
+            <div className="flex items-center justify-between border-b-2 border-slate-900 pb-2">
+              <div>
+                <p className="text-[11px] font-black text-rose-600 uppercase tracking-tight">BLACKWORM AGRITECH PVT LTD</p>
+                <p className="text-xs font-black text-purple-800 font-mono">{capturingOrder.orderNumber}</p>
+              </div>
+              <div className="text-right">
+                <p className="text-[10px] font-bold text-slate-500">Order Date</p>
+                <p className="text-[11px] font-black text-slate-900 font-mono">
+                  {new Date(capturingOrder.createdAt).toLocaleDateString('en-GB')}
+                </p>
+              </div>
+            </div>
+
             {/* Dealer & Location Information */}
             <div className="bg-slate-50 p-3.5 rounded-xl border border-slate-200 text-xs space-y-1.5">
               <p className="text-slate-800">
@@ -1748,39 +2042,641 @@ ${itemsListText}
                     <th className="p-1.5 text-center w-24">Quantity</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-200 border-b border-slate-200 font-semibold">
-                  {capturingOrder.items?.map((it, idx) => (
-                    <tr key={idx} className={idx % 2 === 1 ? "bg-slate-50/70" : ""}>
-                      <td className="p-1.5 pl-2 font-bold text-sky-700 text-[11px]">{idx + 1}. {it.gradeName || it.productName}</td>
-                      <td className="p-1.5 text-center text-slate-600 text-[10px] font-bold">{it.packingSize}</td>
-                      <td className="p-1.5 text-center font-mono font-black text-slate-900 text-xs">{it.quantity} Nos.</td>
-                    </tr>
-                  ))}
-                </tbody>
-                <tfoot className="bg-emerald-50 font-black text-emerald-950 text-[11px]">
-                  <tr>
-                    <td colSpan={2} className="p-2 pl-2 text-right uppercase">Total Quantity:</td>
-                    <td className="p-2 text-center font-mono font-black text-sm text-emerald-900">{capturingOrder.totalQuantity} Nos.</td>
-                  </tr>
-                </tfoot>
+                {(() => {
+                  const resolvedCaptureItems = (capturingOrder.items || []).map((it) =>
+                    resolveOrderLineForBox(it, findProductForOrderItem(it))
+                  );
+                  return (
+                    <>
+                      <tbody className="divide-y divide-slate-200 border-b border-slate-200 font-semibold">
+                        {resolvedCaptureItems.map((it, idx) => (
+                          <tr key={idx} className={idx % 2 === 1 ? "bg-slate-50/70" : ""}>
+                            <td className="p-1.5 pl-2 font-bold text-sky-700 text-[11px]">{idx + 1}. {it.gradeName || it.productName}</td>
+                            <td className="p-1.5 text-center text-slate-600 text-[10px] font-bold">{it.packingSize}</td>
+                            <td className="p-1.5 text-center font-mono font-black text-slate-900 text-xs">{it.quantity} {getOrderLineUnit(it)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                      <tfoot className="bg-emerald-50 font-black text-emerald-950 text-[11px]">
+                        <tr>
+                          <td colSpan={2} className="p-2 pl-2 text-right uppercase">Total Quantity:</td>
+                          <td className="p-2 text-center font-mono font-black text-sm text-emerald-900">{formatOrderTotalQuantity(resolvedCaptureItems, capturingOrder.totalQuantity)}</td>
+                        </tr>
+                      </tfoot>
+                    </>
+                  );
+                })()}
               </table>
             </div>
+
+            {capturingOrder.createdByName && (
+              <div className="flex justify-between items-center pt-1 border-t border-slate-200 text-[10px] text-slate-500 font-bold">
+                <span>Booked by: {toTitleCase(capturingOrder.createdByName)}</span>
+                <span>{capturingOrder.cropName ? `Crop: ${capturingOrder.cropName}` : ''}</span>
+              </div>
+            )}
           </div>
         )}
       </div>
 
       {/* ===================== NEW ORDER ENTRY MODAL ===================== */}
-      {showNewOrderModal && (
+      {showNewOrderModal && (() => {
+        const editingOrderObj = editingOrderId ? orders.find((o) => o.id === editingOrderId) : null;
+
+        const renderProductPickerSection = (sectionNumber: number) => (
+          <div className="space-y-2 bg-purple-50/50 p-2.5 rounded-xl border border-purple-200">
+            <div className="flex justify-between items-center">
+              <label className="text-xs font-black text-slate-800 flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-purple-600" />
+                <span>
+                  {editingOrderId
+                    ? `${sectionNumber}. आणखी प्रॉडक्ट जोडा (Add More Products)`
+                    : `${sectionNumber}. Select Product from Price List (${filteredProducts.length}/${products.length}) *`}
+                </span>
+              </label>
+              {selectedProduct && (
+                <span className="text-[10px] bg-purple-600 text-white font-bold px-2 py-0.5 rounded-full">
+                  {getCleanGradeName(selectedProduct)}
+                </span>
+              )}
+            </div>
+
+            {!selectedDealer && (
+              <div className="bg-amber-50 p-2 rounded-lg border border-amber-200 text-amber-800 text-[11px] font-medium flex items-center justify-between">
+                <span>💡 टीप: तुम्ही प्रथम प्रॉडक्ट्स सिलेक्ट करू शकता, ऑर्डर सेव्ह करण्यापूर्वी वरील लिस्ट मधून डीलर निवडा.</span>
+              </div>
+            )}
+
+            {/* Category Filter Chips */}
+            <div className="flex gap-1 overflow-x-auto pb-0.5 scrollbar-none">
+              <button
+                type="button"
+                onClick={() => setProductCategoryFilter('all')}
+                className={cn(
+                  "px-2 py-0.5 rounded text-[10px] font-bold shrink-0 transition cursor-pointer",
+                  productCategoryFilter === 'all'
+                    ? "bg-purple-600 text-white shadow-2xs"
+                    : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
+                )}
+              >
+                All ({products.length})
+              </button>
+              {productCategories.map((cat) => (
+                <button
+                  key={cat}
+                  type="button"
+                  onClick={() => setProductCategoryFilter(cat)}
+                  className={cn(
+                    "px-2 py-0.5 rounded text-[10px] font-bold shrink-0 transition cursor-pointer truncate max-w-[130px]",
+                    productCategoryFilter === cat
+                      ? "bg-purple-600 text-white shadow-2xs"
+                      : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
+                  )}
+                >
+                  {cat}
+                </button>
+              ))}
+            </div>
+
+            {/* Product Search & Dropdown */}
+            <div className="space-y-1.5">
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-400" />
+                <input
+                  type="text"
+                  placeholder="Search product (उदा. 19:19:19, 0:52:34, Microgrip, Combi)..."
+                  value={productSearchQuery}
+                  onChange={(e) => setProductSearchQuery(e.target.value)}
+                  className="w-full pl-8 pr-8 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-medium focus:outline-none focus:ring-2 focus:ring-purple-500 shadow-xs"
+                />
+                {productSearchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setProductSearchQuery('')}
+                    className="absolute right-2.5 top-2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              {/* Filtered Products Compact Scrollable List */}
+              <div className={cn(
+                "overflow-y-auto space-y-1 bg-white p-1 rounded-lg border border-slate-200",
+                editingOrderId ? "max-h-32" : "max-h-40"
+              )}>
+                {filteredProducts.length === 0 ? (
+                  <div className="text-center py-3">
+                    <p className="text-xs text-slate-400">कोणतेही प्रॉडक्ट सापडले नाही.</p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProductSearchQuery('');
+                        setProductCategoryFilter('all');
+                      }}
+                      className="mt-1 text-[11px] font-bold text-purple-600 hover:underline cursor-pointer"
+                    >
+                      सर्व प्रॉडक्ट्स दाखवा ({products.length})
+                    </button>
+                  </div>
+                ) : (
+                  filteredProducts.map((p) => {
+                    const cleanName = getCleanGradeName(p);
+                    const isSelected = selectedProduct?.id === p.id;
+                    const isBC = isGroupBOrC(p);
+                    return (
+                      <div
+                        key={p.id}
+                        onClick={() => handleSelectProduct(p)}
+                        className={cn(
+                          "p-1.5 px-2 rounded-lg cursor-pointer transition flex justify-between items-center text-[11px]",
+                          isSelected
+                            ? "bg-purple-100 border border-purple-400 text-purple-950 font-bold"
+                            : "hover:bg-purple-50/70 border border-transparent text-slate-700"
+                        )}
+                      >
+                        <div className="min-w-0 pr-2 flex items-center gap-1.5">
+                          {isSelected ? (
+                            <CheckCircle2 className="w-3.5 h-3.5 text-purple-700 shrink-0" />
+                          ) : (
+                            <span className="w-1.5 h-1.5 rounded-full bg-slate-300 shrink-0" />
+                          )}
+                          <div className="truncate">
+                            {isBC ? (
+                              <span className="font-black text-amber-800 text-xs">{cleanName}</span>
+                            ) : (
+                              <>
+                                {p.brandName && (
+                                  <span className="font-bold text-amber-700 text-[10.5px] mr-1">{p.brandName}</span>
+                                )}
+                                <span className="font-black text-sky-800">{cleanName}</span>
+                              </>
+                            )}
+                            {p.groupName && (
+                              <span className="text-[9.5px] text-slate-400 block truncate">{p.groupName}</span>
+                            )}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className="text-[9.5px] font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">
+                            {p.packings?.length || 0} Packings
+                          </span>
+                          {isSelected && (
+                            <span className="text-[9.5px] bg-purple-600 text-white font-bold px-1.5 py-0.5 rounded">
+                              निवडले ✓
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+
+            {/* Quick Packing & Quantity Picker when Product is Selected */}
+            {selectedProduct ? (() => {
+              const activePacking = selectedPacking || (selectedProduct.packings && selectedProduct.packings[0]?.packingSize) || '';
+              const activeIsBox = isBoxPackingOrder(activePacking, selectedProduct);
+              const activePcsPerBox = getBoxPackCount(activePacking, selectedProduct);
+              const activeUnitRate = computeProductUnitRate(selectedProduct, activePacking);
+              return (
+              <div className="bg-white p-2.5 rounded-xl border border-purple-300 shadow-xs space-y-2">
+                <div className="flex justify-between items-center border-b border-slate-100 pb-1.5 gap-2">
+                  <div className="flex items-center flex-wrap gap-1.5">
+                    <span className="text-xs font-black text-sky-800">
+                      {getCleanGradeName(selectedProduct)}
+                    </span>
+                    {selectedProduct.groupName && (
+                      <span className="text-[9.5px] text-slate-400">({selectedProduct.groupName})</span>
+                    )}
+                    {activeIsBox && (
+                      <span className="text-[9.5px] font-black text-emerald-800 bg-emerald-50 border border-emerald-200 px-1.5 py-0.5 rounded">
+                        1 = 1 Box{activePcsPerBox > 1 ? ` (${activePcsPerBox} Nos)` : ''}
+                      </span>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedProduct(null)}
+                    className="text-[10px] font-bold text-rose-600 hover:underline cursor-pointer shrink-0"
+                  >
+                    Clear Selection
+                  </button>
+                </div>
+
+                {/* Packing Selection Buttons - Compact Chips */}
+                <div>
+                  <span className="text-[10px] font-bold text-slate-600 block mb-1">
+                    पॅकिंग निवडा (Select Packing):
+                  </span>
+                  <div className="flex flex-wrap gap-1">
+                    {selectedProduct.packings?.map((pk) => {
+                      const pkComputedRate = computeProductRate(selectedProduct, pk.packingSize);
+                      const pkIsBox = isBoxPackingOrder(pk.packingSize, selectedProduct);
+                      const pkPcs = getBoxPackCount(pk.packingSize, selectedProduct);
+                      return (
+                        <button
+                          key={pk.packingSize}
+                          type="button"
+                          onClick={() => handleSelectPacking(pk.packingSize)}
+                          className={cn(
+                            "px-2.5 py-1 rounded text-[10px] font-bold transition border cursor-pointer active:scale-95 inline-flex items-center gap-1",
+                            selectedPacking === pk.packingSize
+                              ? "bg-purple-600 text-white border-purple-600 shadow-2xs"
+                              : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
+                          )}
+                        >
+                          <span>{pk.packingSize}</span>
+                          {pkIsBox && pkPcs > 1 && (
+                            <span className={cn(
+                              "text-[9px] font-bold",
+                              selectedPacking === pk.packingSize ? "text-purple-100" : "text-slate-500"
+                            )}>
+                              ({pkPcs}/Box)
+                            </span>
+                          )}
+                          <span className={cn(
+                            "font-mono text-[9px] px-1 py-0.2 rounded font-black",
+                            selectedPacking === pk.packingSize ? "bg-white/20 text-white" : "bg-black/5 text-slate-800"
+                          )}>
+                            ₹{pkComputedRate.toLocaleString('en-IN')}{pkIsBox ? '/Box' : ''}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Rate, Quantity, Discount & Add Item Row */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end pt-1">
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-600 block mb-0.5">
+                      {activeIsBox ? 'बॉक्स दर (Rate/Box ₹):' : 'दर (Rate ₹):'}
+                    </label>
+                    <input
+                      type="number"
+                      value={itemRate}
+                      onChange={(e) => setItemRate(e.target.value === '' ? '' : Number(e.target.value))}
+                      className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold focus:outline-none focus:ring-1 focus:ring-purple-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-[10px] font-bold text-slate-600 block mb-0.5">
+                      {activeIsBox ? 'बॉक्स (Box Qty *):' : 'नग (Quantity *):'}
+                    </label>
+                    <div className="relative">
+                      <input
+                        type="number"
+                        min="1"
+                        value={itemQuantity}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          setItemQuantity(val === '' ? '' : Number(val));
+                        }}
+                        onBlur={() => {
+                          if (itemQuantity === '' || Number(itemQuantity) < 1) {
+                            setItemQuantity(1);
+                          }
+                        }}
+                        className={cn(
+                          "w-full py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold text-center focus:outline-none focus:ring-1 focus:ring-purple-500",
+                          activeIsBox ? "pl-2 pr-9" : "px-2"
+                        )}
+                        placeholder="1"
+                      />
+                      {activeIsBox && (
+                        <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] font-black text-emerald-700 pointer-events-none">
+                          Box
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between items-center mb-0.5">
+                      <label className="text-[10px] font-bold text-slate-600">सूट (Discount):</label>
+                      <div className="flex text-[9px] font-bold bg-slate-100 rounded border border-slate-200 overflow-hidden">
+                        <button
+                          type="button"
+                          onClick={() => setDiscountType('percent')}
+                          className={cn(
+                            "px-1 py-0.2 cursor-pointer transition",
+                            discountType === 'percent' ? "bg-purple-600 text-white" : "text-slate-500"
+                          )}
+                        >
+                          %
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDiscountType('flat')}
+                          className={cn(
+                            "px-1 py-0.2 cursor-pointer transition",
+                            discountType === 'flat' ? "bg-purple-600 text-white" : "text-slate-500"
+                          )}
+                        >
+                          ₹
+                        </button>
+                      </div>
+                    </div>
+                    <input
+                      type="number"
+                      min="0"
+                      value={itemDiscount}
+                      onChange={(e) => setItemDiscount(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
+                      className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold text-center focus:outline-none focus:ring-1 focus:ring-purple-500"
+                      placeholder={discountType === 'percent' ? "0%" : "₹0"}
+                    />
+                  </div>
+
+                  <div>
+                    <button
+                      type="button"
+                      onClick={handleAddItemToOrder}
+                      className="w-full py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition shadow-xs cursor-pointer flex items-center justify-center gap-1 active:scale-95 h-[30px]"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>+ ॲड करा (Add Item)</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Live Calculation Preview */}
+                {(() => {
+                  const r = Number(itemRate) || 0;
+                  const q = typeof itemQuantity === 'string' && itemQuantity === '' ? 1 : Math.max(1, Number(itemQuantity) || 1);
+                  const gross = r * q;
+                  const d = Number(itemDiscount) || 0;
+                  const dAmt = discountType === 'percent' ? Math.round((gross * d) / 100) : d;
+                  const net = Math.max(0, gross - dAmt);
+                  return (
+                    <div className="flex flex-wrap justify-between items-center gap-2 text-[10px] font-bold text-slate-500 pt-1 border-t border-slate-100">
+                      <span>
+                        Qty: <span className="font-mono text-slate-800 font-black">{q} {activeIsBox ? 'Box' : 'Nos.'}</span>
+                        {activeIsBox && activePcsPerBox > 1 && (
+                          <span className="text-slate-400 font-medium ml-1">
+                            (₹{activeUnitRate}/pc × {activePcsPerBox} Nos)
+                          </span>
+                        )}
+                        <span className="mx-1.5">•</span>
+                        Base: <span className="font-mono">₹{gross.toLocaleString()}</span>
+                      </span>
+                      {dAmt > 0 && (
+                        <span className="text-rose-600 font-medium">सूट: -₹{dAmt.toLocaleString()}</span>
+                      )}
+                      <span>एकूण (Subtotal): <span className="font-mono text-purple-700 font-black text-xs">₹{net.toLocaleString()}</span></span>
+                    </div>
+                  );
+                })()}
+              </div>
+              );
+            })() : (
+              <div className="bg-white/80 p-2 rounded-lg border border-dashed border-purple-200 text-center text-[11px] text-purple-700 font-medium">
+                👉 वरील लिस्ट मधून प्रॉडक्ट वर क्लिक करा (Click any product above to configure packing and quantity)
+              </div>
+            )}
+          </div>
+        );
+
+        const renderOrderItemsSection = (sectionNumber: number) => (
+          <div className={cn(
+            "space-y-2 rounded-xl p-2.5 border",
+            editingOrderId ? "bg-indigo-50/40 border-indigo-200" : "bg-white border-slate-200"
+          )}>
+            <div className="flex justify-between items-center gap-2">
+              <span className="text-xs font-black text-slate-800 flex items-center gap-1.5">
+                <Edit3 className="w-3.5 h-3.5 text-purple-600" />
+                <span>
+                  {editingOrderId
+                    ? `${sectionNumber}. ऑर्डरमधील प्रॉडक्ट्स - एडिट करा (${orderItems.length})`
+                    : `${sectionNumber}. Items Added (${orderItems.length})`}
+                </span>
+              </span>
+              {orderItems.length > 0 && (
+                <span className="text-xs font-black text-purple-700 font-mono">
+                  Total: ₹{totalBillAmount.toLocaleString()}
+                </span>
+              )}
+            </div>
+
+            {orderItems.length === 0 ? (
+              <div className="bg-slate-50 border border-dashed border-slate-300 rounded-xl p-3 text-center text-slate-400 text-xs font-medium">
+                No products added yet. Select product above to add.
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <div className="space-y-1.5 max-h-72 overflow-y-auto pr-0.5">
+                  {orderItems.map((item, idx) => {
+                    const matchedProd = findProductForOrderItem(item);
+                    const itemUnit = getOrderLineUnit(item);
+                    const availablePackings = matchedProd?.packings || [];
+                    const qtyInputVal = itemQtyDrafts[idx] !== undefined ? itemQtyDrafts[idx] : String(item.quantity);
+                    return (
+                      <div
+                        key={`${item.productId || item.productName}_${idx}`}
+                        className="bg-white rounded-xl border border-slate-200 p-2.5 shadow-2xs space-y-2"
+                      >
+                        <div className="flex justify-between items-start gap-2">
+                          <div className="min-w-0">
+                            <p className="text-xs font-black text-sky-800 leading-snug">
+                              {idx + 1}. {item.gradeName || item.productName}
+                            </p>
+                            {item.groupName && (
+                              <span className="text-[9.5px] font-medium text-slate-400">{item.groupName}</span>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveItem(idx)}
+                            className="px-2 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 text-[10px] font-bold flex items-center gap-1 cursor-pointer shrink-0 transition"
+                            title="Remove Item"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            <span>काढा</span>
+                          </button>
+                        </div>
+
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end">
+                          {/* Packing */}
+                          <div>
+                            <label className="text-[9.5px] font-bold text-slate-500 block mb-0.5">पॅकिंग (Packing)</label>
+                            {availablePackings.length > 1 ? (
+                              <select
+                                value={item.packingSize}
+                                onChange={(e) => handleUpdateOrderItemPacking(idx, e.target.value)}
+                                className="w-full px-1.5 py-1 border border-slate-300 rounded-lg text-[11px] font-bold text-slate-800 bg-white focus:outline-none focus:ring-1 focus:ring-purple-500 cursor-pointer"
+                              >
+                                {!availablePackings.some((pk) => pk.packingSize === item.packingSize) && (
+                                  <option value={item.packingSize}>{item.packingSize}</option>
+                                )}
+                                {availablePackings.map((pk) => (
+                                  <option key={pk.packingSize} value={pk.packingSize}>
+                                    {pk.packingSize}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <div className="px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-[11px] font-bold text-slate-700 truncate">
+                                {item.packingSize}
+                                {itemUnit === 'Box' && (item.pcsPerBox || 1) > 1 ? ` (${item.pcsPerBox}/Box)` : ''}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Editable Quantity with - / + Stepper */}
+                          <div>
+                            <label className="text-[9.5px] font-bold text-slate-500 block mb-0.5">
+                              {itemUnit === 'Box' ? 'बॉक्स (Box Qty)' : 'नग (Qty)'}
+                            </label>
+                            <div className="flex items-center border border-slate-300 rounded-lg overflow-hidden bg-white h-[28px]">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const nextQ = Math.max(1, (Number(item.quantity) || 1) - 1);
+                                  setItemQtyDrafts((p) => {
+                                    const copy = { ...p };
+                                    delete copy[idx];
+                                    return copy;
+                                  });
+                                  handleUpdateOrderItemQty(idx, nextQ);
+                                }}
+                                className="px-2 h-full bg-slate-100 hover:bg-slate-200 text-slate-700 font-black text-xs cursor-pointer"
+                              >
+                                -
+                              </button>
+                              <input
+                                type="number"
+                                min="1"
+                                value={qtyInputVal}
+                                onChange={(e) => {
+                                  const raw = e.target.value;
+                                  setItemQtyDrafts((p) => ({ ...p, [idx]: raw }));
+                                  const parsed = Number(raw);
+                                  if (raw !== '' && !Number.isNaN(parsed) && parsed >= 1) {
+                                    handleUpdateOrderItemQty(idx, parsed);
+                                  }
+                                }}
+                                onBlur={() => {
+                                  const raw = itemQtyDrafts[idx];
+                                  if (raw !== undefined) {
+                                    const parsed = Math.max(1, Number(raw) || 1);
+                                    handleUpdateOrderItemQty(idx, parsed);
+                                    setItemQtyDrafts((p) => {
+                                      const copy = { ...p };
+                                      delete copy[idx];
+                                      return copy;
+                                    });
+                                  }
+                                }}
+                                className="w-full min-w-[28px] text-center text-xs font-mono font-black text-slate-900 focus:outline-none"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const nextQ = (Number(item.quantity) || 1) + 1;
+                                  setItemQtyDrafts((p) => {
+                                    const copy = { ...p };
+                                    delete copy[idx];
+                                    return copy;
+                                  });
+                                  handleUpdateOrderItemQty(idx, nextQ);
+                                }}
+                                className="px-2 h-full bg-slate-100 hover:bg-slate-200 text-slate-700 font-black text-xs cursor-pointer"
+                              >
+                                +
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Editable Rate */}
+                          <div>
+                            <label className="text-[9.5px] font-bold text-slate-500 block mb-0.5">
+                              {itemUnit === 'Box' ? 'दर/Box (₹)' : 'दर (Rate ₹)'}
+                            </label>
+                            <input
+                              type="number"
+                              min="0"
+                              value={item.rate}
+                              onChange={(e) => handleUpdateOrderItemRate(idx, Number(e.target.value))}
+                              className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold text-right text-slate-800 focus:outline-none focus:ring-1 focus:ring-purple-500 h-[28px]"
+                            />
+                          </div>
+
+                          {/* Editable Flat Discount */}
+                          <div>
+                            <label className="text-[9.5px] font-bold text-slate-500 block mb-0.5">सूट (Disc ₹)</label>
+                            <input
+                              type="number"
+                              min="0"
+                              value={item.discount || 0}
+                              onChange={(e) => handleUpdateOrderItemDiscount(idx, Number(e.target.value))}
+                              className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold text-right text-rose-700 focus:outline-none focus:ring-1 focus:ring-purple-500 h-[28px]"
+                            />
+                          </div>
+                        </div>
+
+                        <div className="flex justify-between items-center text-[10.5px] pt-1 border-t border-slate-100">
+                          <span className="font-bold text-slate-500">
+                            {item.quantity} {itemUnit}
+                            {' '}× ₹{item.rate.toLocaleString('en-IN')}
+                            {(item.discount || 0) > 0 ? ` - ₹${item.discount}` : ''}
+                          </span>
+                          <span className="font-mono font-black text-purple-700 text-xs">
+                            ₹{item.subtotal.toLocaleString('en-IN')}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Totals + Extra Order Discount Bar */}
+                <div className="bg-white rounded-xl border border-purple-200 overflow-hidden text-xs">
+                  <div className="flex justify-between items-center px-2.5 py-1.5 bg-slate-50 border-b border-slate-100">
+                    <span className="font-bold text-slate-700 text-[11px]">Extra Order Discount (₹):</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={orderDiscount}
+                      onChange={(e) => setOrderDiscount(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
+                      placeholder="0"
+                      className="w-24 px-2 py-0.5 border border-slate-300 rounded text-xs font-mono font-bold text-right focus:outline-none focus:ring-1 focus:ring-purple-500 bg-white"
+                    />
+                  </div>
+                  <div className="flex flex-wrap justify-between items-center gap-2 px-2.5 py-2 bg-purple-50 font-black text-purple-900">
+                    <span className="font-mono text-xs">
+                      Qty: {formatOrderTotalQuantity(orderItems, totalBagsQuantity)}
+                    </span>
+                    {allDiscountsTotal > 0 && (
+                      <span className="text-[10.5px] text-rose-700">
+                        Total Disc: -₹{allDiscountsTotal.toLocaleString()}
+                      </span>
+                    )}
+                    <span className="font-mono text-sm">Total: ₹{totalBillAmount.toLocaleString()}</span>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+
+        return (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-xs z-50 flex items-center justify-center p-2.5 sm:p-4 animate-in fade-in">
-          <div className="bg-white rounded-2xl max-w-2xl w-full p-3.5 sm:p-5 shadow-2xl border border-slate-200 max-h-[92vh] overflow-y-auto space-y-3">
+          <div
+            ref={orderModalScrollRef}
+            className="bg-white rounded-2xl max-w-2xl w-full p-3.5 sm:p-5 shadow-2xl border border-slate-200 max-h-[92vh] overflow-y-auto space-y-3"
+          >
             {/* Modal Header */}
             <div className="flex justify-between items-center border-b border-slate-100 pb-2">
               <div className="flex items-center gap-2">
                 <div className="w-7 h-7 rounded-lg bg-purple-100 text-purple-700 flex items-center justify-center">
-                  <ShoppingBag className="w-4 h-4" />
+                  {editingOrderId ? <Edit3 className="w-4 h-4" /> : <ShoppingBag className="w-4 h-4" />}
                 </div>
                 <h3 className="text-base font-black text-slate-900 leading-tight">
-                  {editingOrderId ? 'Edit Order Details (ऑर्डर संपादन)' : 'New Order Entry'}
+                  {editingOrderId
+                    ? `Edit Order ${editingOrderObj?.orderNumber ? `(${editingOrderObj.orderNumber})` : '(ऑर्डर संपादन)'}`
+                    : 'New Order Entry'}
                 </h3>
               </div>
               <button
@@ -1793,6 +2689,13 @@ ${itemsListText}
                 <X className="w-4 h-4" />
               </button>
             </div>
+
+            {editingOrderId && (
+              <div className="bg-indigo-50 border border-indigo-200 text-indigo-900 text-[11px] font-bold px-3 py-2 rounded-xl flex items-center gap-2">
+                <Edit3 className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                <span>खालील प्रॉडक्ट्सचे Packing, Qty, Rate किंवा Discount बदला आणि तळाशी &quot;Update Order&quot; वर क्लिक करा.</span>
+              </div>
+            )}
 
             {/* STEP 1: SELECT DEALER FROM SAVED LIST */}
             <div className="space-y-1.5 bg-slate-50 p-2.5 rounded-xl border border-slate-200">
@@ -1811,7 +2714,7 @@ ${itemsListText}
                       onChange={(e) => setSelectedOfficerFilter(e.target.value)}
                       className="px-2 py-0.5 rounded-lg border border-purple-200 bg-white text-purple-900 text-[10px] font-bold focus:outline-none focus:ring-1 focus:ring-purple-500 shadow-2xs cursor-pointer"
                     >
-                      <option value="all">सर्व ऑफिसर्स (All)</option>
+                      <option value="all">All Officers</option>
                       {officers.map((off) => (
                         <option key={off.uid} value={off.uid}>
                           {toTitleCase(off.fullName || 'Officer')}
@@ -1906,396 +2809,18 @@ ${itemsListText}
               )}
             </div>
 
-            {/* STEP 2: SELECT PRODUCT & PACKING FROM PRICE LIST */}
-            <div className="space-y-2 bg-purple-50/50 p-2.5 rounded-xl border border-purple-200">
-              <div className="flex justify-between items-center">
-                <label className="text-xs font-black text-slate-800 flex items-center gap-1.5">
-                  <Sparkles className="w-3.5 h-3.5 text-purple-600" />
-                  <span>2. Select Product from Price List ({filteredProducts.length}/{products.length}) *</span>
-                </label>
-                {selectedProduct && (
-                  <span className="text-[10px] bg-purple-600 text-white font-bold px-2 py-0.5 rounded-full">
-                    {getCleanGradeName(selectedProduct)}
-                  </span>
-                )}
-              </div>
-
-              {!selectedDealer && (
-                <div className="bg-amber-50 p-2 rounded-lg border border-amber-200 text-amber-800 text-[11px] font-medium flex items-center justify-between">
-                  <span>💡 टीप: तुम्ही प्रथम प्रॉडक्ट्स सिलेक्ट करू शकता, ऑर्डर सेव्ह करण्यापूर्वी वरील लिस्ट मधून डीलर निवडा.</span>
-                </div>
-              )}
-
-              {/* Category Filter Chips */}
-              <div className="flex gap-1 overflow-x-auto pb-0.5 scrollbar-none">
-                <button
-                  type="button"
-                  onClick={() => setProductCategoryFilter('all')}
-                  className={cn(
-                    "px-2 py-0.5 rounded text-[10px] font-bold shrink-0 transition cursor-pointer",
-                    productCategoryFilter === 'all'
-                      ? "bg-purple-600 text-white shadow-2xs"
-                      : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
-                  )}
-                >
-                  All ({products.length})
-                </button>
-                {productCategories.map((cat) => (
-                  <button
-                    key={cat}
-                    type="button"
-                    onClick={() => setProductCategoryFilter(cat)}
-                    className={cn(
-                      "px-2 py-0.5 rounded text-[10px] font-bold shrink-0 transition cursor-pointer truncate max-w-[130px]",
-                      productCategoryFilter === cat
-                        ? "bg-purple-600 text-white shadow-2xs"
-                        : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50"
-                    )}
-                  >
-                    {cat}
-                  </button>
-                ))}
-              </div>
-
-              {/* Product Search & Dropdown */}
-              <div className="space-y-1.5">
-                <div className="relative">
-                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-2.5 text-slate-400" />
-                  <input
-                    type="text"
-                    placeholder="Search product (उदा. 19:19:19, 0:52:34, Microgrip, Combi)..."
-                    value={productSearchQuery}
-                    onChange={(e) => setProductSearchQuery(e.target.value)}
-                    className="w-full pl-8 pr-8 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-medium focus:outline-none focus:ring-2 focus:ring-purple-500 shadow-xs"
-                  />
-                  {productSearchQuery && (
-                    <button
-                      type="button"
-                      onClick={() => setProductSearchQuery('')}
-                      className="absolute right-2.5 top-2 text-slate-400 hover:text-slate-600 cursor-pointer"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  )}
-                </div>
-
-                {/* Filtered Products Compact Scrollable List */}
-                <div className="max-h-40 overflow-y-auto space-y-1 bg-white p-1 rounded-lg border border-slate-200">
-                  {filteredProducts.length === 0 ? (
-                    <div className="text-center py-3">
-                      <p className="text-xs text-slate-400">कोणतेही प्रॉडक्ट सापडले नाही.</p>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setProductSearchQuery('');
-                          setProductCategoryFilter('all');
-                        }}
-                        className="mt-1 text-[11px] font-bold text-purple-600 hover:underline cursor-pointer"
-                      >
-                        सर्व प्रॉडक्ट्स दाखवा ({products.length})
-                      </button>
-                    </div>
-                  ) : (
-                    filteredProducts.map((p) => {
-                      const cleanName = getCleanGradeName(p);
-                      const isSelected = selectedProduct?.id === p.id;
-                      const g = (p.groupName || '').toLowerCase();
-                      const isBC = g.includes('group b') || g.includes('group c') || g.includes('micronutrient') || g.includes('growth regulator') || g.includes('pgr') || /microgrip|bw\s*combi|nutrijet/i.test(p.brandName || '') || /microgrip|bw\s*combi|nutrijet/i.test(p.gradeName || '');
-                      return (
-                        <div
-                          key={p.id}
-                          onClick={() => handleSelectProduct(p)}
-                          className={cn(
-                            "p-1.5 px-2 rounded-lg cursor-pointer transition flex justify-between items-center text-[11px]",
-                            isSelected
-                              ? "bg-purple-100 border border-purple-400 text-purple-950 font-bold"
-                              : "hover:bg-purple-50/70 border border-transparent text-slate-700"
-                          )}
-                        >
-                          <div className="min-w-0 pr-2 flex items-center gap-1.5">
-                            {isSelected ? (
-                              <CheckCircle2 className="w-3.5 h-3.5 text-purple-700 shrink-0" />
-                            ) : (
-                              <span className="w-1.5 h-1.5 rounded-full bg-slate-300 shrink-0" />
-                            )}
-                            <div className="truncate">
-                              {isBC ? (
-                                <span className="font-black text-amber-800 text-xs">{cleanName}</span>
-                              ) : (
-                                <>
-                                  {p.brandName && (
-                                    <span className="font-bold text-amber-700 text-[10.5px] mr-1">{p.brandName}</span>
-                                  )}
-                                  <span className="font-black text-sky-800">{cleanName}</span>
-                                </>
-                              )}
-                              {p.groupName && (
-                                <span className="text-[9.5px] text-slate-400 block truncate">{p.groupName}</span>
-                              )}
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-1.5 shrink-0">
-                            <span className="text-[9.5px] font-bold text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded">
-                              {p.packings?.length || 0} Packings
-                            </span>
-                            {isSelected && (
-                              <span className="text-[9.5px] bg-purple-600 text-white font-bold px-1.5 py-0.5 rounded">
-                                निवडले ✓
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-
-              {/* Quick Packing & Quantity Picker when Product is Selected */}
-              {selectedProduct ? (
-                <div className="bg-white p-2.5 rounded-xl border border-purple-300 shadow-xs space-y-2">
-                  <div className="flex justify-between items-center border-b border-slate-100 pb-1.5">
-                    <div>
-                      <span className="text-xs font-black text-sky-800">
-                        {getCleanGradeName(selectedProduct)}
-                      </span>
-                      {selectedProduct.groupName && (
-                        <span className="text-[9.5px] text-slate-400 ml-1.5">({selectedProduct.groupName})</span>
-                      )}
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setSelectedProduct(null)}
-                      className="text-[10px] font-bold text-rose-600 hover:underline cursor-pointer"
-                    >
-                      Clear Selection
-                    </button>
-                  </div>
-
-                  {/* Packing Selection Buttons - Compact Chips */}
-                  <div>
-                    <span className="text-[10px] font-bold text-slate-600 block mb-1">
-                      पॅकिंग निवडा (Select Packing):
-                    </span>
-                    <div className="flex flex-wrap gap-1">
-                      {selectedProduct.packings?.map((pk) => {
-                        const pkComputedRate = computeProductRate(selectedProduct, pk.packingSize);
-                        return (
-                          <button
-                            key={pk.packingSize}
-                            type="button"
-                            onClick={() => handleSelectPacking(pk.packingSize)}
-                            className={cn(
-                              "px-2.5 py-1 rounded text-[10px] font-bold transition border cursor-pointer active:scale-95 inline-flex items-center gap-1",
-                              selectedPacking === pk.packingSize
-                                ? "bg-purple-600 text-white border-purple-600 shadow-2xs"
-                                : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
-                            )}
-                          >
-                            <span>{pk.packingSize}</span>
-                            <span className={cn(
-                              "font-mono text-[9px] px-1 py-0.2 rounded font-black",
-                              selectedPacking === pk.packingSize ? "bg-white/20 text-white" : "bg-black/5 text-slate-800"
-                            )}>
-                              ₹{pkComputedRate}
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-
-                  {/* Rate, Quantity, Discount & Add Item Row */}
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 items-end pt-1">
-                    <div>
-                      <label className="text-[10px] font-bold text-slate-600 block mb-0.5">दर (Rate ₹):</label>
-                      <input
-                        type="number"
-                        value={itemRate}
-                        onChange={(e) => setItemRate(e.target.value === '' ? '' : Number(e.target.value))}
-                        className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold focus:outline-none focus:ring-1 focus:ring-purple-500"
-                      />
-                    </div>
-
-                    <div>
-                      <label className="text-[10px] font-bold text-slate-600 block mb-0.5">नग (Quantity *):</label>
-                      <input
-                        type="number"
-                        min="1"
-                        value={itemQuantity}
-                        onChange={(e) => {
-                          const val = e.target.value;
-                          setItemQuantity(val === '' ? '' : Number(val));
-                        }}
-                        onBlur={() => {
-                          if (itemQuantity === '' || Number(itemQuantity) < 1) {
-                            setItemQuantity(1);
-                          }
-                        }}
-                        className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold text-center focus:outline-none focus:ring-1 focus:ring-purple-500"
-                        placeholder="1"
-                      />
-                    </div>
-
-                    <div>
-                      <div className="flex justify-between items-center mb-0.5">
-                        <label className="text-[10px] font-bold text-slate-600">सूट (Discount):</label>
-                        <div className="flex text-[9px] font-bold bg-slate-100 rounded border border-slate-200 overflow-hidden">
-                          <button
-                            type="button"
-                            onClick={() => setDiscountType('percent')}
-                            className={cn(
-                              "px-1 py-0.2 cursor-pointer transition",
-                              discountType === 'percent' ? "bg-purple-600 text-white" : "text-slate-500"
-                            )}
-                          >
-                            %
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setDiscountType('flat')}
-                            className={cn(
-                              "px-1 py-0.2 cursor-pointer transition",
-                              discountType === 'flat' ? "bg-purple-600 text-white" : "text-slate-500"
-                            )}
-                          >
-                            ₹
-                          </button>
-                        </div>
-                      </div>
-                      <input
-                        type="number"
-                        min="0"
-                        value={itemDiscount}
-                        onChange={(e) => setItemDiscount(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
-                        className="w-full px-2 py-1 border border-slate-300 rounded-lg text-xs font-mono font-bold text-center focus:outline-none focus:ring-1 focus:ring-purple-500"
-                        placeholder={discountType === 'percent' ? "0%" : "₹0"}
-                      />
-                    </div>
-
-                    <div>
-                      <button
-                        type="button"
-                        onClick={handleAddItemToOrder}
-                        className="w-full py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition shadow-xs cursor-pointer flex items-center justify-center gap-1 active:scale-95 h-[30px]"
-                      >
-                        <Plus className="w-3.5 h-3.5" />
-                        <span>+ ॲड करा (Add Item)</span>
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Live Calculation Preview */}
-                  {(() => {
-                    const r = Number(itemRate) || 0;
-                    const q = typeof itemQuantity === 'string' && itemQuantity === '' ? 1 : Math.max(1, Number(itemQuantity) || 1);
-                    const gross = r * q;
-                    const d = Number(itemDiscount) || 0;
-                    const dAmt = discountType === 'percent' ? Math.round((gross * d) / 100) : d;
-                    const net = Math.max(0, gross - dAmt);
-                    return (
-                      <div className="flex justify-between items-center text-[10px] font-bold text-slate-500 pt-0.5 border-t border-slate-100">
-                        <span>Base: <span className="font-mono">₹{gross.toLocaleString()}</span></span>
-                        {dAmt > 0 && (
-                          <span className="text-rose-600 font-medium">सूट: -₹{dAmt.toLocaleString()}</span>
-                        )}
-                        <span>एकूण (Subtotal): <span className="font-mono text-purple-700 font-black text-xs">₹{net.toLocaleString()}</span></span>
-                      </div>
-                    );
-                  })()}
-                </div>
-              ) : (
-                <div className="bg-white/80 p-2 rounded-lg border border-dashed border-purple-200 text-center text-[11px] text-purple-700 font-medium">
-                  👉 वरील लिस्ट मधून प्रॉडक्ट वर क्लिक करा (Click any product above to configure packing and quantity)
-                </div>
-              )}
-            </div>
-
-            {/* STEP 3: ADDED ITEMS SUMMARY - Compact Table Display */}
-            <div className="space-y-1.5">
-              <div className="flex justify-between items-center">
-                <span className="text-xs font-black text-slate-800">
-                  3. Items Added ({orderItems.length})
-                </span>
-                {orderItems.length > 0 && (
-                  <span className="text-xs font-black text-purple-700 font-mono">
-                    Total: ₹{totalBillAmount.toLocaleString()}
-                  </span>
-                )}
-              </div>
-
-              {orderItems.length === 0 ? (
-                <div className="bg-slate-50 border border-dashed border-slate-300 rounded-xl p-3 text-center text-slate-400 text-xs font-medium">
-                  No products added yet. Select product from above to add.
-                </div>
-              ) : (
-                <div className="border border-slate-200 rounded-xl overflow-hidden bg-white text-xs max-h-56 overflow-y-auto space-y-1">
-                  <table className="w-full text-left">
-                    <thead className="bg-slate-100 text-[10px] font-black text-slate-600 uppercase">
-                      <tr>
-                        <th className="p-1.5 pl-2.5"># Product</th>
-                        <th className="p-1.5 text-center">Packing</th>
-                        <th className="p-1.5 text-center">Qty</th>
-                        <th className="p-1.5 text-right">Rate</th>
-                        <th className="p-1.5 text-right">Disc</th>
-                        <th className="p-1.5 text-right">Subtotal</th>
-                        <th className="p-1.5 pr-2.5 text-center">Action</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100 text-[11px]">
-                      {orderItems.map((item, idx) => (
-                        <tr key={idx} className="hover:bg-slate-50">
-                          <td className="p-1.5 pl-2.5 font-bold text-sky-700 truncate max-w-[150px]">
-                            {idx + 1}. {item.gradeName || item.productName}
-                          </td>
-                          <td className="p-1.5 text-center text-slate-500 font-medium">{item.packingSize}</td>
-                          <td className="p-1.5 text-center font-mono font-bold text-slate-800">{item.quantity}</td>
-                          <td className="p-1.5 text-right font-mono text-slate-600">₹{item.rate}</td>
-                          <td className="p-1.5 text-right font-mono text-rose-600">
-                            {item.discount ? `-₹${item.discount}` : '-'}
-                          </td>
-                          <td className="p-1.5 text-right font-mono font-bold text-purple-700">₹{item.subtotal.toLocaleString()}</td>
-                          <td className="p-1.5 pr-2.5 text-center">
-                            <button
-                              type="button"
-                              onClick={() => handleRemoveItem(idx)}
-                              className="p-1 text-slate-400 hover:text-rose-600 transition cursor-pointer"
-                              title="Remove"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                    <tfoot className="bg-purple-50 font-black text-purple-900 border-t border-purple-200 text-xs">
-                      <tr>
-                        <td colSpan={2} className="p-1.5 pl-2.5 text-slate-700">Total:</td>
-                        <td className="p-1.5 text-center font-mono">{totalBagsQuantity} Nos.</td>
-                        <td colSpan={2} className="p-1.5 text-right text-[10px] text-rose-700">
-                          {allDiscountsTotal > 0 ? `Disc: -₹${allDiscountsTotal.toLocaleString()}` : ''}
-                        </td>
-                        <td className="p-1.5 text-right font-mono text-sm">₹{totalBillAmount.toLocaleString()}</td>
-                        <td></td>
-                      </tr>
-                    </tfoot>
-                  </table>
-
-                  {/* Extra Order-level Discount Input */}
-                  <div className="flex justify-between items-center px-2.5 py-1.5 bg-slate-50 border-t border-slate-100 text-xs">
-                    <span className="font-bold text-slate-700 text-[11px]">Extra Order Discount (₹):</span>
-                    <input
-                      type="number"
-                      min="0"
-                      value={orderDiscount}
-                      onChange={(e) => setOrderDiscount(e.target.value === '' ? '' : Math.max(0, Number(e.target.value)))}
-                      placeholder="0"
-                      className="w-24 px-2 py-0.5 border border-slate-300 rounded text-xs font-mono font-bold text-right focus:outline-none focus:ring-1 focus:ring-purple-500"
-                    />
-                  </div>
-                </div>
-              )}
-            </div>
+            {/* Editing Order shows Editable Items FIRST right below Dealer so edits are immediately visible */}
+            {editingOrderId ? (
+              <>
+                {renderOrderItemsSection(2)}
+                {renderProductPickerSection(3)}
+              </>
+            ) : (
+              <>
+                {renderProductPickerSection(2)}
+                {renderOrderItemsSection(3)}
+              </>
+            )}
 
             {/* Error Message Display */}
             {formError && (
@@ -2311,7 +2836,7 @@ ${itemsListText}
                 type="button"
                 onClick={() => {
                   setShowNewOrderModal(false);
-                  setFormError(null);
+                  resetNewOrderForm();
                 }}
                 className="px-3 py-1.5 rounded-lg border border-slate-200 text-xs font-semibold text-slate-600 hover:bg-slate-100 cursor-pointer transition active:scale-95"
               >
@@ -2338,7 +2863,8 @@ ${itemsListText}
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* ===================== SUCCESS & WHATSAPP SHARE MODAL ===================== */}
       {successOrder && (
@@ -2355,11 +2881,20 @@ ${itemsListText}
 
             <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200 text-left text-xs space-y-1">
               <p className="font-black text-slate-900 truncate">Dealer: {successOrder.dealerName}</p>
-              <p className="text-slate-700 font-bold">Total Quantity: <span className="font-mono font-black text-emerald-700">{successOrder.totalQuantity} Nos.</span></p>
+              <p className="text-slate-700 font-bold">Total Quantity: <span className="font-mono font-black text-emerald-700">{formatOrderTotalQuantity((successOrder.items || []).map((it) => resolveOrderLineForBox(it, findProductForOrderItem(it))), successOrder.totalQuantity)}</span></p>
               <p className="text-slate-500 text-[10.5px]">Status: ⏳ Pending Approval</p>
             </div>
 
             <div className="space-y-1.5 pt-1">
+              <button
+                onClick={() => handleDownloadOrderImage(successOrder)}
+                disabled={downloadingOrderId !== null}
+                className="w-full py-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs transition active:scale-95 cursor-pointer"
+              >
+                {downloadingOrderId === successOrder.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                <span>Download Order Image (गॅलरीमध्ये सेव्ह करा)</span>
+              </button>
+
               <button
                 onClick={() => {
                   handleShareOnWhatsApp(successOrder);
@@ -2449,17 +2984,20 @@ ${itemsListText}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 text-[11px]">
-                    {selectedOrderDetails.items?.map((it, idx) => (
-                      <tr key={idx} className="font-semibold text-slate-800">
-                        <td className="p-1.5 pl-2">
-                          <p className="font-bold text-sky-700">{it.gradeName || it.productName}</p>
-                          <span className="text-[9.5px] text-slate-400">{it.packingSize}</span>
-                        </td>
-                        <td className="p-1.5 text-center font-mono">{it.quantity}</td>
-                        <td className="p-1.5 text-right font-mono">₹{it.rate}</td>
-                        <td className="p-1.5 text-right font-mono font-bold">₹{it.subtotal.toLocaleString()}</td>
-                      </tr>
-                    ))}
+                    {(selectedOrderDetails.items || []).map((rawIt, idx) => {
+                      const it = resolveOrderLineForBox(rawIt, findProductForOrderItem(rawIt));
+                      return (
+                        <tr key={idx} className="font-semibold text-slate-800">
+                          <td className="p-1.5 pl-2">
+                            <p className="font-bold text-sky-700">{it.gradeName || it.productName}</p>
+                            <span className="text-[9.5px] text-slate-400">{it.packingSize}</span>
+                          </td>
+                          <td className="p-1.5 text-center font-mono whitespace-nowrap">{it.quantity} {getOrderLineUnit(it)}</td>
+                          <td className="p-1.5 text-right font-mono">₹{it.rate}</td>
+                          <td className="p-1.5 text-right font-mono font-bold">₹{it.subtotal.toLocaleString()}</td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                   <tfoot className="bg-purple-50 font-black text-purple-900 border-t border-purple-200 text-xs">
                     {selectedOrderDetails.discountAmount && selectedOrderDetails.discountAmount > 0 ? (
@@ -2486,12 +3024,12 @@ ${itemsListText}
             {/* Status History & Approvals */}
             <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200 text-[11px] space-y-0.5 text-slate-600">
               <p>Booked by: <span className="font-bold text-slate-900">{selectedOrderDetails.createdByName}</span></p>
-              <p>Booking Date: <span className="font-mono">{new Date(selectedOrderDetails.createdAt).toLocaleString('en-IN')}</span></p>
+              <p>Booking Date: <span className="font-mono">{formatDisplayDate(selectedOrderDetails.createdAt, true) || '-'}</span></p>
               {selectedOrderDetails.approvedBy && (
-                <p>Approved by: <span className="font-bold text-slate-900">{selectedOrderDetails.approvedBy}</span> ({new Date(selectedOrderDetails.approvedAt || '').toLocaleDateString('en-IN')})</p>
+                <p>Approved by: <span className="font-bold text-slate-900">{selectedOrderDetails.approvedBy}</span> ({formatDisplayDate(selectedOrderDetails.approvedAt, false) || '-'})</p>
               )}
               {selectedOrderDetails.deliveredAt && (
-                <p>Delivered on: <span className="font-bold text-emerald-700">{new Date(selectedOrderDetails.deliveredAt).toLocaleString('en-IN')}</span></p>
+                <p>Delivered on: <span className="font-bold text-emerald-700">{formatDisplayDate(selectedOrderDetails.deliveredAt, true) || '-'}</span></p>
               )}
             </div>
 
@@ -2538,6 +3076,17 @@ ${itemsListText}
                 >
                   <PackageCheck className="w-3.5 h-3.5" />
                   <span>Delivered (Complete)</span>
+                </button>
+              )}
+
+              {canUserEditOrder(selectedOrderDetails) && (
+                <button
+                  onClick={() => handleOpenEditOrder(selectedOrderDetails)}
+                  className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer active:scale-95 shrink-0"
+                  title="Edit Order"
+                >
+                  <Edit3 className="w-3.5 h-3.5" />
+                  <span>Edit</span>
                 </button>
               )}
 

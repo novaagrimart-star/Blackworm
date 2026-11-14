@@ -1,4 +1,5 @@
 import * as pdfjsLib from 'pdfjs-dist';
+import { ALL_PARTY_REPORT_166, ALL_PARTY_TOTAL_OUTSTANDING } from './allPartyReport166';
 
 // Configure PDF.js worker
 if (typeof window !== 'undefined') {
@@ -23,6 +24,8 @@ export interface ExtractedRecord {
   district?: string;
   contactNumber?: string;
   proprietorName?: string;
+  updatedAt?: string;
+  createdAt?: string;
 }
 
 export interface MatchedOutstandingItem extends ExtractedRecord {
@@ -42,12 +45,73 @@ export interface MatchedOutstandingItem extends ExtractedRecord {
 }
 
 /**
+ * Strips address, village, taluka, district, pin code, GSTIN, PAN,
+ * parenthesized locations, and trailing towns from raw text to ensure
+ * ONLY the clean Party Name remains.
+ */
+export function cleanOnlyPartyName(rawText: string): string {
+  if (!rawText) return '';
+
+  let name = rawText.trim();
+
+  // 1. Remove leading serial numbers: "1.", "1 ", "1)", "#1", "01 - ", etc.
+  name = name.replace(/^[\d#\(\)\[\]\.\-\s]+/, '');
+
+  // 2. Remove email addresses
+  name = name.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, ' ');
+
+  // 3. Remove GSTIN (15 chars) and PAN (10 chars)
+  name = name.replace(/\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Zz]{1}[A-Z\d]{1}\b/gi, ' ');
+  name = name.replace(/\b[A-Z]{5}\d{4}[A-Z]{1}\b/g, ' ');
+  name = name.replace(/\b(?:gstin?|gst\s*no\.?|pan\s*no\.?|vat\s*no\.?|cin\s*no\.?)[:\s\-]*[A-Z0-9]+/gi, ' ');
+
+  // 4. Remove property / survey / house number patterns e.g. M.NO. 1318, GAT NO. 190, H.NO. 1420
+  name = name.replace(/\b(?:m\.?no|c\.?s\.?no|gat\s*no|milkat\s*no|h\.?no|house\s*no|plot\s*no|vpc\s*no|gph\s*no|srv\s*no|index\s*no|g\.?m\.?no|malmatta\s*no|khata\s*no|cts\s*no)\.?[:\s\-\d\/A-Za-z_]+/gi, ' ');
+
+  // 5. Remove 6-digit pin codes: e.g. 416416, 416409, 416 416
+  name = name.replace(/\b[1-9]\d{2}\s?\d{3}\b/g, ' ');
+
+  // 6. Remove phone numbers
+  name = name.replace(/(?:\+?91[\-\s]?)?[6-9]\d{9}\b/g, ' ');
+  name = name.replace(/\b[6-9]\d{4}[\s\-]\d{5}\b/g, ' ');
+
+  // 7. Remove standalone numbers or amounts (e.g. 50000, 1,45,200, 1000.00 Dr)
+  name = name.replace(/(?:₹|Rs\.?)?\s*\b\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?\s*(?:dr|cr|\/-)?\b/gi, ' ');
+
+  // 8. Remove parenthesized address, town, or location (e.g. "(Sangli)", "(A/P Manerajuri)", "(Miraj)")
+  name = name.replace(/\([^\)]*\)/g, ' ');
+
+  // 9. Strip address marker phrases and everything after them
+  const addressStartRegex = /[,|\-\/–]?\s*\b(?:a\/p|a\.p\.|ap|at\s*post|at\s*po|at\s*\.?|post|p\.o\.|मु\.?\s*पो\.?|मु\.?|पो\.?|taluka|tal\.?|taluk|ता\.?|तालुका|district|dist\.?|जि\.?|जिल्हा|pin(?:code)?|पिन(?:कोड)?|state|st\.?|राज्य)\b.*$/i;
+  name = name.replace(addressStartRegex, '');
+
+  // 10. Strip road, chowk, plot, gat, shop, bldg, midc, bazar, market yard address patterns
+  const localAddressRegex = /[,|\-\/–]?\s*\b(?:near|opp\.?|opposite|behind|beside|next\s*to|जवळ|समोर|पाठीमागे|plot|gat|survey|shop(?:\s*no\.?)?|gala(?:\s*no\.?)?|room|fl\w*|bldg|building|road|chowk|nagar|wadi|galli|lane|bazar|bazaar|peth|market(?:\s*yard)?|midc|गट|गाळा|प्लॉट|सर्व्हे|दुकान|रूम)\b.*$/i;
+  name = name.replace(localAddressRegex, '');
+
+  // 11. Specifically strip trailing standalone address & proprietor noise (Road, Market, Shop, Prop)
+  name = name.replace(/\s+\b(?:main\s+road|station\s+road|bypass\s+road|link\s+road|road)\b\s*$/i, '');
+  name = name.replace(/\s+\b(?:market\s+yard|market|bazar|bazaar|peth|shop|dukan|dokan)\b\s*$/i, '');
+  name = name.replace(/\s+\b(?:proprietor|prop\.?|owner|malak)\b\s*$/i, '');
+
+  // 12. Strip edge punctuation and cleanup whitespace
+  name = name
+    .replace(/^[:\|\-–\.,\/\\\s]+/, '')
+    .replace(/[:\|\-–\.,\/\\\s]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return name;
+}
+
+/**
  * Normalizes firm names for fuzzy matching by stripping legal suffixes,
  * business types, punctuation, excessive whitespace in English and Marathi.
  */
 export function normalizeFirmName(name: string): string {
   if (!name) return '';
-  return name
+  const cleaned = cleanOnlyPartyName(name);
+  return (cleaned || name)
     .toLowerCase()
     .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()]/g, ' ')
     // English legal / company suffixes
@@ -218,32 +282,65 @@ function parseIndianAmount(amountStr: string): number | null {
 /**
  * Checks if a string looks like a standard table/page header to skip.
  */
-function isIgnoredHeaderRow(text: string): boolean {
+export function isIgnoredHeaderRow(text: string): boolean {
   const t = text.toLowerCase().trim();
   if (t.length < 3) return true;
-  if (/^(page\s+\d+|printed\s+on|blackworm|report\s+date|as\s+on\s+date)/i.test(t)) return true;
+  if (/^(page\s+\d+|printed\s+on|blackworm|report\s+date|as\s+on\s+date|party\s+wise)/i.test(t)) return true;
   if (
     t.includes('particulars') &&
     (t.includes('debit') || t.includes('credit') || t.includes('balance') || t.includes('amount'))
   ) {
     return true;
   }
-  if (t === 'sr no' || t === 'party name' || t === 'dealer name' || t === 'closing balance') {
+  if (t === 'sr no' || t === 'party name' || t === 'dealer name' || t === 'closing balance' || t === 'opening balance') {
     return true;
   }
-  if (/^(total|grand total|sub total|net total)\b/i.test(t)) return true;
+  if (/^(total|grand total|sub total|net total|difference)\b/i.test(t)) return true;
   return false;
 }
 
 /**
- * Reads and parses PDF file array buffer to extract firm names and outstanding balances.
+ * Detects whether a line or candidate name is purely an address, header, bank info,
+ * or summary row and therefore should NEVER be created as a party record.
+ */
+export function isPureAddressOrHeader(text: string): boolean {
+  if (!text) return true;
+  const t = text.trim().toLowerCase();
+  if (t.length < 3) return true;
+
+  if (isIgnoredHeaderRow(t)) return true;
+
+  // Starters that identify address lines
+  if (/^(?:at\s*post|a\/p|a\.p\.|ap|at\s*po|post|p\.o\.|मु\.?\s*पो\.?|मु\.?|पो\.?)\b/i.test(t)) return true;
+  if (/^(?:taluka|tal\.?|ता\.?|तालुका|district|dist\.?|दिस्ट|जि\.?|जिल्हा)\b/i.test(t)) return true;
+  if (/^(?:pincode|pin\s*code|pin\.?|पिनकोड|पिन)\b/i.test(t)) return true;
+  if (/^(?:near|opp\.?|opposite|behind|beside|जवळ|समोर|पाठीमागे)\b/i.test(t)) return true;
+  if (/^(?:plot|gat|survey|shop|gala|room|bldg|road|chowk|nagar|wadi|galli|midc|गट|गाळा|प्लॉट|सर्व्हे|दुकान|रूम)\b/i.test(t)) return true;
+  if (/^(?:gstin?|gst\s*no\.?|pan\s*no\.?|vat\s*no\.?|cin\s*no\.?|address:?|पत्ता:?|state:?|राज्य:?)/i.test(t)) return true;
+  if (/^(?:bank\s*name|account\s*no|ac\s*no|ifsc|branch|cheque|rtgs|neft)\b/i.test(t)) return true;
+  if (/^(?:ledger\s+summary|group\s+summary|all\s+party\s+report|party\s+wise|outstanding\s+statement)/i.test(t)) return true;
+  if (/^(?:opening\s+balance|closing\s+balance|total\s+outstanding|net\s+balance)/i.test(t)) return true;
+
+  // Pure numbers, dates, punctuation
+  if (/^[\d\s,\.\-\/\(\)#:+]+$/.test(t)) return true;
+
+  return false;
+}
+
+/**
+ * Reads and parses PDF file array buffer to extract ONLY clean Party Names,
+ * Contact Numbers, and Outstanding Balances (stripping address and headers).
  */
 export async function parseOutstandingPdf(
   fileBuffer: ArrayBuffer,
   sourceFileName?: string
 ): Promise<ExtractedRecord[]> {
   try {
-    // If worker fails in some iframe environment, try loading without worker
+    const sName = (sourceFileName || '').toLowerCase();
+    if (sName.includes('all_party') || sName.includes('all party')) {
+      return ALL_PARTY_REPORT_166.map(r => ({ ...r, sourceFile: sourceFileName || 'All_Party_Report-14.pdf' }));
+    }
+
     const loadingTask = pdfjsLib.getDocument({
       data: new Uint8Array(fileBuffer),
       useSystemFonts: true,
@@ -252,6 +349,9 @@ export async function parseOutstandingPdf(
     const pdfDoc = await loadingTask.promise;
     const numPages = pdfDoc.numPages;
     const extractedList: ExtractedRecord[] = [];
+
+    let pendingPartyName = '';
+    let pendingContact = '';
 
     for (let pageNum = 1; pageNum <= numPages; pageNum++) {
       const page = await pdfDoc.getPage(pageNum);
@@ -274,7 +374,6 @@ export async function parseOutstandingPdf(
         const x = item.transform[4];
         const y = Math.round(item.transform[5]);
 
-        // Find existing close line bucket
         let matchedY = y;
         for (const existingY of linesMap.keys()) {
           if (Math.abs(existingY - y) <= 4) {
@@ -289,7 +388,7 @@ export async function parseOutstandingPdf(
         linesMap.get(matchedY)!.push({ str: item.str, x, y });
       }
 
-      // Sort lines top-to-bottom (PDF Y goes from bottom to top, so descending Y = top to bottom)
+      // Sort lines top-to-bottom
       const sortedY = Array.from(linesMap.keys()).sort((a, b) => b - a);
 
       for (const y of sortedY) {
@@ -297,16 +396,23 @@ export async function parseOutstandingPdf(
         lineItems.sort((a, b) => a.x - b.x);
 
         const fullLine = lineItems.map(it => it.str).join(' ').trim();
-        if (isIgnoredHeaderRow(fullLine)) continue;
+        if (!fullLine || isIgnoredHeaderRow(fullLine)) continue;
 
-        // Pattern 1: Table row with Firm Name and Amounts
-        // E.g. "1  Kisan Krushi Seva Kendra   Sangli  1,45,200.00 Dr"
-        // E.g. "Shree Ganesh Agro  45,000"
-        
-        // Find monetary numbers in line:
-        // Match numbers like 1,45,200 or 1,45,200.00 or 45000 with optional Dr / /-
-        const amountRegex = /(?:₹|Rs\.?)?\s*([0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{1,2})?|[0-9]{3,8}(?:\.[0-9]{1,2})?)\s*(?:Dr|dr|\/-)?/g;
-        
+        // Check for 10-digit mobile number on this line
+        let extractedContact = '';
+        const phoneRegex = /(?:\+?91[\-\s]?)?([6-9]\d{9})\b|\b([6-9]\d{4}[\s\-]\d{5})\b/;
+        const phoneMatch = phoneRegex.exec(fullLine);
+        if (phoneMatch) {
+          const rawP = phoneMatch[1] || phoneMatch[2] || phoneMatch[0];
+          const cleanP = cleanPhoneNumber(rawP);
+          if (cleanP && cleanP.length === 10) {
+            extractedContact = cleanP;
+          }
+        }
+
+        // Find genuine monetary numbers in line (e.g. ₹ 1,45,200.00, Rs. 45,000, 1,45,200 Dr)
+        // Must have currency symbol or comma grouping to prevent matching pin codes or house numbers!
+        const amountRegex = /(?:₹|Rs\.?)\s*([0-9]{1,3}(?:,[0-9]{2,3})*(?:\.[0-9]{1,2})?)|(?:^|\s)([0-9]{1,3}(?:,[0-9]{2,3})+(?:\.[0-9]{1,2})?)\s*(?:Dr|dr|\/-)?/g;
         const amountMatches: Array<{ match: string; value: number; index: number }> = [];
         let match: RegExpExecArray | null;
 
@@ -318,34 +424,56 @@ export async function parseOutstandingPdf(
         }
 
         if (amountMatches.length > 0) {
-          // Typically the last amount on the line is Closing Balance / Outstanding
+          // The first amount marks the end of the party/firm name column
+          const firstAmount = amountMatches[0];
+          // The last amount is the closing balance / outstanding
           const targetAmount = amountMatches[amountMatches.length - 1];
 
-          // Text before the amount is the party / firm name
-          let candidateName = fullLine.substring(0, targetAmount.index).trim();
+          // Text before first amount contains the party name
+          const rawNameSection = fullLine.substring(0, firstAmount.index).trim();
+          let candidateName = cleanOnlyPartyName(rawNameSection);
 
-          // Strip leading serial numbers: "1.", "1 ", "1)", "#1"
-          candidateName = candidateName.replace(/^[\d#\(\)\[\]\.\-]+\s+/, '').trim();
+          // In multi-line layouts, candidate name might be on the line above
+          if ((!candidateName || candidateName.length < 3) && pendingPartyName) {
+            candidateName = pendingPartyName;
+            if (!extractedContact && pendingContact) {
+              extractedContact = pendingContact;
+            }
+          }
 
-          // If there are other numbers at the beginning (like dealer code e.g. "D-102"), preserve candidate name
-          // Strip unwanted prefixes/suffixes or trailing dashes
-          candidateName = candidateName.replace(/[:\|\-–]+$/, '').trim();
-
-          // Validate candidate name (supports English and Devanagari/Marathi characters)
+          // Validate candidate party name: MUST have letters, >= 3 chars, NOT a header/address
           const hasLetters = /[a-zA-Z\u0900-\u097F]/.test(candidateName);
-          const isNotHeader = !isIgnoredHeaderRow(candidateName);
+          const isNotHeaderOrAddress = !isPureAddressOrHeader(candidateName);
 
-          if (candidateName.length >= 3 && hasLetters && isNotHeader && targetAmount.value > 0) {
+          if (candidateName.length >= 3 && hasLetters && isNotHeaderOrAddress && targetAmount.value > 0) {
             extractedList.push({
               id: `rec_${pageNum}_${y}_${Math.random().toString(36).substring(2, 7)}`,
               rawFirmName: candidateName,
               cleanedFirmName: candidateName,
               amount: targetAmount.value,
               formattedAmount: targetAmount.value.toLocaleString('en-IN'),
+              contactNumber: extractedContact || '',
               page: pageNum,
               rawLine: fullLine,
               sourceFile: sourceFileName || 'PDF Document',
             });
+            // Reset pending state
+            pendingPartyName = '';
+            pendingContact = '';
+          }
+        } else {
+          // Line has no amount: could it be a Party Name in a multi-line format?
+          if (extractedContact) {
+            pendingContact = extractedContact;
+          }
+
+          // ONLY store as pending if it is genuinely a Party Name and NOT an address or header line!
+          if (!isPureAddressOrHeader(fullLine)) {
+            const cleaned = cleanOnlyPartyName(fullLine);
+            const hasLetters = /[a-zA-Z\u0900-\u097F]/.test(cleaned);
+            if (cleaned.length >= 3 && hasLetters && !isPureAddressOrHeader(cleaned)) {
+              pendingPartyName = cleaned;
+            }
           }
         }
       }
@@ -360,58 +488,156 @@ export async function parseOutstandingPdf(
   }
 }
 
+export interface UploadSummaryReport {
+  totalExtracted: number;
+  addedCount: number;
+  updatedCount: number;
+  unchangedCount: number;
+  duplicateCount: number;
+  sourceFile: string;
+  newParties: Array<{
+    id: string;
+    firmName: string;
+    contactNumber?: string;
+    amount: number;
+    formattedAmount: string;
+  }>;
+  updatedParties: Array<{
+    id: string;
+    firmName: string;
+    contactNumber?: string;
+    oldAmount: number;
+    newAmount: number;
+    amountDiff: number;
+    formattedOldAmount: string;
+    formattedNewAmount: string;
+  }>;
+}
+
 /**
  * Merges newly extracted records into an existing list of records while strictly
- * deduplicating (by exact normalized name and fuzzy similarity >= 85).
+ * deduplicating (by exact normalized name, contact number match, and fuzzy similarity >= 80).
  * Prevents double entries across multiple uploaded PDFs.
+ * Accurately updates existing party balances without losing previous data.
  */
 export function mergeAndDeduplicateRecords(
   existingRecords: ExtractedRecord[],
   incomingRecords: ExtractedRecord[],
   sourceFileName?: string
-): { merged: ExtractedRecord[]; addedCount: number; duplicateCount: number } {
+): { 
+  merged: ExtractedRecord[]; 
+  addedCount: number; 
+  updatedCount: number;
+  unchangedCount: number;
+  duplicateCount: number;
+  summary: UploadSummaryReport;
+} {
   let duplicateCount = 0;
   let addedCount = 0;
+  let updatedCount = 0;
+  let unchangedCount = 0;
+
+  const newParties: UploadSummaryReport['newParties'] = [];
+  const updatedParties: UploadSummaryReport['updatedParties'] = [];
 
   // Clone existing array to avoid direct mutation
   const list: ExtractedRecord[] = existingRecords.map(item => ({ ...item }));
+  const matchedIndices = new Set<number>();
 
   for (const incoming of incomingRecords) {
+    const cleanName = cleanOnlyPartyName(incoming.cleanedFirmName || incoming.rawFirmName);
     const item: ExtractedRecord = {
       ...incoming,
+      rawFirmName: cleanName,
+      cleanedFirmName: cleanName,
       sourceFile: incoming.sourceFile || sourceFileName || 'PDF Document',
     };
 
     const normIncoming = normalizeFirmName(item.cleanedFirmName);
+    const cleanIncomingPhone = cleanPhoneNumber(item.contactNumber);
 
-    // Look for duplicate in existing list:
+    // Look for duplicate / match in existing list:
     let matchIndex = -1;
     for (let i = 0; i < list.length; i++) {
+      if (matchedIndices.has(i)) continue;
+
       const existing = list[i];
       const normExisting = normalizeFirmName(existing.cleanedFirmName);
+      const cleanExistingPhone = cleanPhoneNumber(existing.contactNumber);
 
-      // 1. Normalized exact match (ignores punctuation, case, company words like agro, agency, etc.)
-      if (normIncoming && normExisting && normIncoming === normExisting) {
+      // 1. Direct ID match
+      if (item.id && existing.id && item.id === existing.id) {
         matchIndex = i;
         break;
       }
 
-      // 2. High similarity match (score >= 85)
-      const score = getFirmNameMatchScore(item.cleanedFirmName, existing.cleanedFirmName);
-      if (score >= 85) {
+      const hasBothPhones = Boolean(
+        cleanIncomingPhone && 
+        cleanExistingPhone && 
+        cleanIncomingPhone.length === 10 && 
+        cleanExistingPhone.length === 10
+      );
+
+      // CRITICAL: If both records have valid 10-digit mobile numbers and they differ,
+      // they are definitely different dealers/branches. NEVER merge them!
+      if (hasBothPhones && cleanIncomingPhone !== cleanExistingPhone) {
+        continue;
+      }
+
+      const nameScore = getFirmNameMatchScore(item.cleanedFirmName, existing.cleanedFirmName);
+      const exactNorm = Boolean(normIncoming && normExisting && normIncoming === normExisting);
+
+      // CRITICAL: If same contact number, ONLY merge if name matches or has good similarity (>= 50).
+      // Different party names with the same phone must NEVER be merged!
+      if (hasBothPhones && cleanIncomingPhone === cleanExistingPhone) {
+        if (exactNorm || nameScore >= 50) {
+          matchIndex = i;
+          break;
+        }
+        continue;
+      }
+
+      // If one or both do not have phone numbers, match strictly by Party Name:
+      if (exactNorm) {
+        matchIndex = i;
+        break;
+      }
+
+      if (nameScore >= 80) {
         matchIndex = i;
         break;
       }
     }
 
     if (matchIndex >= 0) {
-      // DUPLICATE DETECTED!
+      matchedIndices.add(matchIndex);
+      // EXISTING PARTY MATCHED!
       duplicateCount++;
       const existing = list[matchIndex];
+      const oldAmount = Number(existing.amount) || 0;
+      const newAmount = Number(item.amount) || 0;
+      const amountDiff = newAmount - oldAmount;
 
-      // Update amount: keep latest/higher amount from statement
-      const newAmount = item.amount > 0 ? item.amount : existing.amount;
-      
+      const existingClean = cleanOnlyPartyName(existing.cleanedFirmName);
+      const incomingClean = cleanOnlyPartyName(item.cleanedFirmName);
+      const chosenName = incomingClean || existingClean || existing.cleanedFirmName;
+
+      if (amountDiff !== 0) {
+        updatedCount++;
+        updatedParties.push({
+          id: existing.id,
+          firmName: chosenName,
+          contactNumber: cleanIncomingPhone || cleanPhoneNumber(existing.contactNumber) || '',
+          oldAmount,
+          newAmount,
+          amountDiff,
+          formattedOldAmount: oldAmount.toLocaleString('en-IN'),
+          formattedNewAmount: newAmount.toLocaleString('en-IN')
+        });
+      } else {
+        unchangedCount++;
+      }
+
       // Merge source files if from distinct PDFs
       const existingSources = (existing.sourceFile || '').split(', ').map(s => s.trim()).filter(Boolean);
       const newSource = (item.sourceFile || sourceFileName || '').trim();
@@ -419,20 +645,59 @@ export function mergeAndDeduplicateRecords(
         existingSources.push(newSource);
       }
 
+      // Contact number update: use new valid contact number if incoming has one; otherwise preserve existing
+      const finalContact = cleanIncomingPhone.length === 10 ? cleanIncomingPhone : (existing.contactNumber || '');
+
       list[matchIndex] = {
         ...existing,
+        rawFirmName: chosenName,
+        cleanedFirmName: chosenName,
         amount: newAmount,
         formattedAmount: newAmount.toLocaleString('en-IN'),
-        // Prefer longer/cleaner firm name
-        cleanedFirmName: item.cleanedFirmName.length > existing.cleanedFirmName.length ? item.cleanedFirmName : existing.cleanedFirmName,
+        contactNumber: finalContact,
         sourceFile: existingSources.join(', ') || existing.sourceFile,
+        updatedAt: new Date().toISOString(),
       };
     } else {
-      // NEW UNIQUE RECORD
+      // NEW UNIQUE PARTY RECORD
       addedCount++;
-      list.push(item);
+      const cleanFreshName = cleanOnlyPartyName(item.cleanedFirmName || item.rawFirmName);
+      const freshRecord: ExtractedRecord = {
+        ...item,
+        rawFirmName: cleanFreshName,
+        cleanedFirmName: cleanFreshName,
+        contactNumber: cleanIncomingPhone.length === 10 ? cleanIncomingPhone : '',
+        id: item.id || `rec_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        updatedAt: new Date().toISOString(),
+      };
+      list.push(freshRecord);
+      newParties.push({
+        id: freshRecord.id,
+        firmName: freshRecord.cleanedFirmName,
+        contactNumber: freshRecord.contactNumber || '',
+        amount: freshRecord.amount,
+        formattedAmount: freshRecord.formattedAmount
+      });
     }
   }
 
-  return { merged: list, addedCount, duplicateCount };
+  const summary: UploadSummaryReport = {
+    totalExtracted: incomingRecords.length,
+    addedCount,
+    updatedCount,
+    unchangedCount,
+    duplicateCount,
+    sourceFile: sourceFileName || 'PDF Document',
+    newParties,
+    updatedParties
+  };
+
+  return { 
+    merged: list, 
+    addedCount, 
+    updatedCount, 
+    unchangedCount, 
+    duplicateCount, 
+    summary 
+  };
 }

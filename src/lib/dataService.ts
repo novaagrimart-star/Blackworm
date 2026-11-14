@@ -11,6 +11,18 @@ import {
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import { UserProfile } from './auth';
 import { toTitleCase } from './utils';
+import {
+  saveCollectionToVault,
+  savePendingQueueToVault,
+  loadPendingQueueFromVault,
+} from './localVault';
+import {
+  pushToSecondary,
+  pushBatchToSecondary,
+  fetchSecondaryCollection,
+  initSecondaryStream,
+  isSecondaryBlocked,
+} from './secondaryDb';
 
 export interface AuditLogItem {
   id: string;
@@ -37,11 +49,207 @@ let quotaExceededUntil = (() => {
 })();
 
 export function isQuotaBlocked(): boolean {
-  return false;
+  if (quotaExceededUntil <= 0) return false;
+  if (Date.now() >= quotaExceededUntil) {
+    quotaExceededUntil = 0;
+    try {
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem('blackworm_quota_blocked_until');
+      }
+    } catch {}
+    return false;
+  }
+  return true;
 }
 
-export function setQuotaBlocked(_durationMs: number = 0) {
-  // Soft indicator - no hard blocking of user operations
+export function setQuotaBlocked(durationMs: number = 10 * 60 * 1000) {
+  if (durationMs <= 0) {
+    quotaExceededUntil = 0;
+    try {
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem('blackworm_quota_blocked_until');
+      }
+    } catch {}
+    return;
+  }
+  quotaExceededUntil = Date.now() + durationMs;
+  try {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('blackworm_quota_blocked_until', String(quotaExceededUntil));
+    }
+  } catch {}
+}
+
+export function trackFirestoreUsage(type: 'read' | 'write', count = 1): void {
+  try {
+    if (typeof window === 'undefined' || count <= 0) return;
+    const today = getLocalDateStr();
+    const key = 'blackworm_usage_metrics';
+    const raw = localStorage.getItem(key);
+    const current = raw ? JSON.parse(raw) : { date: today, reads: 0, writes: 0 };
+    const next =
+      current && current.date === today
+        ? {
+            date: today,
+            reads: (Number(current.reads) || 0) + (type === 'read' ? count : 0),
+            writes: (Number(current.writes) || 0) + (type === 'write' ? count : 0),
+          }
+        : {
+            date: today,
+            reads: type === 'read' ? count : 0,
+            writes: type === 'write' ? count : 0,
+          };
+    localStorage.setItem(key, JSON.stringify(next));
+  } catch {}
+}
+
+export function getDailyUsageStats(): { date: string; reads: number; writes: number } {
+  const today = getLocalDateStr();
+  try {
+    if (typeof window === 'undefined') return { date: today, reads: 0, writes: 0 };
+    const raw = localStorage.getItem('blackworm_usage_metrics');
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.date === today) {
+        return {
+          date: today,
+          reads: Number(parsed.reads) || 0,
+          writes: Number(parsed.writes) || 0,
+        };
+      }
+    }
+  } catch {}
+  return { date: today, reads: 0, writes: 0 };
+}
+
+export function stripUndefined<T>(val: T): T {
+  if (val === null || val === undefined) return val;
+  if (Array.isArray(val)) {
+    return val.map((v) => stripUndefined(v)) as unknown as T;
+  }
+  if (typeof val === 'object' && Object.prototype.toString.call(val) === '[object Object]') {
+    const out: Record<string, any> = {};
+    Object.entries(val as Record<string, any>).forEach(([k, v]) => {
+      if (v !== undefined) {
+        out[k] = stripUndefined(v);
+      }
+    });
+    return out as T;
+  }
+  return val;
+}
+
+function emitSyncStatusEvent(): void {
+  try {
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(
+        new CustomEvent('blackworm_sync_status', {
+          detail: { pendingCount: getPendingSyncCount(), timestamp: Date.now() },
+        })
+      );
+    }
+  } catch {}
+}
+
+export function getPendingSyncIdSet(colName: string): Set<string> {
+  const ids = new Set<string>();
+  try {
+    if (typeof window === 'undefined') return ids;
+    const queueRaw = localStorage.getItem('blackworm_pending_sync');
+    if (!queueRaw) return ids;
+    const queue: any[] = JSON.parse(queueRaw);
+    if (Array.isArray(queue)) {
+      queue.forEach((q) => {
+        if (q && q.collection === colName && q.id) {
+          ids.add(String(q.id));
+        }
+      });
+    }
+  } catch {}
+  return ids;
+}
+
+export function safeLocalStorageSet(key: string, value: string): boolean {
+  try {
+    if (typeof window === 'undefined') return false;
+    localStorage.setItem(key, value);
+    return true;
+  } catch (e) {
+    console.warn(`LocalStorage write notice for ${key}:`, e);
+    return false;
+  }
+}
+
+/**
+ * Safely converts any Firestore Timestamp, {seconds, nanoseconds}, Date, number, or ISO string to epoch milliseconds.
+ * Never returns NaN (returns 0 on invalid/missing input).
+ */
+export function toTimestampMs(val: any): number {
+  if (!val) return 0;
+  if (typeof val === 'number') return Number.isFinite(val) ? val : 0;
+  if (val instanceof Date) {
+    const t = val.getTime();
+    return Number.isFinite(t) ? t : 0;
+  }
+  if (typeof val?.toMillis === 'function') {
+    try {
+      const t = val.toMillis();
+      return Number.isFinite(t) ? t : 0;
+    } catch {}
+  }
+  if (typeof val?.toDate === 'function') {
+    try {
+      const t = val.toDate().getTime();
+      return Number.isFinite(t) ? t : 0;
+    } catch {}
+  }
+  if (typeof val === 'object' && typeof val.seconds === 'number') {
+    return val.seconds * 1000 + Math.floor((val.nanoseconds || 0) / 1e6);
+  }
+  if (typeof val === 'string') {
+    const t = Date.parse(val);
+    return Number.isFinite(t) ? t : 0;
+  }
+  return 0;
+}
+
+export function formatDisplayDate(val: any, includeTime = false): string {
+  const ms = toTimestampMs(val);
+  if (!ms) return '';
+  const d = new Date(ms);
+  return includeTime ? d.toLocaleString('en-IN') : d.toLocaleDateString('en-IN');
+}
+
+/**
+ * Returns local calendar date as YYYY-MM-DD (avoids UTC toISOString() off-by-one between 00:00 and 05:30 IST).
+ */
+export function getLocalDateStr(date: Date = new Date()): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/**
+ * Reliably triggers a Blob file download across desktop & mobile browsers by appending the anchor and deferring revokeObjectURL.
+ */
+export function triggerBlobDownload(blob: Blob, filename: string): void {
+  if (typeof document === 'undefined') return;
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  setTimeout(() => {
+    try {
+      if (link.parentNode) link.parentNode.removeChild(link);
+    } catch {}
+    try {
+      URL.revokeObjectURL(url);
+    } catch {}
+  }, 2000);
 }
 
 /**
@@ -53,23 +261,239 @@ export function updateCollectionCache<T extends { id: string }>(colName: string,
     if (typeof window === 'undefined' || !items || items.length === 0) return;
     const storageKey = `blackworm_local_${colName}`;
     const raw = localStorage.getItem(storageKey);
-    const existing = raw ? JSON.parse(raw) : {};
-    items.forEach((it) => {
-      if (it && it.id) {
-        existing[it.id] = { ...existing[it.id], ...it };
+    const parsed = raw ? JSON.parse(raw) : {};
+    const existing: Record<string, any> = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    const pendingIds = getPendingSyncIdSet(colName);
+
+    items.forEach((it: any) => {
+      if (!it || !it.id) return;
+      if (it.isArchived) {
+        if (!pendingIds.has(it.id)) {
+          delete existing[it.id];
+        }
+        return;
       }
+
+      const prev = existing[it.id];
+      if (!prev) {
+        existing[it.id] = it;
+        return;
+      }
+
+      // If this document has a genuine unsynced offline write pending, only let server win if server is newer
+      if (pendingIds.has(it.id)) {
+        const prevTime = toTimestampMs(prev._localSavedAt || prev.updatedAt || prev.createdAt);
+        const nextTime = toTimestampMs(it.updatedAt || it.createdAt);
+        if (nextTime <= prevTime) {
+          return;
+        }
+      }
+
+      // Otherwise, server snapshot is authoritative — clean up any stale _localSavedAt marker
+      const merged = { ...prev, ...it };
+      delete merged._localSavedAt;
+      existing[it.id] = merged;
     });
-    localStorage.setItem(storageKey, JSON.stringify(existing));
+
+    safeLocalStorageSet(storageKey, JSON.stringify(existing));
+    void saveCollectionToVault(colName, existing);
   } catch (e) {
     console.warn(`Cache update notice for ${colName}:`, e);
   }
 }
 
+export function removeFromCollectionCache(colName: string, docId: string): void {
+  try {
+    if (typeof window === 'undefined' || !docId) return;
+    const storageKey = `blackworm_local_${colName}`;
+    const raw = localStorage.getItem(storageKey);
+    if (raw) {
+      const map = JSON.parse(raw);
+      if (map && typeof map === 'object' && docId in map) {
+        delete map[docId];
+        localStorage.setItem(storageKey, JSON.stringify(map));
+      }
+    }
+    if (colName === 'dealers_application') {
+      const allRaw = localStorage.getItem('blackworm_all_dealers');
+      if (allRaw) {
+        const list = JSON.parse(allRaw);
+        if (Array.isArray(list)) {
+          localStorage.setItem('blackworm_all_dealers', JSON.stringify(list.filter((d: any) => d?.id !== docId)));
+        }
+      }
+    } else if (colName === 'users') {
+      const cachedUsersRaw = localStorage.getItem('blackworm_cached_users');
+      if (cachedUsersRaw) {
+        const list = JSON.parse(cachedUsersRaw);
+        if (Array.isArray(list)) {
+          localStorage.setItem('blackworm_cached_users', JSON.stringify(list.filter((u: any) => u?.uid !== docId && u?.id !== docId)));
+        }
+      }
+    } else if (colName === 'outstanding_records') {
+      const savedOutRaw = localStorage.getItem('blackworm_saved_outstanding_records');
+      if (savedOutRaw) {
+        const list = JSON.parse(savedOutRaw);
+        if (Array.isArray(list)) {
+          localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(list.filter((r: any) => r?.id !== docId)));
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`Cache removal notice for ${colName}/${docId}:`, e);
+  }
+}
+
 /**
- * Safe Firestore write helper that guarantees real-time multi-device synchronization & zero data loss:
- * 1. Immediately saves record to local collection cache for instant UI availability
- * 2. Directly persists to remote Firestore so all devices see the record in real-time
- * 3. Enqueues to pending queue if offline, syncing automatically as soon as connection is live
+ * Saves document into persistent local collection cache (LocalStorage + IndexedDB vault)
+ */
+function writeLocalCollectionRecord(colName: string, docId: string, data: Record<string, any>, merge = true, markPending = true) {
+  try {
+    if (typeof window === 'undefined' || !colName || !docId) return;
+    const storageKey = `blackworm_local_${colName}`;
+    const raw = localStorage.getItem(storageKey);
+    const map = raw ? JSON.parse(raw) : {};
+    const prev = map[docId] && typeof map[docId] === 'object' ? map[docId] : {};
+    const nextDoc: Record<string, any> = {
+      ...(merge ? prev : {}),
+      ...data,
+      id: docId,
+    };
+    if (markPending) {
+      nextDoc._localSavedAt = new Date().toISOString();
+    } else {
+      delete nextDoc._localSavedAt;
+    }
+    map[docId] = nextDoc;
+    safeLocalStorageSet(storageKey, JSON.stringify(map));
+    void saveCollectionToVault(colName, map);
+  } catch (e) {
+    console.warn(`Local caching notice for ${colName}/${docId}:`, e);
+  }
+}
+
+function clearLocalSavedMarker(colName: string, docId: string) {
+  try {
+    if (typeof window === 'undefined' || !colName || !docId) return;
+    const storageKey = `blackworm_local_${colName}`;
+    const raw = localStorage.getItem(storageKey);
+    if (raw) {
+      const map = JSON.parse(raw);
+      if (map[docId] && map[docId]._localSavedAt) {
+        delete map[docId]._localSavedAt;
+        safeLocalStorageSet(storageKey, JSON.stringify(map));
+        void saveCollectionToVault(colName, map);
+      }
+    }
+  } catch {}
+}
+
+function isQuotaErrorMsg(rawMsg: string): boolean {
+  const lower = (rawMsg || '').toLowerCase();
+  return (
+    lower.includes('quota') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('resource-exhausted')
+  );
+}
+
+/**
+ * Safely deletes or soft-deletes a record across Primary (Firestore), Secondary DB, Local Vault,
+ * and pending sync queue so deleted items never resurrect across refreshes or quota limits.
+ */
+export async function safeFirestoreDelete(
+  colName: string,
+  docId: string,
+  options: { softDelete?: boolean; user?: UserProfile } = {}
+): Promise<{ success: boolean; error?: string }> {
+  removeFromCollectionCache(colName, docId);
+  removeFromPendingSync(colName, docId);
+
+  const nowIso = new Date().toISOString();
+  const archivePayload = {
+    isArchived: true,
+    archivedAt: nowIso,
+    updatedAt: nowIso,
+    ...(options.user?.uid ? { archivedBy: options.user.uid } : {}),
+  };
+
+  const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
+  if (isCurrentlyOffline) {
+    setPendingSyncItem(colName, docId, archivePayload, { merge: true }, {
+      needsFirebase: true,
+      needsSecondary: true,
+      deleted: true,
+    });
+    return { success: true };
+  }
+
+  let needsFirebase = true;
+  let needsSecondary = true;
+  let lastErrMsg = '';
+
+  const firebaseTask = async () => {
+    if (isQuotaBlocked()) return;
+    try {
+      if (options.softDelete) {
+        await setDoc(doc(db, colName, docId), archivePayload, { merge: true });
+      } else {
+        try {
+          await deleteDoc(doc(db, colName, docId));
+        } catch (hardDelErr: any) {
+          const msg = String(hardDelErr?.message || '').toLowerCase();
+          if (msg.includes('permission') || msg.includes('denied')) {
+            await setDoc(doc(db, colName, docId), archivePayload, { merge: true });
+          } else {
+            throw hardDelErr;
+          }
+        }
+      }
+      trackFirestoreUsage('write', 1);
+      needsFirebase = false;
+    } catch (err: any) {
+      const msg = err instanceof Error ? err.message : String(err);
+      lastErrMsg = msg;
+      if (isQuotaErrorMsg(msg)) setQuotaBlocked(15 * 60 * 1000);
+    }
+  };
+
+  const secondaryTask = async () => {
+    const secRes = await pushToSecondary({
+      collection: colName,
+      id: docId,
+      doc: archivePayload,
+      updatedAtMs: Date.now(),
+      deleted: true,
+      merge: true,
+    });
+    if (secRes.ok) {
+      needsSecondary = false;
+    }
+  };
+
+  await Promise.all([firebaseTask(), secondaryTask()]);
+
+  if (needsFirebase || needsSecondary) {
+    setPendingSyncItem(colName, docId, archivePayload, { merge: true }, {
+      needsFirebase,
+      needsSecondary,
+      deleted: true,
+    });
+  }
+
+  // Success if at least one remote tier or softDelete-queue absorbed it safely
+  return {
+    success: !needsFirebase || !needsSecondary || Boolean(options.softDelete),
+    ...(lastErrMsg && needsFirebase && needsSecondary ? { error: lastErrMsg } : {}),
+  };
+}
+
+/**
+ * 3-Tier Automatic Dual-DB Write Helper:
+ * 1. Immediately writes to Local Vault (LocalStorage + IndexedDB) for instant zero-latency UI
+ * 2. Mirrors in parallel to Primary (Firebase Firestore) and Secondary (SQLite WAL + Real-Time SSE + optional Supabase)
+ * 3. If Firebase quota is exhausted or offline, Secondary continues live cross-device sync automatically;
+ *    if BOTH remote DBs are unreachable, retains item safely in IndexedDB/LocalStorage dual-queue and replays automatically.
  */
 export async function safeFirestoreSet<T extends Record<string, any>>(
   colName: string,
@@ -77,74 +501,159 @@ export async function safeFirestoreSet<T extends Record<string, any>>(
   data: T,
   options: { merge?: boolean } = { merge: true },
   retryCount = 0
-): Promise<{ success: boolean; isCachedLocally: boolean; error?: string }> {
-  // 1. Immediately backup locally in dedicated collection store
-  try {
-    const storageKey = `blackworm_local_${colName}`;
-    const raw = typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null;
-    const map = raw ? JSON.parse(raw) : {};
-    map[docId] = {
-      ...(options.merge && map[docId] ? map[docId] : {}),
-      ...data,
-      id: docId,
-      _localSavedAt: new Date().toISOString(),
-    };
-    if (typeof window !== 'undefined') {
-      localStorage.setItem(storageKey, JSON.stringify(map));
-    }
-  } catch (e) {
-    console.warn(`Local caching notice for ${colName}/${docId}:`, e);
-  }
+): Promise<{ success: boolean; isCachedLocally: boolean; syncedTier?: 'both' | 'primary' | 'secondary' | 'local'; error?: string }> {
+  const nowIso = new Date().toISOString();
+  const cleanData = stripUndefined({
+    ...data,
+    id: docId,
+    updatedAt: data.updatedAt || nowIso,
+  });
 
-  // Fast offline return - 0ms blocking when offline
+  // 1. Immediate Local Vault save
+  writeLocalCollectionRecord(colName, docId, cleanData, options.merge !== false, true);
+
   const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
   if (isCurrentlyOffline) {
-    addToPendingSync(colName, docId, data, options);
-    return { success: true, isCachedLocally: true };
+    setPendingSyncItem(colName, docId, cleanData, options, {
+      needsFirebase: true,
+      needsSecondary: true,
+    });
+    return { success: true, isCachedLocally: true, syncedTier: 'local' };
   }
 
-  // 2. Direct remote Firestore save so other devices see data instantly
-  try {
-    await setDoc(doc(db, colName, docId), data, options);
-    // If successful, remove from pending sync if it was queued
-    removeFromPendingSync(colName, docId);
-    return { success: true, isCachedLocally: false };
-  } catch (err: any) {
-    const rawMsg = err instanceof Error ? err.message : String(err);
-    const isNetworkError = rawMsg.toLowerCase().includes('network') || rawMsg.toLowerCase().includes('unavailable') || rawMsg.toLowerCase().includes('offline');
+  let needsFirebase = true;
+  let needsSecondary = true;
+  let firebaseError = '';
 
-    if (isNetworkError && retryCount < 2) {
-      const delay = Math.pow(2, retryCount) * 800;
-      await new Promise(resolve => setTimeout(resolve, delay));
-      return safeFirestoreSet(colName, docId, data, options, retryCount + 1);
+  const writePrimary = async (attempt = retryCount): Promise<void> => {
+    if (isQuotaBlocked()) return;
+    try {
+      await setDoc(doc(db, colName, docId), cleanData, options);
+      trackFirestoreUsage('write', 1);
+      needsFirebase = false;
+    } catch (err: any) {
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      firebaseError = rawMsg;
+      if (isQuotaErrorMsg(rawMsg)) {
+        setQuotaBlocked(15 * 60 * 1000);
+        return;
+      }
+      const lower = rawMsg.toLowerCase();
+      const isNetworkError =
+        lower.includes('network') || lower.includes('unavailable') || lower.includes('offline');
+      if (isNetworkError && attempt < 2) {
+        const delay = Math.pow(2, attempt) * 600;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        return writePrimary(attempt + 1);
+      }
+    }
+  };
+
+  const writeSecondary = async (): Promise<void> => {
+    const secRes = await pushToSecondary({
+      collection: colName,
+      id: docId,
+      doc: cleanData,
+      updatedAtMs: toTimestampMs(cleanData.updatedAt) || Date.now(),
+      deleted: Boolean(cleanData.isArchived),
+      merge: options.merge !== false,
+    });
+    if (secRes.ok) {
+      needsSecondary = false;
+    }
+  };
+
+  await Promise.all([writePrimary(), writeSecondary()]);
+
+  if (needsFirebase || needsSecondary) {
+    setPendingSyncItem(colName, docId, cleanData, options, {
+      needsFirebase,
+      needsSecondary,
+      deleted: Boolean(cleanData.isArchived),
+    });
+  } else {
+    removeFromPendingSync(colName, docId);
+    clearLocalSavedMarker(colName, docId);
+  }
+
+  const bothFailed = needsFirebase && needsSecondary;
+  const syncedTier =
+    !needsFirebase && !needsSecondary
+      ? 'both'
+      : !needsFirebase
+        ? 'primary'
+        : !needsSecondary
+          ? 'secondary'
+          : 'local';
+
+  if (bothFailed && firebaseError) {
+    console.warn(`Both DBs queued locally (${colName}/${docId}):`, firebaseError);
+  }
+
+  return {
+    success: true,
+    isCachedLocally: bothFailed,
+    syncedTier,
+    ...(bothFailed && firebaseError ? { error: firebaseError } : {}),
+  };
+}
+
+function persistPendingQueue(queue: any[]) {
+  try {
+    if (typeof window === 'undefined') return;
+    const qKey = 'blackworm_pending_sync';
+    const trimmed = queue.slice(-500);
+    safeLocalStorageSet(qKey, JSON.stringify(trimmed));
+    void savePendingQueueToVault(queue);
+    emitSyncStatusEvent();
+  } catch {}
+}
+
+function setPendingSyncItem(
+  colName: string,
+  docId: string,
+  data: any,
+  options: any,
+  flags: { needsFirebase?: boolean; needsSecondary?: boolean; deleted?: boolean } = {}
+) {
+  try {
+    if (typeof window === 'undefined') return;
+    const qKey = 'blackworm_pending_sync';
+    const queueRaw = localStorage.getItem(qKey);
+    const queue: any[] = queueRaw ? JSON.parse(queueRaw) : [];
+    const idx = queue.findIndex((q) => q && q.collection === colName && q.id === docId);
+
+    const needsFirebase = flags.needsFirebase !== undefined ? flags.needsFirebase : true;
+    const needsSecondary = flags.needsSecondary !== undefined ? flags.needsSecondary : true;
+
+    if (!needsFirebase && !needsSecondary) {
+      if (idx >= 0) {
+        queue.splice(idx, 1);
+        persistPendingQueue(queue);
+      }
+      return;
     }
 
-    console.warn(`Firestore write queued for sync (${colName}/${docId}):`, rawMsg);
-
-    // Queue for background synchronization
-    addToPendingSync(colName, docId, data, options);
-
-    return {
-      success: true,
-      isCachedLocally: true,
-      error: rawMsg,
+    const item = {
+      collection: colName,
+      id: docId,
+      data: stripUndefined(data),
+      options: options || { merge: true },
+      timestamp: Date.now(),
+      needsFirebase,
+      needsSecondary,
+      deleted: Boolean(flags.deleted || data?.isArchived),
     };
-  }
+
+    if (idx >= 0) queue[idx] = item;
+    else queue.push(item);
+
+    persistPendingQueue(queue);
+  } catch {}
 }
 
 function addToPendingSync(colName: string, docId: string, data: any, options: any) {
-  try {
-    if (typeof window !== 'undefined') {
-      const qKey = 'blackworm_pending_sync';
-      const queueRaw = localStorage.getItem(qKey);
-      const queue: any[] = queueRaw ? JSON.parse(queueRaw) : [];
-      const idx = queue.findIndex((q) => q.collection === colName && q.id === docId);
-      const item = { collection: colName, id: docId, data, options, timestamp: Date.now() };
-      if (idx >= 0) queue[idx] = item;
-      else queue.push(item);
-      localStorage.setItem(qKey, JSON.stringify(queue.slice(-200)));
-    }
-  } catch {}
+  setPendingSyncItem(colName, docId, data, options, { needsFirebase: true, needsSecondary: true });
 }
 
 function removeFromPendingSync(colName: string, docId: string) {
@@ -153,62 +662,113 @@ function removeFromPendingSync(colName: string, docId: string) {
       const qKey = 'blackworm_pending_sync';
       const queueRaw = localStorage.getItem(qKey);
       if (!queueRaw) return;
-      let queue: any[] = JSON.parse(queueRaw);
-      const filtered = queue.filter((q) => !(q.collection === colName && q.id === docId));
+      const queue: any[] = JSON.parse(queueRaw);
+      const filtered = queue.filter((q) => !(q && q.collection === colName && q.id === docId));
       if (filtered.length !== queue.length) {
-        localStorage.setItem(qKey, JSON.stringify(filtered));
+        persistPendingQueue(filtered);
       }
     }
   } catch {}
 }
 
 /**
- * Background worker to sync pending data to Firestore
+ * Background worker that drains pending operations to both Primary (Firebase) and Secondary DB
+ * independently whenever each service or internet becomes available.
  */
 let isSyncing = false;
 let syncStarted = false;
 
 export async function startBackgroundSync() {
   if (typeof window === 'undefined') return;
+  initSecondaryStream();
 
   const processQueue = async () => {
-    if (isSyncing || isQuotaBlocked()) return;
+    if (isSyncing) return;
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+
+    const qKey = 'blackworm_pending_sync';
+    let queue: any[] = [];
+    try {
+      const queueRaw = localStorage.getItem(qKey);
+      if (queueRaw) queue = JSON.parse(queueRaw);
+      if (!Array.isArray(queue) || queue.length === 0) {
+        const vaultQueue = await loadPendingQueueFromVault();
+        if (Array.isArray(vaultQueue) && vaultQueue.length > 0) {
+          queue = vaultQueue;
+        }
+      }
+    } catch {
+      localStorage.removeItem(qKey);
+      return;
+    }
+
+    if (!Array.isArray(queue) || queue.length === 0) return;
+
+    const firebaseUp = !isQuotaBlocked();
+    const secondaryUp = !isSecondaryBlocked();
+    if (!firebaseUp && !secondaryUp) return;
+
     isSyncing = true;
     try {
-      const qKey = 'blackworm_pending_sync';
-      const queueRaw = localStorage.getItem(qKey);
-      if (!queueRaw) {
-        isSyncing = false;
-        return;
-      }
-
-      const queue: any[] = JSON.parse(queueRaw);
-      if (queue.length === 0) {
-        isSyncing = false;
-        return;
-      }
-
       const remaining: any[] = [];
-      for (const item of queue) {
-        if (isQuotaBlocked()) {
-          remaining.push(...queue.slice(queue.indexOf(item)));
-          break;
-        }
-        try {
-          await setDoc(doc(db, item.collection, item.id), item.data, item.options);
-        } catch (err: any) {
-          const rawMsg = err instanceof Error ? err.message : String(err);
-          const isQuota = rawMsg.toLowerCase().includes('quota') || rawMsg.toLowerCase().includes('resource_exhausted') || rawMsg.toLowerCase().includes('resource-exhausted');
-          if (isQuota) {
-            setQuotaBlocked(30 * 60 * 1000); // 30 minute backoff
-            remaining.push(...queue.slice(queue.indexOf(item)));
-            break;
+      for (let i = 0; i < queue.length; i++) {
+        const item = queue[i];
+        if (!item || !item.collection || !item.id) continue;
+
+        let needsFb = item.needsFirebase !== false;
+        let needsSec = item.needsSecondary !== false;
+        let dropItem = false;
+
+        // 1. Primary (Firebase) replay
+        if (needsFb && !isQuotaBlocked()) {
+          try {
+            const payload = stripUndefined(item.data || {});
+            await setDoc(doc(db, item.collection, item.id), payload, item.options || { merge: true });
+            trackFirestoreUsage('write', 1);
+            needsFb = false;
+          } catch (err: any) {
+            const rawMsg = err instanceof Error ? err.message : String(err);
+            const lower = rawMsg.toLowerCase();
+            if (isQuotaErrorMsg(rawMsg)) {
+              setQuotaBlocked(30 * 60 * 1000);
+            } else if (
+              lower.includes('invalid-argument') ||
+              lower.includes('unsupported field value') ||
+              lower.includes('exceeds the maximum allowed size')
+            ) {
+              console.warn(`Dropped invalid queued Firebase sync item (${item.collection}/${item.id}):`, rawMsg);
+              dropItem = true;
+            }
           }
-          remaining.push(item);
+        }
+
+        // 2. Secondary DB replay
+        if (!dropItem && needsSec && !isSecondaryBlocked()) {
+          const secRes = await pushToSecondary({
+            collection: item.collection,
+            id: item.id,
+            doc: stripUndefined(item.data || {}),
+            updatedAtMs: item.timestamp || Date.now(),
+            deleted: Boolean(item.deleted || item.data?.isArchived),
+            merge: item.options?.merge !== false,
+          });
+          if (secRes.ok) {
+            needsSec = false;
+          }
+        }
+
+        if (!dropItem && (needsFb || needsSec)) {
+          remaining.push({
+            ...item,
+            needsFirebase: needsFb,
+            needsSecondary: needsSec,
+          });
+        } else if (!needsFb && !needsSec) {
+          clearLocalSavedMarker(item.collection, item.id);
         }
       }
 
-      localStorage.setItem(qKey, JSON.stringify(remaining));
+      persistPendingQueue(remaining);
     } catch (e) {
       console.error('Background sync error:', e);
     } finally {
@@ -220,127 +780,148 @@ export async function startBackgroundSync() {
 
   if (!syncStarted) {
     syncStarted = true;
-    window.addEventListener('online', processQueue);
-    window.addEventListener('focus', processQueue);
-    setInterval(processQueue, 60000); // Check every 60s
+    window.addEventListener('online', () => {
+      initSecondaryStream();
+      void processQueue();
+    });
+    window.addEventListener('focus', () => {
+      void processQueue();
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        void processQueue();
+      }
+    });
+    setInterval(() => {
+      void processQueue();
+    }, 60000);
   }
 }
 
 /**
- * Safe Firestore update helper with retries
+ * 3-Tier update helper with automatic Secondary DB failover & offline queue
  */
 export async function safeFirestoreUpdate(
   colName: string,
   docId: string,
   data: any,
   retryCount = 0
-): Promise<{ success: boolean; error?: string }> {
-  // Update local collection cache immediately
-  try {
-    const storageKey = `blackworm_local_${colName}`;
-    const raw = typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null;
-    if (raw) {
-      const map = JSON.parse(raw);
-      if (map[docId]) {
-        map[docId] = { ...map[docId], ...data, updatedAt: new Date().toISOString(), _localSavedAt: new Date().toISOString() };
-        localStorage.setItem(storageKey, JSON.stringify(map));
-      }
-    }
-  } catch (e) {
-    console.warn(`Local cache update notice for ${colName}/${docId}:`, e);
-  }
+): Promise<{ success: boolean; isCachedLocally?: boolean; error?: string }> {
+  const nowIso = new Date().toISOString();
+  const cleanData = stripUndefined({
+    ...data,
+    updatedAt: nowIso,
+  });
+
+  writeLocalCollectionRecord(colName, docId, cleanData, true, true);
 
   const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
   if (isCurrentlyOffline) {
-    addToPendingSync(colName, docId, data, { merge: true });
-    return { success: true };
+    setPendingSyncItem(colName, docId, cleanData, { merge: true }, {
+      needsFirebase: true,
+      needsSecondary: true,
+    });
+    return { success: true, isCachedLocally: true };
   }
 
-  try {
-    await updateDoc(doc(db, colName, docId), {
-      ...data,
-      updatedAt: new Date().toISOString(),
-    });
-    removeFromPendingSync(colName, docId);
-    return { success: true };
-  } catch (err: any) {
-    const rawMsg = err instanceof Error ? err.message : String(err);
-    const isNetworkError = rawMsg.toLowerCase().includes('network') || rawMsg.toLowerCase().includes('unavailable') || rawMsg.toLowerCase().includes('offline');
-    
-    if (isNetworkError && retryCount < 3) {
-      const delay = Math.pow(2, retryCount) * 1000;
-      await new Promise(resolve => setTimeout(resolve, delay));
-      return safeFirestoreUpdate(colName, docId, data, retryCount + 1);
+  let needsFirebase = true;
+  let needsSecondary = true;
+  let firebaseError = '';
+
+  const updatePrimary = async (attempt = retryCount): Promise<void> => {
+    if (isQuotaBlocked()) return;
+    try {
+      await updateDoc(doc(db, colName, docId), cleanData);
+      trackFirestoreUsage('write', 1);
+      needsFirebase = false;
+    } catch (err: any) {
+      const rawMsg = err instanceof Error ? err.message : String(err);
+      firebaseError = rawMsg;
+      if (isQuotaErrorMsg(rawMsg)) {
+        setQuotaBlocked(15 * 60 * 1000);
+        return;
+      }
+      const lower = rawMsg.toLowerCase();
+      if (lower.includes('no document to update') || lower.includes('not-found')) {
+        try {
+          await setDoc(doc(db, colName, docId), { ...cleanData, id: docId }, { merge: true });
+          trackFirestoreUsage('write', 1);
+          needsFirebase = false;
+          return;
+        } catch {}
+      }
+      const isNetworkError =
+        lower.includes('network') || lower.includes('unavailable') || lower.includes('offline');
+      if (isNetworkError && attempt < 2) {
+        const delay = Math.pow(2, attempt) * 600;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        return updatePrimary(attempt + 1);
+      }
     }
-    
-    addToPendingSync(colName, docId, data, { merge: true });
-    return { success: false, error: rawMsg };
+  };
+
+  const updateSecondary = async (): Promise<void> => {
+    const secRes = await pushToSecondary({
+      collection: colName,
+      id: docId,
+      doc: cleanData,
+      updatedAtMs: Date.now(),
+      merge: true,
+    });
+    if (secRes.ok) {
+      needsSecondary = false;
+    }
+  };
+
+  await Promise.all([updatePrimary(), updateSecondary()]);
+
+  if (needsFirebase || needsSecondary) {
+    setPendingSyncItem(colName, docId, cleanData, { merge: true }, {
+      needsFirebase,
+      needsSecondary,
+    });
+  } else {
+    removeFromPendingSync(colName, docId);
+    clearLocalSavedMarker(colName, docId);
   }
+
+  const bothFailed = needsFirebase && needsSecondary;
+  return {
+    success: !bothFailed || true,
+    isCachedLocally: bothFailed,
+    ...(bothFailed && firebaseError ? { error: firebaseError } : {}),
+  };
 }
 
 /**
- * Safe Firestore add helper with retries
+ * 3-Tier add helper generating a deterministic unique ID when Primary is unavailable
+ * so Secondary DB and subsequent Firebase sync share the exact same ID without duplicates.
  */
 export async function safeFirestoreAdd(
   colName: string,
   data: any,
   retryCount = 0
 ): Promise<{ success: boolean; id?: string; error?: string }> {
-  const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
-  if (isCurrentlyOffline) {
-    const tempId = `temp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-    try {
-      const storageKey = `blackworm_local_${colName}`;
-      const raw = typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null;
-      const map = raw ? JSON.parse(raw) : {};
-      map[tempId] = {
-        ...data,
-        id: tempId,
-        _localSavedAt: new Date().toISOString(),
-      };
-      if (typeof window !== 'undefined') {
-        localStorage.setItem(storageKey, JSON.stringify(map));
-      }
-    } catch {}
-    addToPendingSync(colName, tempId, data, { merge: true });
-    return { success: true, id: tempId };
-  }
+  const nowIso = new Date().toISOString();
+  const cleanData = stripUndefined({
+    ...data,
+    createdAt: data?.createdAt || nowIso,
+    updatedAt: data?.updatedAt || nowIso,
+  });
 
-  try {
-    const docRef = await addDoc(collection(db, colName), {
-      ...data,
-      createdAt: data.createdAt || new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
-    return { success: true, id: docRef.id };
-  } catch (err: any) {
-    const rawMsg = err instanceof Error ? err.message : String(err);
-    const isNetworkError = rawMsg.toLowerCase().includes('network') || rawMsg.toLowerCase().includes('unavailable') || rawMsg.toLowerCase().includes('offline');
-    
-    if (isNetworkError && retryCount < 3) {
-      const delay = Math.pow(2, retryCount) * 1000;
-      await new Promise(resolve => setTimeout(resolve, delay));
-      return safeFirestoreAdd(colName, data, retryCount + 1);
-    }
-    
-    // For addDoc, we don't have a docId yet, so we generate one for the queue
-    const tempId = `temp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-    try {
-      const storageKey = `blackworm_local_${colName}`;
-      const raw = typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null;
-      const map = raw ? JSON.parse(raw) : {};
-      map[tempId] = {
-        ...data,
-        id: tempId,
-        _localSavedAt: new Date().toISOString(),
-      };
-      if (typeof window !== 'undefined') {
-        localStorage.setItem(storageKey, JSON.stringify(map));
-      }
-    } catch {}
-    addToPendingSync(colName, tempId, data, { merge: true });
-    return { success: false, id: tempId, error: rawMsg };
-  }
+  // Always allocate a deterministic ID upfront when offline/quota-blocked, or write via Firebase doc() ref
+  const generatedId =
+    cleanData.id && typeof cleanData.id === 'string' && !cleanData.id.startsWith('temp_')
+      ? cleanData.id
+      : doc(collection(db, colName)).id;
+
+  const docWithId = { ...cleanData, id: generatedId };
+  const res = await safeFirestoreSet(colName, generatedId, docWithId, { merge: true }, retryCount);
+  return {
+    success: res.success,
+    id: generatedId,
+    ...(res.error ? { error: res.error } : {}),
+  };
 }
 
 export function getPendingSyncCount(): number {
@@ -350,7 +931,8 @@ export function getPendingSyncCount(): number {
     const queueRaw = localStorage.getItem(qKey);
     if (!queueRaw) return 0;
     const queue: any[] = JSON.parse(queueRaw);
-    return queue.length;
+    if (!Array.isArray(queue)) return 0;
+    return queue.filter((q) => q && (q.needsFirebase !== false || q.needsSecondary !== false)).length;
   } catch {
     return 0;
   }
@@ -400,45 +982,113 @@ export function normalizeKey(s: any): string {
  */
 export function normalizePackingSize(raw: any): string {
   if (!raw) return '1 Kg';
-  const s = String(raw).toLowerCase().trim();
-  
-  if (/2\.5\s*(kg|kilo|bucket|bag|nos|\*|x)|2500\s*(gm|g)\b/.test(s)) {
+  const s = String(raw).toLowerCase().replace(/\s+/g, ' ').trim();
+  const hasBucket = /\bbucket\b/i.test(s);
+
+  // Strip piece-count multipliers (e.g. "* 25 Nos", "* 8 Nos", ".*20 Nos", "* 4 Ns", "* 20 N0s", "* 1 No.")
+  // BEFORE extracting container weight/volume so "1Kg * 25 Nos" never gets misread as "25 Kg".
+  const base = s
+    .replace(/\s*\.?\s*[\*x×]\s*\d+\s*n[o0]?s?\.?/gi, '')
+    .replace(/\s*\.?\s*[\*x×]\s*\d+\s*pcs?\.?/gi, '')
+    .trim();
+
+  if (/(?:^|[^\d.])10(?:\.0)?\s*(ltr|litre|l\b)/.test(base)) {
+    return '10 Ltr';
+  }
+  if (/(?:^|[^\d.])10(?:\.0)?\s*(kg|kilo|bucket|bag)/.test(base)) {
+    return hasBucket ? '10 Kg Bucket' : '10 Kg';
+  }
+  if (/2\.5\s*(ltr|litre|l\b)/.test(base)) {
+    return '2.5 Ltr';
+  }
+  if (/2\.5\s*(kg|kilo|bucket|bag)|2500\s*(gm|g)\b/.test(base)) {
     return '2.5 Kg';
   }
-  if (/(?:^|[^\d.])25(?:\.0)?\s*(kg|kilo|hdpe|bag|nos|\*|x)/.test(s)) {
+  if (/(?:^|[^\d.])2(?:\.0)?\s*(kg|kilo)/.test(base)) {
+    return '2 Kg';
+  }
+  if (/(?:^|[^\d.])25(?:\.0)?\s*(kg|kilo|hdpe|bag)/.test(base)) {
     return '25 Kg';
   }
-  if (/(?:^|[^\d.])50(?:\.0)?\s*(kg|kilo|bag)/.test(s)) {
+  if (/(?:^|[^\d.])50(?:\.0)?\s*(kg|kilo|bag)/.test(base)) {
     return '50 Kg';
   }
-  if (/(?:^|[^\d.])1(?:\.0)?\s*(kg|kilo|box|bag|nos|\*|x)|1000\s*(gm|g)\b/.test(s)) {
-    return '1 Kg';
-  }
-  if (/500\s*(gm|g)|0\.5\s*kg/.test(s)) {
-    return '500 gm';
-  }
-  if (/250\s*(gm|g)|0\.25\s*kg/.test(s)) {
-    return '250 gm';
-  }
-  if (/100\s*(gm|g)|0\.1\s*kg/.test(s)) {
-    return '100 gm';
-  }
-  if (/5\s*(ltr|litre|l\b)/.test(s)) {
+  if (/(?:^|[^\d.])5(?:\.0)?\s*(ltr|litre|l\b)/.test(base)) {
     return '5 Ltr';
   }
-  if (/1\s*(ltr|litre|l\b)/.test(s)) {
+  if (/(?:^|[^\d.])5(?:\.0)?\s*(kg|kilo)/.test(base)) {
+    return '5 Kg';
+  }
+  if (/(?:^|[^\d.])1(?:\.0)?\s*(ltr|litre|l\b)/.test(base)) {
     return '1 Ltr';
   }
-  if (/500\s*ml/.test(s)) {
+  if (/(?:^|[^\d.])1(?:\.0)?\s*(kg|kilo|box|bag)|1000\s*(gm|g)\b/.test(base)) {
+    return '1 Kg';
+  }
+  if (/500\s*ml/.test(base)) {
     return '500 ml';
   }
-  if (/250\s*ml/.test(s)) {
+  if (/500\s*(gm|g)|0\.5\s*kg/.test(base)) {
+    return '500 gm';
+  }
+  if (/250\s*ml/.test(base)) {
     return '250 ml';
   }
-  if (/100\s*ml/.test(s)) {
+  if (/250\s*(gm|g)|0\.25\s*kg/.test(base)) {
+    return '250 gm';
+  }
+  if (/100\s*ml/.test(base)) {
     return '100 ml';
   }
+  if (/100\s*(gm|g)|0\.1\s*kg/.test(base)) {
+    return '100 gm';
+  }
   return String(raw).replace(/\s+/g, ' ').trim();
+}
+
+const PACKING_SORT_ORDER: Record<string, number> = {
+  '100 ml': 10,
+  '100 gm': 20,
+  '250 ml': 30,
+  '250 gm': 40,
+  '500 ml': 50,
+  '500 gm': 60,
+  '1 Ltr': 70,
+  '1 Kg': 80,
+  '2 Kg': 90,
+  '2.5 Ltr': 100,
+  '2.5 Kg': 110,
+  '5 Ltr': 120,
+  '5 Kg': 125,
+  '10 Ltr': 130,
+  '10 Kg': 140,
+  '10 Kg Bucket': 145,
+  '25 Kg': 150,
+  '50 Kg': 160,
+};
+
+export function getPackingSortWeight(packingSize: any): number {
+  const norm = normalizePackingSize(packingSize);
+  if (PACKING_SORT_ORDER[norm] !== undefined) {
+    return PACKING_SORT_ORDER[norm];
+  }
+  const lower = norm.toLowerCase();
+  const numMatch = lower.match(/(\d+(?:\.\d+)?)/);
+  const num = numMatch ? parseFloat(numMatch[1]) : 0;
+  if (lower.includes('ml') || lower.includes('gm')) {
+    return 1000 + num * 0.001;
+  }
+  return 1000 + num;
+}
+
+export function sortPackings<T extends { packingSize?: any; rate?: any }>(packings: T[]): T[] {
+  if (!Array.isArray(packings)) return [];
+  return [...packings].sort((a, b) => {
+    const wA = getPackingSortWeight(a?.packingSize);
+    const wB = getPackingSortWeight(b?.packingSize);
+    if (wA !== wB) return wA - wB;
+    return (Number(a?.rate) || 0) - (Number(b?.rate) || 0);
+  });
 }
 
 /**
@@ -492,12 +1142,157 @@ export function getCanonicalFertilizerKey(gradeOrName: any): string {
 }
 
 /**
+ * Standardizes product group / category names to prevent split sections
+ */
+export function normalizeProductGroupName(g: any): string {
+  const s = String(g || '').trim();
+  const lower = s.toLowerCase();
+  if (lower.includes('specialty') || lower.includes('speciality') || lower.includes('स्पेशालिटी') || lower.includes('स्पेशल')) {
+    return 'Specialty Grades';
+  }
+  if (
+    lower.includes('group a') ||
+    lower.includes('group-a') ||
+    lower.includes('a group') ||
+    lower.includes('gr. a') ||
+    lower.includes('gr a') ||
+    lower === 'a' ||
+    lower.includes('water soluble') ||
+    lower.includes('ग्रुप अ') ||
+    lower.includes('गट अ')
+  ) {
+    return 'Group A - Water Soluble Fertilizers';
+  }
+  if (
+    lower.includes('group b') ||
+    lower.includes('group-b') ||
+    lower.includes('b group') ||
+    lower.includes('b-group') ||
+    lower.includes('gr. b') ||
+    lower.includes('gr b') ||
+    lower === 'b' ||
+    /^b\s*[-–:]/.test(lower) ||
+    lower.includes('micronutrient') ||
+    lower.includes('micro nutrient') ||
+    lower.includes('micro') ||
+    lower.includes('ग्रुप ब') ||
+    lower.includes('गट ब')
+  ) {
+    return 'Group B - Micronutrients';
+  }
+  if (
+    lower.includes('group c') ||
+    lower.includes('group-c') ||
+    lower.includes('c group') ||
+    lower.includes('c-group') ||
+    lower.includes('gr. c') ||
+    lower.includes('gr c') ||
+    lower === 'c' ||
+    /^c\s*[-–:]/.test(lower) ||
+    lower.includes('growth regulator') ||
+    lower.includes('plant growth') ||
+    lower.includes('pgr') ||
+    lower.includes('stimulant') ||
+    lower.includes('ग्रुप क') ||
+    lower.includes('गट क')
+  ) {
+    return 'Group C - Plant Growth Regulators';
+  }
+  return s.replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Cleans gradeName and brandName to ensure brand is never repeated inside grade
+ */
+export function cleanProductGradeAndBrand(brand: any, grade: any): { brandName: string; gradeName: string } {
+  let b = String(brand || '').replace(/\s+/g, ' ').trim() || 'Airawat®';
+  let g = String(grade || '').replace(/\s+/g, ' ').trim();
+
+  // Strip leading numbering or codes like "C 1.", "B 1.", "A 1.", "S 1.", "1."
+  g = g.replace(/^[A-Za-z]?\s*\d+\s*[\.\-\)]\s*/i, '').trim();
+
+  // If grade starts with brand name (with or without symbol), strip brand from grade
+  if (b) {
+    const bClean = b.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const gClean = g.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (gClean.startsWith(bClean) && g.length > b.length) {
+      // Find the slice point
+      const matchedPrefix = g.match(new RegExp(`^${b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[®™]?\\s*`, 'i'));
+      if (matchedPrefix) {
+        g = g.slice(matchedPrefix[0].length).trim();
+      } else {
+        // Fallback by length of letters
+        const stripped = g.replace(/^[A-Za-z0-9®™\s\-_]+\b/i, (match) => {
+          if (match.toLowerCase().replace(/[^a-z0-9]/g, '') === bClean) return '';
+          return match;
+        }).trim();
+        if (stripped) g = stripped;
+      }
+    }
+  }
+
+  // Common Blackworm brand names prefix check
+  const knownBrands = [
+    'BioVinS2® Plus', 'BioVinS2®', '4 Star', 'Black Gold™', 'AminoX', 'Fulvi Grow',
+    'Siliboost®', 'Megaenergeol®', 'Strange Super™', 'Strange™', 'UV Guard™', 'Neemaza',
+    'V-Lin', 'Blackelp', 'Blackworm Sulphur', 'Bullet™', 'Phantom™', 'Fungifight™ - P',
+    'Fungifight™ - L', 'Whitewash™', 'KICK®', 'DRONA™', 'Sparsh™', 'Nutri Excel',
+    'Microgrip DF®', 'Microgrip®', 'Nutrijet', 'Nutriva', 'BW Combi®', 'Nutrizen',
+    'Zingo', 'PoMag®', 'BLOW - B', 'BLOW - Fe', 'BLOW - Zn', 'Blackworm’s VAM',
+    'BLOW - Ca', 'BLOW - Mg', 'FENZO', 'BLACKWORM CMB'
+  ];
+
+  for (const kb of knownBrands) {
+    const kbClean = kb.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const gClean = g.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (gClean.startsWith(kbClean) && gClean.length > kbClean.length) {
+      if (!b || b === 'Airawat®') b = kb;
+      const stripped = g.replace(new RegExp(`^${kb.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*`, 'i'), '').trim();
+      if (stripped) g = stripped;
+      break;
+    }
+  }
+
+  const finalGrade = (g || String(grade || '')).replace(/\s+/g, ' ').trim();
+  return { brandName: b, gradeName: finalGrade };
+}
+
+/**
  * Resolves a unique canonical key for any product object
+ * Prioritizes (Group + Serial Code) so B 1. to B 16. and C 1. to C 27. never duplicate
  */
 export function getCanonicalProductKey(p: any): string {
   if (!p) return '';
-  const gradeKey = getCanonicalFertilizerKey(p.gradeName || p.name);
-  if (gradeKey) return gradeKey;
+  const normGroup = normalizeProductGroupName(p.groupName);
+  
+  // 1. Group + Numeric Code Match (e.g. Group B + B 1. or 1. -> grp_b_1)
+  const codeStr = String(p.code || '').trim();
+  const numMatch = codeStr.match(/(\d+)/);
+  if (numMatch) {
+    const num = parseInt(numMatch[1], 10);
+    let groupPrefix = '';
+    if (normGroup.includes('Group A')) groupPrefix = 'grp_a';
+    else if (normGroup.includes('Specialty')) groupPrefix = 'grp_s';
+    else if (normGroup.includes('Group B')) groupPrefix = 'grp_b';
+    else if (normGroup.includes('Group C')) groupPrefix = 'grp_c';
+
+    if (groupPrefix && num > 0) {
+      return `${groupPrefix}_${num}`;
+    }
+  }
+
+  // 2. Canonical Fertilizer / Nutrient Ratio / Chemical Key
+  const { gradeName } = cleanProductGradeAndBrand(p.brandName, p.gradeName || p.name);
+  const gradeKey = getCanonicalFertilizerKey(gradeName);
+  if (gradeKey) {
+    let groupPrefix = '';
+    if (normGroup.includes('Group A')) groupPrefix = 'grp_a';
+    else if (normGroup.includes('Specialty')) groupPrefix = 'grp_s';
+    else if (normGroup.includes('Group B')) groupPrefix = 'grp_b';
+    else if (normGroup.includes('Group C')) groupPrefix = 'grp_c';
+    return groupPrefix ? `${groupPrefix}_${gradeKey}` : gradeKey;
+  }
+
   if (p.code) {
     const codeClean = String(p.code).toLowerCase().replace(/[^a-z0-9]/g, '');
     if (codeClean && !codeClean.startsWith('item')) return codeClean;
@@ -507,7 +1302,7 @@ export function getCanonicalProductKey(p: any): string {
 
 /**
  * Deduplicates product list so no product ever appears duplicated.
- * Matches by invariant canonical nutrient keys & chemical names.
+ * Matches by invariant canonical keys (Group + Code and Nutrient/Chemical names).
  * When duplicate entries or packing rows occur, combines packings seamlessly
  * without duplicate packing sizes or conflicting rates.
  */
@@ -517,33 +1312,58 @@ export function deduplicateProducts<T = any>(products: T[]): T[] {
 
   products.forEach((p: any) => {
     if (!p) return;
-    const key = getCanonicalProductKey(p);
-    if (!key) {
-      if (p.id) map.set(p.id, p);
-      return;
-    }
+    const normGroup = normalizeProductGroupName(p.groupName);
+    const { brandName, gradeName } = cleanProductGradeAndBrand(p.brandName, p.gradeName || p.name);
 
-    // Standardize packing list for incoming item
-    const incomingPackings: any[] = [];
+    // Standardize packing list for incoming item (with Group A 1Kg self-healing & ascending sort)
+    const incomingPackingsRaw: any[] = [];
     if (Array.isArray(p.packings) && p.packings.length > 0) {
       p.packings.forEach((pk: any) => {
         if (!pk) return;
-        const normSize = normalizePackingSize(pk.packingSize);
+        let normSize = normalizePackingSize(pk.packingSize);
         const rate = Number(pk.rate) || 0;
         const mrp = Number(pk.mrp) || 0;
-        incomingPackings.push({ ...pk, packingSize: normSize, rate, mrp });
+        // Self-heal Group A & Specialty single-kg pouches that were previously misclassified as "25 Kg" due to "1Kg * 25 Nos"
+        if ((normGroup.includes('Group A') || normGroup.includes('Specialty')) && normSize === '25 Kg' && rate > 0 && rate < 1000) {
+          normSize = '1 Kg';
+        }
+        const existingIdx = incomingPackingsRaw.findIndex((ep: any) => ep.packingSize === normSize);
+        if (existingIdx >= 0) {
+          incomingPackingsRaw[existingIdx] = {
+            ...incomingPackingsRaw[existingIdx],
+            packingSize: normSize,
+            rate: rate > 0 ? rate : incomingPackingsRaw[existingIdx].rate,
+            mrp: mrp > 0 ? mrp : incomingPackingsRaw[existingIdx].mrp,
+          };
+        } else {
+          incomingPackingsRaw.push({ ...pk, packingSize: normSize, rate, mrp });
+        }
       });
+    }
+    const incomingPackings = sortPackings(incomingPackingsRaw);
+
+    const key = getCanonicalProductKey({ ...p, groupName: normGroup, gradeName, brandName });
+    if (!key) {
+      if (p.id) map.set(p.id, { ...p, groupName: normGroup, gradeName, brandName, packings: incomingPackings });
+      return;
     }
 
     if (!map.has(key)) {
-      map.set(key, { ...p, packings: incomingPackings });
+      map.set(key, {
+        ...p,
+        groupName: normGroup,
+        brandName,
+        gradeName,
+        packings: incomingPackings,
+        isArchived: false,
+      });
     } else {
       const existing: any = map.get(key)!;
       const existingPackings: any[] = Array.isArray(existing.packings) ? [...existing.packings] : [];
 
       incomingPackings.forEach((pk: any) => {
         const pkSize = pk.packingSize;
-        const idx = existingPackings.findIndex((ep: any) => normalizePackingSize(ep?.packingSize) === pkSize);
+        const idx = existingPackings.findIndex((ep: any) => ep?.packingSize === pkSize);
         if (idx >= 0) {
           existingPackings[idx] = {
             ...existingPackings[idx],
@@ -560,6 +1380,12 @@ export function deduplicateProducts<T = any>(products: T[]): T[] {
         }
       });
 
+      // Keep cleanest gradeName: prefer gradeName that does NOT contain brandName
+      let chosenGrade = existing.gradeName;
+      if (chosenGrade.toLowerCase().includes(brandName.toLowerCase().replace(/[®™]/g, '')) && !gradeName.toLowerCase().includes(brandName.toLowerCase().replace(/[®™]/g, ''))) {
+        chosenGrade = gradeName;
+      }
+
       const preferExistingCode = existing.code && !String(existing.code).startsWith('item_');
       const preferIncomingId = existing.id?.startsWith('temp_');
 
@@ -567,12 +1393,12 @@ export function deduplicateProducts<T = any>(products: T[]): T[] {
         ...existing,
         ...p,
         id: preferIncomingId ? (p.id || existing.id) : (existing.id || p.id),
-        packings: existingPackings,
-        groupName: existing.groupName || p.groupName || 'Group A - Water Soluble Fertilizers',
-        brandName: existing.brandName || p.brandName || 'Airawat®',
+        packings: sortPackings(existingPackings),
+        groupName: normGroup,
+        brandName: (brandName && brandName !== 'Airawat®') ? brandName : existing.brandName,
         code: preferExistingCode ? existing.code : (p.code || existing.code),
-        gradeName: existing.gradeName || p.gradeName,
-        hsn: existing.hsn || p.hsn,
+        gradeName: chosenGrade,
+        hsn: p.hsn || existing.hsn,
         gstRate: p.gstRate !== undefined ? p.gstRate : existing.gstRate,
         orderIndex: existing.orderIndex || p.orderIndex,
         isArchived: false,
@@ -581,7 +1407,32 @@ export function deduplicateProducts<T = any>(products: T[]): T[] {
     }
   });
 
-  return Array.from(map.values()) as unknown as T[];
+  const list = Array.from(map.values()).map((item: any) => ({
+    ...item,
+    packings: sortPackings(item.packings || []),
+  }));
+
+  // Sort by official Group order and numeric serial number
+  list.sort((a, b) => {
+    const getGroupWeight = (g: string) => {
+      if (g.includes('Group A')) return 1;
+      if (g.includes('Specialty')) return 2;
+      if (g.includes('Group B')) return 3;
+      if (g.includes('Group C')) return 4;
+      return 5;
+    };
+    const wA = getGroupWeight(a.groupName);
+    const wB = getGroupWeight(b.groupName);
+    if (wA !== wB) return wA - wB;
+
+    const numA = parseInt(String(a.code || '').replace(/\D/g, '') || '0', 10);
+    const numB = parseInt(String(b.code || '').replace(/\D/g, '') || '0', 10);
+    if (numA !== numB) return numA - numB;
+
+    return (a.orderIndex || 0) - (b.orderIndex || 0);
+  });
+
+  return list as unknown as T[];
 }
 
 /**
@@ -708,48 +1559,67 @@ export function deduplicateCollections<T = any>(entries: T[]): T[] {
  */
 export function mergeWithLocalData<T extends { id: string }>(
   colName: string,
-  serverItems: T[]
+  serverItems: T[],
+  options?: { archivedIds?: Set<string>; authoritativeServer?: boolean }
 ): T[] {
   try {
-    if (typeof window === 'undefined') return serverItems;
+    if (typeof window === 'undefined') {
+      return (serverItems || []).filter((it: any) => it && !it.isArchived);
+    }
     const storageKey = `blackworm_local_${colName}`;
+    const pendingIds = getPendingSyncIdSet(colName);
+    const archivedSet = new Set<string>(options?.archivedIds ? Array.from(options.archivedIds) : []);
+    (serverItems || []).forEach((it: any) => {
+      if (it && it.id && it.isArchived) {
+        archivedSet.add(it.id);
+      }
+    });
 
     // Automatically update local cache whenever fresh server data arrives
     if (serverItems && serverItems.length > 0) {
       updateCollectionCache(colName, serverItems);
     }
 
+    const activeServerItems = (serverItems || []).filter((it: any) => it && !it.isArchived);
     const raw = localStorage.getItem(storageKey);
     if (!raw) {
-      if (colName === 'dealers_application' || colName === 'dealers') return deduplicateDealers(serverItems as any) as unknown as T[];
-      if (colName === 'orders') return deduplicateOrders(serverItems as any) as unknown as T[];
-      if (colName === 'collection_entries') return deduplicateCollections(serverItems as any) as unknown as T[];
-      if (colName === 'products_pricelist_v2' || colName === 'products') return deduplicateProducts(serverItems as any) as unknown as T[];
-      return serverItems;
+      if (colName === 'dealers_application' || colName === 'dealers') return deduplicateDealers(activeServerItems as any) as unknown as T[];
+      if (colName === 'orders') return deduplicateOrders(activeServerItems as any) as unknown as T[];
+      if (colName === 'collection_entries') return deduplicateCollections(activeServerItems as any) as unknown as T[];
+      if (colName === 'products_pricelist_v2' || colName === 'products') return deduplicateProducts(activeServerItems as any) as unknown as T[];
+      return activeServerItems;
     }
-    
+
     let map: Record<string, any>;
     try {
-      map = JSON.parse(raw);
+      const parsed = JSON.parse(raw);
+      map = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
     } catch (e) {
       console.warn(`Local cache corrupt for ${colName}, clearing.`);
       localStorage.removeItem(storageKey);
-      return serverItems;
+      return activeServerItems;
     }
-    
+
     const mergedMap = new Map<string, any>();
 
-    // First insert server items
-    serverItems.forEach((it) => {
+    // First insert active server items
+    activeServerItems.forEach((it) => {
       if (it && it.id) mergedMap.set(it.id, it);
     });
 
-    // Clean up temporary items from map if server already has the real document!
+    // Clean up temporary or archived items from local map when server confirms
     let mapMutated = false;
+    archivedSet.forEach((archId) => {
+      if (archId in map && !pendingIds.has(archId)) {
+        delete map[archId];
+        mapMutated = true;
+      }
+    });
+
     Object.keys(map).forEach((id) => {
       if (id.startsWith('temp_')) {
         const tempItem = map[id];
-        const hasMatch = serverItems.some((s: any) => {
+        const hasMatch = activeServerItems.some((s: any) => {
           if (s.orderNumber && tempItem.orderNumber && s.orderNumber === tempItem.orderNumber) return true;
           if (s.dealerCode && tempItem.dealerCode && s.dealerCode === tempItem.dealerCode) return true;
           if (s.receiptNumber && tempItem.receiptNumber && s.receiptNumber === tempItem.receiptNumber) return true;
@@ -769,22 +1639,32 @@ export function mergeWithLocalData<T extends { id: string }>(
       } catch {}
     }
 
-    // Then overlay/append locally saved items (retaining offline changes)
+    // Overlay locally saved items ONLY when they are genuinely pending sync (prevents clock skew overwriting fresh server updates)
     Object.entries(map).forEach(([id, localDoc]) => {
+      if (!localDoc || localDoc.isArchived || archivedSet.has(id)) {
+        mergedMap.delete(id);
+        return;
+      }
+      const isPending = pendingIds.has(id) || id.startsWith('temp_');
       if (mergedMap.has(id)) {
         const serverItem = mergedMap.get(id);
-        const localTime = new Date(localDoc._localSavedAt || localDoc.updatedAt || 0).getTime();
-        const serverTime = new Date(serverItem.updatedAt || serverItem.createdAt || 0).getTime();
-        
-        if (localTime > serverTime) {
-          mergedMap.set(id, { ...serverItem, ...localDoc });
+        if (serverItem?.isArchived) {
+          mergedMap.delete(id);
+          return;
         }
-      } else {
+        if (isPending) {
+          const localTime = toTimestampMs(localDoc._localSavedAt || localDoc.updatedAt);
+          const serverTime = toTimestampMs(serverItem.updatedAt || serverItem.createdAt);
+          if (localTime > serverTime) {
+            mergedMap.set(id, { ...serverItem, ...localDoc });
+          }
+        }
+      } else if (!options?.authoritativeServer || isPending) {
         mergedMap.set(id, localDoc);
       }
     });
 
-    let mergedList = Array.from(mergedMap.values());
+    let mergedList = Array.from(mergedMap.values()).filter((it) => it && !it.isArchived);
 
     // Apply collection-specific intelligent deduplication
     if (colName === 'dealers_application' || colName === 'dealers') {
@@ -929,12 +1809,7 @@ export async function exportAllData() {
 
   const jsonStr = JSON.stringify(backup, null, 2);
   const blob = new Blob([jsonStr], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `blackworm_backup_${new Date().toISOString().slice(0, 10)}.json`;
-  a.click();
-  URL.revokeObjectURL(url);
+  triggerBlobDownload(blob, `blackworm_backup_${getLocalDateStr()}.json`);
 }
 
 export async function seedInitialDataIfEmpty(user: UserProfile) {
@@ -1012,195 +1887,172 @@ export async function syncOfficerDetailsEverywhere(
   const extraOldName = (extraIdentifiers?.oldName || '').trim().toUpperCase();
   const extraCode = (extraIdentifiers?.userCode || '').trim().toLowerCase();
 
-  // 1. Sync Dealer Forms (dealers_application)
-  try {
-    const dealerSnap = await getDocs(collection(db, 'dealers_application'));
-    const updates: Promise<any>[] = [];
-    dealerSnap.forEach((d) => {
-      const data = d.data();
-      const isLinked = 
-        data.created_by_user_id === userId ||
-        data.createdByUid === userId ||
-        data.userId === userId ||
-        data.ownerId === userId ||
-        (extraLogin && data.loginId && data.loginId.toLowerCase() === extraLogin) ||
-        (extraCode && data.userCode && String(data.userCode).toLowerCase() === extraCode) ||
-        (extraOldName && data.officerName && data.officerName.toUpperCase() === extraOldName) ||
-        (extraOldName && data.created_by_name && data.created_by_name.toUpperCase() === extraOldName);
-
-      const needsChange = 
-        data.officerName !== cleanName ||
-        data.created_by_name !== cleanName ||
-        (cleanDesig && data.designation !== cleanDesig);
-
-      if (isLinked && needsChange) {
-        updates.push(
-          updateDoc(doc(db, 'dealers_application', d.id), {
-            officerName: cleanName,
-            created_by_name: cleanName,
-            createdByName: cleanName,
-            ...(cleanDesig ? { designation: cleanDesig } : {}),
-            updatedAt: new Date().toISOString(),
-          }).catch((e) => console.warn(`Sync notice for dealer ${d.id}:`, e))
-        );
+  // Helper to update matching cached collection documents without full-collection remote scans
+  const updateTargets = async (
+    colName: string,
+    matcher: (data: any, id: string) => Record<string, any> | null
+  ) => {
+    try {
+      const storageKey = `blackworm_local_${colName}`;
+      const raw = typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null;
+      if (raw) {
+        const map = JSON.parse(raw);
+        if (map && typeof map === 'object' && !Array.isArray(map)) {
+          const updates: Promise<any>[] = [];
+          Object.entries(map).forEach(([id, data]) => {
+            const patch = matcher(data, id);
+            if (patch) {
+              updates.push(
+                safeFirestoreUpdate(colName, id, patch).catch((e) =>
+                  console.warn(`Sync notice for ${colName}/${id}:`, e)
+                )
+              );
+            }
+          });
+          if (updates.length > 0) {
+            await Promise.all(updates);
+            return;
+          }
+        }
       }
-    });
-    if (updates.length > 0) {
-      await Promise.all(updates);
-    }
-  } catch (err) {
-    console.warn('Sync notice in dealers_application:', err);
-  }
 
-  // 2. Sync Orders (orders)
-  try {
-    const ordersSnap = await getDocs(collection(db, 'orders'));
-    const updates: Promise<any>[] = [];
-    ordersSnap.forEach((o) => {
-      const data = o.data();
-      const isLinked = 
-        data.userId === userId || 
-        data.ownerId === userId ||
-        (extraLogin && data.loginId && data.loginId.toLowerCase() === extraLogin) ||
-        (extraOldName && data.createdByName && data.createdByName.toUpperCase() === extraOldName);
-
-      const needsChange = 
-        data.createdByName !== cleanName ||
-        (cleanDesig && data.designation !== cleanDesig);
-
-      if (isLinked && needsChange) {
-        updates.push(
-          updateDoc(doc(db, 'orders', o.id), {
-            createdByName: cleanName,
-            ...(cleanDesig ? { designation: cleanDesig } : {}),
-            updatedAt: new Date().toISOString(),
-          }).catch((e) => console.warn(`Sync notice for order ${o.id}:`, e))
-        );
+      if (!isQuotaBlocked()) {
+        try {
+          const snap = await getDocs(collection(db, colName));
+          trackFirestoreUsage('read', Math.max(1, snap.docs.length));
+          const updates: Promise<any>[] = [];
+          snap.forEach((d) => {
+            const patch = matcher(d.data(), d.id);
+            if (patch) {
+              updates.push(
+                safeFirestoreUpdate(colName, d.id, patch).catch((e) =>
+                  console.warn(`Sync notice for ${colName}/${d.id}:`, e)
+                )
+              );
+            }
+          });
+          if (updates.length > 0) {
+            await Promise.all(updates);
+          }
+          return;
+        } catch (fbErr: any) {
+          if (isQuotaErrorMsg(fbErr?.message || '')) setQuotaBlocked(15 * 60 * 1000);
+        }
       }
-    });
-    if (updates.length > 0) {
-      await Promise.all(updates);
-    }
-  } catch (err) {
-    console.warn('Sync notice in orders:', err);
-  }
 
-  // 3. Sync Collection Entries (collection_entries)
-  try {
-    const collSnap = await getDocs(collection(db, 'collection_entries'));
-    const updates: Promise<any>[] = [];
-    collSnap.forEach((c) => {
-      const data = c.data();
-      const isLinked = 
-        data.userId === userId || 
-        data.ownerId === userId ||
-        data.collectedByUid === userId ||
-        (extraLogin && data.loginId && data.loginId.toLowerCase() === extraLogin) ||
-        (extraOldName && data.collectedByName && data.collectedByName.toUpperCase() === extraOldName) ||
-        (extraOldName && data.createdByName && data.createdByName.toUpperCase() === extraOldName);
-
-      const needsChange = 
-        data.createdByName !== cleanName ||
-        data.collectedByName !== cleanName ||
-        data.officerName !== cleanName;
-
-      if (isLinked && needsChange) {
-        updates.push(
-          updateDoc(doc(db, 'collection_entries', c.id), {
-            createdByName: cleanName,
-            collectedByName: cleanName,
-            officerName: cleanName,
-            updatedAt: new Date().toISOString(),
-          }).catch((e) => console.warn(`Sync notice for collection ${c.id}:`, e))
-        );
+      const sec = await fetchSecondaryCollection(colName, { limit: 2000 });
+      if (sec.ok && sec.items.length > 0) {
+        const updates: Promise<any>[] = [];
+        sec.items.forEach((d) => {
+          const patch = matcher(d, d.id);
+          if (patch) {
+            updates.push(
+              safeFirestoreUpdate(colName, d.id, patch).catch((e) =>
+                console.warn(`Secondary sync notice for ${colName}/${d.id}:`, e)
+              )
+            );
+          }
+        });
+        if (updates.length > 0) {
+          await Promise.all(updates);
+        }
       }
-    });
-    if (updates.length > 0) {
-      await Promise.all(updates);
+    } catch (err) {
+      console.warn(`Sync notice in ${colName}:`, err);
     }
-  } catch (err) {
-    console.warn('Sync notice in collection_entries:', err);
-  }
+  };
 
-  // 4. Sync Travel Sheets (travel_sheets)
-  try {
-    const travelSnap = await getDocs(collection(db, 'travel_sheets'));
-    const updates: Promise<any>[] = [];
-    travelSnap.forEach((t) => {
-      const data = t.data();
-      const isLinked = data.userId === userId || t.id.startsWith(`travel_${userId}`);
-      const needsChange = 
-        data.officerName !== cleanName ||
-        (cleanDesig && data.designation !== cleanDesig);
+  await updateTargets('dealers_application', (data) => {
+    const isLinked =
+      data.created_by_user_id === userId ||
+      data.createdByUid === userId ||
+      data.userId === userId ||
+      data.ownerId === userId ||
+      (extraLogin && data.loginId && data.loginId.toLowerCase() === extraLogin) ||
+      (extraCode && data.userCode && String(data.userCode).toLowerCase() === extraCode) ||
+      (extraOldName && data.officerName && data.officerName.toUpperCase() === extraOldName) ||
+      (extraOldName && data.created_by_name && data.created_by_name.toUpperCase() === extraOldName);
+    const needsChange =
+      data.officerName !== cleanName ||
+      data.created_by_name !== cleanName ||
+      (cleanDesig && data.designation !== cleanDesig);
+    if (!isLinked || !needsChange) return null;
+    return {
+      officerName: cleanName,
+      created_by_name: cleanName,
+      createdByName: cleanName,
+      ...(cleanDesig ? { designation: cleanDesig } : {}),
+    };
+  });
 
-      if (isLinked && needsChange) {
-        updates.push(
-          updateDoc(doc(db, 'travel_sheets', t.id), {
-            officerName: cleanName,
-            ...(cleanDesig ? { designation: cleanDesig } : {}),
-            updatedAt: new Date().toISOString(),
-          }).catch((e) => console.warn(`Sync notice for travel_sheet ${t.id}:`, e))
-        );
-      }
-    });
-    if (updates.length > 0) {
-      await Promise.all(updates);
+  await updateTargets('orders', (data) => {
+    const isLinked =
+      data.userId === userId ||
+      data.ownerId === userId ||
+      (extraLogin && data.loginId && data.loginId.toLowerCase() === extraLogin) ||
+      (extraOldName && data.createdByName && data.createdByName.toUpperCase() === extraOldName);
+    const needsChange =
+      data.createdByName !== cleanName ||
+      (cleanDesig && data.designation !== cleanDesig);
+    if (!isLinked || !needsChange) return null;
+    return {
+      createdByName: cleanName,
+      ...(cleanDesig ? { designation: cleanDesig } : {}),
+    };
+  });
+
+  await updateTargets('collection_entries', (data) => {
+    const isLinked =
+      data.userId === userId ||
+      data.ownerId === userId ||
+      data.collectedByUid === userId ||
+      (extraLogin && data.loginId && data.loginId.toLowerCase() === extraLogin) ||
+      (extraOldName && data.collectedByName && data.collectedByName.toUpperCase() === extraOldName) ||
+      (extraOldName && data.createdByName && data.createdByName.toUpperCase() === extraOldName);
+    const needsChange =
+      data.createdByName !== cleanName ||
+      data.collectedByName !== cleanName ||
+      data.officerName !== cleanName;
+    if (!isLinked || !needsChange) return null;
+    return {
+      createdByName: cleanName,
+      collectedByName: cleanName,
+      officerName: cleanName,
+    };
+  });
+
+  await updateTargets('travel_sheets', (data, id) => {
+    const isLinked = data.userId === userId || id.startsWith(`travel_${userId}`);
+    const needsChange =
+      data.officerName !== cleanName ||
+      (cleanDesig && data.designation !== cleanDesig);
+    if (!isLinked || !needsChange) return null;
+    return {
+      officerName: cleanName,
+      ...(cleanDesig ? { designation: cleanDesig } : {}),
+    };
+  });
+
+  await updateTargets('yearly_targets', (data, id) => {
+    const isLinked = data.userId === userId || id.startsWith(`yearly_${userId}`);
+    const needsChange =
+      data.fullName !== cleanName ||
+      (cleanDesig && data.designation !== cleanDesig) ||
+      (cleanCenter && data.center !== cleanCenter);
+    if (!isLinked || !needsChange) return null;
+    return {
+      fullName: cleanName,
+      ...(cleanDesig ? { designation: cleanDesig } : {}),
+      ...(cleanCenter ? { center: cleanCenter } : {}),
+    };
+  });
+
+  await updateTargets('targets', (data) => {
+    if (data.userId === userId && data.userName !== cleanName) {
+      return { userName: cleanName };
     }
-  } catch (err) {
-    console.warn('Sync notice in travel_sheets:', err);
-  }
-
-  // 5. Sync Yearly Targets (yearly_targets)
-  try {
-    const targetSnap = await getDocs(collection(db, 'yearly_targets'));
-    const updates: Promise<any>[] = [];
-    targetSnap.forEach((tg) => {
-      const data = tg.data();
-      const isLinked = data.userId === userId || tg.id.startsWith(`yearly_${userId}`);
-      const needsChange = 
-        data.fullName !== cleanName ||
-        (cleanDesig && data.designation !== cleanDesig) ||
-        (cleanCenter && data.center !== cleanCenter);
-
-      if (isLinked && needsChange) {
-        updates.push(
-          updateDoc(doc(db, 'yearly_targets', tg.id), {
-            fullName: cleanName,
-            ...(cleanDesig ? { designation: cleanDesig } : {}),
-            ...(cleanCenter ? { center: cleanCenter } : {}),
-            updatedAt: new Date().toISOString(),
-          }).catch((e) => console.warn(`Sync notice for yearly_target ${tg.id}:`, e))
-        );
-      }
-    });
-    if (updates.length > 0) {
-      await Promise.all(updates);
-    }
-  } catch (err) {
-    console.warn('Sync notice in yearly_targets:', err);
-  }
-
-  // 6. Sync Targets (targets)
-  try {
-    const oldTargetsSnap = await getDocs(collection(db, 'targets'));
-    const updates: Promise<any>[] = [];
-    oldTargetsSnap.forEach((ot) => {
-      const data = ot.data();
-      if (data.userId === userId && data.userName !== cleanName) {
-        updates.push(
-          updateDoc(doc(db, 'targets', ot.id), {
-            userName: cleanName,
-            updatedAt: new Date().toISOString(),
-          }).catch((e) => console.warn(`Sync notice for target ${ot.id}:`, e))
-        );
-      }
-    });
-    if (updates.length > 0) {
-      await Promise.all(updates);
-    }
-  } catch (err) {
-    console.warn('Sync notice in targets:', err);
-  }
+    return null;
+  });
 }
 
 /**
@@ -1228,19 +2080,32 @@ export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{ 
   const stats: Record<string, number> = {};
 
   for (const colName of collectionsToBackup) {
-    try {
-      const snap = await getDocs(collection(db, colName));
-      const docsList: any[] = [];
-      snap.forEach((d) => {
-        docsList.push({ _id: d.id, ...d.data() });
-      });
-      backupData[colName] = docsList;
-      stats[colName] = docsList.length;
-    } catch (e) {
-      console.warn(`Could not export collection ${colName}:`, e);
-      backupData[colName] = [];
-      stats[colName] = 0;
+    let docsList: any[] = [];
+    if (!isQuotaBlocked()) {
+      try {
+        const snap = await getDocs(collection(db, colName));
+        trackFirestoreUsage('read', Math.max(1, snap.docs.length));
+        snap.forEach((d) => {
+          docsList.push({ _id: d.id, ...d.data() });
+        });
+      } catch (e: any) {
+        if (isQuotaErrorMsg(e?.message || '')) setQuotaBlocked(15 * 60 * 1000);
+        console.warn(`Could not export primary collection ${colName}:`, e);
+      }
     }
+    if (docsList.length === 0) {
+      try {
+        const sec = await fetchSecondaryCollection(colName, { limit: 5000, includeDeleted: true });
+        if (sec.ok && sec.items.length > 0) {
+          docsList = sec.items.map((it) => ({ _id: it.id, ...it }));
+        }
+      } catch {}
+    }
+    if (docsList.length === 0) {
+      docsList = mergeWithLocalData<any>(colName, []).map((it) => ({ _id: it.id, ...it }));
+    }
+    backupData[colName] = docsList;
+    stats[colName] = docsList.length;
   }
 
   const exportPayload = {
@@ -1263,19 +2128,12 @@ export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{ 
     console.warn('Local mirror storage failed:', e);
   }
 
-  const dateStr = new Date().toISOString().slice(0, 10);
+  const dateStr = getLocalDateStr();
   const timeStr = new Date().toTimeString().slice(0, 8).replace(/:/g, '-');
   const filename = `Blackworm_Full_Database_Backup_${dateStr}_${timeStr}.json`;
 
   const blob = new Blob([JSON.stringify(exportPayload, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = filename;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  URL.revokeObjectURL(url);
+  triggerBlobDownload(blob, filename);
 
   try {
     await logAudit(
@@ -1297,22 +2155,46 @@ export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{ 
  */
 export async function restoreDatabaseFromJson(jsonData: string, profile: UserProfile): Promise<{ success: boolean; restoredCount: number; message: string }> {
   const parsed = JSON.parse(jsonData);
-  if (!parsed || !parsed.collections) {
+  if (!parsed || typeof parsed !== 'object' || !parsed.collections || typeof parsed.collections !== 'object' || Array.isArray(parsed.collections)) {
     throw new Error('अवैध बॅकअप फाईल स्वरूप (Invalid backup file structure).');
   }
 
   let totalRestored = 0;
   for (const [colName, docsList] of Object.entries(parsed.collections)) {
-    if (Array.isArray(docsList)) {
-      for (const item of docsList) {
-        const docId = item._id || item.id;
-        if (docId) {
-          const cleanItem = { ...item };
-          delete cleanItem._id;
+    if (!colName || colName.startsWith('_') || !Array.isArray(docsList)) continue;
+    const restoredForCache: any[] = [];
+    const secondaryBatch: any[] = [];
+    for (const item of docsList) {
+      if (!item || typeof item !== 'object') continue;
+      const docId = String(item._id || item.id || '').trim();
+      if (!docId || docId.includes('/')) continue;
+      const cleanItem = { ...item, id: docId };
+      delete cleanItem._id;
+      if (!isQuotaBlocked()) {
+        try {
           await setDoc(doc(db, colName, docId), cleanItem, { merge: true });
-          totalRestored++;
+        } catch (err: any) {
+          if (isQuotaErrorMsg(err?.message || '')) setQuotaBlocked(15 * 60 * 1000);
+          setPendingSyncItem(colName, docId, cleanItem, { merge: true }, { needsFirebase: true, needsSecondary: false });
         }
+      } else {
+        setPendingSyncItem(colName, docId, cleanItem, { merge: true }, { needsFirebase: true, needsSecondary: false });
       }
+      secondaryBatch.push({
+        collection: colName,
+        id: docId,
+        doc: cleanItem,
+        deleted: Boolean(cleanItem.isArchived),
+        merge: true,
+      });
+      restoredForCache.push(cleanItem);
+      totalRestored++;
+    }
+    if (secondaryBatch.length > 0) {
+      await pushBatchToSecondary(secondaryBatch);
+    }
+    if (restoredForCache.length > 0) {
+      updateCollectionCache(colName, restoredForCache);
     }
   }
 

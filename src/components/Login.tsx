@@ -1,9 +1,16 @@
-import React, { useState, useEffect } from 'react';
-import { collection, getDocs, doc, setDoc, onSnapshot } from 'firebase/firestore';
+import React, { useState } from 'react';
+import { collection, getDocs } from 'firebase/firestore';
 import { db } from '../firebase';
 import { UserProfile } from '../lib/auth';
 import { User, Lock, ArrowRight, AlertCircle, ShieldCheck, Eye, EyeOff, Loader2, Key } from 'lucide-react';
-
+import {
+  isQuotaBlocked,
+  setQuotaBlocked,
+  trackFirestoreUsage,
+  safeFirestoreSet,
+  mergeWithLocalData,
+} from '../lib/dataService';
+import { fetchSecondaryCollection, bootstrapCollectionToSecondary } from '../lib/secondaryDb';
 import { useBranding } from '../lib/branding';
 
 interface LoginProps {
@@ -43,62 +50,95 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
       const numericDigits = trimmedId.replace(/\D/g, ''); // Extract numbers only
       const last10Digits = numericDigits.length >= 10 ? numericDigits.slice(-10) : numericDigits;
 
-      // 1. Try to fetch all users from Firestore (fast single-read, cached in IndexedDB)
+      // 1. Primary lookup: Try Firebase if online & not quota-blocked
       let allUsers: any[] = [];
-      try {
-        const usersSnap = await getDocs(collection(db, 'users'));
-        if (!usersSnap.empty) {
-          allUsers = usersSnap.docs.map(d => ({ ...d.data(), uid: d.id }));
-          // Cache users in localStorage for zero-latency / offline fallback
-          try {
-            localStorage.setItem('blackworm_cached_users', JSON.stringify(allUsers));
-          } catch {}
-        } else {
-          // If Firestore is completely empty on fresh setup, seed initial owner document
-          const initialOwner = {
-            uid: 'user_1791302472208',
-            userCode: 'EMP-001',
-            fullName: 'SHRIDHAR BALKRUSHNA SHINDE',
-            designation: 'MANAGING DIRECTOR',
-            center: 'SANGLI',
-            mobileNumber: '7798716201',
-            altPhone: '',
-            emailId: 'blackwormagritechpvtltd@gmail.com',
-            role: 'owner',
-            address: 'SANGLI',
-            village: 'SANGLI',
-            taluka: 'MIRAJ',
-            district: 'SANGLI',
-            state: 'Maharashtra',
-            pinCode: '416409',
-            dateOfBirth: '1985-05-15',
-            joiningDate: '2024-01-01',
-            aadhaarNo: '',
-            panNo: '',
-            loginId: 'admin',
-            password: 'bw@123',
-            status: 'Active',
-            allowedModules: ['target', 'user', 'order', 'collection', 'calculator', 'price', 'dealer', 'travel', 'scheme', 'report', 'setting'],
-            createdAt: new Date().toISOString(),
-          };
-          await setDoc(doc(db, 'users', initialOwner.uid), initialOwner);
-          allUsers = [initialOwner];
-          try {
-            localStorage.setItem('blackworm_cached_users', JSON.stringify(allUsers));
-          } catch {}
+      let firebaseChecked = false;
+      if (!isQuotaBlocked() && (typeof navigator === 'undefined' || navigator.onLine)) {
+        try {
+          const usersSnap = await getDocs(collection(db, 'users'));
+          trackFirestoreUsage('read', Math.max(1, usersSnap.docs.length));
+          firebaseChecked = true;
+          if (!usersSnap.empty) {
+            allUsers = usersSnap.docs
+              .map(d => ({ ...d.data(), uid: d.id, id: d.id }))
+              .filter((u: any) => !u.isArchived);
+            try {
+              localStorage.setItem('blackworm_cached_users', JSON.stringify(allUsers));
+            } catch {}
+            bootstrapCollectionToSecondary('users', allUsers);
+          }
+        } catch (networkErr: any) {
+          const msg = String(networkErr?.message || '').toLowerCase();
+          if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+            setQuotaBlocked(15 * 60 * 1000);
+          }
+          console.warn('Primary login lookup fallback:', networkErr);
         }
-      } catch (networkErr) {
-        console.warn('Network read error, attempting cached users store:', networkErr);
       }
 
-      // If network was unavailable or returned empty, try localStorage cache
+      // 2. Secondary DB failover lookup (SQLite WAL / Supabase mirror)
       if (allUsers.length === 0) {
         try {
-          const cached = localStorage.getItem('blackworm_cached_users');
-          if (cached) {
-            allUsers = JSON.parse(cached);
+          const secRes = await fetchSecondaryCollection('users', { limit: 1000 });
+          if (secRes.ok && secRes.items.length > 0) {
+            allUsers = secRes.items
+              .filter((u: any) => !u.isArchived)
+              .map((u: any) => ({ ...u, uid: u.uid || u.id, id: u.id || u.uid }));
+            try {
+              localStorage.setItem('blackworm_cached_users', JSON.stringify(allUsers));
+            } catch {}
           }
         } catch {}
+      }
+
+      // 3. Seed initial owner only when BOTH Firebase and Secondary are genuinely empty
+      if (allUsers.length === 0 && firebaseChecked) {
+        const initialOwner = {
+          uid: 'user_1791302472208',
+          userCode: 'EMP-001',
+          fullName: 'SHRIDHAR BALKRUSHNA SHINDE',
+          designation: 'MANAGING DIRECTOR',
+          center: 'SANGLI',
+          mobileNumber: '7798716201',
+          altPhone: '',
+          emailId: 'blackwormagritechpvtltd@gmail.com',
+          role: 'owner',
+          address: 'SANGLI',
+          village: 'SANGLI',
+          taluka: 'MIRAJ',
+          district: 'SANGLI',
+          state: 'Maharashtra',
+          pinCode: '416409',
+          dateOfBirth: '1985-05-15',
+          joiningDate: '2024-01-01',
+          aadhaarNo: '',
+          panNo: '',
+          loginId: 'admin',
+          password: 'bw@123',
+          status: 'Active',
+          allowedModules: ['target', 'user', 'order', 'collection', 'calculator', 'price', 'dealer', 'travel', 'scheme', 'report', 'setting'],
+          createdAt: new Date().toISOString(),
+        };
+        await safeFirestoreSet('users', initialOwner.uid, initialOwner, { merge: true });
+        allUsers = [initialOwner];
+        try {
+          localStorage.setItem('blackworm_cached_users', JSON.stringify(allUsers));
+        } catch {}
+      }
+
+      // 4. Local cache / LocalStorage fallback (3rd tier offline resilience)
+      if (allUsers.length === 0) {
+        const localUsers = mergeWithLocalData<any>('users', []);
+        if (localUsers.length > 0) {
+          allUsers = localUsers;
+        } else {
+          try {
+            const cached = localStorage.getItem('blackworm_cached_users');
+            if (cached) {
+              allUsers = JSON.parse(cached);
+            }
+          } catch {}
+        }
       }
 
       // Flexible, accurate login identification: Login ID, User Code, Mobile Number, or Email

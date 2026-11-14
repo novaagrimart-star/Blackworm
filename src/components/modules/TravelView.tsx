@@ -1,15 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  collection, 
-  query, 
-  onSnapshot, 
-  doc, 
-  setDoc,
-  getDocs
+import {
+  doc,
+  onSnapshot,
 } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import { logAudit, safeFirestoreSet } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, getLocalDateStr, getPendingSyncIdSet, trackFirestoreUsage, isQuotaBlocked, setQuotaBlocked } from '../../lib/dataService';
+import { subscribeSecondaryCollection, fetchSecondaryCollection } from '../../lib/secondaryDb';
+import { useSharedUsers } from '../../lib/realtimeStore';
 import { Language, translations } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
@@ -130,18 +128,9 @@ export const generateMonthRows = (
 export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const t = translations[lang];
   const userIsAdmin = isAdmin(profile);
-  const [users, setUsers] = useState<UserProfile[]>(() => {
-    try {
-      const cached = localStorage.getItem('blackworm_cached_users');
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        if (Array.isArray(parsed)) {
-          return parsed.filter((u: any) => u.role !== 'owner');
-        }
-      }
-    } catch {}
-    return [];
-  });
+  const { fieldOfficers: users } = useSharedUsers();
+  const usersRef = useRef<UserProfile[]>(users);
+  usersRef.current = users;
   const [selectedUserId, setSelectedUserId] = useState<string>(() => {
     if (profile.role === 'owner') {
       try {
@@ -161,9 +150,8 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const [isUserDropdownOpen, setIsUserDropdownOpen] = useState(false);
   
   // Current date by default
-  const today = new Date();
   const [selectedDate, setSelectedDate] = useState<string>(() => {
-    return today.toISOString().slice(0, 10);
+    return getLocalDateStr();
   });
 
   // For non-admin (officers), strictly lock selectedUserId to logged-in user's uid
@@ -325,48 +313,26 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   // Branding
   const { logoUrl, logoSize } = useBranding();
 
-  // Fetch users for dropdown - filter out Owner so Owner traveling sheet is never created or selected
+  // Auto-select first field officer for Owner login without touching blackworm_cached_users
   useEffect(() => {
-    const loadUsers = async () => {
-      try {
-        const snap = await getDocs(query(collection(db, 'users')));
-        const list: UserProfile[] = [];
-        snap.forEach(d => {
-          const userData = d.data() as UserProfile;
-          // Strictly exclude owner from traveling sheet users
-          if (userData.role !== 'owner') {
-            list.push({ ...userData, uid: d.id });
-          }
-        });
-        list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
-        setUsers(list);
-        try {
-          localStorage.setItem('blackworm_cached_users', JSON.stringify(list));
-        } catch {}
-
-        // Auto-select first officer if current selection is empty or is an owner
-        if (list.length > 0) {
-          setSelectedUserId(prev => {
-            if (!prev || (profile.role === 'owner' && prev === profile.uid)) {
-              return list[0].uid;
-            }
-            const exists = list.some(u => u.uid === prev);
-            return exists ? prev : list[0].uid;
-          });
+    if (users.length === 0) return;
+    if (profile.role === 'owner' || !selectedUserId) {
+      setSelectedUserId((prev) => {
+        if (!prev || (profile.role === 'owner' && prev === profile.uid)) {
+          return users[0].uid;
         }
-      } catch (err) {
-        console.warn('TravelView users fetch notice:', err);
-      }
-    };
-    
-    loadUsers();
-  }, [profile.role, profile.uid]);
+        const exists = users.some((u) => u.uid === prev);
+        return exists ? prev : users[0].uid;
+      });
+    }
+  }, [users, profile.role, profile.uid, selectedUserId]);
 
-  // Fetch or initialize sheet with instant cache-first and live sync
+  // Fetch or initialize sheet with instant cache-first and live sync (stable deps: no listener churn)
   useEffect(() => {
+    const currentUsers = usersRef.current;
     // Strictly prevent creating or loading travel sheets for Owner
     const isOwnerTarget = (profile.role === 'owner' && (!selectedUserId || selectedUserId === profile.uid)) ||
-                          users.some(u => u.uid === selectedUserId && u.role === 'owner');
+                          currentUsers.some(u => u.uid === selectedUserId && u.role === 'owner');
     if (isOwnerTarget || !selectedUserId) {
       setSheet(null);
       setLoading(false);
@@ -390,103 +356,144 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       }
     } catch {}
 
-    const selectedUser = users.find(u => u.uid === targetUid) || profile;
     const currentRate = 3.5;
 
-    const unsub = onSnapshot(doc(db, 'travel_sheets', sheetId), (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data() as TravelSheetData;
-        const rRate = data.ratePerKm || currentRate;
-        setRatePerKm(rRate);
+    const applyTravelSheetPayload = (data: TravelSheetData) => {
+      const selectedUser = usersRef.current.find(u => u.uid === targetUid) || profile;
+      const hasPendingWrite = getPendingSyncIdSet('travel_sheets').has(sheetId);
+      if (hasPendingWrite) {
+        setLoading(false);
+        return;
+      }
+      const rRate = data.ratePerKm || currentRate;
+      setRatePerKm(rRate);
+      const fullRows = generateMonthRows(
+        selectedYearNumber,
+        selectedMonthIndex,
+        rRate,
+        data.rows || []
+      );
+
+      const totalKm = fullRows.reduce((acc, r) => acc + (r.km || 0), 0);
+      const totalAmount = fullRows.reduce((acc, r) => acc + (r.amount || 0), 0);
+      const totalOtherExpenses = fullRows.reduce((acc, r) => acc + (r.otherExpenses || 0), 0);
+      const subtotalAmount = Math.round((totalAmount + totalOtherExpenses) * 100) / 100;
+      const totalExpensesAmount = subtotalAmount;
+      const averageCostPerKm = totalKm > 0 ? Math.round((totalExpensesAmount / totalKm) * 100) / 100 : 0;
+
+      const updatedSheet: TravelSheetData = {
+        ...data,
+        id: sheetId,
+        userId: targetUid,
+        officerName: selectedUser.fullName || data.officerName || targetUid,
+        designation: selectedUser.designation || data.designation || 'FIELD OFFICER',
+        date: selectedDate,
+        monthName: selectedMonthName,
+        yearNumber: selectedYearNumber,
+        ratePerKm: rRate,
+        rows: fullRows,
+        totalKm,
+        totalAmount,
+        totalOtherExpenses,
+        subtotalAmount,
+        averageCostPerKm,
+        totalExpensesAmount
+      };
+
+      setSheet(updatedSheet);
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify(updatedSheet));
+      } catch {}
+    };
+
+    const ensureBlankSheetIfEmpty = () => {
+      const selectedUser = usersRef.current.find(u => u.uid === targetUid) || profile;
+      setSheet((prevSheet) => {
+        if (prevSheet && prevSheet.id === sheetId && prevSheet.rows.some(r => r.openingKm > 0 || r.closingKm > 0 || r.route)) {
+          return prevSheet;
+        }
         const fullRows = generateMonthRows(
-          selectedYearNumber, 
-          selectedMonthIndex, 
-          rRate, 
-          data.rows || []
+          selectedYearNumber,
+          selectedMonthIndex,
+          currentRate
         );
-
-        const totalKm = fullRows.reduce((acc, r) => acc + (r.km || 0), 0);
-        const totalAmount = fullRows.reduce((acc, r) => acc + (r.amount || 0), 0);
-        const totalOtherExpenses = fullRows.reduce((acc, r) => acc + (r.otherExpenses || 0), 0);
-        const subtotalAmount = Math.round((totalAmount + totalOtherExpenses) * 100) / 100;
-        const totalExpensesAmount = subtotalAmount;
-        const averageCostPerKm = totalKm > 0 ? Math.round((totalExpensesAmount / totalKm) * 100) / 100 : 0;
-
-        const updatedSheet: TravelSheetData = {
-          ...data,
+        const newSheet: TravelSheetData = {
           id: sheetId,
           userId: targetUid,
-          officerName: selectedUser.fullName || data.officerName || targetUid,
-          designation: selectedUser.designation || data.designation || 'FIELD OFFICER',
+          officerName: selectedUser.fullName || targetUid,
+          designation: selectedUser.designation || 'FIELD OFFICER',
           date: selectedDate,
           monthName: selectedMonthName,
           yearNumber: selectedYearNumber,
-          ratePerKm: rRate,
+          ratePerKm: currentRate,
           rows: fullRows,
-          totalKm,
-          totalAmount,
-          totalOtherExpenses,
-          subtotalAmount,
-          averageCostPerKm,
-          totalExpensesAmount
+          totalKm: 0,
+          totalAmount: 0,
+          totalOtherExpenses: 0,
+          subtotalAmount: 0,
+          averageCostPerKm: 0,
+          totalExpensesAmount: 0
         };
-
-        setSheet(updatedSheet);
         try {
-          localStorage.setItem(cacheKey, JSON.stringify(updatedSheet));
+          localStorage.setItem(cacheKey, JSON.stringify(newSheet));
         } catch {}
-      } else {
-        // Document doesn't exist yet on server; check if local state already has rows
-        setSheet((prevSheet) => {
-          if (prevSheet && prevSheet.id === sheetId && prevSheet.rows.some(r => r.openingKm > 0 || r.closingKm > 0 || r.route)) {
-            return prevSheet;
-          }
-          const fullRows = generateMonthRows(
-            selectedYearNumber, 
-            selectedMonthIndex, 
-            currentRate
-          );
-          const newSheet: TravelSheetData = {
-            id: sheetId,
-            userId: targetUid,
-            officerName: selectedUser.fullName || targetUid,
-            designation: selectedUser.designation || 'FIELD OFFICER',
-            date: selectedDate,
-            monthName: selectedMonthName,
-            yearNumber: selectedYearNumber,
-            ratePerKm: currentRate,
-            rows: fullRows,
-            totalKm: 0,
-            totalAmount: 0,
-            totalOtherExpenses: 0,
-            subtotalAmount: 0,
-            averageCostPerKm: 0,
-            totalExpensesAmount: 0
-          };
-          try {
-            localStorage.setItem(cacheKey, JSON.stringify(newSheet));
-          } catch {}
-          return newSheet;
-        });
-      }
-      setLoading(false);
-    }, (err) => {
-      console.warn('Travel sheet snapshot notice:', err);
-      // Offline fallback: load cached sheet from localStorage
+        return newSheet;
+      });
+    };
+
+    const pullTravelFromSecondary = async () => {
       try {
-        const cached = localStorage.getItem(cacheKey);
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          if (parsed && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
-            setSheet(parsed);
+        const res = await fetchSecondaryCollection('travel_sheets', { limit: 500 });
+        if (res.ok) {
+          const found = res.items.find((it) => it?.id === sheetId);
+          if (found) {
+            applyTravelSheetPayload(found as TravelSheetData);
+            setLoading(false);
+            return;
           }
         }
       } catch {}
+      ensureBlankSheetIfEmpty();
       setLoading(false);
+    };
+
+    const unsubSec = subscribeSecondaryCollection('travel_sheets', (events) => {
+      events.forEach((evt) => {
+        if (evt.id === sheetId && evt.doc && !evt.deleted) {
+          applyTravelSheetPayload(evt.doc as TravelSheetData);
+          setLoading(false);
+        }
+      });
     });
 
-    return () => unsub();
-  }, [selectedUserId, selectedYearNumber, selectedMonthIndex, users, profile.role, profile.uid]);
+    let unsubFb: (() => void) | null = null;
+    if (isQuotaBlocked()) {
+      void pullTravelFromSecondary();
+    } else {
+      unsubFb = onSnapshot(doc(db, 'travel_sheets', sheetId), (docSnap) => {
+        trackFirestoreUsage('read', 1);
+        if (docSnap.exists()) {
+          applyTravelSheetPayload(docSnap.data() as TravelSheetData);
+        } else {
+          void pullTravelFromSecondary();
+          return;
+        }
+        setLoading(false);
+      }, (err) => {
+        const msg = String(err?.message || '').toLowerCase();
+        if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+          setQuotaBlocked(15 * 60 * 1000);
+        }
+        console.warn('Travel sheet snapshot notice:', err);
+        void pullTravelFromSecondary();
+      });
+    }
+
+    return () => {
+      unsubSec();
+      if (unsubFb) unsubFb();
+    };
+  }, [selectedUserId, selectedYearNumber, selectedMonthIndex, profile.role, profile.uid]);
 
   const updateRow = (index: number, updates: Partial<TravelRow>) => {
     if (!sheet) return;
@@ -496,6 +503,8 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
 
     // Auto-calculate KM (Closing KM - Opening KM)
     if ('openingKm' in updates || 'closingKm' in updates) {
+      updated.openingKm = Math.max(0, Number(updated.openingKm) || 0);
+      updated.closingKm = Math.max(0, Number(updated.closingKm) || 0);
       if (updated.closingKm >= updated.openingKm && updated.openingKm > 0) {
         updated.km = updated.closingKm - updated.openingKm;
       } else if (updated.closingKm === 0 && updated.openingKm === 0) {
@@ -505,12 +514,16 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
 
     // Manual Amount: strictly set by user input, not auto-calculated from KM
     if ('amount' in updates) {
-      updated.amount = updates.amount !== undefined && updates.amount !== null ? Number(updates.amount) || 0 : 0;
+      updated.amount = updates.amount !== undefined && updates.amount !== null ? Math.max(0, Number(updates.amount) || 0) : 0;
+    }
+
+    if ('otherExpenses' in updates) {
+      updated.otherExpenses = Math.max(0, Number(updated.otherExpenses) || 0);
     }
 
     // Auto-calculate Subtotal (Manual Amount + Other Expenses)
-    const amount = Number(updated.amount) || 0;
-    const other = Number(updated.otherExpenses) || 0;
+    const amount = Math.max(0, Number(updated.amount) || 0);
+    const other = Math.max(0, Number(updated.otherExpenses) || 0);
     updated.subtotal = Math.round((amount + other) * 100) / 100;
 
     newRows[index] = updated;
@@ -554,11 +567,16 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const handleRateChange = (newRate: number) => {
     if (!sheet) return;
     setRatePerKm(newRate);
-    // Amount is strictly manual per user instruction - never auto-calculate
-    setSheet({
+    const updatedSheet: TravelSheetData = {
       ...sheet,
       ratePerKm: newRate,
-    });
+    };
+    setSheet(updatedSheet);
+    try {
+      const sheetMonthKey = `${sheet.yearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
+      localStorage.setItem(`travel_sheet_${sheet.userId}_${sheetMonthKey}`, JSON.stringify(updatedSheet));
+      localStorage.setItem(`travel_sheet_${sheet.userId}`, JSON.stringify(updatedSheet));
+    } catch {}
   };
 
   const handleSave = async () => {

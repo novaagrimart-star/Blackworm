@@ -8,7 +8,6 @@ import {
   onSnapshot, 
   doc, 
   setDoc, 
-  deleteDoc, 
   runTransaction, 
   getDocs, 
   getDoc, 
@@ -17,7 +16,9 @@ import {
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { logAudit, safeFirestoreSet, mergeWithLocalData, isQuotaBlocked, deduplicateDealers } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, getLocalDateStr, mergeWithLocalData, isQuotaBlocked, setQuotaBlocked, deduplicateDealers } from '../../lib/dataService';
+import { subscribeSecondaryCollection, fetchSecondaryCollection } from '../../lib/secondaryDb';
+import { useSharedUsers, useSharedDealers } from '../../lib/realtimeStore';
 import { toTitleCase } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
 import { compressImageFile } from '../../lib/imageCompression';
@@ -26,7 +27,6 @@ import { CustomDialogModal } from '../CustomDialogModal';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas-pro';
 import { 
-  Plus, 
   Search, 
   Trash2, 
   Printer, 
@@ -50,7 +50,6 @@ import {
   Table as TableIcon,
   User as UserIcon,
   ChevronDown,
-  ArrowUpDown,
   UserCheck
 } from 'lucide-react';
 
@@ -140,15 +139,9 @@ interface Props {
 }
 
 export const DealerView: React.FC<Props> = ({ profile }) => {
-  const [dealers, setDealers] = useState<DealershipFormItem[]>(() => {
-    try {
-      const local = mergeWithLocalData('dealers_application', []);
-      if (local && local.length > 0) return local;
-    } catch {}
-    return [];
-  });
+  const { dealers, setDealersOptimistic } = useSharedDealers();
+  const { officers, usersMap } = useSharedUsers();
   const [searchQuery, setSearchQuery] = useState('');
-  const [activeFilter, setActiveFilter] = useState<'all' | 'active'>('all');
   
   const [viewMode, setViewMode] = useState<'list' | 'form'>('list');
   const [isEditing, setIsEditing] = useState(true);
@@ -188,14 +181,13 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const [chequeNos, setChequeNos] = useState('');
 
   const [place, setPlace] = useState('Sangli');
-  const [declarationDate, setDeclarationDate] = useState(new Date().toISOString().slice(0, 10));
+  const [declarationDate, setDeclarationDate] = useState(getLocalDateStr());
   const [remarks, setRemarks] = useState('');
   const [officerName, setOfficerName] = useState((profile.fullName || profile.loginId || 'OFFICER').toUpperCase());
   const [createdByUserId, setCreatedByUserId] = useState<string>(profile.uid || '');
   const [createdByName, setCreatedByName] = useState<string>((profile.fullName || profile.loginId || 'OFFICER').toUpperCase());
   const [globalSequence, setGlobalSequence] = useState<number>(0);
   const [status, setStatus] = useState<'Approved' | 'Pending' | 'Draft'>('Approved');
-  const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
   
   // Office Use Fields
   const [officeDate, setOfficeDate] = useState('');
@@ -211,80 +203,31 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
   const printableFormRef = useRef<HTMLDivElement>(null);
-  const [usersMap, setUsersMap] = useState<Record<string, string>>(() => {
-    try {
-      const cached = localStorage.getItem('blackworm_cached_users');
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        const map: Record<string, string> = {};
-        parsed.forEach((u: any) => {
-          if (u.fullName) {
-            map[u.uid || u.id] = u.fullName;
-            if (u.loginId) map[u.loginId.toLowerCase()] = u.fullName;
-            if (u.userCode) map[u.userCode.toLowerCase()] = u.fullName;
-          }
-        });
-        return map;
-      }
-    } catch {}
-    return {};
-  });
-  const [officers, setOfficers] = useState<{ uid: string; fullName: string; designation?: string; role?: string; loginId?: string; userCode?: string }[]>(() => {
-    try {
-      const cached = localStorage.getItem('blackworm_cached_users');
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        return parsed.filter((u: any) => u.role !== 'dealer');
-      }
-    } catch {}
-    return [];
-  });
   const [selectedOfficerFilter, setSelectedOfficerFilter] = useState<string>('all');
   const [showUserFilterDropdown, setShowUserFilterDropdown] = useState<boolean>(false);
   const [isSavingDealer, setIsSavingDealer] = useState<boolean>(false);
   const formSessionIdRef = useRef<string>('');
 
-  useEffect(() => {
-    const unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
-      const map: Record<string, string> = {};
-      const uList: { uid: string; fullName: string; designation?: string; role?: string; loginId?: string; userCode?: string }[] = [];
-      snap.forEach((d) => {
-        const u = d.data();
-        if (u.fullName) {
-          map[d.id] = u.fullName;
-          if (u.loginId) map[u.loginId.toLowerCase()] = u.fullName;
-          if (u.userCode) map[u.userCode.toLowerCase()] = u.fullName;
-        }
-        if (u.role !== 'dealer') {
-          uList.push({
-            uid: d.id,
-            fullName: u.fullName || u.loginId || d.id,
-            designation: u.designation || u.role || 'OFFICER',
-            role: u.role,
-            loginId: u.loginId,
-            userCode: u.userCode,
-          });
-        }
-      });
-      uList.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
-      setUsersMap(map);
-      setOfficers(uList);
-      try {
-        localStorage.setItem('blackworm_cached_users', JSON.stringify(uList));
-      } catch {}
-    });
-    return () => unsubUsers();
-  }, []);
+  const dealerFormHistoryPushedRef = useRef(false);
   useEffect(() => {
     if (viewMode === 'form') {
-      const handlePopState = (e: PopStateEvent) => {
-        // If user hits browser back button while in form, return directly to dealer list
+      if (!dealerFormHistoryPushedRef.current) {
+        window.history.pushState({ tab: 'dealer', dealerFormOpen: true }, '');
+        dealerFormHistoryPushedRef.current = true;
+      }
+      const handlePopState = () => {
+        dealerFormHistoryPushedRef.current = false;
         setViewMode('list');
       };
       window.addEventListener('popstate', handlePopState);
       return () => {
         window.removeEventListener('popstate', handlePopState);
       };
+    } else if (dealerFormHistoryPushedRef.current) {
+      dealerFormHistoryPushedRef.current = false;
+      if (window.history.state?.dealerFormOpen) {
+        window.history.back();
+      }
     }
   }, [viewMode]);
 
@@ -342,17 +285,50 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
 
 
-  // Real-time listener for global sequence counter
+  // Real-time listener for global sequence counter (Primary + Secondary DB)
   useEffect(() => {
-    const unsubSeq = onSnapshot(doc(db, 'config', 'dealer_sequence'), (snap) => {
-      if (snap.exists()) {
-        const val = Number(snap.data()?.currentSequence) || 0;
-        setGlobalSequence(val);
-      }
-    }, (err) => {
-      console.warn('Dealer sequence sync notice:', err);
+    const pullSeqFromSecondary = async () => {
+      try {
+        const res = await fetchSecondaryCollection('config', { limit: 50 });
+        const seqDoc = res.items.find((it) => it?.id === 'dealer_sequence');
+        if (seqDoc) {
+          const val = Number(seqDoc.currentSequence) || 0;
+          setGlobalSequence((prev) => Math.max(prev, val));
+        }
+      } catch {}
+    };
+
+    const unsubSecSeq = subscribeSecondaryCollection('config', (events) => {
+      events.forEach((evt) => {
+        if (evt.id === 'dealer_sequence' && evt.doc && !evt.deleted) {
+          const val = Number(evt.doc.currentSequence) || 0;
+          setGlobalSequence((prev) => Math.max(prev, val));
+        }
+      });
     });
-    return () => unsubSeq();
+
+    let unsubSeq: (() => void) | null = null;
+    if (isQuotaBlocked()) {
+      void pullSeqFromSecondary();
+    } else {
+      unsubSeq = onSnapshot(doc(db, 'config', 'dealer_sequence'), (snap) => {
+        if (snap.exists()) {
+          const val = Number(snap.data()?.currentSequence) || 0;
+          setGlobalSequence(val);
+        }
+      }, (err) => {
+        const msg = String(err?.message || '').toLowerCase();
+        if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+          setQuotaBlocked(15 * 60 * 1000);
+        }
+        console.warn('Dealer sequence sync notice:', err);
+        void pullSeqFromSecondary();
+      });
+    }
+    return () => {
+      unsubSecSeq();
+      if (unsubSeq) unsubSeq();
+    };
   }, []);
 
   // Re-index all saved dealers with continuous clean serial numbers (001, 002, 003...)
@@ -361,8 +337,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     try {
       let itemsList: DealershipFormItem[] = [];
 
-      // 1. Try remote fetch if quota allows
-      if (!isQuotaBlocked()) {
+      // 1. Only hit full server scan if explicitly triggered by manual admin button
+      if (showModalAlert && !isQuotaBlocked()) {
         try {
           const snap = await getDocs(collection(db, 'dealers_application'));
           snap.forEach((d) => {
@@ -376,7 +352,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         }
       }
 
-      // 2. If remote was empty or skipped/blocked, fall back to in-memory + local storage
+      // 2. Use in-memory live shared dealers list + local storage (0 extra reads!)
       if (itemsList.length === 0) {
         const localItems = mergeWithLocalData('dealers_application', dealers);
         itemsList = localItems.filter((d) => !d.isArchived);
@@ -397,8 +373,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
       // 3. Sort strictly by creation time
       itemsList.sort((a, b) => {
-        const timeA = new Date(a.createdAt || 0).getTime() || parseInt((a.id.match(/\d+/) || ['0'])[0], 10);
-        const timeB = new Date(b.createdAt || 0).getTime() || parseInt((b.id.match(/\d+/) || ['0'])[0], 10);
+        const timeA = toTimestampMs(a.createdAt) || parseInt((a.id.match(/\d+/) || ['0'])[0], 10);
+        const timeB = toTimestampMs(b.createdAt) || parseInt((b.id.match(/\d+/) || ['0'])[0], 10);
         if (timeA !== timeB) return timeA - timeB;
         const numA = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
         const numB = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
@@ -440,7 +416,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
       const totalDealers = itemsList.length;
       setGlobalSequence(totalDealers);
-      setDealers(updatedDealers);
+      setDealersOptimistic(() => updatedDealers);
 
       // Sync counter config
       if (!isQuotaBlocked()) {
@@ -476,99 +452,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     }
   };
 
-  const loadDealers = async (isLoadMore = false) => {
-    if (isLoadingMore || (isLoadMore && !hasMore)) return;
-    
-    setIsLoadingMore(true);
-    try {
-      let q = query(
-        collection(db, 'dealers_application'),
-        orderBy('createdAt', 'desc'),
-        limit(PAGE_SIZE)
-      );
-
-      if (isLoadMore && lastDoc) {
-        q = query(
-          collection(db, 'dealers_application'),
-          orderBy('createdAt', 'desc'),
-          startAfter(lastDoc),
-          limit(PAGE_SIZE)
-        );
-      }
-
-      const snap = await getDocs(q);
-      
-      const list: DealershipFormItem[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as DealershipFormItem;
-        list.push({ ...data, id: d.id });
-      });
-
-      const merged = mergeWithLocalData('dealers_application', list);
-      
-      if (isLoadMore) {
-        setDealers(prev => deduplicateDealers([...prev, ...merged]));
-      } else {
-        setDealers(deduplicateDealers(merged));
-      }
-
-      setLastDoc(snap.docs[snap.docs.length - 1] || null);
-      setHasMore(snap.docs.length === PAGE_SIZE);
-    } catch (error) {
-      console.warn("dealers_application fetch error:", error);
-      if (!isLoadMore) {
-        const cached = mergeWithLocalData('dealers_application', []);
-        setDealers(deduplicateDealers(cached));
-      }
-    } finally {
-      setIsLoadingMore(false);
-    }
-  };
-
-  useEffect(() => {
-    const q = query(
-      collection(db, 'dealers_application'),
-      limit(500)
-    );
-
-    const unsub = onSnapshot(q, (snap) => {
-      const list: DealershipFormItem[] = [];
-      snap.forEach((d) => {
-        const data = d.data() as DealershipFormItem;
-        list.push({ ...data, id: d.id });
-      });
-      // Strictly sort by numeric dealerCode so order never jumps on refresh
-      list.sort((a, b) => {
-        const numA = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
-        const numB = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
-        if (numA !== numB) return numB - numA;
-        const timeA = new Date(a.createdAt || 0).getTime() || 0;
-        const timeB = new Date(b.createdAt || 0).getTime() || 0;
-        return timeB - timeA;
-      });
-      const merged = mergeWithLocalData('dealers_application', list);
-      merged.sort((a, b) => {
-        const numA = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
-        const numB = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
-        if (numA !== numB) return numB - numA;
-        const timeA = new Date(a.createdAt || 0).getTime() || 0;
-        const timeB = new Date(b.createdAt || 0).getTime() || 0;
-        return timeB - timeA;
-      });
-      setDealers(deduplicateDealers(merged));
-    }, (error) => {
-      console.warn("dealers_application real-time sync notice:", error);
-      const cached = mergeWithLocalData<DealershipFormItem>('dealers_application', []);
-      cached.sort((a, b) => {
-        const numA = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
-        const numB = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
-        return numB - numA;
-      });
-      setDealers(deduplicateDealers(cached));
-    });
-
-    return () => unsub();
-  }, []);
+  // Dealers are synced globally across all modules via useSharedDealers().
 
   // Populate form fields directly from memory cache (Zero extra network reads!)
   useEffect(() => {
@@ -600,7 +484,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         setIfscCode(item.ifscCode || '');
         setChequeNos(item.chequeNos || '');
         setPlace(item.place || 'Sangli');
-        setDeclarationDate(item.declarationDate || new Date().toISOString().slice(0, 10));
+        setDeclarationDate(item.declarationDate || getLocalDateStr());
         setRemarks(item.remarks || '');
         // Preserve strictly the officer name of the user who filled the form
         const origOfficer = item.officerName || item.created_by_name || (item.userId && usersMap[item.userId]) || (item.created_by_user_id && usersMap[item.created_by_user_id]) || (item.loginId && usersMap[item.loginId.toLowerCase()]) || '';
@@ -651,34 +535,31 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     const seqRef = doc(db, 'config', 'dealer_sequence');
     let nextNum: number;
 
-    try {
-      // Execute atomic Firestore transaction to guarantee that concurrent officer submissions NEVER collide
-      nextNum = await runTransaction(db, async (transaction) => {
-        const seqSnap = await transaction.get(seqRef);
-        let cur = 0;
-        if (seqSnap.exists()) {
-          cur = Number(seqSnap.data()?.currentSequence) || 0;
-        }
-        cur = Math.max(cur, maxKnown, globalSequence || 0);
-        const allocated = cur + 1;
-        transaction.set(
-          seqRef,
-          {
-            currentSequence: allocated,
-            lastAllocatedCode: String(allocated).padStart(3, '0'),
-            updatedAt: new Date().toISOString(),
-          },
-          { merge: true }
-        );
-        return allocated;
-      });
-    } catch (txErr) {
-      console.warn('Atomic transaction sequence fallback (offline or network retry):', txErr);
-      const baseNum = Math.max(maxKnown, globalSequence || 0);
-      nextNum = baseNum + 1;
+    if (!isQuotaBlocked() && (typeof navigator === 'undefined' || navigator.onLine)) {
       try {
-        setDoc(
-          seqRef,
+        // Execute atomic Firestore transaction to guarantee concurrent officer submissions NEVER collide
+        nextNum = await runTransaction(db, async (transaction) => {
+          const seqSnap = await transaction.get(seqRef);
+          let cur = 0;
+          if (seqSnap.exists()) {
+            cur = Number(seqSnap.data()?.currentSequence) || 0;
+          }
+          cur = Math.max(cur, maxKnown, globalSequence || 0);
+          const allocated = cur + 1;
+          transaction.set(
+            seqRef,
+            {
+              currentSequence: allocated,
+              lastAllocatedCode: String(allocated).padStart(3, '0'),
+              updatedAt: new Date().toISOString(),
+            },
+            { merge: true }
+          );
+          return allocated;
+        });
+        void safeFirestoreSet(
+          'config',
+          'dealer_sequence',
           {
             currentSequence: nextNum,
             lastAllocatedCode: String(nextNum).padStart(3, '0'),
@@ -686,7 +567,38 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           },
           { merge: true }
         ).catch(() => {});
-      } catch (_) {}
+      } catch (txErr: any) {
+        const msg = String(txErr?.message || '').toLowerCase();
+        if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+          setQuotaBlocked(15 * 60 * 1000);
+        }
+        console.warn('Atomic transaction sequence fallback (offline or quota retry):', txErr);
+        const baseNum = Math.max(maxKnown, globalSequence || 0);
+        nextNum = baseNum + 1;
+        void safeFirestoreSet(
+          'config',
+          'dealer_sequence',
+          {
+            currentSequence: nextNum,
+            lastAllocatedCode: String(nextNum).padStart(3, '0'),
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        ).catch(() => {});
+      }
+    } else {
+      const baseNum = Math.max(maxKnown, globalSequence || 0);
+      nextNum = baseNum + 1;
+      void safeFirestoreSet(
+        'config',
+        'dealer_sequence',
+        {
+          currentSequence: nextNum,
+          lastAllocatedCode: String(nextNum).padStart(3, '0'),
+          updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      ).catch(() => {});
     }
 
     setGlobalSequence(nextNum);
@@ -708,7 +620,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     setCurrentId(null);
     formSessionIdRef.current = '';
     setCenter('');
-    setShopOpeningDate(new Date().toISOString().slice(0, 10));
+    setShopOpeningDate(getLocalDateStr());
     setDealerCode(previewCode);
     setVillage('');
     setSecurityDeposit('NA');
@@ -732,14 +644,14 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     setIfscCode('');
     setChequeNos('');
     setPlace('Sangli');
-    setDeclarationDate(new Date().toISOString().slice(0, 10));
+    setDeclarationDate(getLocalDateStr());
     setRemarks('');
     // For a new form: the officer is strictly the logged-in user filling the form
     const myName = (profile.fullName || profile.loginId || 'OFFICER').toUpperCase();
     setOfficerName(myName);
     setCreatedByUserId(profile.uid || '');
     setCreatedByName(myName);
-    setOfficeDate(new Date().toISOString().slice(0, 10));
+    setOfficeDate(getLocalDateStr());
     const now = new Date();
     const hh = String(now.getHours()).padStart(2, '0');
     const mm = String(now.getMinutes()).padStart(2, '0');
@@ -758,17 +670,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   // Do not revert this behavior under any circumstances!
   // ============================================================================
   const loadDealerToForm = (item: DealershipFormItem, editMode: boolean = true) => {
-    if (!isAdmin(profile) && !isCreatedByOfficer(item, profile.uid)) {
-      setDialogConfig({
-        isOpen: true,
-        type: 'alert',
-        title: 'Access Restricted',
-        message: 'तुम्हाला फक्त स्वतः भरलेले डीलर फॉर्म पाहण्याची परवानगी आहे. (You can only access dealership forms filled by you)',
-        confirmText: 'ठीक आहे',
-        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
-      });
-      return;
-    }
+    const canEdit = isAdmin(profile) || isCreatedByOfficer(item, profile.uid);
     setCurrentId(item.id);
     formSessionIdRef.current = item.id;
     setCenter(item.center || '');
@@ -796,7 +698,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     setIfscCode(item.ifscCode || '');
     setChequeNos(item.chequeNos || '');
     setPlace(item.place || 'Sangli');
-    setDeclarationDate(item.declarationDate || new Date().toISOString().slice(0, 10));
+    setDeclarationDate(item.declarationDate || getLocalDateStr());
     setRemarks(item.remarks || '');
     // Strictly display the officer name of the user who filled the form!
     const originalOfficer = item.officerName || item.created_by_name || (item.userId && usersMap[item.userId]) || (item.created_by_user_id && usersMap[item.created_by_user_id]) || (item.loginId && usersMap[item.loginId.toLowerCase()]) || '';
@@ -808,7 +710,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     setOfficeTime(item.officeTime || '');
     setOfficePlace(item.officePlace || '');
     setStatus(item.status || 'Approved');
-    setIsEditing(editMode);
+    setIsEditing(canEdit ? editMode : false);
     setViewMode('form');
     // Scroll directly to the top so user immediately views the form
     if (typeof window !== 'undefined') {
@@ -876,10 +778,11 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       const finalCreatorId = currentId ? (createdByUserId || profile.uid) : profile.uid;
       const finalCreatorName = currentId ? (createdByName || finalOfficer) : (profile.fullName || profile.loginId || 'OFFICER');
 
+      const existingDealerRec = currentId ? dealers.find(d => d.id === currentId) : undefined;
       const payload: DealershipFormItem = {
         id,
         center: (center || '').trim(),
-        shopOpeningDate: shopOpeningDate || new Date().toISOString().slice(0, 10),
+        shopOpeningDate: shopOpeningDate || getLocalDateStr(),
         dealerCode: finalCode || 'AUTO',
         village: (village || '').trim(),
         securityDeposit: (securityDeposit || 'NA').trim(),
@@ -903,9 +806,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         ifscCode: (ifscCode || '').trim().toUpperCase(),
         chequeNos: (chequeNos || '').trim(),
         place: (place || 'Sangli').trim(),
-        declarationDate: declarationDate || new Date().toISOString().slice(0, 10),
+        declarationDate: declarationDate || getLocalDateStr(),
         remarks: (remarks || '').trim(),
-        officeDate: officeDate || new Date().toISOString().slice(0, 10),
+        officeDate: officeDate || getLocalDateStr(),
         officeTime: officeTime || '',
         officePlace: (officePlace || place || 'SANGLI').trim().toUpperCase(),
         officerName: finalOfficer || 'OFFICER',
@@ -915,7 +818,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         isArchived: false,
         ownerId: finalCreatorId || '',
         userId: finalCreatorId || '',
-        loginId: profile.loginId || '',
+        loginId: (currentId && existingDealerRec?.loginId) ? existingDealerRec.loginId : (profile.loginId || ''),
         createdByUid: finalCreatorId || '',
         updatedAt: new Date().toISOString(),
       };
@@ -933,8 +836,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         profile
       );
 
-      // Immediately update in-memory state
-      setDealers((prev) => {
+      // Immediately update shared in-memory state
+      setDealersOptimistic((prev) => {
         const idx = prev.findIndex((d) => d.id === id);
         if (idx >= 0) {
           const updated = [...prev];
@@ -1019,34 +922,17 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       onConfirm: async () => {
         setDialogConfig(prev => ({ ...prev, isOpen: false }));
         try {
-          // 1. Immediately remove from local storage
-          try {
-            const storageKey = 'blackworm_local_dealers_application';
-            const raw = localStorage.getItem(storageKey);
-            if (raw) {
-              const map = JSON.parse(raw);
-              delete map[id];
-              localStorage.setItem(storageKey, JSON.stringify(map));
-            }
-          } catch {}
-
-          // 2. Remove from state immediately
-          setDealers(prev => prev.filter(d => d.id !== id));
+          // 1. Remove from shared state immediately
+          setDealersOptimistic(prev => prev.filter(d => d.id !== id));
 
           if (currentId === id) {
             setViewMode('list');
           }
 
-          // 3. Delete from remote if quota allows
-          if (!isQuotaBlocked()) {
-            try {
-              await deleteDoc(doc(db, 'dealers_application', id));
-            } catch (delErr) {
-              console.warn('Delete remote notice:', delErr);
-            }
-          }
+          // 2. Soft-delete remotely & purge local caches + pending sync
+          await safeFirestoreDelete('dealers_application', id, { softDelete: true, user: profile });
 
-          // 4. Automatically re-index continuous serial numbers (001, 002, 003...)
+          // 3. Automatically re-index continuous serial numbers (001, 002, 003...)
           await reindexAllDealersSequence(false);
         } catch (err: any) {
           console.warn('Dealer delete handler notice:', err);
@@ -1123,6 +1009,14 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   };
 
   const userIsAdmin = isAdmin(profile);
+  const currentDealerItem = useMemo(
+    () => (currentId ? dealers.find((d) => d.id === currentId) : undefined),
+    [dealers, currentId]
+  );
+  const canEditCurrentDealer =
+    userIsAdmin ||
+    !currentId ||
+    (currentDealerItem ? isCreatedByOfficer(currentDealerItem, profile.uid) : createdByUserId === profile.uid);
 
   const usersWithCounts = useMemo(() => {
     return officers.map(off => {
@@ -1137,40 +1031,24 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const selectedOfficerObj = officers.find((o) => o.uid === selectedOfficerFilter);
 
   const officerScopedDealers = useMemo(() => {
-    if (!userIsAdmin) {
-      return dealers.filter((d) => isCreatedByOfficer(d, profile.uid));
-    }
     if (selectedOfficerFilter !== 'all') {
       return dealers.filter((d) => isCreatedByOfficer(d, selectedOfficerFilter));
     }
     return dealers;
-  }, [dealers, userIsAdmin, profile, selectedOfficerFilter, officers]);
+  }, [dealers, selectedOfficerFilter, officers]);
 
   const officerDealersCount = officerScopedDealers.length;
-  const officerActiveCount = officerScopedDealers.filter((d) => d.status === 'Approved').length;
-
-  const maxCodeFormatted = useMemo(() => {
-    const maxNum = dealers.reduce((acc, d) => {
-      const n = parseInt(String(d.dealerCode || '').replace(/\D/g, ''), 10) || 0;
-      return Math.max(acc, n);
-    }, dealers.length || 70);
-    return String(maxNum).padStart(3, '0');
-  }, [dealers]);
 
   const filteredDealers = useMemo(() => {
     let list = officerScopedDealers.filter((d) => {
       const q = searchQuery.toLowerCase().trim();
-      const matchQuery =
+      return (
         !q ||
         (d.dealerCode || '').toLowerCase().includes(q) ||
         (d.firmName || '').toLowerCase().includes(q) ||
         (d.proprietorName || '').toLowerCase().includes(q) ||
-        (d.village || '').toLowerCase().includes(q);
-
-      if (activeFilter === 'active') {
-        return matchQuery && d.status === 'Approved';
-      }
-      return matchQuery;
+        (d.village || '').toLowerCase().includes(q)
+      );
     });
 
     // Strictly sort by numeric form number so forms never jump around on refresh!
@@ -1178,15 +1056,15 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       const numA = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
       const numB = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
       if (numA !== numB) {
-        return sortOrder === 'desc' ? numB - numA : numA - numB;
+        return numB - numA;
       }
-      const timeA = new Date(a.createdAt || 0).getTime() || 0;
-      const timeB = new Date(b.createdAt || 0).getTime() || 0;
-      return sortOrder === 'desc' ? timeB - timeA : timeA - timeB;
+      const timeA = toTimestampMs(a.createdAt);
+      const timeB = toTimestampMs(b.createdAt);
+      return timeB - timeA;
     });
 
     return list;
-  }, [officerScopedDealers, searchQuery, activeFilter, sortOrder]);
+  }, [officerScopedDealers, searchQuery]);
 
   return (
     <div className="space-y-4 pb-24">
@@ -1238,7 +1116,6 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
             className="flex items-center gap-1.5 bg-red-600 hover:bg-red-700 text-white px-3.5 py-2.5 rounded-xl transition shadow-lg shrink-0 active:scale-95 cursor-pointer font-bold text-xs"
             title="Add New Dealer"
           >
-            <Plus className="w-4 h-4 stroke-[3px]" />
             <span className="font-bold whitespace-nowrap">Add New Dealer</span>
           </button>
 
@@ -1274,50 +1151,33 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
           {/* Filter Pills in a Single Inline Row on Mobile & Desktop */}
           <div className="flex items-center gap-1.5 px-1 overflow-x-auto whitespace-nowrap py-1 scrollbar-none">
-            <button
-              onClick={() => setActiveFilter('all')}
-              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer shrink-0 ${
-                activeFilter === 'all'
-                  ? 'bg-slate-900 text-white shadow-md'
-                  : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
-              }`}
+            <span
+              className="px-3 py-1 rounded-lg text-xs font-black shrink-0 bg-slate-900 text-white shadow-md"
             >
-              {isAdmin(profile) ? `All (${dealers.length})` : `My Forms (${officerDealersCount})`}
-            </button>
-            <button
-              onClick={() => setActiveFilter('active')}
-              className={`px-3 py-1 rounded-lg text-xs font-black transition cursor-pointer shrink-0 ${
-                activeFilter === 'active'
-                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 shadow-sm'
-                  : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'
-              }`}
+              {`All (${officerDealersCount})`}
+            </span>
+
+            {/* Officer Select - Available across authorized employees & admin */}
+            <select
+              value={selectedOfficerFilter}
+              onChange={(e) => setSelectedOfficerFilter(e.target.value)}
+              className="bg-slate-900 text-white hover:bg-slate-800 border-2 border-slate-900 rounded-lg px-2.5 py-1 text-xs font-black focus:outline-none focus:ring-2 focus:ring-slate-900 cursor-pointer shadow-xs tracking-tight shrink-0"
+              title="Officer Select"
             >
-              Active ({officerActiveCount})
-            </button>
+              <option value="all" className="bg-white text-slate-900 font-black py-1">
+                Officer Select
+              </option>
+              {officers.map((off) => {
+                const count = dealers.filter((d) => isCreatedByOfficer(d, off.uid)).length;
+                return (
+                  <option key={off.uid} value={off.uid} className="bg-white text-slate-900 font-bold text-xs py-1">
+                    {toTitleCase(off.fullName || 'Officer')} ({count})
+                  </option>
+                );
+              })}
+            </select>
 
-            {/* Officer Select - Directly beside Active in the same row on mobile and desktop */}
-            {isAdmin(profile) && (
-              <select
-                value={selectedOfficerFilter}
-                onChange={(e) => setSelectedOfficerFilter(e.target.value)}
-                className="bg-slate-900 text-white hover:bg-slate-800 border-2 border-slate-900 rounded-lg px-2.5 py-1 text-xs font-black focus:outline-none focus:ring-2 focus:ring-slate-900 cursor-pointer shadow-xs tracking-tight shrink-0"
-                title="Officer Select"
-              >
-                <option value="all" className="bg-white text-slate-900 font-black py-1">
-                  Officer Select (All)
-                </option>
-                {officers.map((off) => {
-                  const count = dealers.filter((d) => isCreatedByOfficer(d, off.uid)).length;
-                  return (
-                    <option key={off.uid} value={off.uid} className="bg-white text-slate-900 font-bold text-xs py-1">
-                      {toTitleCase(off.fullName || 'Officer')} ({count})
-                    </option>
-                  );
-                })}
-              </select>
-            )}
-
-            {isAdmin(profile) && selectedOfficerFilter !== 'all' && (
+            {selectedOfficerFilter !== 'all' && (
               <button
                 type="button"
                 onClick={() => setSelectedOfficerFilter('all')}
@@ -1341,17 +1201,6 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                 <span className="hidden sm:inline text-[11px]">सिंक सिरीयल</span>
               </button>
             )}
-
-            {/* Deterministic Sort Order Toggle */}
-            <button
-              type="button"
-              onClick={() => setSortOrder(prev => prev === 'desc' ? 'asc' : 'desc')}
-              className="flex items-center gap-1 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 px-2.5 py-1 rounded-lg text-xs font-black transition cursor-pointer shadow-xs shrink-0 active:scale-95 ml-auto"
-              title="फॉर्म नंबर क्रमवारी बदला"
-            >
-              <ArrowUpDown className="w-3.5 h-3.5 text-red-600" />
-              <span>{sortOrder === 'desc' ? `नवीन वर (${maxCodeFormatted}→001)` : `पहिले वर (001→${maxCodeFormatted})`}</span>
-            </button>
           </div>
 
           {/* TABLE DISPLAY MODE */}
@@ -1436,19 +1285,15 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           {/* CARDS DISPLAY MODE */}
           {listDisplayMode === 'cards' && (
             <div className="space-y-2">
-              {filteredDealers.map((d, index) => {
+              {filteredDealers.map((d) => {
                 const displayCode = d.dealerCode ? d.dealerCode.replace(/^#/, '') : 'DEALER';
-                const rowNumber = sortOrder === 'desc' ? filteredDealers.length - index : index + 1;
                 return (
                   <div
                     key={d.id}
                     onClick={() => loadDealerToForm(d, true)}
                     className="bg-white rounded-xl border border-slate-200 hover:border-red-400 hover:shadow-xs px-3 py-2.5 sm:px-3.5 sm:py-3 transition-all cursor-pointer flex items-center gap-2.5 group relative"
                   >
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      <span className="text-[10px] font-bold text-slate-400 font-mono min-w-[24px] text-right">
-                        #{rowNumber}
-                      </span>
+                    <div className="flex items-center shrink-0">
                       <span
                         className="text-[11px] font-bold text-red-600 bg-red-50 border border-red-200 px-2 py-0.5 rounded-md uppercase tracking-wider font-mono shadow-2xs"
                       >
@@ -1508,7 +1353,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               </div>
 
               <div className="flex items-center gap-2">
-                {(profile.role === 'owner' || profile.role === 'admin' || profile.uid === createdByUserId) && (
+                {canEditCurrentDealer && (
                   <button
                     type="button"
                     onClick={() => setIsEditing(!isEditing)}
@@ -1557,7 +1402,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                   <Printer className="w-4 h-4" />
                 </button>
 
-                {currentId && (
+                {currentId && canEditCurrentDealer && (
                   <button
                     type="button"
                     onClick={() => handleDelete(currentId, firmName)}

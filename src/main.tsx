@@ -19,16 +19,29 @@ if (typeof window !== 'undefined') {
   });
 
   try {
-    registerSW({
-      immediate: true,
-      onNeedRefresh() {
-        // Log update without forcefully destroying user session
-        console.log('New app version available in background');
-      },
-      onOfflineReady() {
-        console.log('App ready for offline use');
-      },
-    });
+    if (import.meta.env.DEV && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then((regs) => {
+        regs.forEach((reg) => {
+          reg.unregister().catch(() => {});
+        });
+      }).catch(() => {});
+      if ('caches' in window) {
+        caches.keys().then((names) => {
+          names.forEach((n) => caches.delete(n));
+        }).catch(() => {});
+      }
+    } else if (import.meta.env.PROD) {
+      registerSW({
+        immediate: true,
+        onNeedRefresh() {
+          // Log update without forcefully destroying user session
+          console.log('New app version available in background');
+        },
+        onOfflineReady() {
+          console.log('App ready for offline use');
+        },
+      });
+    }
   } catch (e) {
     console.warn('PWA registration skipped:', e);
   }

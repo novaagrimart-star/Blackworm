@@ -1,18 +1,14 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
-  collection, 
-  query, 
   onSnapshot, 
-  limit,
   doc,
-  setDoc,
-  getDocs,
-  deleteDoc,
   writeBatch
 } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../../firebase';
+import { db } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { safeFirestoreSet, mergeWithLocalData } from '../../lib/dataService';
+import { safeFirestoreSet, safeFirestoreDelete, triggerBlobDownload, getLocalDateStr, trackFirestoreUsage, isQuotaBlocked, setQuotaBlocked } from '../../lib/dataService';
+import { subscribeSecondaryCollection, fetchSecondaryCollection, pushBatchToSecondary } from '../../lib/secondaryDb';
+import { useSharedDealers, useSharedOutstandingRecords } from '../../lib/realtimeStore';
 import { Language } from '../../lib/i18n';
 import { cn, toTitleCase, openExternalLinkSafely } from '../../lib/utils';
 import { CustomDialogModal } from '../CustomDialogModal';
@@ -25,8 +21,9 @@ import {
   buildWhatsAppLink, 
   cleanPhoneNumber,
   mergeAndDeduplicateRecords,
-  normalizeFirmName
+  UploadSummaryReport
 } from '../../lib/pdfOutstandingParser';
+import { ALL_PARTY_REPORT_166, ALL_PARTY_TOTAL_OUTSTANDING } from '../../lib/allPartyReport166';
 import { DealershipFormItem } from './DealerView';
 import { 
   FileUp, 
@@ -35,7 +32,6 @@ import {
   Phone, 
   AlertCircle, 
   Download, 
-  Sparkles, 
   Printer, 
   CheckCircle2, 
   MessageSquare, 
@@ -49,7 +45,14 @@ import {
   Copy,
   Files,
   Trash2,
-  FileCheck
+  FileCheck,
+  ShieldCheck,
+  ArrowUpRight,
+  ArrowDownRight,
+  Users,
+  UserPlus,
+  Lock,
+  Unlock
 } from 'lucide-react';
 
 export interface UploadedPdfFile {
@@ -69,34 +72,37 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
   const isUserAdmin = isAdmin(profile);
   const { logoUrl } = useBranding();
 
-  // Raw dealers from dealers_application
-  const [dealers, setDealers] = useState<DealershipFormItem[]>([]);
-  const [loadingDealers, setLoadingDealers] = useState(true);
+  // Shared real-time dealers & outstanding records across app (zero duplicate listeners!)
+  const { dealers: sharedDealers, loaded: dealersLoaded } = useSharedDealers();
+  const {
+    outstandingRecords: sharedOutstandingRecords,
+    loaded: outstandingLoaded,
+    setOutstandingOptimistic,
+  } = useSharedOutstandingRecords();
+  const dealers = sharedDealers as DealershipFormItem[];
+  const [loadingDealers, setLoadingDealers] = useState(!dealersLoaded || !outstandingLoaded);
 
-  // Multi-PDF Parsing & File state (Persisted in Firestore & LocalStorage)
+  // Multi-PDF Parsing & File state (Persisted in Firestore, Secondary DB & LocalStorage)
   const [isParsing, setIsParsing] = useState(false);
   const [uploadedFiles, setUploadedFiles] = useState<UploadedPdfFile[]>([]);
   const [duplicatesPreventedCount, setDuplicatesPreventedCount] = useState<number>(0);
-  const [rawRecords, setRawRecords] = useState<ExtractedRecord[]>(() => {
-    try {
-      const saved = localStorage.getItem('blackworm_saved_outstanding_records');
-      return saved ? JSON.parse(saved) : [];
-    } catch {
-      return [];
-    }
-  });
+  const [uploadSummaryReport, setUploadSummaryReport] = useState<UploadSummaryReport | null>(null);
+  const [summaryModalTab, setSummaryModalTab] = useState<'new' | 'updated'>('new');
+  const rawRecords = sharedOutstandingRecords as ExtractedRecord[];
+  const setRawRecords = setOutstandingOptimistic as React.Dispatch<React.SetStateAction<ExtractedRecord[]>>;
   const [parseError, setParseError] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const printableSheetRef = useRef<HTMLDivElement>(null);
 
-  // Manual Add Dealer Modal state
-  const [showAddDealerModal, setShowAddDealerModal] = useState(false);
-  const [newFirmName, setNewFirmName] = useState('');
-  const [newVillage, setNewVillage] = useState('');
-  const [newContact, setNewContact] = useState('');
-  const [newAmount, setNewAmount] = useState('');
-  const [newProprietor, setNewProprietor] = useState('');
-  const [isSavingDealer, setIsSavingDealer] = useState(false);
+  // Party Master Lock State (Stored in Firestore config/party_master_meta)
+  const [isPartyMasterLocked, setIsPartyMasterLocked] = useState<boolean>(false);
+  const [lockMeta, setLockMeta] = useState<{
+    lockedAt?: string | null;
+    lockedBy?: string | null;
+    totalRecords?: number;
+    totalOutstanding?: number;
+  }>({});
+  const [isUpdatingLock, setIsUpdatingLock] = useState<boolean>(false);
 
   // Officer filter for Admin
   const [selectedOfficer, setSelectedOfficer] = useState<string>('all');
@@ -156,165 +162,123 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     onConfirm: () => {},
   });
 
-  // Seed default outstanding records (including user's exact example: Ganesh Krushi Seva Kendra Manerajuri 9897594653)
+  // Seed verified outstanding records (166 records from All Party Report totaling ₹1,63,59,049)
+  const seededOnceRef = useRef(false);
   const seedDefaultOutstandingRecords = async () => {
+    if (seededOnceRef.current) return;
+    seededOnceRef.current = true;
     try {
-      const defaultData: ExtractedRecord[] = [
-        {
-          id: 'rec_ganesh_manerajuri',
-          rawFirmName: 'Ganesh Krushi Seva Kendra',
-          cleanedFirmName: 'Ganesh Krushi Seva Kendra',
-          amount: 84500,
-          formattedAmount: '84,500',
-          page: 1,
-          rawLine: 'Ganesh Krushi Seva Kendra Manerajuri 84,500 Dr',
-          contactNumber: '9897594653',
-          village: 'Manerajuri',
-          district: 'Sangli',
-          proprietorName: 'Ganesh Patil',
-          sourceFile: 'Standing Statement',
-        },
-        {
-          id: 'rec_kisan_sangli',
-          rawFirmName: 'Kisan Krushi Seva Kendra',
-          cleanedFirmName: 'Kisan Krushi Seva Kendra',
-          amount: 145200,
-          formattedAmount: '1,45,200',
-          page: 1,
-          rawLine: 'Kisan Krushi Seva Kendra Sangli 1,45,200 Dr',
-          contactNumber: '9822456789',
-          village: 'Sangli',
-          district: 'Sangli',
-          proprietorName: 'Sachin Patil',
-          sourceFile: 'Standing Statement',
-        },
-        {
-          id: 'rec_balaji_miraj',
-          rawFirmName: 'Balaji Fertilisers & Seeds',
-          cleanedFirmName: 'Balaji Fertilisers & Seeds',
-          amount: 210800,
-          formattedAmount: '2,10,800',
-          page: 1,
-          rawLine: 'Balaji Fertilisers & Seeds Miraj 2,10,800 Dr',
-          contactNumber: '9423871234',
-          village: 'Miraj',
-          district: 'Sangli',
-          proprietorName: 'Balaji Shinde',
-          sourceFile: 'Standing Statement',
-        },
-        {
-          id: 'rec_mahalaxmi_jat',
-          rawFirmName: 'Mahalaxmi Krishi Vikas',
-          cleanedFirmName: 'Mahalaxmi Krishi Vikas',
-          amount: 63500,
-          formattedAmount: '63,500',
-          page: 1,
-          rawLine: 'Mahalaxmi Krishi Vikas Jat 63,500 Dr',
-          contactNumber: '9860123456',
-          village: 'Jat',
-          district: 'Sangli',
-          proprietorName: 'Ramesh Sawant',
-          sourceFile: 'Standing Statement',
-        },
-        {
-          id: 'rec_shivaji_tasgaon',
-          rawFirmName: 'Shivaji Agro Services',
-          cleanedFirmName: 'Shivaji Agro Services',
-          amount: 115000,
-          formattedAmount: '1,15,000',
-          page: 1,
-          rawLine: 'Shivaji Agro Services Tasgaon 1,15,000 Dr',
-          contactNumber: '9765432109',
-          village: 'Tasgaon',
-          district: 'Sangli',
-          proprietorName: 'Shivaji Yadav',
-          sourceFile: 'Standing Statement',
-        }
-      ];
-
-      const batch = writeBatch(db);
-      defaultData.forEach((item) => {
-        const docRef = doc(db, 'outstanding_records', item.id);
-        batch.set(docRef, {
-          ...item,
-          updatedAt: new Date().toISOString(),
-          updatedBy: profile.fullName || 'System'
-        });
-      });
-      await batch.commit();
+      const nowIso = new Date().toISOString();
+      const defaultData: ExtractedRecord[] = ALL_PARTY_REPORT_166.map(r => ({
+        ...r,
+        updatedAt: nowIso,
+        updatedBy: profile.fullName || 'System'
+      }));
 
       setRawRecords(defaultData);
-      try {
-        localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(defaultData));
-      } catch {}
+
+      await pushBatchToSecondary(
+        defaultData.map((item) => ({
+          collection: 'outstanding_records',
+          id: item.id,
+          doc: item,
+          merge: true,
+        }))
+      );
+
+      if (!isQuotaBlocked()) {
+        for (let i = 0; i < defaultData.length; i += 400) {
+          const chunk = defaultData.slice(i, i + 400);
+          const batch = writeBatch(db);
+          chunk.forEach((item) => {
+            const docRef = doc(db, 'outstanding_records', item.id);
+            batch.set(docRef, item);
+          });
+          await batch.commit();
+        }
+      }
     } catch (e) {
       console.warn('Failed to seed default outstanding records:', e);
     }
   };
 
-  // Real-time synchronization of persistent outstanding records from Firestore
   useEffect(() => {
-    setLoadingDealers(true);
-
-    // 1. Real-time Outstanding Records
-    const qOut = query(collection(db, 'outstanding_records'), limit(500));
-    const unsubOut = onSnapshot(qOut, (snapOut) => {
-      if (!snapOut.empty) {
-        const list: ExtractedRecord[] = [];
-        snapOut.forEach((d) => {
-          const data = d.data() as ExtractedRecord;
-          list.push({ ...data, id: d.id });
-        });
-        const merged = mergeWithLocalData('outstanding_records', list);
-        setRawRecords(merged);
-        localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(merged));
-      } else {
-        seedDefaultOutstandingRecords();
+    if (outstandingLoaded) {
+      setLoadingDealers(false);
+      if (rawRecords.length === 0) {
+        void seedDefaultOutstandingRecords();
       }
-      setLoadingDealers(false);
-    }, (err) => {
-      console.warn("Outstanding records real-time sync notice:", err);
-      const saved = mergeWithLocalData('outstanding_records', []);
-      if (saved.length > 0) setRawRecords(saved);
-      setLoadingDealers(false);
+    }
+  }, [outstandingLoaded, rawRecords.length]);
+
+  // Real-time Party Master Lock metadata from config/party_master_meta (Primary + Secondary DB)
+  useEffect(() => {
+    const applyMeta = (data: any) => {
+      if (!data) return;
+      setIsPartyMasterLocked(Boolean(data.isLocked));
+      setLockMeta({
+        lockedAt: data.lockedAt || null,
+        lockedBy: data.lockedBy || null,
+        totalRecords: data.totalRecords,
+        totalOutstanding: data.totalOutstanding,
+      });
+    };
+
+    const pullMetaFromSecondary = async () => {
+      try {
+        const res = await fetchSecondaryCollection('config', { limit: 50 });
+        if (res.ok) {
+          const found = res.items.find((it) => it?.id === 'party_master_meta');
+          if (found) applyMeta(found);
+        }
+      } catch {}
+    };
+
+    const unsubSecMeta = subscribeSecondaryCollection('config', (events) => {
+      events.forEach((evt) => {
+        if (evt.id === 'party_master_meta' && evt.doc && !evt.deleted) {
+          applyMeta(evt.doc);
+        }
+      });
     });
 
-    // 2. Real-time Dealers
-    const qDealers = query(collection(db, 'dealers_application'), limit(500));
-    const unsubDealers = onSnapshot(qDealers, (snapDealers) => {
-      const dList: DealershipFormItem[] = [];
-      snapDealers.forEach((d) => {
-        const data = d.data() as DealershipFormItem;
-        dList.push({ ...data, id: d.id });
+    let unsubMeta: (() => void) | null = null;
+    if (isQuotaBlocked()) {
+      void pullMetaFromSecondary();
+    } else {
+      unsubMeta = onSnapshot(doc(db, 'config', 'party_master_meta'), (docSnap) => {
+        trackFirestoreUsage('read', 1);
+        if (docSnap.exists()) {
+          applyMeta(docSnap.data());
+        }
+      }, (err) => {
+        const msg = String(err?.message || '').toLowerCase();
+        if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+          setQuotaBlocked(15 * 60 * 1000);
+        }
+        console.warn("Party master meta sync notice:", err);
+        void pullMetaFromSecondary();
       });
-      const mergedDealers = mergeWithLocalData('dealers_application', dList);
-      setDealers(mergedDealers);
-    }, (err) => {
-      console.warn("Dealers sync notice in OutstandingView:", err);
-      const cached = mergeWithLocalData('dealers_application', []);
-      setDealers(cached);
-    });
+    }
 
     return () => {
-      unsubOut();
-      unsubDealers();
+      unsubSecMeta();
+      if (unsubMeta) unsubMeta();
     };
   }, []);
 
-  // Filter dealers accessible to current user / selected officer
+  // All registered dealers (including Amir Nanavare's) provide contact enrichment across authorized logins;
+  // Admin can filter by specific officer.
   const accessibleDealers = useMemo(() => {
-    if (isUserAdmin) {
-      if (selectedOfficer === 'all') return dealers;
+    if (isUserAdmin && selectedOfficer !== 'all') {
       return dealers.filter(d => {
         const officer = (d.officerName || d.created_by_name || '').toLowerCase();
-        return officer.includes(selectedOfficer.toLowerCase()) || 
+        return officer.includes(selectedOfficer.toLowerCase()) ||
                d.created_by_user_id === selectedOfficer;
       });
-    } else {
-      // Non-admin Officer: Strictly ONLY dealers submitted by this logged-in officer
-      return dealers.filter(d => isUserRecord(d, profile));
     }
-  }, [dealers, isUserAdmin, selectedOfficer, profile]);
+    return dealers;
+  }, [dealers, isUserAdmin, selectedOfficer]);
 
   // List of distinct officers for Admin dropdown
   const distinctOfficers = useMemo(() => {
@@ -329,8 +293,65 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     return Array.from(map.entries()).map(([name, id]) => ({ name, id }));
   }, [dealers]);
 
-  // Handle Multi-PDF file upload and deduplication
+  // Toggle Party Master Data Lock (Admin-only)
+  const handleToggleLock = async () => {
+    if (!isUserAdmin) {
+      showToast('फक्त ॲडमिनला Party Master लॉक किंवा अनलॉक करण्याची परवानगी आहे.', 'info');
+      return;
+    }
+
+    const nextLockState = !isPartyMasterLocked;
+    const actionText = nextLockState ? 'लॉक (Lock)' : 'अनलॉक (Unlock)';
+
+    setDialogConfig({
+      isOpen: true,
+      type: 'confirm',
+      title: `Party Master ${actionText} करा`,
+      message: nextLockState 
+        ? `तुम्ही Party Master डेटा Final Lock करू इच्छिता का? लॉक केल्यानंतर नवीन PDF अपलोड किंवा नोंदी बदलता येणार नाहीत. (एकूण १६६ पार्टी, एकूण ₹१,६३,५९,०४९)`
+        : `तुम्हाला Party Master Unlock करायचा आहे का? त्यानंतर नवीन PDF अपलोड आणि नोंदी एडिट करता येतील.`,
+      confirmText: nextLockState ? 'होय, डेटा लॉक करा' : 'होय, अनलॉक करा',
+      cancelText: 'रद्द करा',
+      onConfirm: async () => {
+        setDialogConfig(p => ({ ...p, isOpen: false }));
+        setIsUpdatingLock(true);
+        try {
+          const totalAmt = processedRecords.reduce((acc, curr) => acc + curr.amount, 0);
+          await safeFirestoreSet('config', 'party_master_meta', {
+            isLocked: nextLockState,
+            lockedAt: nextLockState ? new Date().toISOString() : null,
+            lockedBy: nextLockState ? (profile.fullName || profile.emailId || 'Admin') : null,
+            totalRecords: processedRecords.length,
+            totalOutstanding: totalAmt,
+            updatedAt: new Date().toISOString()
+          }, { merge: true });
+
+          showToast(nextLockState ? 'Party Master यशस्वीरित्या लॉक केला!' : 'Party Master अनलॉक केला.');
+        } catch (err: any) {
+          console.error('Lock error:', err);
+          showToast('लॉक स्थिती बदलताना त्रुटी आली.', 'info');
+        } finally {
+          setIsUpdatingLock(false);
+        }
+      },
+      onCancel: () => setDialogConfig(p => ({ ...p, isOpen: false }))
+    });
+  };
+
+  // Handle Multi-PDF file upload and duplicate-free auto update
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!isUserAdmin) {
+      setParseError('फक्त ॲडमिनला All Party Report PDF अपलोड करण्याची परवानगी आहे.');
+      showToast('फक्त ॲडमिनला PDF अपलोड करण्याची परवानगी आहे.', 'info');
+      return;
+    }
+
+    if (isPartyMasterLocked) {
+      setParseError('Party Master डेटा सध्या लॉक आहे. नवीन PDF अपलोड करण्यासाठी आधी ॲडमिनने डेटा अनलॉक करावा.');
+      showToast('Party Master डेटा लॉक आहे. आधी अनलॉक करा.', 'info');
+      return;
+    }
+
     const fileList = e.target.files ? Array.from(e.target.files) : [];
     if (fileList.length === 0) return;
 
@@ -350,15 +371,19 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
 
       let currentRecords = [...rawRecords];
       let totalNewAdded = 0;
+      let totalUpdated = 0;
+      let totalUnchanged = 0;
       let totalDuplicatesMerged = 0;
       const newlyProcessedFiles: UploadedPdfFile[] = [];
+      const aggregatedNewParties: UploadSummaryReport['newParties'] = [];
+      const aggregatedUpdatedParties: UploadSummaryReport['updatedParties'] = [];
 
       for (const file of validPdfFiles) {
         const buffer = await file.arrayBuffer();
         const extracted = await parseOutstandingPdf(buffer, file.name);
 
         if (extracted.length > 0) {
-          const { merged, addedCount, duplicateCount } = mergeAndDeduplicateRecords(
+          const { merged, addedCount, updatedCount, unchangedCount, duplicateCount, summary } = mergeAndDeduplicateRecords(
             currentRecords,
             extracted,
             file.name
@@ -366,7 +391,11 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
 
           currentRecords = merged;
           totalNewAdded += addedCount;
+          totalUpdated += updatedCount;
+          totalUnchanged += unchangedCount;
           totalDuplicatesMerged += duplicateCount;
+          aggregatedNewParties.push(...summary.newParties);
+          aggregatedUpdatedParties.push(...summary.updatedParties);
 
           newlyProcessedFiles.push({
             id: `${file.name}_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -379,7 +408,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       }
 
       if (newlyProcessedFiles.length === 0) {
-        setParseError('निवडलेल्या PDF फाईल्समधून कोणताही डेटा काढता आला नाही. कृपया टेक्स्ट-बेस्ड आउटस्टँडिंग PDF असल्याची खात्री करा.');
+        setParseError('निवडलेल्या PDF फाईल्समधून कोणताही डेटा काढता आला नाही. कृपया वैध पार्टी रिपोर्ट किंवा आउटस्टँडिंग PDF फाईल निवडा.');
       } else {
         setRawRecords(currentRecords);
         setUploadedFiles(prev => {
@@ -389,31 +418,61 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
         });
         setDuplicatesPreventedCount(prev => prev + totalDuplicatesMerged);
 
-        // Persist all extracted records to Firestore permanently so they are never lost on reload
-        try {
-          const batch = writeBatch(db);
-          currentRecords.forEach((rec) => {
-            const docRef = doc(db, 'outstanding_records', rec.id);
-            batch.set(docRef, {
-              ...rec,
-              updatedAt: new Date().toISOString(),
-              updatedBy: profile.fullName || 'User'
-            }, { merge: true });
-          });
-          await batch.commit();
-        } catch (dbErr) {
-          console.warn('Failed to persist to Firestore:', dbErr);
+        // Persist all extracted records to Secondary DB and Firestore in safe chunks of 400
+        const nowIso = new Date().toISOString();
+        await pushBatchToSecondary(
+          currentRecords.map((rec) => ({
+            collection: 'outstanding_records',
+            id: rec.id,
+            doc: { ...rec, updatedAt: nowIso, updatedBy: profile.fullName || 'User' },
+            merge: true,
+          }))
+        );
+        if (!isQuotaBlocked()) {
+          try {
+            for (let i = 0; i < currentRecords.length; i += 400) {
+              const chunk = currentRecords.slice(i, i + 400);
+              const batch = writeBatch(db);
+              chunk.forEach((rec) => {
+                const docRef = doc(db, 'outstanding_records', rec.id);
+                batch.set(docRef, {
+                  ...rec,
+                  updatedAt: nowIso,
+                  updatedBy: profile.fullName || 'User'
+                }, { merge: true });
+              });
+              await batch.commit();
+            }
+          } catch (dbErr) {
+            console.warn('Failed to persist to Primary Firestore:', dbErr);
+          }
         }
 
         try {
           localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(currentRecords));
         } catch {}
 
-        if (totalDuplicatesMerged > 0) {
-          showToast(`${newlyProcessedFiles.length} PDF जोडल्या! एकूण ${currentRecords.length} डीलर्स (ज्यात ${totalDuplicatesMerged} डुप्लिकेट्स आपोआप एकत्र केले).`);
-        } else {
-          showToast(`${newlyProcessedFiles.length} PDF फाईल(्स) मधून एकूण ${currentRecords.length} डीलर्स लोड झाले.`);
+        // Set the full Summary Report for user visibility
+        setUploadSummaryReport({
+          totalExtracted: totalNewAdded + totalUpdated + totalUnchanged,
+          addedCount: totalNewAdded,
+          updatedCount: totalUpdated,
+          unchangedCount: totalUnchanged,
+          duplicateCount: totalDuplicatesMerged,
+          sourceFile: newlyProcessedFiles.map(f => f.name).join(', '),
+          newParties: aggregatedNewParties,
+          updatedParties: aggregatedUpdatedParties,
+        });
+
+        if (aggregatedNewParties.length > 0) {
+          setSummaryModalTab('new');
+        } else if (aggregatedUpdatedParties.length > 0) {
+          setSummaryModalTab('updated');
         }
+
+        showToast(
+          `Party Master अपडेट झाला! ${totalNewAdded} नवीन जोडल्या, ${totalUpdated} अपडेट, ${totalDuplicatesMerged} डुप्लिकेट्स रोखले.`
+        );
       }
     } catch (err: any) {
       console.error('PDF parsing error:', err);
@@ -424,73 +483,17 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     }
   };
 
-  // Add new dealer outstanding record manually (e.g. Ganesh Krushi Seva Kendra Manerajuri 9897594653)
-  const handleSaveNewDealer = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newFirmName.trim()) {
-      showToast('कृपया डीलर / फर्मचे नाव टाका.', 'info');
-      return;
-    }
-    const cleanAmount = parseFloat(newAmount.replace(/,/g, ''));
-    if (isNaN(cleanAmount) || cleanAmount <= 0) {
-      showToast('कृपया वैध थकीत येणेबाकी रक्कम टाका.', 'info');
-      return;
-    }
-
-    setIsSavingDealer(true);
-    try {
-      const cleanPhone = cleanPhoneNumber(newContact);
-      const newId = `rec_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-      const newRec: ExtractedRecord = {
-        id: newId,
-        rawFirmName: newFirmName.trim(),
-        cleanedFirmName: newFirmName.trim(),
-        amount: Math.round(cleanAmount),
-        formattedAmount: Math.round(cleanAmount).toLocaleString('en-IN'),
-        page: 1,
-        rawLine: `${newFirmName} ${newVillage} ${cleanAmount} Dr`,
-        contactNumber: cleanPhone,
-        village: newVillage.trim(),
-        proprietorName: newProprietor.trim(),
-        sourceFile: 'Manual Entry',
-      };
-
-      // 1. Immediately update in-memory state and localStorage so user data is never lost
-      const updated = [newRec, ...rawRecords];
-      setRawRecords(updated);
-      try {
-        localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(updated));
-      } catch {}
-
-      // 2. Safely sync to Firestore / local cache
-      const saveRes = await safeFirestoreSet('outstanding_records', newId, {
-        ...newRec,
-        updatedAt: new Date().toISOString(),
-        updatedBy: profile.fullName || 'User'
-      });
-
-      if (saveRes.isCachedLocally) {
-        showToast(`'${newFirmName}' ची थकीत रक्कम ₹${newRec.formattedAmount} सुरक्षित सेव्ह झाली! (स्थानिक मेमरी)`);
-      } else {
-        showToast(`'${newFirmName}' ची थकीत रक्कम ₹${newRec.formattedAmount} सेव्ह झाली!`);
-      }
-
-      setShowAddDealerModal(false);
-      setNewFirmName('');
-      setNewVillage('');
-      setNewContact('');
-      setNewAmount('');
-      setNewProprietor('');
-    } catch (err: any) {
-      console.warn('Failed to save manual dealer:', err);
-      showToast('डीलर सेव्ह करताना अडचण आली, परंतु डेटा सुरक्षित सेव्ह झाला आहे.');
-    } finally {
-      setIsSavingDealer(false);
-    }
-  };
-
   // Delete a dealer outstanding record from Firestore
   const handleDeleteRecord = (recordId: string, firmName: string) => {
+    if (!isUserAdmin || isPartyMasterLocked) {
+      showToast(
+        isPartyMasterLocked
+          ? 'Party Master डेटा लॉक आहे. नोंद काढण्यासाठी आधी अनलॉक करा.'
+          : 'फक्त ॲडमिन नोंद काढू शकतात.',
+        'info'
+      );
+      return;
+    }
     setDialogConfig({
       isOpen: true,
       type: 'confirm',
@@ -501,8 +504,8 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       onConfirm: async () => {
         setDialogConfig(p => ({ ...p, isOpen: false }));
         try {
-          await deleteDoc(doc(db, 'outstanding_records', recordId));
           setRawRecords(prev => prev.filter(r => r.id !== recordId));
+          await safeFirestoreDelete('outstanding_records', recordId);
           showToast(`'${firmName}' ची नोंद काढली.`);
         } catch (err) {
           console.error('Failed to delete record:', err);
@@ -516,18 +519,26 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
   const handleRemoveFile = (fileNameToRemove: string) => {
     setUploadedFiles(prev => prev.filter(f => f.name !== fileNameToRemove));
 
+    const toDeleteIds: string[] = [];
+    const toUpdateRecords: { id: string; sourceFile: string }[] = [];
+
     setRawRecords(prev => {
-      const remaining = prev.filter(record => {
+      const remaining: ExtractedRecord[] = [];
+      prev.forEach(record => {
         const sources = (record.sourceFile || '').split(', ').map(s => s.trim()).filter(Boolean);
         // If this record only came from this file, remove it
         if (sources.length <= 1 && (sources[0] === fileNameToRemove || !record.sourceFile)) {
-          return false;
+          toDeleteIds.push(record.id);
+          return;
         }
-        // If it came from multiple files, keep it but remove this source
+        // If it came from multiple files, keep a copy with this source removed
         if (sources.includes(fileNameToRemove)) {
-          record.sourceFile = sources.filter(s => s !== fileNameToRemove).join(', ');
+          const nextSources = sources.filter(s => s !== fileNameToRemove).join(', ');
+          toUpdateRecords.push({ id: record.id, sourceFile: nextSources });
+          remaining.push({ ...record, sourceFile: nextSources });
+        } else {
+          remaining.push(record);
         }
-        return true;
       });
       try {
         localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(remaining));
@@ -535,84 +546,19 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       return remaining;
     });
 
+    Promise.all([
+      ...toDeleteIds.map(id => safeFirestoreDelete('outstanding_records', id).catch(() => {})),
+      ...toUpdateRecords.map(u => safeFirestoreSet('outstanding_records', u.id, { sourceFile: u.sourceFile }, { merge: true }).catch(() => {}))
+    ]).catch(() => {});
+
     showToast(`"${fileNameToRemove}" फाईल आणि तिचा डेटा शीटमधून काढला.`);
   };
 
-  // Load Sample / Demo Statement for instant testing
-  const handleLoadDemoData = () => {
-    setParseError('');
-    const demoFileName = 'Dealer_Standing_Amount_Statement.pdf';
-    
-    const demoItems: ExtractedRecord[] = [];
-    const sampleAmounts = [145200, 84500, 42000, 210800, 63500, 115000, 92000, 178000];
-
-    const targetDealers = accessibleDealers.length > 0 ? accessibleDealers : dealers;
-    if (targetDealers.length > 0) {
-      const sample = targetDealers.slice(0, 8);
-      sample.forEach((d, idx) => {
-        const val = sampleAmounts[idx % sampleAmounts.length];
-        demoItems.push({
-          id: `demo_${d.id}`,
-          rawFirmName: d.firmName,
-          cleanedFirmName: d.firmName,
-          amount: val,
-          formattedAmount: val.toLocaleString('en-IN'),
-          page: 1,
-          rawLine: `${idx + 1} ${d.firmName} ${val.toLocaleString('en-IN')} Dr`,
-          contactNumber: d.contactNumber || d.responsibleContact || '',
-          village: d.village || '',
-          district: d.district || '',
-          proprietorName: d.proprietorName || '',
-          sourceFile: demoFileName,
-        });
-      });
-    }
-
-    if (demoItems.length < 4) {
-      const fallbackData = [
-        { name: 'Ganesh Krushi Seva Kendra', village: 'Manerajuri', contact: '9897594653', amount: 84500 },
-        { name: 'Kisan Krushi Seva Kendra', village: 'Sangli', contact: '9822456789', amount: 145200 },
-        { name: 'Balaji Fertilisers & Seeds', village: 'Miraj', contact: '9423871234', amount: 210800 },
-        { name: 'Mahalaxmi Krishi Vikas', village: 'Jat', contact: '9860123456', amount: 63500 },
-        { name: 'Shivaji Agro Services', village: 'Tasgaon', contact: '9765432109', amount: 115000 }
-      ];
-      fallbackData.forEach((item, idx) => {
-        demoItems.push({
-          id: `demo_fallback_${idx}`,
-          rawFirmName: item.name,
-          cleanedFirmName: item.name,
-          amount: item.amount,
-          formattedAmount: item.amount.toLocaleString('en-IN'),
-          page: 1,
-          rawLine: `${idx + 1} ${item.name} ${item.amount.toLocaleString('en-IN')} Dr`,
-          contactNumber: item.contact,
-          village: item.village,
-          sourceFile: demoFileName,
-        });
-      });
-    }
-
-    const { merged, duplicateCount } = mergeAndDeduplicateRecords(rawRecords, demoItems, demoFileName);
-    setRawRecords(merged);
-    try {
-      localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(merged));
-    } catch {}
-
-    setUploadedFiles(prev => {
-      if (prev.some(f => f.name === demoFileName)) return prev;
-      return [...prev, {
-        id: `demo_${Date.now()}`,
-        name: demoFileName,
-        size: 45000,
-        recordCount: demoItems.length,
-        uploadedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      }];
-    });
-    setDuplicatesPreventedCount(prev => prev + duplicateCount);
-    showToast('डेमो आउटस्टँडिंग शीट यशस्वीरीत्या लोड झाली!');
-  };
-
   const handleClearData = () => {
+    if (!isUserAdmin || isPartyMasterLocked) {
+      showToast('Party Master डेटा लॉक आहे किंवा परवानगी नाही.', 'info');
+      return;
+    }
     setDialogConfig({
       isOpen: true,
       type: 'confirm',
@@ -622,13 +568,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       cancelText: 'रद्द करा',
       onConfirm: async () => {
         setDialogConfig(p => ({ ...p, isOpen: false }));
-        try {
-          const batch = writeBatch(db);
-          rawRecords.forEach((r) => {
-            batch.delete(doc(db, 'outstanding_records', r.id));
-          });
-          await batch.commit();
-        } catch (e) {}
+        const recordsToDelete = [...rawRecords];
 
         setRawRecords([]);
         setUploadedFiles([]);
@@ -636,7 +576,42 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
         setParseError('');
         try {
           localStorage.removeItem('blackworm_saved_outstanding_records');
+          localStorage.removeItem('blackworm_local_outstanding_records');
+          const pendingRaw = localStorage.getItem('blackworm_pending_sync');
+          if (pendingRaw) {
+            const pending = JSON.parse(pendingRaw);
+            if (Array.isArray(pending)) {
+              localStorage.setItem(
+                'blackworm_pending_sync',
+                JSON.stringify(pending.filter((q: any) => q?.collection !== 'outstanding_records'))
+              );
+            }
+          }
         } catch {}
+
+        try {
+          await pushBatchToSecondary(
+            recordsToDelete.map((r) => ({
+              collection: 'outstanding_records',
+              id: r.id,
+              doc: { isArchived: true, updatedAt: new Date().toISOString() },
+              deleted: true,
+              merge: true,
+            }))
+          );
+          if (!isQuotaBlocked()) {
+            for (let i = 0; i < recordsToDelete.length; i += 400) {
+              const chunk = recordsToDelete.slice(i, i + 400);
+              const batch = writeBatch(db);
+              chunk.forEach((r) => {
+                batch.delete(doc(db, 'outstanding_records', r.id));
+              });
+              await batch.commit();
+            }
+          }
+        } catch (e) {
+          console.warn('Clear outstanding batch notice:', e);
+        }
         showToast('सर्व डेटा साफ केला.');
       },
       onCancel: () => setDialogConfig(p => ({ ...p, isOpen: false }))
@@ -644,7 +619,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
   };
 
   // Cross-reference extracted PDF records with dealers in dealers_application
-  // and apply strict deduplication so identical firms/dealers NEVER appear twice!
+  // and preserve each clean unique party record
   const processedRecords = useMemo<MatchedOutstandingItem[]>(() => {
     if (rawRecords.length === 0) return [];
 
@@ -666,7 +641,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       // Check if user manually saved an override phone for this record
       const overridePhone = phoneOverrides[rec.id];
 
-      if (bestMatch && highestScore >= 55) {
+      if (bestMatch && highestScore >= 60) {
         matchedList.push({
           ...rec,
           matchedDealerId: bestMatch.id,
@@ -695,21 +670,16 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       }
     });
 
-    // STRICT DEDUPLICATION:
-    // Guarantee that NO firm appears twice in the sheet:
-    // If multiple records match the same registered dealer in Firestore, OR share the exact same normalized firm name,
-    // consolidate them into a single row with the latest/higher outstanding balance!
+    // STRICT UNIQUE PRESERVATION:
+    // Every distinct party record from the PDF report is maintained cleanly
     const deduplicatedMap = new Map<string, MatchedOutstandingItem>();
 
     matchedList.forEach((item) => {
-      const dedupKey = item.matchedDealerId
-        ? `dealer_${item.matchedDealerId}`
-        : `firm_${normalizeFirmName(item.cleanedFirmName) || item.cleanedFirmName.toLowerCase()}`;
+      const dedupKey = item.id || `firm_${(item.cleanedFirmName || item.rawFirmName).toLowerCase().trim()}`;
 
       if (!deduplicatedMap.has(dedupKey)) {
         deduplicatedMap.set(dedupKey, item);
       } else {
-        // DUPLICATE DETECTED: Merge without adding another row!
         const existing = deduplicatedMap.get(dedupKey)!;
         const higherAmount = Math.max(existing.amount, item.amount);
 
@@ -722,9 +692,6 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           amount: higherAmount,
           formattedAmount: higherAmount.toLocaleString('en-IN'),
           contactNumber: existing.contactNumber || item.contactNumber || '',
-          proprietorName: existing.proprietorName || item.proprietorName,
-          village: existing.village || item.village,
-          district: existing.district || item.district,
           sourceFile: mergedSources.join(', ') || existing.sourceFile,
         });
       }
@@ -857,14 +824,9 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       ];
     });
 
-    const csvContent = 'data:text/csv;charset=utf-8,' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `Dealer_Standing_Amount_Statement_${new Date().toISOString().slice(0, 10)}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const csvContent = '\uFEFF' + [headers.join(','), ...rows.map(e => e.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    triggerBlobDownload(blob, `Dealer_Standing_Amount_Statement_${getLocalDateStr()}.csv`);
   };
 
   return (
@@ -901,15 +863,12 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           </div>
           <div className="min-w-0">
             <h2 className="text-base sm:text-lg font-black text-slate-900 tracking-tight">
-              Outstanding (थकीत येणेबाकी)
+              Outstanding
             </h2>
-            <p className="text-[11px] text-slate-500 font-medium">
-              Dealer Standing Amount Statement & Direct WhatsApp
-            </p>
           </div>
         </div>
 
-        {/* Action Buttons: Upload Statement PDF(s), Demo Data, Print Sheet */}
+        {/* Action Buttons: Upload Statement PDF(s), Add Party, Demo Data, Print Sheet */}
         <div className="flex items-center gap-1.5 shrink-0 ml-auto flex-wrap">
           <input
             type="file"
@@ -921,34 +880,35 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
             id="outstanding-pdf-upload"
           />
 
+          {isUserAdmin && (
+            <button
+              type="button"
+              onClick={handleToggleLock}
+              disabled={isUpdatingLock}
+              className={cn(
+                "flex items-center gap-1.5 font-bold text-xs px-3 py-1.5 rounded-lg border shadow-2xs transition active:scale-95 cursor-pointer whitespace-nowrap",
+                isPartyMasterLocked
+                  ? "bg-amber-100 hover:bg-amber-200 text-amber-900 border-amber-300"
+                  : "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200"
+              )}
+              title={lockMeta.lockedBy ? `Locked by ${lockMeta.lockedBy}` : 'Toggle Party Master Lock'}
+            >
+              {isPartyMasterLocked ? <Lock className="w-3.5 h-3.5 text-amber-700" /> : <Unlock className="w-3.5 h-3.5 text-slate-600" />}
+              <span>{isUpdatingLock ? 'Updating...' : isPartyMasterLocked ? 'Locked' : 'Lock Data'}</span>
+            </button>
+          )}
+
           <label
             htmlFor="outstanding-pdf-upload"
-            className="flex items-center gap-1.5 bg-red-600 hover:bg-red-700 active:scale-95 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-2xs transition cursor-pointer whitespace-nowrap"
-            title="Upload one or more Outstanding Statement PDFs"
+            className={cn(
+              "flex items-center gap-1.5 bg-red-600 hover:bg-red-700 active:scale-95 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-2xs transition cursor-pointer whitespace-nowrap",
+              (isPartyMasterLocked || !isUserAdmin) && "opacity-60"
+            )}
+            title="All Party Report PDF अपलोड करा"
           >
             <FileUp className="w-3.5 h-3.5" />
-            <span>{isParsing ? 'वाचत आहे...' : '+ PDF जोडा'}</span>
+            <span>{isParsing ? 'अपडेट करत आहे...' : '+ All Party PDF अपलोड करा'}</span>
           </label>
-
-          <button
-            type="button"
-            onClick={() => setShowAddDealerModal(true)}
-            className="flex items-center gap-1.5 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-2xs transition cursor-pointer whitespace-nowrap"
-            title="नवीन डीलर थकीत नोंद जोडा"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span>+ डीलर जोडा</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={handleLoadDemoData}
-            className="flex items-center gap-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs px-2.5 py-1.5 rounded-lg border border-slate-200 shadow-2xs transition active:scale-95 cursor-pointer whitespace-nowrap"
-            title="Load Sample Statement"
-          >
-            <Sparkles className="w-3.5 h-3.5 text-amber-500" />
-            <span>डेमो डेटा</span>
-          </button>
 
           {rawRecords.length > 0 && (
             <>
@@ -962,14 +922,16 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
                 <span className="hidden sm:inline">Print Sheet</span>
               </button>
 
-              <button
-                type="button"
-                onClick={handleClearData}
-                className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-slate-100 transition"
-                title="Clear Data"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-              </button>
+              {isUserAdmin && !isPartyMasterLocked && (
+                <button
+                  type="button"
+                  onClick={handleClearData}
+                  className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-slate-100 transition"
+                  title="Clear Data"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                </button>
+              )}
             </>
           )}
         </div>
@@ -1080,39 +1042,17 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           </div>
           <div>
             <h3 className="text-sm sm:text-base font-black text-slate-900">
-              Dealer Standing Statement PDF(s) अपलोड करा
+              All Party Report / Outstanding PDF अपलोड करा
             </h3>
-            <p className="text-xs text-slate-500 max-w-md mx-auto mt-1">
-              तुम्ही एकाच वेळी किंवा एकामागून एक अनेक PDFs अपलोड करू शकता. सर्व PDF मधील डेटा एकत्र जोडला जाईल आणि कोणताही डेटा डबल (Duplicate) होणार नाही!
+            <p className="text-xs text-slate-500 max-w-lg mx-auto mt-1 leading-relaxed">
+              PDF मधील <strong>Party Name</strong>, <strong>Contact Number</strong> व <strong>Receivable Balance</strong> अचूकपणे Party Master मध्ये नोंदवले जातील. आधीच्या पार्टींचे बॅलन्स अपडेट होईल व कोणताही डेटा डबल (Duplicate) होणार नाही!
             </p>
           </div>
           <div className="pt-2 flex items-center justify-center gap-2 flex-wrap">
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                setShowAddDealerModal(true);
-              }}
-              className="inline-flex items-center gap-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-xs transition"
-            >
-              <Plus className="w-4 h-4" />
-              + डीलर नोंद जोडा
-            </button>
             <span className="inline-flex items-center gap-1.5 px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-bold text-xs rounded-xl shadow-xs transition">
               <FileUp className="w-4 h-4" />
-              किंवा PDF अपलोड करा
+              + All Party PDF अपलोड करा
             </span>
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                handleLoadDemoData();
-              }}
-              className="inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 font-bold text-xs rounded-xl shadow-2xs transition"
-            >
-              <Sparkles className="w-3.5 h-3.5 text-amber-500" />
-              सॅम्पल डेटा पहा
-            </button>
           </div>
         </div>
       )}
@@ -1135,7 +1075,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
               <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-slate-400" />
               <input
                 type="text"
-                placeholder="डीलरचे नाव, मोबाईल नंबर किंवा गावाचे नाव शोधा..."
+                placeholder="पार्टीचे नाव किंवा मोबाईल नंबर शोधा..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 className="w-full pl-8 pr-3 py-1.5 rounded-lg border border-slate-200 bg-slate-50 focus:bg-white text-xs font-medium focus:outline-none focus:ring-1 focus:ring-red-500"
@@ -1150,11 +1090,6 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
               )}
             </div>
 
-            {/* Quick Action Hint */}
-            <div className="text-[11px] text-slate-500 font-medium flex items-center gap-1.5">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-              <span>थकीत रकमेवर क्लिक करताच थेट WhatsApp मेसेज पाठवला जाईल.</span>
-            </div>
           </div>
 
           {/* ============================================================== */}
@@ -1209,11 +1144,11 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
                 </div>
               </div>
 
-              {/* Statement Sub-banner: Dealer Standing Amount Statement */}
+              {/* Statement Sub-banner: Party Master & Receivable Balance Statement */}
               <div className="bg-slate-900 text-white font-black px-3 sm:px-4 py-2 flex items-center justify-between border-b-2 border-black text-xs uppercase tracking-wider whitespace-nowrap">
-                <span>DEALER STANDING AMOUNT STATEMENT</span>
+                <span>PARTY MASTER & RECEIVABLE BALANCE STATEMENT</span>
                 <span className="font-mono text-emerald-400">
-                  Total Standing: ₹{totalStanding.toLocaleString('en-IN')}
+                  Total Receivable: ₹{totalStanding.toLocaleString('en-IN')}
                 </span>
               </div>
 
@@ -1221,17 +1156,17 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
               <table className="w-full text-left text-xs border-collapse">
                 <thead>
                   <tr className="bg-slate-100 text-black font-black uppercase text-[10px] sm:text-[11px] border-b-2 border-black">
-                    {/* COLUMN 1: Dealer / Firm Name */}
+                    {/* COLUMN 1: Party Name */}
                     <th className="p-2.5 sm:p-3 border-r border-black min-w-[220px] sm:min-w-[300px]">
-                      डीलरचे नाव (Dealer / Firm Name)
+                      पार्टीचे नाव (Party Name)
                     </th>
-                    {/* COLUMN 2: Mobile Number */}
+                    {/* COLUMN 2: Contact Number */}
                     <th className="p-2.5 sm:p-3 border-r border-black min-w-[140px] sm:min-w-[180px]">
-                      मोबाईल नंबर (Mobile Number)
+                      मोबाईल नंबर (Contact Number)
                     </th>
-                    {/* COLUMN 3: Outstanding Amount (Clickable for WhatsApp) */}
+                    {/* COLUMN 3: Receivable Balance (Clickable for WhatsApp) */}
                     <th className="p-2.5 sm:p-3 text-right min-w-[150px] sm:min-w-[190px] bg-rose-50/80 font-mono">
-                      थकीत रक्कम (Outstanding Amount)
+                      थकीत येणेबाकी (Receivable Balance)
                     </th>
                   </tr>
                 </thead>
@@ -1280,23 +1215,6 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
                                   <Trash2 className="w-3 h-3" />
                                 </button>
                               </div>
-
-                              {/* Secondary details: Proprietor & Village */}
-                              {(item.proprietorName || item.village || item.district) && (
-                                <div className="text-[10.5px] text-slate-600 flex items-center gap-1.5 flex-wrap">
-                                  {item.proprietorName && (
-                                    <span>
-                                      प्रो.: <strong className="text-slate-800">{toTitleCase(item.proprietorName)}</strong>
-                                    </span>
-                                  )}
-                                  {item.village && (
-                                    <span>• {toTitleCase(item.village)}</span>
-                                  )}
-                                  {item.district && (
-                                    <span className="text-slate-500">({toTitleCase(item.district)})</span>
-                                  )}
-                                </div>
-                              )}
                             </div>
                           </td>
 
@@ -1471,128 +1389,6 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
         </div>
       )}
 
-      {/* Modal: Add Manual Dealer Outstanding (No PDF Required) */}
-      {showAddDealerModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 animate-fade-in no-print">
-          <div className="bg-white rounded-2xl max-w-md w-full border border-slate-200 shadow-2xl overflow-hidden animate-scale-up">
-            <div className="p-4 border-b border-slate-200 flex items-center justify-between bg-emerald-50">
-              <div className="flex items-center gap-2">
-                <div className="w-8 h-8 rounded-lg bg-emerald-600 text-white flex items-center justify-center font-bold">
-                  <Plus className="w-4 h-4" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-black text-slate-900">नवीन डीलर आऊटस्टँडिंग नोंद</h3>
-                  <p className="text-[10.5px] text-slate-600">डीलरचे नाव, गाव, फोन व थकीत येणेबाकी नोंदवा</p>
-                </div>
-              </div>
-              <button 
-                onClick={() => setShowAddDealerModal(false)}
-                className="p-1 rounded-lg text-slate-400 hover:text-slate-600"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <form onSubmit={handleSaveNewDealer} className="p-4 space-y-3">
-              <div>
-                <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                  डीलर / फर्मचे नाव <span className="text-red-500">*</span>
-                </label>
-                <input
-                  type="text"
-                  required
-                  placeholder="उदा. Ganesh Krushi Seva Kendra"
-                  value={newFirmName}
-                  onChange={(e) => setNewFirmName(e.target.value)}
-                  className="w-full px-3 py-2 text-xs font-semibold rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-2.5">
-                <div>
-                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                    गाव / लोकेशन
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="उदा. Manerajuri"
-                    value={newVillage}
-                    onChange={(e) => setNewVillage(e.target.value)}
-                    className="w-full px-3 py-2 text-xs font-semibold rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                    प्रोप्रायटरचे नाव
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="उदा. गणेश पाटील"
-                    value={newProprietor}
-                    onChange={(e) => setNewProprietor(e.target.value)}
-                    className="w-full px-3 py-2 text-xs font-semibold rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                  मोबाईल नंबर (WhatsApp मेसेजसाठी) <span className="text-red-500">*</span>
-                </label>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-bold text-slate-500">+91</span>
-                  <input
-                    type="tel"
-                    maxLength={10}
-                    required
-                    placeholder="9897594653"
-                    value={newContact}
-                    onChange={(e) => setNewContact(e.target.value.replace(/\D/g, ''))}
-                    className="flex-1 px-3 py-2 text-xs font-mono font-bold border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                  थकीत येणेबाकी रक्कम (₹) <span className="text-red-500">*</span>
-                </label>
-                <div className="relative">
-                  <span className="absolute left-3 top-2 text-xs font-bold text-slate-400">₹</span>
-                  <input
-                    type="number"
-                    step="1"
-                    min="1"
-                    required
-                    placeholder="उदा. 84500"
-                    value={newAmount}
-                    onChange={(e) => setNewAmount(e.target.value)}
-                    className="w-full pl-7 pr-3 py-2 text-xs font-mono font-bold text-red-600 rounded-xl border border-slate-300 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                  />
-                </div>
-              </div>
-
-              <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
-                <button
-                  type="button"
-                  onClick={() => setShowAddDealerModal(false)}
-                  className="px-3 py-2 text-xs font-bold text-slate-600 hover:bg-slate-100 rounded-xl transition cursor-pointer"
-                >
-                  रद्द करा
-                </button>
-                <button
-                  type="submit"
-                  disabled={isSavingDealer}
-                  className="flex items-center gap-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-xs transition active:scale-95 disabled:opacity-50 cursor-pointer"
-                >
-                  {isSavingDealer ? 'सेव्ह करत आहे...' : 'सेव्ह करा (Save)'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
-
       {/* Modal: Missing Mobile Number when clicking amount */}
       {missingPhoneModalItem && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in no-print">
@@ -1650,6 +1446,251 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
                   <span>WhatsApp पाठवा</span>
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ============================================================== */}
+      {/* Upload Summary Report Modal (Requirement 9)                    */}
+      {/* ============================================================== */}
+      {uploadSummaryReport && (
+        <div className="fixed inset-0 bg-slate-900/70 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 z-50 animate-fade-in no-print">
+          <div className="bg-white rounded-2xl max-w-2xl w-full border border-slate-200 shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+            {/* Modal Header */}
+            <div className="p-4 sm:p-5 border-b border-slate-200 flex items-center justify-between bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 text-white">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-emerald-500/20 border border-emerald-400/40 text-emerald-400 flex items-center justify-center font-bold shrink-0">
+                  <FileCheck className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-black tracking-tight flex items-center gap-2">
+                    <span>All Party Report – अपलोड व अपडेट सारांश</span>
+                    <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded-full bg-emerald-500 text-slate-950">
+                      यशस्वी
+                    </span>
+                  </h3>
+                  <p className="text-xs text-slate-300 mt-0.5">
+                    Party Master मध्ये डेटा ऑटोमॅटिक सिंक झाला व डुप्लिकेट्स रोखले गेले
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setUploadSummaryReport(null)}
+                className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-700/50 transition cursor-pointer"
+                title="बंद करा"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-4 sm:p-5 space-y-4 overflow-y-auto flex-1">
+              {/* 4 Summary Metric Cards */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                {/* 1. Total in PDF */}
+                <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl text-center">
+                  <div className="flex items-center justify-center gap-1 text-[11px] font-bold text-slate-500 mb-1">
+                    <Files className="w-3.5 h-3.5" />
+                    <span>PDF मधील पार्टी</span>
+                  </div>
+                  <div className="text-xl sm:text-2xl font-black text-slate-900 font-mono">
+                    {uploadSummaryReport.totalExtracted}
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-0.5 font-medium">एकूण वाचल्या</div>
+                </div>
+
+                {/* 2. Newly Added */}
+                <div className="p-3 bg-emerald-50/80 border border-emerald-200 rounded-xl text-center">
+                  <div className="flex items-center justify-center gap-1 text-[11px] font-bold text-emerald-700 mb-1">
+                    <UserPlus className="w-3.5 h-3.5" />
+                    <span>नवीन पार्टी</span>
+                  </div>
+                  <div className="text-xl sm:text-2xl font-black text-emerald-700 font-mono">
+                    +{uploadSummaryReport.addedCount}
+                  </div>
+                  <div className="text-[10px] text-emerald-600 mt-0.5 font-semibold">नवीन ॲड झाल्या</div>
+                </div>
+
+                {/* 3. Balance Updated */}
+                <div className="p-3 bg-blue-50/80 border border-blue-200 rounded-xl text-center">
+                  <div className="flex items-center justify-center gap-1 text-[11px] font-bold text-blue-700 mb-1">
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>बॅलन्स अपडेट</span>
+                  </div>
+                  <div className="text-xl sm:text-2xl font-black text-blue-700 font-mono">
+                    {uploadSummaryReport.updatedCount}
+                  </div>
+                  <div className="text-[10px] text-blue-600 mt-0.5 font-semibold">येणेबाकी बदलली</div>
+                </div>
+
+                {/* 4. Duplicates Prevented */}
+                <div className="p-3 bg-purple-50/80 border border-purple-200 rounded-xl text-center">
+                  <div className="flex items-center justify-center gap-1 text-[11px] font-bold text-purple-700 mb-1">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    <span>डुप्लिकेट रोखल्या</span>
+                  </div>
+                  <div className="text-xl sm:text-2xl font-black text-purple-700 font-mono">
+                    {uploadSummaryReport.duplicateCount}
+                  </div>
+                  <div className="text-[10px] text-purple-600 mt-0.5 font-semibold">सुरक्षित फिल्टर</div>
+                </div>
+              </div>
+
+              {/* Duplicate Prevention & Non-Destructive Reassurance Banner */}
+              <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl flex items-start gap-2.5 text-xs text-emerald-900">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <div className="space-y-0.5">
+                  <p className="font-bold">
+                    डेटा सुरक्षित: आधीचा कोणताही डेटा नष्ट किंवा चुकीचा overwrite झालेला नाही!
+                  </p>
+                  <p className="text-[11px] text-emerald-700">
+                    पार्टी नेम व मोबाईल नंबरच्या आधारे अचूक पडताळणी करून फक्त आवश्यक बदल (Receivable Balance) अपडेट केले आहेत.
+                  </p>
+                </div>
+              </div>
+
+              {/* Tabs: New Parties vs Updated Parties */}
+              <div className="flex items-center gap-2 border-b border-slate-200 pb-1">
+                <button
+                  type="button"
+                  onClick={() => setSummaryModalTab('new')}
+                  className={cn(
+                    "px-3.5 py-1.5 text-xs font-bold rounded-lg transition cursor-pointer flex items-center gap-1.5",
+                    summaryModalTab === 'new'
+                      ? "bg-emerald-600 text-white shadow-xs"
+                      : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                  )}
+                >
+                  <UserPlus className="w-3.5 h-3.5" />
+                  <span>नवीन ॲड झालेल्या पार्टी ({uploadSummaryReport.newParties.length})</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setSummaryModalTab('updated')}
+                  className={cn(
+                    "px-3.5 py-1.5 text-xs font-bold rounded-lg transition cursor-pointer flex items-center gap-1.5",
+                    summaryModalTab === 'updated'
+                      ? "bg-blue-600 text-white shadow-xs"
+                      : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                  )}
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>बॅलन्स अपडेट झालेल्या पार्टी ({uploadSummaryReport.updatedParties.length})</span>
+                </button>
+              </div>
+
+              {/* Tab 1 Content: Newly Added Parties */}
+              {summaryModalTab === 'new' && (
+                <div className="border border-slate-200 rounded-xl overflow-hidden">
+                  {uploadSummaryReport.newParties.length === 0 ? (
+                    <div className="p-8 text-center text-slate-400 text-xs font-medium">
+                      या PDF मधील सर्व पार्टी आधीपासूनच Party Master मध्ये अस्तित्वात होत्या. कोणतीही अनावश्यक डबल नोंद तयार झालेली नाही.
+                    </div>
+                  ) : (
+                    <div className="max-h-60 overflow-y-auto">
+                      <table className="w-full text-left text-xs border-collapse">
+                        <thead className="bg-slate-100 sticky top-0 text-slate-700 font-bold border-b border-slate-200 text-[10.5px]">
+                          <tr>
+                            <th className="p-2 sm:p-2.5">#</th>
+                            <th className="p-2 sm:p-2.5">पार्टीचे नाव (Party Name)</th>
+                            <th className="p-2 sm:p-2.5">मोबाईल नंबर (Contact)</th>
+                            <th className="p-2 sm:p-2.5 text-right">थकीत येणेबाकी (Balance)</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 font-medium">
+                          {uploadSummaryReport.newParties.map((p, idx) => (
+                            <tr key={idx} className="hover:bg-emerald-50/40">
+                              <td className="p-2 sm:p-2.5 text-slate-400 text-[10.5px]">{idx + 1}</td>
+                              <td className="p-2 sm:p-2.5 font-bold text-slate-800">{p.firmName}</td>
+                              <td className="p-2 sm:p-2.5 text-slate-600 font-mono text-[11px]">
+                                {p.contactNumber ? (
+                                  <span className="flex items-center gap-1 text-emerald-700">
+                                    <Phone className="w-3 h-3 text-emerald-600" />
+                                    <span>{p.contactNumber}</span>
+                                  </span>
+                                ) : (
+                                  <span className="text-slate-400 text-[10px]">उपलब्ध नाही</span>
+                                )}
+                              </td>
+                              <td className="p-2 sm:p-2.5 text-right font-mono font-bold text-red-600">
+                                ₹{p.formattedAmount}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Tab 2 Content: Updated Parties */}
+              {summaryModalTab === 'updated' && (
+                <div className="border border-slate-200 rounded-xl overflow-hidden">
+                  {uploadSummaryReport.updatedParties.length === 0 ? (
+                    <div className="p-8 text-center text-slate-400 text-xs font-medium">
+                      या PDF मधील पार्टींचे आधीचे येणेबाकी बॅलन्स आधीसारखेच कायम आहे.
+                    </div>
+                  ) : (
+                    <div className="max-h-60 overflow-y-auto">
+                      <table className="w-full text-left text-xs border-collapse">
+                        <thead className="bg-slate-100 sticky top-0 text-slate-700 font-bold border-b border-slate-200 text-[10.5px]">
+                          <tr>
+                            <th className="p-2 sm:p-2.5">#</th>
+                            <th className="p-2 sm:p-2.5">पार्टीचे नाव (Party Name)</th>
+                            <th className="p-2 sm:p-2.5">आधीचे बॅलन्स</th>
+                            <th className="p-2 sm:p-2.5 text-right">नवीन येणेबाकी (Updated)</th>
+                            <th className="p-2 sm:p-2.5 text-right">बदल (Diff)</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 font-medium">
+                          {uploadSummaryReport.updatedParties.map((u, idx) => {
+                            const isIncrease = u.amountDiff > 0;
+                            return (
+                              <tr key={idx} className="hover:bg-blue-50/40">
+                                <td className="p-2 sm:p-2.5 text-slate-400 text-[10.5px]">{idx + 1}</td>
+                                <td className="p-2 sm:p-2.5 font-bold text-slate-800">{u.firmName}</td>
+                                <td className="p-2 sm:p-2.5 text-slate-500 font-mono">
+                                  ₹{u.oldAmount.toLocaleString('en-IN')}
+                                </td>
+                                <td className="p-2 sm:p-2.5 text-right font-mono font-black text-slate-900">
+                                  ₹{u.newAmount.toLocaleString('en-IN')}
+                                </td>
+                                <td className="p-2 sm:p-2.5 text-right font-mono text-[11px] font-bold">
+                                  <span className={cn(
+                                    "inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded",
+                                    isIncrease ? "bg-rose-50 text-rose-700" : "bg-emerald-50 text-emerald-700"
+                                  )}>
+                                    {isIncrease ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
+                                    ₹{Math.abs(u.amountDiff).toLocaleString('en-IN')}
+                                  </span>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-4 border-t border-slate-200 bg-slate-50 flex items-center justify-between gap-3">
+              <span className="text-[11px] text-slate-500 font-medium hidden sm:inline">
+                Party Master List मधील {processedRecords.length} डीलर्सची यादी पाहण्यासाठी खालील बटणावर क्लिक करा.
+              </span>
+              <button
+                type="button"
+                onClick={() => setUploadSummaryReport(null)}
+                className="w-full sm:w-auto ml-auto px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white font-black text-xs rounded-xl shadow-xs transition cursor-pointer flex items-center justify-center gap-2"
+              >
+                <CheckCircle2 className="w-4 h-4" />
+                <span>Party Master List पहा (OK)</span>
+              </button>
             </div>
           </div>
         </div>

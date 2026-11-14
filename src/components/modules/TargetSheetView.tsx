@@ -12,18 +12,9 @@
  */
 
 import React, { useState, useEffect, useRef } from 'react';
-import { 
-  collection, 
-  query, 
-  onSnapshot, 
-  doc, 
-  setDoc,
-  getDoc,
-  getDocs
-} from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import { logAudit, safeFirestoreSet } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, startBackgroundSync } from '../../lib/dataService';
+import { useSharedUsers, useSharedYearlyTargets, findYearlySheetForUser } from '../../lib/realtimeStore';
 import { Language } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
@@ -131,9 +122,10 @@ const CellInput: React.FC<{
       }}
       onChange={(e) => {
         const val = e.target.value;
-        // Accept valid positive decimal patterns
+        // Accept valid positive decimal patterns & propagate immediately so mobile Save never drops the active cell
         if (/^\d*\.?\d*$/.test(val)) {
           setText(val);
+          onChange(toDecimal2(val));
         }
       }}
       onBlur={() => {
@@ -158,16 +150,13 @@ const CellInput: React.FC<{
 
 export const TargetSheetView: React.FC<Props> = ({ profile }) => {
   const userIsAdmin = isAdmin(profile);
-  const [users, setUsers] = useState<UserProfile[]>(() => {
-    try {
-      const cached = localStorage.getItem('blackworm_cached_users');
-      if (cached) {
-        const parsed = JSON.parse(cached);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-      }
-    } catch {}
-    return [];
-  });
+  const { users } = useSharedUsers();
+  const {
+    yearlyTargets,
+    loaded: targetsLoaded,
+    refreshYearlyTargetDocFromServer,
+    refreshAllYearlyTargetsFromServer,
+  } = useSharedYearlyTargets();
   const [selectedUserId, setSelectedUserId] = useState<string>(profile.uid);
   const [sheet, setYearlySheet] = useState<YearlySheet | null>(() => {
     try {
@@ -184,12 +173,17 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
   const [loading, setLoading] = useState(!sheet);
   const [saving, setSaving] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
+  const [saveMessage, setSaveMessage] = useState('Target Sheet successfully updated and saved to server!');
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
   const [downloadTimestamp, setDownloadTimestamp] = useState<string>('');
   const [isUserDropdownOpen, setIsUserDropdownOpen] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [syncKey, setSyncKey] = useState(0);
-  const lastSyncRef = useRef<number>(Date.now());
+  const hasUnsavedEditsRef = useRef(false);
+
+  // Reset unsaved flag when switching officer
+  useEffect(() => {
+    hasUnsavedEditsRef.current = false;
+  }, [selectedUserId]);
 
   // Failsafe: Never allow full-page loading spinner to stay stuck indefinitely
   useEffect(() => {
@@ -201,39 +195,24 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     }
   }, [loading]);
 
-  // Manual refresh that forces instant server pull without wiping UI data
+  // Manual refresh: flush offline queue + pull latest doc(s) from server without wiping UI
   const handleManualRefresh = async () => {
     try {
       setRefreshing(true);
-      lastSyncRef.current = Date.now();
-      // Increment syncKey to trigger clean re-fetch from Firestore server
-      setSyncKey(prev => prev + 1);
+      hasUnsavedEditsRef.current = false;
+      await startBackgroundSync();
+      const targetUser = users.find((u) => u.uid === selectedUserId) || profile;
+      if (targetUser.role === 'owner') {
+        await refreshAllYearlyTargetsFromServer();
+      } else {
+        await refreshYearlyTargetDocFromServer(sheet?.id || `yearly_${selectedUserId}_2026_27`);
+      }
     } catch {
       // ignore
     } finally {
-      setTimeout(() => setRefreshing(false), 700);
+      setTimeout(() => setRefreshing(false), 500);
     }
   };
-
-  // Auto-refresh when app comes to foreground or window gains focus (debounced to avoid loop)
-  useEffect(() => {
-    const handleFocus = () => {
-      if (document.visibilityState === 'visible') {
-        const now = Date.now();
-        // Only re-sync if at least 15 seconds have passed since last sync to prevent infinite loops
-        if (now - lastSyncRef.current > 15000) {
-          lastSyncRef.current = now;
-          setSyncKey(prev => prev + 1);
-        }
-      }
-    };
-    window.addEventListener('focus', handleFocus);
-    document.addEventListener('visibilitychange', handleFocus);
-    return () => {
-      window.removeEventListener('focus', handleFocus);
-      document.removeEventListener('visibilitychange', handleFocus);
-    };
-  }, []);
 
   // If not admin, lock selectedUserId to logged-in user profile
   useEffect(() => {
@@ -254,194 +233,166 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     'January', 'February', 'March'
   ];
 
-  // Fetch users for dropdown with cache synchronization (Optimized for Free Tier)
+  // Derive & keep sheet synchronized in real-time from shared useSharedYearlyTargets() singleton (0 duplicate listeners)
   useEffect(() => {
-    const loadUsers = async () => {
-      try {
-        const cached = localStorage.getItem('blackworm_cached_users');
-        if (cached) {
-          const parsed = JSON.parse(cached);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            setUsers(parsed);
-          }
-        }
-
-        const snap = await getDocs(query(collection(db, 'users')));
-        const list: UserProfile[] = [];
-        snap.forEach(d => list.push({ ...d.data(), uid: d.id } as UserProfile));
-        list.sort((a, b) => (a.fullName || '').localeCompare(b.fullName || ''));
-        setUsers(list);
-        localStorage.setItem('blackworm_cached_users', JSON.stringify(list));
-      } catch (err) {
-        console.warn('TargetSheetView users fetch notice:', err);
-      }
-    };
-    
-    loadUsers();
-  }, [syncKey]);
-
-  // Fetch or init sheet for selected user with 0ms instant cache resolution & live real-time sync
-  useEffect(() => {
-    const selectedUser = users.find(u => u.uid === selectedUserId) || profile;
+    const selectedUser = users.find((u) => u.uid === selectedUserId) || profile;
     const isOwner = selectedUser.role === 'owner';
 
-    // 1. Instant 0ms read from cache for this specific selected user (eliminates loading wait)
-    if (!sheet || sheet.userId !== selectedUserId) {
-      if (!isOwner) {
-        try {
-          const cached = localStorage.getItem(`yearly_target_sheet_${selectedUserId}`);
-          if (cached) {
-            const parsed = JSON.parse(cached);
-            if (parsed && Array.isArray(parsed.months) && parsed.months.length > 0) {
-              setYearlySheet(parsed);
-              setLoading(false);
-            } else {
-              setLoading(true);
+    if (isOwner) {
+      // Consolidated sheet across all non-owner sheets (even while users list hydrates)
+      const ownerUids = new Set(
+        users.filter((u) => u.role === 'owner').map((u) => u.uid)
+      );
+      ownerUids.add(selectedUserId);
+
+      const allSheets: YearlySheet[] = [];
+      yearlyTargets.forEach((rawDoc: any) => {
+        if (rawDoc?.isArchived) return;
+        const data = rawDoc as YearlySheet;
+        if (ownerUids.has(data.userId)) return;
+        const sheetUser = users.find(
+          (u) =>
+            u.uid === data.userId ||
+            (u.loginId && u.loginId.toLowerCase() === (data.userId || '').toLowerCase())
+        );
+        if (sheetUser && sheetUser.role === 'owner') return;
+        allSheets.push(data);
+      });
+
+      const consolidatedSheet: YearlySheet = {
+        id: `consolidated_owner_${selectedUserId}`,
+        userId: selectedUserId,
+        fullName: selectedUser.fullName || selectedUser.uid,
+        designation: 'CONSOLIDATED (TOTAL)',
+        center: 'ALL CENTERS',
+        year: '2026-27',
+        lastYearSale: addDecimal2(...allSheets.map((s) => s.lastYearSale)),
+        lastYearCollection: addDecimal2(...allSheets.map((s) => s.lastYearCollection)),
+        salesTarget: addDecimal2(...allSheets.map((s) => s.salesTarget)),
+        lastYearOutstanding: addDecimal2(...allSheets.map((s) => s.lastYearOutstanding)),
+        collectionPercent: 0,
+        months: monthsList.map((mName) => {
+          let t = 0;
+          let a = 0;
+          let c = 0;
+          let ac = 0;
+          allSheets.forEach((s) => {
+            const sm = s.months?.find((month) => month.month === mName);
+            if (sm) {
+              t = addDecimal2(t, sm.target);
+              a = addDecimal2(a, sm.achievement);
+              c = addDecimal2(c, sm.collection);
+              ac = addDecimal2(ac, sm.actualCollection);
             }
-          } else {
-            setLoading(true);
-          }
-        } catch {
-          setLoading(true);
-        }
-      } else {
-        setLoading(true);
+          });
+          return {
+            month: mName,
+            target: t,
+            achievement: a,
+            collection: c,
+            actualCollection: ac,
+          };
+        }),
+      };
+      setYearlySheet(consolidatedSheet);
+      if (targetsLoaded || allSheets.length > 0) {
+        setLoading(false);
       }
-    } else {
-      // Sheet already in state for selected user - keep it visible without full-screen loading flash
-      setLoading(false);
+      return;
     }
 
-    if (isOwner) {
-      // Aggregation logic for owner - strictly decimal/cents precision
-      const q = query(collection(db, 'yearly_targets'));
-      const unsub = onSnapshot(q, { includeMetadataChanges: true }, (snap) => {
-        const allSheets: YearlySheet[] = [];
-        snap.forEach(d => {
-          const data = d.data() as YearlySheet;
-          const sheetUser = users.find(u => u.uid === data.userId);
-          if (sheetUser && sheetUser.role !== 'owner') {
-            allSheets.push(data);
-          }
-        });
+    // Individual officer view
+    const foundDoc = findYearlySheetForUser(yearlyTargets, selectedUser, '2026_27') as YearlySheet | undefined;
+    const sheetId = foundDoc?.id || `yearly_${selectedUserId}_2026_27`;
 
-        // Exact financial addition without floating point inaccuracies
-        const consolidatedSheet: YearlySheet = {
-          id: `consolidated_owner_${selectedUserId}`,
+    if (hasUnsavedEditsRef.current && sheet && sheet.userId === selectedUserId) {
+      return;
+    }
+
+    if (foundDoc) {
+      const perc = Number(foundDoc.collectionPercent) || 0;
+      const normalizedMonths = (foundDoc.months && foundDoc.months.length > 0
+        ? foundDoc.months
+        : monthsList.map((m) => ({ month: m, target: 0, achievement: 0, collection: 0, actualCollection: 0 }))
+      ).map((m) => {
+        const target = toDecimal2(m.target);
+        const achievement = toDecimal2(m.achievement);
+        const collectionVal = perc > 0 ? multiplyDecimal2(target > 0 ? target : achievement, perc) : toDecimal2(m.collection);
+        return {
+          ...m,
+          target,
+          achievement,
+          collection: collectionVal,
+          actualCollection: toDecimal2(m.actualCollection),
+        };
+      });
+
+      const normalizedSheet: YearlySheet = {
+        ...foundDoc,
+        id: sheetId,
+        userId: foundDoc.userId || selectedUserId,
+        lastYearSale: toDecimal2(foundDoc.lastYearSale),
+        lastYearCollection: toDecimal2(foundDoc.lastYearCollection),
+        salesTarget: toDecimal2(foundDoc.salesTarget),
+        lastYearOutstanding: toDecimal2(foundDoc.lastYearOutstanding),
+        collectionPercent: perc,
+        fullName: selectedUser.fullName || foundDoc.fullName || selectedUser.uid,
+        designation: selectedUser.designation || foundDoc.designation || 'FIELD OFFICER',
+        center: selectedUser.center || foundDoc.center || '',
+        months: normalizedMonths,
+      };
+      setYearlySheet(normalizedSheet);
+      try {
+        localStorage.setItem(`yearly_target_sheet_${selectedUserId}`, JSON.stringify(normalizedSheet));
+      } catch {}
+      setLoading(false);
+    } else {
+      // Check per-user cache first before falling back to empty template
+      let cachedForUser: YearlySheet | null = null;
+      try {
+        const raw = localStorage.getItem(`yearly_target_sheet_${selectedUserId}`);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed && Array.isArray(parsed.months) && parsed.months.length > 0) {
+            cachedForUser = parsed;
+          }
+        }
+      } catch {}
+
+      if (cachedForUser) {
+        setYearlySheet(cachedForUser);
+        setLoading(false);
+      } else if (targetsLoaded) {
+        setYearlySheet({
+          id: sheetId,
           userId: selectedUserId,
           fullName: selectedUser.fullName || selectedUser.uid,
-          designation: 'CONSOLIDATED (TOTAL)',
-          center: 'ALL CENTERS',
+          designation: selectedUser.designation || 'FIELD OFFICER',
+          center: selectedUser.center || '',
           year: '2026-27',
-          lastYearSale: addDecimal2(...allSheets.map(s => s.lastYearSale)),
-          lastYearCollection: addDecimal2(...allSheets.map(s => s.lastYearCollection)),
-          salesTarget: addDecimal2(...allSheets.map(s => s.salesTarget)),
-          lastYearOutstanding: addDecimal2(...allSheets.map(s => s.lastYearOutstanding)),
-          collectionPercent: 0,
-          months: monthsList.map(mName => {
-            let t = 0;
-            let a = 0;
-            let c = 0;
-            let ac = 0;
-            allSheets.forEach(s => {
-              const sm = s.months?.find(month => month.month === mName);
-              if (sm) {
-                t = addDecimal2(t, sm.target);
-                a = addDecimal2(a, sm.achievement);
-                c = addDecimal2(c, sm.collection);
-                ac = addDecimal2(ac, sm.actualCollection);
-              }
-            });
-            return {
-              month: mName,
-              target: t,
-              achievement: a,
-              collection: c,
-              actualCollection: ac
-            };
-          })
-        };
-        setYearlySheet(consolidatedSheet);
+          lastYearSale: 0,
+          lastYearCollection: 0,
+          salesTarget: 0,
+          lastYearOutstanding: 0,
+          collectionPercent: 40,
+          months: monthsList.map((m) => ({
+            month: m,
+            target: 0,
+            achievement: 0,
+            collection: 0,
+            actualCollection: 0,
+          })),
+        });
         setLoading(false);
-      }, (error) => {
-        handleFirestoreError(error, OperationType.LIST, 'yearly_targets');
-        setLoading(false);
-        setRefreshing(false);
-      });
-      return () => unsub();
-    } else {
-      // Regular fetching for individual users with real-time metadata changes
-      const sheetId = `yearly_${selectedUserId}_2026_27`;
-      const unsub = onSnapshot(doc(db, 'yearly_targets', sheetId), { includeMetadataChanges: true }, (docSnap) => {
-        if (docSnap.exists()) {
-          const data = docSnap.data() as YearlySheet;
-          // Normalize and clean all numbers to 2 decimal places using toDecimal2
-          if (data.months) {
-            const perc = Number(data.collectionPercent) || 0;
-            data.months = data.months.map(m => {
-              const target = toDecimal2(m.target);
-              const achievement = toDecimal2(m.achievement);
-              const collection = perc > 0 ? multiplyDecimal2(target > 0 ? target : achievement, perc) : toDecimal2(m.collection);
-              return {
-                ...m,
-                target,
-                achievement,
-                collection,
-                actualCollection: toDecimal2(m.actualCollection),
-              };
-            });
-          }
-          data.lastYearSale = toDecimal2(data.lastYearSale);
-          data.lastYearCollection = toDecimal2(data.lastYearCollection);
-          data.salesTarget = toDecimal2(data.salesTarget);
-          data.lastYearOutstanding = toDecimal2(data.lastYearOutstanding);
-          data.collectionPercent = Number(data.collectionPercent) || 0;
-          // Synchronize from authoritative users collection
-          data.fullName = selectedUser.fullName || data.fullName || selectedUser.uid;
-          data.designation = selectedUser.designation || data.designation || 'FIELD OFFICER';
-          data.center = selectedUser.center || data.center || '';
-          setYearlySheet(data);
-          try {
-            localStorage.setItem(`yearly_target_sheet_${selectedUserId}`, JSON.stringify(data));
-          } catch {}
-        } else {
-          const newSheet: YearlySheet = {
-            id: sheetId,
-            userId: selectedUserId,
-            fullName: selectedUser.fullName || selectedUser.uid,
-            designation: selectedUser.designation || 'FIELD OFFICER',
-            center: selectedUser.center || '',
-            year: '2026-27',
-            lastYearSale: 0,
-            lastYearCollection: 0,
-            salesTarget: 0,
-            lastYearOutstanding: 0,
-            collectionPercent: 40,
-            months: monthsList.map(m => ({
-              month: m,
-              target: 0,
-              achievement: 0,
-              collection: 0,
-              actualCollection: 0
-            }))
-          };
-          setYearlySheet(newSheet);
-        }
-        setLoading(false);
-        setRefreshing(false);
-      }, (error) => {
-        handleFirestoreError(error, OperationType.GET, `yearly_targets/${sheetId}`);
-        setLoading(false);
-        setRefreshing(false);
-      });
-      return () => unsub();
+      }
     }
-  }, [selectedUserId, users, profile, syncKey]);
+  }, [selectedUserId, users, profile, yearlyTargets, targetsLoaded]);
 
   const updateSheet = (updates: Partial<YearlySheet>) => {
     if (!sheet) return;
     const selectedUser = users.find(u => u.uid === selectedUserId) || profile;
     if (selectedUser.role === 'owner') return;
+    hasUnsavedEditsRef.current = true;
 
     let newSheet = { ...sheet, ...updates };
 
@@ -467,6 +418,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
     if (!sheet) return;
     const selectedUser = users.find(u => u.uid === selectedUserId) || profile;
     if (selectedUser.role === 'owner') return;
+    hasUnsavedEditsRef.current = true;
 
     const newMonths = [...sheet.months];
     let monthUpdate = { ...newMonths[index], ...updates };
@@ -498,14 +450,17 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
 
   const handleSave = async () => {
     if (!sheet) return;
+    if (typeof document !== 'undefined' && document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
     setSaving(true);
     try {
-      // Ensure all numbers in sheet are clean decimal 2 numbers before persisting
+      const targetUser = users.find((u) => u.uid === selectedUserId) || profile;
       const cleanedSheet: YearlySheet = {
         ...sheet,
-        fullName: selectedUser.fullName || sheet.fullName || selectedUser.uid,
-        designation: selectedUser.designation || sheet.designation || 'FIELD OFFICER',
-        center: selectedUser.center || sheet.center || '',
+        fullName: targetUser.fullName || sheet.fullName || targetUser.uid,
+        designation: targetUser.designation || sheet.designation || 'FIELD OFFICER',
+        center: targetUser.center || sheet.center || '',
         lastYearSale: toDecimal2(sheet.lastYearSale),
         lastYearCollection: toDecimal2(sheet.lastYearCollection),
         salesTarget: toDecimal2(sheet.salesTarget),
@@ -522,29 +477,34 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
 
       try {
         localStorage.setItem(`yearly_target_sheet_${cleanedSheet.userId}`, JSON.stringify(cleanedSheet));
-        // Permanent automated local backup before Firestore update
         localStorage.setItem(`backup_yearly_target_${cleanedSheet.userId}`, JSON.stringify({
           backupTimestamp: new Date().toISOString(),
           sheet: cleanedSheet
         }));
       } catch {}
 
-      // Update in-memory state and notify user immediately
       setYearlySheet(cleanedSheet);
-      setShowSuccess(true);
-      setTimeout(() => setShowSuccess(false), 3000);
+      hasUnsavedEditsRef.current = false;
 
-      await safeFirestoreSet('yearly_targets', sheet.id, {
+      const saveRes = await safeFirestoreSet('yearly_targets', sheet.id, {
         ...cleanedSheet,
         updatedAt: new Date().toISOString()
       }, { merge: true });
+
+      setSaveMessage(
+        saveRes.isCachedLocally
+          ? 'Target Sheet स्थानिक सेव्ह झाले आहे — इंटरनेट आल्यावर सर्व डिव्हाइसवर सिंक होईल!'
+          : 'Target Sheet successfully updated and synced to all devices!'
+      );
+      setShowSuccess(true);
+      setTimeout(() => setShowSuccess(false), 3000);
 
       try {
         await logAudit('UPDATE', 'yearly_targets', sheet.id, `Updated yearly target sheet for ${sheet.fullName}`, profile);
       } catch {}
     } catch (err) {
       console.warn('Save notice:', err);
-      // Still show success since it is safely cached in localStorage
+      setSaveMessage('Target Sheet स्थानिक मेमरीमध्ये सुरक्षित सेव्ह झाले आहे!');
       setShowSuccess(true);
       setTimeout(() => setShowSuccess(false), 3000);
     } finally {
@@ -800,7 +760,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
       {showSuccess && (
         <div className="flex items-center gap-2 p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl shadow-sm animate-fade-in print:hidden">
           <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-          <span className="font-semibold">Target Sheet successfully updated and saved to server!</span>
+          <span className="font-semibold">{saveMessage}</span>
         </div>
       )}
 

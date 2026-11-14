@@ -5,6 +5,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
+import { secondarySyncDb } from './server/secondaryDb';
 
 dotenv.config();
 
@@ -17,7 +18,10 @@ const ai = new GoogleGenAI({
   }
 });
 
-const upload = multer({ storage: multer.memoryStorage() });
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+});
 
 async function createServer() {
   const app = express();
@@ -36,8 +40,23 @@ async function createServer() {
   });
 
   // API Route for parsing price list with Exponential Backoff & Multi-Model Fallback
-  app.post('/api/parse-pricelist', upload.single('file') as any, async (req: any, res: any) => {
+  app.post('/api/parse-pricelist', (req: any, res: any, next: any) => {
+    upload.single('file')(req, res, (uploadErr: any) => {
+      if (uploadErr) {
+        const isTooLarge = uploadErr?.code === 'LIMIT_FILE_SIZE';
+        return res.status(isTooLarge ? 413 : 400).json({
+          error: isTooLarge
+            ? 'फाईलचा आकार १५ MB पेक्षा जास्त आहे. कृपया लहान फाईल निवडा.'
+            : (uploadErr.message || 'फाईल अपलोड करताना त्रुटी आली.'),
+        });
+      }
+      next();
+    });
+  }, async (req: any, res: any) => {
     try {
+      if (!process.env.GEMINI_API_KEY) {
+        return res.status(500).json({ error: 'सर्व्हरवर AI Key कॉन्फिगर केलेली नाही.' });
+      }
       if (!req.file) {
         return res.status(400).json({ error: 'कोणतीही फाईल निवडलेली नाही. कृपया फाईल निवडा.' });
       }
@@ -103,7 +122,7 @@ async function createServer() {
       };
 
       // Resilient Multi-Tier Models with Exponential Backoff Retry (Auto Re-try Mechanism)
-      const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
+      const candidateModels = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
       const maxRetries = 3;
       let lastError: any = null;
       let parsedData: any = null;
@@ -133,11 +152,15 @@ async function createServer() {
         } catch (attemptErr: any) {
           lastError = attemptErr;
           const errMsg = String(attemptErr?.message || '');
-          const isOverload = errMsg.includes('503') || errMsg.includes('UNAVAILABLE') || errMsg.includes('overloaded') || errMsg.includes('429');
+          const isTransient = errMsg.includes('503') || errMsg.includes('500') || errMsg.includes('UNAVAILABLE') || errMsg.includes('overloaded') || errMsg.includes('429') || errMsg.includes('404') || errMsg.toLowerCase().includes('timeout');
           console.warn(`[AI Parser] Attempt ${attempt} encountered error:`, errMsg.slice(0, 150));
 
+          if (!isTransient && attempt > 1) {
+            break;
+          }
+
           if (attempt < maxRetries) {
-            const backoffMs = attempt * 2000; // 2s, 4s...
+            const backoffMs = attempt * 1500;
             console.log(`[AI Parser] Applying exponential backoff: waiting ${backoffMs}ms before attempt ${attempt + 1}...`);
             await new Promise(r => setTimeout(r, backoffMs));
           }
@@ -150,33 +173,85 @@ async function createServer() {
 
       // Server-side robust deduplication & packing merger
       if (Array.isArray(parsedData.products)) {
+        const normalizeServerGroupName = (g: any): string => {
+          const s = String(g || '').trim();
+          const lower = s.toLowerCase();
+          if (lower.includes('group a') || lower.includes('water soluble')) return 'Group A - Water Soluble Fertilizers';
+          if (lower.includes('specialty')) return 'Specialty Grades';
+          if (lower.includes('group b') || lower.includes('micronutrient') || lower.includes('micro')) return 'Group B - Micronutrients';
+          if (lower.includes('group c') || lower.includes('growth regulator') || lower.includes('pgr') || lower.includes('stimulant')) return 'Group C - Plant Growth Regulators';
+          return s.replace(/[–—]/g, '-').replace(/\s+/g, ' ').trim();
+        };
+
         const dedupMap = new Map<string, any>();
         parsedData.products.forEach((p: any) => {
           if (!p) return;
-          const gradeClean = String(p.gradeName || '')
-            .toLowerCase()
-            .replace(/[®™]/g, '')
-            .replace(/blackworm|airawat/g, '')
-            .replace(/^[a-z]?\s*\d+\s*[\.\-\)]\s*/i, '')
-            .trim();
-          
-          let key = gradeClean.replace(/[^a-z0-9]/g, '');
-          const ratioM = gradeClean.match(/(\d+)\s*[:\-/]\s*(\d+)\s*[:\-/]\s*(\d+)/);
-          if (ratioM) {
-            const n1 = parseInt(ratioM[1], 10);
-            const n2 = parseInt(ratioM[2], 10);
-            const n3 = parseInt(ratioM[3], 10);
-            key = `${n1}-${n2}-${n3}`;
-            if (/\bfe\b/i.test(gradeClean)) key += '-fe';
-            if (/\bmg\b/i.test(gradeClean)) key += '-mg';
-            if (/\bzn\b/i.test(gradeClean)) key += '-zn';
-            if (/\bcu\b/i.test(gradeClean)) key += '-cu';
-            if (/\bs\b/i.test(gradeClean)) key += '-s';
-            if (/\bcombi\b/i.test(gradeClean)) key += '-combi';
+          const normGroup = normalizeServerGroupName(p.groupName);
+          let brand = String(p.brandName || '').trim() || 'Airawat®';
+          let grade = String(p.gradeName || '').trim();
+
+          // Strip leading numbering or codes like "C 1.", "B 1.", "A 1.", "S 1.", "1."
+          grade = grade.replace(/^[A-Za-z]?\s*\d+\s*[\.\-\)]\s*/i, '').trim();
+
+          // If grade starts with brand name, strip brand from grade
+          if (brand) {
+            const bClean = brand.toLowerCase().replace(/[^a-z0-9]/g, '');
+            const gClean = grade.toLowerCase().replace(/[^a-z0-9]/g, '');
+            if (gClean.startsWith(bClean) && grade.length > brand.length) {
+              const matchedPrefix = grade.match(new RegExp(`^${brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[®™]?\\s*`, 'i'));
+              if (matchedPrefix) {
+                grade = grade.slice(matchedPrefix[0].length).trim();
+              }
+            }
           }
 
+          // Generate canonical key using Group + Serial code
+          let key = '';
+          const codeStr = String(p.code || '').trim();
+          const numMatch = codeStr.match(/(\d+)/);
+          if (numMatch) {
+            const num = parseInt(numMatch[1], 10);
+            let groupPrefix = '';
+            if (normGroup.includes('Group A')) groupPrefix = 'grp_a';
+            else if (normGroup.includes('Specialty')) groupPrefix = 'grp_s';
+            else if (normGroup.includes('Group B')) groupPrefix = 'grp_b';
+            else if (normGroup.includes('Group C')) groupPrefix = 'grp_c';
+            if (groupPrefix && num > 0) {
+              key = `${groupPrefix}_${num}`;
+            }
+          }
+
+          if (!key) {
+            const gradeClean = grade
+              .toLowerCase()
+              .replace(/[®™]/g, '')
+              .replace(/blackworm|airawat/g, '')
+              .trim();
+            key = gradeClean.replace(/[^a-z0-9]/g, '');
+            const ratioM = gradeClean.match(/(\d+)\s*[:\-/]\s*(\d+)\s*[:\-/]\s*(\d+)/);
+            if (ratioM) {
+              const n1 = parseInt(ratioM[1], 10);
+              const n2 = parseInt(ratioM[2], 10);
+              const n3 = parseInt(ratioM[3], 10);
+              key = `${n1}-${n2}-${n3}`;
+              if (/\bfe\b/i.test(gradeClean)) key += '-fe';
+              if (/\bmg\b/i.test(gradeClean)) key += '-mg';
+              if (/\bzn\b/i.test(gradeClean)) key += '-zn';
+              if (/\bcu\b/i.test(gradeClean)) key += '-cu';
+              if (/\bs\b/i.test(gradeClean)) key += '-s';
+              if (/\bcombi\b/i.test(gradeClean)) key += '-combi';
+            }
+          }
+
+          const productItem = {
+            ...p,
+            groupName: normGroup,
+            brandName: brand,
+            gradeName: grade,
+          };
+
           if (!dedupMap.has(key)) {
-            dedupMap.set(key, { ...p });
+            dedupMap.set(key, productItem);
           } else {
             const existing = dedupMap.get(key);
             const exPackings = Array.isArray(existing.packings) ? [...existing.packings] : [];
@@ -192,6 +267,10 @@ async function createServer() {
               }
             });
             existing.packings = exPackings;
+            // Keep cleanest gradeName
+            if (existing.gradeName.length > grade.length && grade.length > 2) {
+              existing.gradeName = grade;
+            }
           }
         });
         parsedData.products = Array.from(dedupMap.values());
@@ -219,9 +298,127 @@ async function createServer() {
     }
   });
 
+  // Dual-DB Secondary Sync Endpoints (SQLite WAL + Real-Time SSE + Optional Supabase Mirror)
+  app.get('/api/sync/health', (_req, res) => {
+    try {
+      res.json(secondarySyncDb.getStats());
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Secondary DB unavailable' });
+    }
+  });
+
+  app.get('/api/sync/stream', (req, res) => {
+    res.set({
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    if (typeof (res as any).flushHeaders === 'function') {
+      (res as any).flushHeaders();
+    }
+
+    const sinceRev = Number(req.query.sinceRevision) || 0;
+    const stats = secondarySyncDb.getStats();
+    res.write(`event: connected\ndata: ${JSON.stringify({ latestRevision: stats.latestRevision, engine: stats.engine })}\n\n`);
+
+    if (sinceRev > 0) {
+      try {
+        const catchup = secondarySyncDb.getChangesSince(sinceRev, 500);
+        catchup.events.forEach((evt) => {
+          res.write(`event: delta\ndata: ${JSON.stringify(evt)}\n\n`);
+        });
+      } catch (e) {
+        console.warn('[SecondaryDB SSE] Catchup error:', e);
+      }
+    }
+
+    secondarySyncDb.addSseClient(res);
+    const keepAlive = setInterval(() => {
+      try {
+        res.write(`: keepalive ${Date.now()}\n\n`);
+      } catch {
+        clearInterval(keepAlive);
+        secondarySyncDb.removeSseClient(res);
+      }
+    }, 25000);
+
+    req.on('close', () => {
+      clearInterval(keepAlive);
+      secondarySyncDb.removeSseClient(res);
+    });
+  });
+
+  app.get('/api/sync/collection/:name', (req, res) => {
+    try {
+      const colName = String(req.params.name || '').trim();
+      if (!colName) {
+        return res.status(400).json({ ok: false, error: 'Collection name is required' });
+      }
+      const sinceMs = Number(req.query.since) || 0;
+      const limit = Number(req.query.limit) || 1000;
+      const offset = Number(req.query.offset) || 0;
+      const includeDeleted = req.query.includeDeleted === 'true' || req.query.includeDeleted === '1';
+
+      const result = secondarySyncDb.getCollection(colName, { sinceMs, limit, offset, includeDeleted });
+      res.json({ ok: true, ...result });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Failed to query secondary collection' });
+    }
+  });
+
+  app.get('/api/sync/changes', (req, res) => {
+    try {
+      const sinceRev = Number(req.query.since) || 0;
+      const limit = Number(req.query.limit) || 500;
+      const result = secondarySyncDb.getChangesSince(sinceRev, limit);
+      res.json({ ok: true, ...result });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Failed to read secondary changes' });
+    }
+  });
+
+  app.post('/api/sync/upsert', (req, res) => {
+    try {
+      const { collection, id, doc: docData, updatedAtMs, deleted, merge } = req.body || {};
+      if (!collection || !id) {
+        return res.status(400).json({ ok: false, error: 'collection and id are required' });
+      }
+      const result = secondarySyncDb.upsert({
+        collection: String(collection),
+        id: String(id),
+        doc: docData && typeof docData === 'object' ? docData : {},
+        updatedAtMs: updatedAtMs ? Number(updatedAtMs) : undefined,
+        deleted: Boolean(deleted),
+        merge: merge !== false,
+      });
+      res.json({ ok: true, applied: result.applied, stored: result.stored });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Secondary upsert failed' });
+    }
+  });
+
+  app.post('/api/sync/batch', (req, res) => {
+    try {
+      const items = Array.isArray(req.body?.items) ? req.body.items : [];
+      if (items.length === 0) {
+        return res.json({ ok: true, count: 0, latestRevision: secondarySyncDb.getStats().latestRevision });
+      }
+      const result = secondarySyncDb.upsertBatch(items);
+      res.json({ ok: true, count: result.count, latestRevision: result.latestRevision });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Secondary batch upsert failed' });
+    }
+  });
+
+  // Return clean JSON 404 for unmatched API routes before SPA middlewares handle them
+  app.all('/api/*', (_req, res) => {
+    res.status(404).json({ error: 'API route not found' });
+  });
+
   // Never cache Service Worker or manifest
   app.use((req, res, next) => {
-    if (req.url === '/sw.js' || req.url === '/manifest.webmanifest' || req.url === '/registerSW.js') {
+    if (req.url === '/sw.js' || req.url.startsWith('/dev-sw.js') || req.url === '/manifest.webmanifest' || req.url === '/registerSW.js') {
       res.set({
         'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
         'Pragma': 'no-cache',
@@ -230,6 +427,21 @@ async function createServer() {
     }
     next();
   });
+
+  if (process.env.NODE_ENV !== 'production') {
+    app.get(['/dev-sw.js', '/sw.js'], (_req, res) => {
+      res.set({
+        'Content-Type': 'application/javascript; charset=utf-8',
+        'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      });
+      res.send(
+        `self.addEventListener('install', () => self.skipWaiting());\n` +
+        `self.addEventListener('activate', (event) => {\n` +
+        `  event.waitUntil(caches.keys().then((ks) => Promise.all(ks.map((k) => caches.delete(k)))).then(() => self.registration.unregister()));\n` +
+        `});\n`
+      );
+    });
+  }
 
   const distPath = path.join(process.cwd(), 'dist');
   const indexPath = path.join(distPath, 'index.html');
@@ -261,6 +473,9 @@ async function createServer() {
 
     app.use('*', async (req, res, next) => {
       const url = req.originalUrl;
+      if (url.startsWith('/api/')) {
+        return res.status(404).json({ error: 'API route not found' });
+      }
       try {
         let template = fs.readFileSync(path.resolve(process.cwd(), 'index.html'), 'utf-8');
         template = await vite.transformIndexHtml(url, template);

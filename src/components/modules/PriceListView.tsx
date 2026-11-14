@@ -19,7 +19,22 @@ import {
   X, 
   Check
 } from 'lucide-react';
-import { logAudit, deduplicateProducts, getCanonicalProductKey, normalizePackingSize } from '../../lib/dataService';
+import { 
+  logAudit, 
+  deduplicateProducts, 
+  getCanonicalProductKey, 
+  normalizePackingSize,
+  normalizeProductGroupName,
+  cleanProductGradeAndBrand,
+  sortPackings,
+  triggerBlobDownload,
+  getLocalDateStr,
+  safeFirestoreSet,
+  isQuotaBlocked,
+  setQuotaBlocked
+} from '../../lib/dataService';
+import { useBranding } from '../../lib/branding';
+import { pushBatchToSecondary, fetchSecondaryCollection, subscribeSecondaryCollection } from '../../lib/secondaryDb';
 import * as XLSX from 'xlsx';
 
 export interface PackingOption {
@@ -468,19 +483,24 @@ export function parseExcelToProducts(workbook: XLSX.WorkBook): { products: Dynam
         continue;
       }
 
-      const groupName = (groupCol !== -1 && String(row[groupCol] || '').trim()) || currentSection;
+      const rawGroupName = (groupCol !== -1 && String(row[groupCol] || '').trim()) || currentSection;
+      const groupName = normalizeProductGroupName(rawGroupName);
       let code = (codeCol !== -1 && String(row[codeCol] || '').trim()) || '';
-      const brandName = (brandCol !== -1 && String(row[brandCol] || '').trim()) || 'Airawat®';
+      let brandName = (brandCol !== -1 && String(row[brandCol] || '').trim()) || 'Airawat®';
       const hsn = (hsnCol !== -1 && String(row[hsnCol] || '').trim()) || '31052000';
       const gstRate = cleanNumber(gstCol !== -1 ? row[gstCol] : 5, 5);
 
       // Auto-extract code if embedded in gradeName (e.g. "A 1. 19:19:19" or "1. 19:19:19")
-      let cleanGradeName = rawGrade;
+      let rawGradeName = rawGrade;
       const codeMatch = rawGrade.match(/^([A-Za-z]?\s*\d+\.?)\s+(.+)$/);
       if (codeMatch && !code) {
         code = codeMatch[1].trim();
-        cleanGradeName = codeMatch[2].trim();
+        rawGradeName = codeMatch[2].trim();
       }
+
+      const cleaned = cleanProductGradeAndBrand(brandName, rawGradeName);
+      brandName = cleaned.brandName;
+      const cleanGradeName = cleaned.gradeName;
 
       const normGrade = normStr(cleanGradeName);
       const key = `${groupName.toLowerCase()}___${normGrade}`;
@@ -675,7 +695,7 @@ export async function savePriceListPermanently(
   // 2. Automated Permanent Backup of previous state
   try {
     const backupId = `backup_${Date.now()}`;
-    await setDoc(doc(db, 'pricelist_backups', backupId), {
+    await safeFirestoreSet('pricelist_backups', backupId, {
       id: backupId,
       backupId,
       createdAt: new Date().toISOString(),
@@ -689,8 +709,8 @@ export async function savePriceListPermanently(
     console.warn('Pre-upload automatic backup notice:', backupErr);
   }
 
-  // 3. Save to Master Document config/master_pricelist (Single atomic source of truth)
-  await setDoc(doc(db, 'config', 'master_pricelist'), {
+  // 3. Save to Master Document config/master_pricelist across Primary + Secondary DB
+  await safeFirestoreSet('config', 'master_pricelist', {
     products: cleanProducts,
     validityDate: validityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
     updatedAt: new Date().toISOString(),
@@ -703,53 +723,72 @@ export async function savePriceListPermanently(
 
   if (validityDate) {
     try {
-      await setDoc(doc(db, 'config', 'pricelist_meta'), {
+      await safeFirestoreSet('config', 'pricelist_meta', {
         validityDate,
         updatedAt: new Date().toISOString(),
       }, { merge: true });
     } catch {}
   }
 
-  // 4. Batch Upsert products into products_pricelist_v2 in chunks of 400 (Ultra fast atomic commits)
-  try {
-    const BATCH_SIZE = 400;
-    for (let i = 0; i < cleanProducts.length; i += BATCH_SIZE) {
-      const chunk = cleanProducts.slice(i, i + BATCH_SIZE);
-      const batch = writeBatch(db);
-      chunk.forEach(item => {
-        const itemRef = doc(db, 'products_pricelist_v2', item.id);
-        batch.set(itemRef, {
-          ...item,
-          isArchived: false,
-          updatedAt: new Date().toISOString(),
-        }, { merge: true });
-      });
-      await batch.commit();
+  // 4. Batch Upsert products into Secondary DB and Primary products_pricelist_v2 in chunks of 400
+  const nowIso = new Date().toISOString();
+  await pushBatchToSecondary(
+    cleanProducts.map((item) => ({
+      collection: 'products_pricelist_v2',
+      id: item.id,
+      doc: { ...item, isArchived: false, updatedAt: nowIso },
+      merge: true,
+    }))
+  );
+
+  if (!isQuotaBlocked()) {
+    try {
+      const BATCH_SIZE = 400;
+      for (let i = 0; i < cleanProducts.length; i += BATCH_SIZE) {
+        const chunk = cleanProducts.slice(i, i + BATCH_SIZE);
+        const batch = writeBatch(db);
+        chunk.forEach(item => {
+          const itemRef = doc(db, 'products_pricelist_v2', item.id);
+          batch.set(itemRef, {
+            ...item,
+            isArchived: false,
+            updatedAt: nowIso,
+          }, { merge: true });
+        });
+        await batch.commit();
+      }
+    } catch (upsertErr: any) {
+      const msg = String(upsertErr?.message || '').toLowerCase();
+      if (msg.includes('quota') || msg.includes('resource_exhausted')) setQuotaBlocked(15 * 60 * 1000);
+      console.warn('Batch upsert products notice:', upsertErr);
     }
-  } catch (upsertErr) {
-    console.warn('Batch upsert products notice:', upsertErr);
   }
 
-  // 5. Soft-archive any duplicate or superseded products in products_pricelist_v2
-  try {
-    const cleanIds = new Set(cleanProducts.map(p => p.id));
-    const cleanCanonicalKeys = new Set(cleanProducts.map(p => getCanonicalProductKey(p)));
-    const oldSnap = await getDocs(collection(db, 'products_pricelist_v2'));
-    const archiveBatch = writeBatch(db);
-    let count = 0;
-    oldSnap.forEach(d => {
-      const data = d.data();
-      const dKey = getCanonicalProductKey(data);
-      if (!cleanIds.has(d.id) && (!data.isArchived || cleanCanonicalKeys.has(dKey))) {
-        archiveBatch.update(d.ref, { isArchived: true, archivedAt: new Date().toISOString() });
-        count++;
+  // 5. Soft-archive any duplicate or superseded products in products_pricelist_v2 (chunked at 400 ops)
+  if (!isQuotaBlocked()) {
+    try {
+      const cleanIds = new Set(cleanProducts.map(p => p.id));
+      const cleanCanonicalKeys = new Set(cleanProducts.map(p => getCanonicalProductKey(p)));
+      const oldSnap = await getDocs(collection(db, 'products_pricelist_v2'));
+      const toArchiveRefs: any[] = [];
+      oldSnap.forEach(d => {
+        const data = d.data();
+        const dKey = getCanonicalProductKey(data);
+        if (!cleanIds.has(d.id) && (!data.isArchived || cleanCanonicalKeys.has(dKey))) {
+          toArchiveRefs.push(d.ref);
+        }
+      });
+      for (let i = 0; i < toArchiveRefs.length; i += 400) {
+        const chunk = toArchiveRefs.slice(i, i + 400);
+        const archiveBatch = writeBatch(db);
+        chunk.forEach(ref => {
+          archiveBatch.update(ref, { isArchived: true, archivedAt: nowIso });
+        });
+        await archiveBatch.commit();
       }
-    });
-    if (count > 0) {
-      await archiveBatch.commit();
+    } catch (archErr) {
+      console.warn('Soft-archive notice:', archErr);
     }
-  } catch (archErr) {
-    console.warn('Soft-archive notice:', archErr);
   }
 
   // 6. Audit Log
@@ -772,8 +811,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
   // Pre-load from instant cache for 0ms initial render
   const [products, setProducts] = useState<DynamicPriceProduct[]>(getInitialCachedProducts);
   const [validityDate, setValidityDate] = useState('Pricelist w.e.f 01/10/2026 to 31/10/2026');
-  const [logoUrl, setLogoUrl] = useState<string>('');
-  const [logoSize, setLogoSize] = useState<number>(75);
+  const { logoUrl, logoSize } = useBranding();
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [uploadStatusMessage, setUploadStatusMessage] = useState<string>('');
   const [isResetting, setIsResetting] = useState<boolean>(false);
@@ -791,14 +829,30 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
     try {
-      const masterSnap = await getDoc(doc(db, 'config', 'master_pricelist'));
-      if (masterSnap.exists() && Array.isArray(masterSnap.data()?.products) && masterSnap.data().products.length > 0) {
-        const validList = deduplicateProducts(masterSnap.data().products.filter((p: any) => !p.isArchived));
+      if (!isQuotaBlocked()) {
+        const masterSnap = await getDoc(doc(db, 'config', 'master_pricelist'));
+        if (masterSnap.exists() && Array.isArray(masterSnap.data()?.products) && masterSnap.data().products.length > 0) {
+          const validList = deduplicateProducts(masterSnap.data().products.filter((p: any) => !p.isArchived));
+          setProducts(validList);
+          try {
+            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(validList));
+          } catch {}
+          return;
+        }
+      }
+
+      const secCfg = await fetchSecondaryCollection('config', { limit: 50 });
+      const secMaster = secCfg.ok ? secCfg.items.find((it) => it?.id === 'master_pricelist') : null;
+      if (secMaster && Array.isArray(secMaster.products) && secMaster.products.length > 0) {
+        const validList = deduplicateProducts(secMaster.products.filter((p: any) => !p.isArchived));
         setProducts(validList);
         try {
           localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(validList));
         } catch {}
-      } else {
+        return;
+      }
+
+      if (!isQuotaBlocked()) {
         const snap = await getDocs(query(collection(db, 'products_pricelist_v2')));
         const pList: DynamicPriceProduct[] = [];
         snap.forEach((d) => {
@@ -813,7 +867,9 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
           } catch {}
         }
       }
-    } catch (e) {
+    } catch (e: any) {
+      const msg = String(e?.message || '').toLowerCase();
+      if (msg.includes('quota') || msg.includes('resource_exhausted')) setQuotaBlocked(15 * 60 * 1000);
       console.warn('Manual refresh notice:', e);
     } finally {
       setTimeout(() => setIsRefreshing(false), 400);
@@ -863,120 +919,142 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
     onConfirm: () => {},
   });
 
-  // 1. Fetch Branding & Validity Date
+  // 1. Validity Date (Primary + Secondary DB) — Branding uses shared useBranding() singleton!
   useEffect(() => {
-    const unsubBranding = onSnapshot(doc(db, 'config', 'branding'), (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        setLogoUrl(data.logoUrl || '');
-        setLogoSize(data.logoSize || 75);
-      }
-    }, (err) => {
-      console.warn('PriceList branding live sync notice:', err);
+    const unsubSecMeta = subscribeSecondaryCollection('config', (events) => {
+      events.forEach((evt) => {
+        if (evt.id === 'pricelist_meta' && evt.doc?.validityDate) {
+          setValidityDate(evt.doc.validityDate);
+        }
+      });
     });
 
-    const unsubMeta = onSnapshot(doc(db, 'config', 'pricelist_meta'), (snap) => {
-      if (snap.exists() && snap.data().validityDate) {
-        setValidityDate(snap.data().validityDate);
-      }
-    }, (err) => {
-      console.warn('PriceList meta live sync notice:', err);
-    });
+    let unsubMeta: (() => void) | null = null;
+    if (!isQuotaBlocked()) {
+      unsubMeta = onSnapshot(doc(db, 'config', 'pricelist_meta'), (snap) => {
+        if (snap.exists() && snap.data().validityDate) {
+          setValidityDate(snap.data().validityDate);
+        }
+      }, (err) => {
+        console.warn('PriceList meta live sync notice:', err);
+      });
+    }
 
     return () => {
-      unsubBranding();
-      unsubMeta();
+      unsubSecMeta();
+      if (unsubMeta) unsubMeta();
     };
   }, []);
 
-  // 2. Real-time Listener with Dual Master-Doc & Collection Redundancy (Zero-Wipe Guarantee)
+  // 2. Real-time Listener with Dual Master-Doc, Secondary DB SSE & Collection Redundancy
   useEffect(() => {
-    // 2.1 First listen to config/master_pricelist (Master Document)
-    const unsubMaster = onSnapshot(doc(db, 'config', 'master_pricelist'), (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        if (data && Array.isArray(data.products) && data.products.length > 0) {
-          const clean = deduplicateProducts(data.products);
-          try {
-            localStorage.setItem('blackworm_master_pricelist', JSON.stringify({ ...data, products: clean }));
-            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(clean));
-          } catch {}
-          setProducts(clean);
-          if (data.validityDate) setValidityDate(data.validityDate);
-          if (clean.length < data.products.length && isAdmin(profile)) {
-            savePriceListPermanently(clean, 'Auto Deduplication Self-Healing', profile, data.validityDate, data.products).catch(() => {});
-          }
+    const applyMasterData = (data: any) => {
+      if (data && Array.isArray(data.products) && data.products.length > 0) {
+        const clean = deduplicateProducts(data.products);
+        try {
+          localStorage.setItem('blackworm_master_pricelist', JSON.stringify({ ...data, products: clean }));
+          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(clean));
+        } catch {}
+        setProducts(clean);
+        if (data.validityDate) setValidityDate(data.validityDate);
+        if (clean.length < data.products.length && isAdmin(profile)) {
+          savePriceListPermanently(clean, 'Auto Deduplication Self-Healing', profile, data.validityDate, data.products).catch(() => {});
         }
       }
-    }, (err) => {
-      console.warn('Master price list sync notice:', err);
-    });
+    };
 
-    // 2.2 Listen to products_pricelist_v2 collection
-    const q = query(collection(db, 'products_pricelist_v2'));
-    const unsub = onSnapshot(q, async (snap) => {
-      const list: DynamicPriceProduct[] = [];
-      snap.forEach((docSnap) => {
-        const data = docSnap.data() as DynamicPriceProduct;
-        if (!data.isArchived) {
-          list.push({ ...data, id: docSnap.id });
+    const unsubSecMaster = subscribeSecondaryCollection('config', (events) => {
+      events.forEach((evt) => {
+        if (evt.id === 'master_pricelist' && evt.doc && !evt.deleted) {
+          applyMasterData(evt.doc);
         }
       });
+    });
 
-      if (list.length > 0) {
-        const cleanList = deduplicateProducts(list);
-        cleanList.sort((a, b) => {
-          if (a.groupName !== b.groupName) {
-            if (a.groupName.includes('Group A')) return -1;
-            if (b.groupName.includes('Group A')) return 1;
-            if (a.groupName.includes('Specialty')) return -1;
-            if (b.groupName.includes('Specialty')) return 1;
-            return a.groupName.localeCompare(b.groupName);
+    let unsubMaster: (() => void) | null = null;
+    let unsub: (() => void) | null = null;
+
+    if (isQuotaBlocked()) {
+      void fetchSecondaryCollection('config', { limit: 50 }).then((res) => {
+        const found = res.items.find((it) => it?.id === 'master_pricelist');
+        if (found) applyMasterData(found);
+      });
+    } else {
+      unsubMaster = onSnapshot(doc(db, 'config', 'master_pricelist'), (docSnap) => {
+        if (docSnap.exists()) {
+          applyMasterData(docSnap.data());
+        }
+      }, (err) => {
+        const msg = String(err?.message || '').toLowerCase();
+        if (msg.includes('quota') || msg.includes('resource_exhausted')) setQuotaBlocked(15 * 60 * 1000);
+        console.warn('Master price list sync notice:', err);
+      });
+
+      const q = query(collection(db, 'products_pricelist_v2'));
+      unsub = onSnapshot(q, async (snap) => {
+        const list: DynamicPriceProduct[] = [];
+        snap.forEach((docSnap) => {
+          const data = docSnap.data() as DynamicPriceProduct;
+          if (!data.isArchived) {
+            list.push({ ...data, id: docSnap.id });
           }
-          return (a.orderIndex || 0) - (b.orderIndex || 0);
         });
-        setProducts(cleanList);
-        try {
-          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanList));
-        } catch {}
-      } else {
-        // Collection returned 0 items: NEVER auto-wipe!
-        // Check if master_pricelist or localStorage already has custom products
+
+        if (list.length > 0) {
+          const cleanList = deduplicateProducts(list);
+          cleanList.sort((a, b) => {
+            if (a.groupName !== b.groupName) {
+              if (a.groupName.includes('Group A')) return -1;
+              if (b.groupName.includes('Group A')) return 1;
+              if (a.groupName.includes('Specialty')) return -1;
+              if (b.groupName.includes('Specialty')) return 1;
+              return a.groupName.localeCompare(b.groupName);
+            }
+            return (a.orderIndex || 0) - (b.orderIndex || 0);
+          });
+          setProducts(cleanList);
+          try {
+            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanList));
+          } catch {}
+        } else {
+          const cached = getInitialCachedProducts();
+          if (cached.length > 0) {
+            setProducts(cached);
+          } else {
+            await seedReferenceDataSafe();
+          }
+        }
+      }, (err) => {
+        console.warn('PriceList products live sync notice:', err);
         const cached = getInitialCachedProducts();
         if (cached.length > 0) {
           setProducts(cached);
         } else {
-          // Truly empty first-time database setup only
-          await seedReferenceDataSafe();
+          const fallback: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
+            ...item,
+            id: `ref_${idx + 1}`,
+          }));
+          setProducts(fallback);
         }
-      }
-    }, (err) => {
-      console.warn('PriceList products live sync notice:', err);
-      const cached = getInitialCachedProducts();
-      if (cached.length > 0) {
-        setProducts(cached);
-      } else {
-        const fallback: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
-          ...item,
-          id: `ref_${idx + 1}`,
-        }));
-        setProducts(fallback);
-      }
-    });
+      });
+    }
 
     return () => {
-      unsubMaster();
-      unsub();
+      unsubSecMaster();
+      if (unsubMaster) unsubMaster();
+      if (unsub) unsub();
     };
   }, []);
 
   // Safe Seeding: Only runs if database is completely empty; NEVER wipes or overwrites
   const seedReferenceDataSafe = async () => {
     try {
-      const masterCheck = await getDoc(doc(db, 'config', 'master_pricelist'));
-      if (masterCheck.exists() && masterCheck.data()?.products?.length > 0) {
-        setProducts(masterCheck.data().products);
-        return;
+      if (!isQuotaBlocked()) {
+        const masterCheck = await getDoc(doc(db, 'config', 'master_pricelist'));
+        if (masterCheck.exists() && masterCheck.data()?.products?.length > 0) {
+          setProducts(masterCheck.data().products);
+          return;
+        }
       }
 
       const initialProducts: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item) => {
@@ -988,7 +1066,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         };
       });
 
-      await setDoc(doc(db, 'config', 'master_pricelist'), {
+      await safeFirestoreSet('config', 'master_pricelist', {
         products: initialProducts,
         validityDate: 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
         updatedAt: new Date().toISOString(),
@@ -996,8 +1074,19 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         isInitialDefault: true,
       }, { merge: true });
 
-      for (const item of initialProducts) {
-        await setDoc(doc(db, 'products_pricelist_v2', item.id), item, { merge: true });
+      await pushBatchToSecondary(
+        initialProducts.map((item) => ({
+          collection: 'products_pricelist_v2',
+          id: item.id,
+          doc: item,
+          merge: true,
+        }))
+      );
+
+      if (!isQuotaBlocked()) {
+        for (const item of initialProducts) {
+          await setDoc(doc(db, 'products_pricelist_v2', item.id), item, { merge: true });
+        }
       }
       setProducts(initialProducts);
       try {
@@ -1008,15 +1097,24 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
     }
   };
 
-  // Fetch Firestore backup history
+  // Fetch backup history (Primary + Secondary DB)
   const fetchBackups = async () => {
     setIsLoadingBackups(true);
     try {
-      const qBackups = query(collection(db, 'pricelist_backups'), orderBy('createdAt', 'desc'), limit(15));
-      const snap = await getDocs(qBackups);
-      const list: any[] = [];
-      snap.forEach(d => list.push({ id: d.id, ...d.data() }));
-      setBackupList(list);
+      if (!isQuotaBlocked()) {
+        const qBackups = query(collection(db, 'pricelist_backups'), orderBy('createdAt', 'desc'), limit(15));
+        const snap = await getDocs(qBackups);
+        const list: any[] = [];
+        snap.forEach(d => list.push({ id: d.id, ...d.data() }));
+        if (list.length > 0) {
+          setBackupList(list);
+          return;
+        }
+      }
+      const sec = await fetchSecondaryCollection('pricelist_backups', { limit: 15 });
+      if (sec.ok && sec.items.length > 0) {
+        setBackupList(sec.items);
+      }
     } catch (e) {
       console.warn('Fetch backups notice:', e);
     } finally {
@@ -1095,14 +1193,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         products: products,
       };
       const blob = new Blob([JSON.stringify(exportPayload, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `Blackworm_PriceList_Backup_${new Date().toISOString().slice(0, 10)}.json`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
+      triggerBlobDownload(blob, `Blackworm_PriceList_Backup_${getLocalDateStr()}.json`);
     } catch (e) {
       console.error('JSON export error:', e);
     }
@@ -1220,12 +1311,14 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         if (parsedData.validityDate) newValidity = parsedData.validityDate;
 
         uploadedProducts = extractedProducts.map((item, idx) => {
-          const cleanId = `prod_${(item.code || `item_${idx}`).replace(/[^A-Za-z0-9]/g, '_')}_${(item.gradeName || '').replace(/[^A-Za-z0-9]/g, '_')}`;
+          const normGroup = normalizeProductGroupName(item.groupName);
+          const { brandName, gradeName } = cleanProductGradeAndBrand(item.brandName, item.gradeName);
+          const cleanId = `prod_${(item.code || `item_${idx}`).replace(/[^A-Za-z0-9]/g, '_')}_${gradeName.replace(/[^A-Za-z0-9]/g, '_')}`;
           return {
-            groupName: item.groupName || 'Group A - Water Soluble Fertilizers',
+            groupName: normGroup,
             code: item.code || `${idx + 1}.`,
-            brandName: item.brandName || 'Airawat®',
-            gradeName: item.gradeName || '',
+            brandName: brandName || 'Airawat®',
+            gradeName: gradeName || '',
             hsn: item.hsn || '31052000',
             gstRate: Number(item.gstRate) || 5,
             packings: (item.packings || []).map((pk: any) => ({
@@ -1297,19 +1390,50 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
     }
   };
 
-  // Group products dynamically by Category Name (e.g. Group A, Specialty Grades, etc.)
+  // Group products dynamically by Category Name (e.g. Group A, Specialty Grades, Group B, Group C)
   const groupedProducts: { groupName: string; items: DynamicPriceProduct[] }[] = [];
   const groupMap = new Map<string, DynamicPriceProduct[]>();
 
   products.forEach((p) => {
-    if (!groupMap.has(p.groupName)) {
-      groupMap.set(p.groupName, []);
+    const gName = normalizeProductGroupName(p.groupName);
+    if (!groupMap.has(gName)) {
+      groupMap.set(gName, []);
     }
-    groupMap.get(p.groupName)!.push(p);
+    groupMap.get(gName)!.push({ ...p, groupName: gName });
   });
 
-  groupMap.forEach((items, groupName) => {
-    groupedProducts.push({ groupName, items });
+  const officialGroupOrder = [
+    'Group A - Water Soluble Fertilizers',
+    'Specialty Grades',
+    'Group B - Micronutrients',
+    'Group C - Plant Growth Regulators'
+  ];
+
+  // 1. First add known official groups in order
+  officialGroupOrder.forEach((gName) => {
+    if (groupMap.has(gName)) {
+      const items = groupMap.get(gName)!;
+      items.sort((a, b) => {
+        const numA = parseInt(String(a.code || '').replace(/\D/g, '') || '0', 10);
+        const numB = parseInt(String(b.code || '').replace(/\D/g, '') || '0', 10);
+        if (numA !== numB) return numA - numB;
+        return (a.orderIndex || 0) - (b.orderIndex || 0);
+      });
+      groupedProducts.push({ groupName: gName, items });
+    }
+  });
+
+  // 2. Add any other custom groups if present
+  groupMap.forEach((items, gName) => {
+    if (!officialGroupOrder.includes(gName)) {
+      items.sort((a, b) => {
+        const numA = parseInt(String(a.code || '').replace(/\D/g, '') || '0', 10);
+        const numB = parseInt(String(b.code || '').replace(/\D/g, '') || '0', 10);
+        if (numA !== numB) return numA - numB;
+        return (a.orderIndex || 0) - (b.orderIndex || 0);
+      });
+      groupedProducts.push({ groupName: gName, items });
+    }
   });
 
   const isUserAdminOrOwner = isAdmin(profile);
@@ -1534,7 +1658,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
                   <tbody className="text-black font-bold">
                     {section.items.map((prod) => {
                       const packings = prod.packings && prod.packings.length > 0
-                        ? prod.packings
+                        ? sortPackings(prod.packings)
                         : [{ packingSize: '25 Kg', rate: 0, mrp: 0 }];
                       const rowCount = packings.length;
 

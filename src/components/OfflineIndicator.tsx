@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { WifiOff, CheckCircle2, RefreshCw } from 'lucide-react';
 import { useOnlineStatus } from '../lib/useOnlineStatus';
 import { getPendingSyncCount, triggerFullDataRefresh } from '../lib/dataService';
@@ -7,7 +7,20 @@ import { cn } from '../lib/utils';
 export const OfflineIndicator: React.FC = () => {
   const isOnline = useOnlineStatus();
   const [isRefreshing, setIsRefreshing] = useState(false);
-  const pendingCount = getPendingSyncCount();
+  const [pendingCount, setPendingCount] = useState<number>(() => getPendingSyncCount());
+
+  useEffect(() => {
+    const syncCount = () => setPendingCount(getPendingSyncCount());
+    syncCount();
+    window.addEventListener('blackworm_sync_status', syncCount as EventListener);
+    window.addEventListener('storage', syncCount);
+    window.addEventListener('online', syncCount);
+    return () => {
+      window.removeEventListener('blackworm_sync_status', syncCount as EventListener);
+      window.removeEventListener('storage', syncCount);
+      window.removeEventListener('online', syncCount);
+    };
+  }, []);
 
   if (isOnline && pendingCount === 0) return null;
 
@@ -15,6 +28,7 @@ export const OfflineIndicator: React.FC = () => {
     setIsRefreshing(true);
     try {
       await triggerFullDataRefresh();
+      setPendingCount(getPendingSyncCount());
     } finally {
       setTimeout(() => setIsRefreshing(false), 800);
     }

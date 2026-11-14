@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { collection, query, onSnapshot, doc, deleteDoc, updateDoc, limit } from 'firebase/firestore';
 import { db } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
@@ -9,8 +9,11 @@ import {
   exportFullDatabaseBackup, 
   restoreDatabaseFromJson,
   getPendingSyncCount,
-  startBackgroundSync
+  startBackgroundSync,
+  toTimestampMs,
+  isQuotaBlocked
 } from '../../lib/dataService';
+import { safeClearTransientCaches } from '../../lib/localVault';
 import { Language, translations } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
 import { 
@@ -52,30 +55,45 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
   const [backupStatusMessage, setBackupStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [pendingSyncCount, setPendingSyncCount] = useState<number>(0);
   const [isSyncingNow, setIsSyncingNow] = useState<boolean>(false);
+  const [localLogoSize, setLocalLogoSize] = useState<number>(logoSize);
+  const sizeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    setLocalLogoSize(logoSize);
+  }, [logoSize]);
 
   useEffect(() => {
     const userIsAdmin = isAdmin(profile);
-    const qAudit = query(collection(db, 'audit_logs'), limit(50));
-    const unsubAudit = onSnapshot(qAudit, (snap) => {
-      let list: AuditLogItem[] = [];
-      snap.forEach(d => list.push({ id: d.id, ...d.data() } as AuditLogItem));
-      if (!userIsAdmin) {
-        list = list.filter(item => item.performedByUid === profile.uid || item.performedByName === profile.fullName);
-      }
-      setAuditLogs(list.reverse());
-    }, (err) => {
-      console.warn('SettingView audit logs sync notice:', err);
-    });
+    let unsubAudit: (() => void) | null = null;
+    if (!isQuotaBlocked()) {
+      const qAudit = query(collection(db, 'audit_logs'), limit(50));
+      unsubAudit = onSnapshot(qAudit, (snap) => {
+        let list: AuditLogItem[] = [];
+        snap.forEach(d => list.push({ id: d.id, ...d.data() } as AuditLogItem));
+        if (!userIsAdmin) {
+          list = list.filter(item => item.performedByUid === profile.uid || item.performedByName === profile.fullName);
+        }
+        list.sort((a: any, b: any) => toTimestampMs(b.timestamp || b.createdAt) - toTimestampMs(a.timestamp || a.createdAt));
+        setAuditLogs(list);
+      }, (err) => {
+        console.warn('SettingView audit logs sync notice:', err);
+      });
+    }
 
-    const countInterval = setInterval(() => {
-      setPendingSyncCount(getPendingSyncCount());
-    }, 2000);
+    const updateCount = () => setPendingSyncCount(getPendingSyncCount());
+    updateCount();
+    window.addEventListener('blackworm_sync_status', updateCount as EventListener);
+    window.addEventListener('storage', updateCount);
+    window.addEventListener('online', updateCount);
 
     return () => {
-      unsubAudit();
-      clearInterval(countInterval);
+      if (unsubAudit) unsubAudit();
+      window.removeEventListener('blackworm_sync_status', updateCount as EventListener);
+      window.removeEventListener('storage', updateCount);
+      window.removeEventListener('online', updateCount);
+      if (sizeDebounceRef.current) clearTimeout(sizeDebounceRef.current);
     };
-  }, []);
+  }, [profile.uid, profile.role, profile.fullName]);
 
   const saveLogoConfig = async (newUrl: string, newSize: number) => {
     setIsSavingLogo(true);
@@ -90,19 +108,75 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
 
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const base64 = reader.result as string;
-        saveLogoConfig(base64, logoSize);
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64 = reader.result as string;
+      if (!base64) return;
+      if (base64.length <= 450000) {
+        saveLogoConfig(base64, localLogoSize);
+        return;
+      }
+      const img = new Image();
+      img.onload = () => {
+        const maxDim = 512;
+        let w = img.width;
+        let h = img.height;
+        if (w > maxDim || h > maxDim) {
+          if (w > h) {
+            h = Math.round((h * maxDim) / w);
+            w = maxDim;
+          } else {
+            w = Math.round((w * maxDim) / h);
+            h = maxDim;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, w, h);
+          const outputMime = file.type === 'image/png' ? 'image/png' : 'image/jpeg';
+          let resized = canvas.toDataURL(outputMime, 0.85);
+          if (resized.length > 650000) {
+            resized = canvas.toDataURL('image/jpeg', 0.8);
+          }
+          saveLogoConfig(resized, localLogoSize);
+        } else {
+          saveLogoConfig(base64, localLogoSize);
+        }
       };
-      reader.readAsDataURL(file);
-    }
+      img.onerror = () => {
+        setDialogConfig({
+          isOpen: true,
+          type: 'alert',
+          title: 'लोगो त्रुटी',
+          message: 'निवडलेली इमेज वाचता आली नाही. कृपया वैध PNG किंवा JPG लोगो निवडा.',
+          onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+        });
+      };
+      img.src = base64;
+    };
+    reader.onerror = () => {
+      setDialogConfig({
+        isOpen: true,
+        type: 'alert',
+        title: 'लोगो त्रुटी',
+        message: 'लोगो फाईल वाचताना त्रुटी आली.',
+        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+      });
+    };
+    reader.readAsDataURL(file);
   };
 
   const handleSizeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const newSize = parseInt(e.target.value);
-    saveLogoConfig(logoUrl, newSize);
+    const newSize = parseInt(e.target.value, 10) || 80;
+    setLocalLogoSize(newSize);
+    if (sizeDebounceRef.current) clearTimeout(sizeDebounceRef.current);
+    sizeDebounceRef.current = setTimeout(() => {
+      saveLogoConfig(logoUrl, newSize);
+    }, 350);
   };
 
   const [dialogConfig, setDialogConfig] = useState<{
@@ -139,31 +213,16 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
   const handleClearCacheAndSync = async () => {
     setIsClearingCache(true);
     try {
-      // 1. Flush any pending offline sync items before clearing cache
+      // 1. Flush any pending offline / dual-DB sync items before clearing HTTP/SW cache
       try {
         await startBackgroundSync();
       } catch (_) {}
 
-      // 2. Clear browser cache storage and service workers
-      if ('caches' in window) {
-        const cacheNames = await caches.keys();
-        await Promise.all(cacheNames.map((name) => caches.delete(name)));
-      }
-      if ('serviceWorker' in navigator) {
-        const registrations = await navigator.serviceWorker.getRegistrations();
-        for (const reg of registrations) {
-          await reg.unregister();
-        }
-      }
+      // 2. Safely clear only browser Cache API & Service Workers;
+      //    never call localStorage.clear() so unsynced records & local vault remain 100% intact.
+      await safeClearTransientCaches();
 
-      // 3. Clear localStorage but preserve authenticated profile & company branding
-      const savedProfile = localStorage.getItem('blackworm_user_profile');
-      const savedBranding = localStorage.getItem('blackworm_branding');
-      localStorage.clear();
-      if (savedProfile) localStorage.setItem('blackworm_user_profile', savedProfile);
-      if (savedBranding) localStorage.setItem('blackworm_branding', savedBranding);
-      
-      // 4. Force reload without stale cache to fetch fresh data from server
+      // 3. Force reload without stale cache to fetch fresh code/data
       window.location.href = window.location.origin + window.location.pathname + '?fresh=' + Date.now();
     } catch (e) {
       window.location.reload();
@@ -243,6 +302,13 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
               setIsRestoringBackup(false);
             }
           };
+          reader.onerror = () => {
+            setIsRestoringBackup(false);
+            setBackupStatusMessage({
+              type: 'error',
+              text: 'फाईल वाचताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'
+            });
+          };
           reader.readAsText(file);
         } catch (err: any) {
           setIsRestoringBackup(false);
@@ -305,7 +371,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
           <div className="flex flex-col items-center gap-4 p-8 border-2 border-dashed border-slate-200 rounded-2xl bg-slate-50/50">
             <div className="w-48 h-48 bg-white rounded-2xl border border-slate-200 shadow-sm flex items-center justify-center overflow-hidden">
               {logoUrl ? (
-                <img src={logoUrl} alt="Company Logo" style={{ width: `${logoSize}px`, height: `${logoSize}px` }} className="object-contain" />
+                <img src={logoUrl} alt="Company Logo" style={{ width: `${localLogoSize}px`, height: `${localLogoSize}px` }} className="object-contain" />
               ) : (
                 <Settings className="w-12 h-12 text-slate-200" />
               )}
@@ -314,13 +380,13 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
             <div className="w-full max-w-xs space-y-4">
               <div className="space-y-2">
                 <div className="flex justify-between items-center">
-                  <span className="font-bold text-slate-700">Logo Size: {logoSize}px</span>
+                  <span className="font-bold text-slate-700">Logo Size: {localLogoSize}px</span>
                 </div>
                 <input
                   type="range"
                   min="40"
                   max="200"
-                  value={logoSize}
+                  value={localLogoSize}
                   onChange={handleSizeChange}
                   className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-rose-600"
                 />
