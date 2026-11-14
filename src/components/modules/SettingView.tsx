@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { collection, query, onSnapshot, doc, deleteDoc, updateDoc, limit } from 'firebase/firestore';
-import { db } from '../../firebase';
+import { db, getFriendlyErrorMessage } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { 
   restoreRecord, 
@@ -261,7 +261,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
       console.error('Backup export failed:', err);
       setBackupStatusMessage({
         type: 'error',
-        text: `बॅकअप डाउनलोड करताना त्रुटी आली: ${err.message || err}`
+        text: getFriendlyErrorMessage(err, 'बॅकअप डाउनलोड करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.')
       });
     } finally {
       setIsExportingBackup(false);
@@ -296,7 +296,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
             } catch (err: any) {
               setBackupStatusMessage({
                 type: 'error',
-                text: `रिस्टोर अयशस्वी: ${err.message || err}`
+                text: getFriendlyErrorMessage(err, 'रिस्टोर करताना त्रुटी आली. कृपया वैध बॅकअप JSON फाईल निवडा.')
               });
             } finally {
               setIsRestoringBackup(false);
@@ -314,7 +314,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
           setIsRestoringBackup(false);
           setBackupStatusMessage({
             type: 'error',
-            text: `फाईल वाचण्यात त्रुटी आली: ${err.message || err}`
+            text: getFriendlyErrorMessage(err, 'फाईल वाचण्यात त्रुटी आली. कृपया पुन्हा प्रयत्न करा.')
           });
         }
       },

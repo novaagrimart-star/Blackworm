@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { collection, query, onSnapshot, doc, setDoc } from 'firebase/firestore';
-import { db } from '../../firebase';
+import { db, getFriendlyErrorMessage } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import { logAudit, syncOfficerDetailsEverywhere, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, getLocalDateStr, mergeWithLocalData, isQuotaBlocked } from '../../lib/dataService';
+import { logAudit, syncOfficerDetailsEverywhere, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, getLocalDateStr, mergeWithLocalData, isQuotaBlocked, formatDisplayDate, safeLocalStorageSet } from '../../lib/dataService';
 import { useSharedUsers } from '../../lib/realtimeStore';
 import { useBranding } from '../../lib/branding';
 import { subscribeSecondaryCollection } from '../../lib/secondaryDb';
@@ -391,7 +391,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
         isOpen: true,
         type: 'alert',
         title: 'त्रुटी',
-        message: err.message || 'मंजूर करताना त्रुटी आली.',
+        message: getFriendlyErrorMessage(err, 'मंजूर करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'),
         onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
       });
     } finally {
@@ -675,9 +675,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
         (profile.loginId && payload.loginId && profile.loginId.toLowerCase() === payload.loginId.toLowerCase()) ||
         (profile.mobileNumber && payload.mobileNumber && profile.mobileNumber === payload.mobileNumber)
       ) {
-        try {
-          localStorage.setItem('blackworm_user_profile', JSON.stringify(payload));
-        } catch (e) {}
+        safeLocalStorageSet('blackworm_user_profile', JSON.stringify(payload));
         onProfileUpdate?.(payload);
       }
 
@@ -764,8 +762,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
       setDialogConfig({
         isOpen: true,
         type: 'alert',
-        title: 'Save Error',
-        message: `Save error: ${err.message || err}`,
+        title: 'सेव्ह करताना त्रुटी',
+        message: getFriendlyErrorMessage(err, 'माहिती सेव्ह करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'),
         onConfirm: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
       });
     }
@@ -803,8 +801,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
           setDialogConfig({
             isOpen: true,
             type: 'alert',
-            title: 'Delete Failed',
-            message: 'Delete failed: ' + err.message,
+            title: 'डिलीट करताना त्रुटी',
+            message: getFriendlyErrorMessage(err, 'युजर हटवताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'),
             onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
           });
         }
@@ -947,7 +945,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
                     <span>सेंटर: <strong className="text-slate-900">{req.proposedData?.center || '-'}</strong></span>
                   </div>
                   <p className="text-[10px] text-slate-400 font-bold mt-1">
-                    विनंती दिनांक: {new Date(req.createdAt).toLocaleString('en-GB')} ({req.requestedByName} द्वारे)
+                    विनंती दिनांक: {formatDisplayDate(req.createdAt, true) || '-'} ({req.requestedByName} द्वारे)
                   </p>
                 </div>
 

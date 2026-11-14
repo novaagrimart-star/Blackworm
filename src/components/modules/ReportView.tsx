@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Language } from '../../lib/i18n';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { toTitleCase } from '../../lib/utils';
-import { mergeWithLocalData, triggerBlobDownload, startBackgroundSync } from '../../lib/dataService';
+import { mergeWithLocalData, triggerBlobDownload, startBackgroundSync, safeLocalStorageSet } from '../../lib/dataService';
 import { useSharedUsers, useSharedTravelSheets, useSharedYearlyTargets, useSharedCollectionEntries } from '../../lib/realtimeStore';
 import html2canvas from 'html2canvas-pro';
 import { 
@@ -409,9 +409,7 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
       activeDate,
       profile
     );
-    try {
-      localStorage.setItem(`${LOCAL_STORAGE_DAILY_PREFIX}${activeDate}`, JSON.stringify(rows));
-    } catch {}
+    safeLocalStorageSet(`${LOCAL_STORAGE_DAILY_PREFIX}${activeDate}`, JSON.stringify(rows));
     return rows;
   }, [users, travelSheets, yearlyTargets, collectionEntries, selectedDate, profile]);
 
@@ -708,10 +706,10 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
                     {row.totalKm}
                   </td>
                   <td className="p-2 border border-slate-300 font-mono font-black text-emerald-900 bg-emerald-50/40">
-                    ₹{row.paymentCollection.toLocaleString()}
+                    ₹{(Number(row.paymentCollection) || 0).toLocaleString()}
                   </td>
                   <td className="p-2 border border-slate-300 font-mono font-black text-rose-900 bg-rose-50/40">
-                    ₹{row.dailyExpense.toLocaleString()}
+                    ₹{(Number(row.dailyExpense) || 0).toLocaleString()}
                   </td>
                   <td className="p-2 border border-slate-300 font-mono font-bold text-slate-800">
                     {formatAmount(row.monthlySalesTarget)}
@@ -756,10 +754,10 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
                     {totalKmSum}
                   </td>
                   <td className="p-2 border-r border-slate-300 font-mono font-black text-emerald-900 bg-emerald-100/60">
-                    ₹{totalCollectionSum.toLocaleString()}
+                    ₹{(Number(totalCollectionSum) || 0).toLocaleString()}
                   </td>
                   <td className="p-2 border-r border-slate-300 font-mono font-black text-rose-900 bg-rose-100/60">
-                    ₹{totalExpenseSum.toLocaleString()}
+                    ₹{(Number(totalExpenseSum) || 0).toLocaleString()}
                   </td>
                   <td className="p-2 border-r border-slate-300 font-mono font-bold text-slate-900">
                     {formatAmount(totalTargetSum)}

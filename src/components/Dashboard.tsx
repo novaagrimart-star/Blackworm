@@ -203,7 +203,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     if (view) {
       return (
         <div className="animate-in fade-in slide-in-from-bottom-2 duration-300">
-          <ErrorBoundary>{view}</ErrorBoundary>
+          <ErrorBoundary key={activeTab} resetKey={activeTab}>{view}</ErrorBoundary>
         </div>
       );
     }

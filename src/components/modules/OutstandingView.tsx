@@ -4,9 +4,9 @@ import {
   doc,
   writeBatch
 } from 'firebase/firestore';
-import { db } from '../../firebase';
+import { db, getFriendlyErrorMessage, isQuotaExceededError } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { safeFirestoreSet, safeFirestoreDelete, triggerBlobDownload, getLocalDateStr, trackFirestoreUsage, isQuotaBlocked, setQuotaBlocked } from '../../lib/dataService';
+import { safeFirestoreSet, safeFirestoreDelete, triggerBlobDownload, getLocalDateStr, trackFirestoreUsage, isQuotaBlocked, setQuotaBlocked, safeLocalStorageSet } from '../../lib/dataService';
 import { subscribeSecondaryCollection, fetchSecondaryCollection, pushBatchToSecondary } from '../../lib/secondaryDb';
 import { useSharedDealers, useSharedOutstandingRecords } from '../../lib/realtimeStore';
 import { Language } from '../../lib/i18n';
@@ -252,8 +252,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           applyMeta(docSnap.data());
         }
       }, (err) => {
-        const msg = String(err?.message || '').toLowerCase();
-        if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+        if (isQuotaExceededError(err)) {
           setQuotaBlocked(15 * 60 * 1000);
         }
         console.warn("Party master meta sync notice:", err);
@@ -448,9 +447,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           }
         }
 
-        try {
-          localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(currentRecords));
-        } catch {}
+        safeLocalStorageSet('blackworm_saved_outstanding_records', JSON.stringify(currentRecords));
 
         // Set the full Summary Report for user visibility
         setUploadSummaryReport({
@@ -476,7 +473,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       }
     } catch (err: any) {
       console.error('PDF parsing error:', err);
-      setParseError('PDF वाचताना त्रुटी आली: ' + (err.message || 'Unknown error.'));
+      setParseError(getFriendlyErrorMessage(err, 'PDF फाईल वाचता आली नाही. कृपया वैध पार्टी रिपोर्ट PDF निवडा.'));
     } finally {
       setIsParsing(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -540,9 +537,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           remaining.push(record);
         }
       });
-      try {
-        localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(remaining));
-      } catch {}
+      safeLocalStorageSet('blackworm_saved_outstanding_records', JSON.stringify(remaining));
       return remaining;
     });
 
@@ -581,7 +576,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           if (pendingRaw) {
             const pending = JSON.parse(pendingRaw);
             if (Array.isArray(pending)) {
-              localStorage.setItem(
+              safeLocalStorageSet(
                 'blackworm_pending_sync',
                 JSON.stringify(pending.filter((q: any) => q?.collection !== 'outstanding_records'))
               );
@@ -690,7 +685,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
         deduplicatedMap.set(dedupKey, {
           ...existing,
           amount: higherAmount,
-          formattedAmount: higherAmount.toLocaleString('en-IN'),
+          formattedAmount: (Number(higherAmount) || 0).toLocaleString('en-IN'),
           contactNumber: existing.contactNumber || item.contactNumber || '',
           sourceFile: mergedSources.join(', ') || existing.sourceFile,
         });
@@ -1653,10 +1648,10 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
                                 <td className="p-2 sm:p-2.5 text-slate-400 text-[10.5px]">{idx + 1}</td>
                                 <td className="p-2 sm:p-2.5 font-bold text-slate-800">{u.firmName}</td>
                                 <td className="p-2 sm:p-2.5 text-slate-500 font-mono">
-                                  ₹{u.oldAmount.toLocaleString('en-IN')}
+                                  ₹{(Number(u.oldAmount) || 0).toLocaleString('en-IN')}
                                 </td>
                                 <td className="p-2 sm:p-2.5 text-right font-mono font-black text-slate-900">
-                                  ₹{u.newAmount.toLocaleString('en-IN')}
+                                  ₹{(Number(u.newAmount) || 0).toLocaleString('en-IN')}
                                 </td>
                                 <td className="p-2 sm:p-2.5 text-right font-mono text-[11px] font-bold">
                                   <span className={cn(
@@ -1664,7 +1659,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
                                     isIncrease ? "bg-rose-50 text-rose-700" : "bg-emerald-50 text-emerald-700"
                                   )}>
                                     {isIncrease ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
-                                    ₹{Math.abs(u.amountDiff).toLocaleString('en-IN')}
+                                    ₹{(Number(Math.abs(u.amountDiff || 0)) || 0).toLocaleString('en-IN')}
                                   </span>
                                 </td>
                               </tr>

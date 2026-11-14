@@ -3,9 +3,9 @@ import {
   doc,
   onSnapshot,
 } from 'firebase/firestore';
-import { db } from '../../firebase';
+import { db, isQuotaExceededError } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import { logAudit, safeFirestoreSet, getLocalDateStr, getPendingSyncIdSet, trackFirestoreUsage, isQuotaBlocked, setQuotaBlocked } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, getLocalDateStr, getPendingSyncIdSet, trackFirestoreUsage, isQuotaBlocked, setQuotaBlocked, safeLocalStorageSet } from '../../lib/dataService';
 import { subscribeSecondaryCollection, fetchSecondaryCollection } from '../../lib/secondaryDb';
 import { useSharedUsers } from '../../lib/realtimeStore';
 import { Language, translations } from '../../lib/i18n';
@@ -125,6 +125,49 @@ export const generateMonthRows = (
   return rows;
 };
 
+const normalizeTravelSheet = (
+  raw: any,
+  yearNumber: number,
+  monthIndex: number,
+  monthName: string,
+  targetUid: string,
+  defaultOfficerName: string,
+  defaultDesignation: string
+): TravelSheetData => {
+  const rate = Number(raw?.ratePerKm) || 3.5;
+  const fullRows = generateMonthRows(
+    yearNumber,
+    monthIndex,
+    rate,
+    Array.isArray(raw?.rows) ? raw.rows : []
+  );
+  const totalKm = fullRows.reduce((acc, r) => acc + (Number(r.km) || 0), 0);
+  const totalAmount = fullRows.reduce((acc, r) => acc + (Number(r.amount) || 0), 0);
+  const totalOtherExpenses = fullRows.reduce((acc, r) => acc + (Number(r.otherExpenses) || 0), 0);
+  const subtotalAmount = Math.round((totalAmount + totalOtherExpenses) * 100) / 100;
+  const totalExpensesAmount = subtotalAmount;
+  const averageCostPerKm = totalKm > 0 ? Math.round((totalExpensesAmount / totalKm) * 100) / 100 : 0;
+
+  return {
+    ...(raw && typeof raw === 'object' ? raw : {}),
+    id: String(raw?.id || `travel_${targetUid}_${yearNumber}_${String(monthIndex + 1).padStart(2, '0')}`),
+    userId: String(raw?.userId || targetUid),
+    officerName: String(raw?.officerName || defaultOfficerName || targetUid),
+    designation: String(raw?.designation || defaultDesignation || 'FIELD OFFICER'),
+    date: String(raw?.date || ''),
+    monthName: String(raw?.monthName || monthName || ''),
+    yearNumber: Number(raw?.yearNumber) || yearNumber,
+    ratePerKm: rate,
+    rows: fullRows,
+    totalKm: Number(raw?.totalKm ?? totalKm) || totalKm,
+    totalAmount: Number(raw?.totalAmount ?? totalAmount) || totalAmount,
+    totalOtherExpenses: Number(raw?.totalOtherExpenses ?? totalOtherExpenses) || totalOtherExpenses,
+    subtotalAmount: Number(raw?.subtotalAmount ?? subtotalAmount) || subtotalAmount,
+    averageCostPerKm: Number(raw?.averageCostPerKm ?? averageCostPerKm) || averageCostPerKm,
+    totalExpensesAmount: Number(raw?.totalExpensesAmount ?? totalExpensesAmount) || totalExpensesAmount,
+  };
+};
+
 export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const t = translations[lang];
   const userIsAdmin = isAdmin(profile);
@@ -220,7 +263,15 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
-          return parsed;
+          return normalizeTravelSheet(
+            parsed,
+            selectedYearNumber,
+            selectedMonthIndex,
+            selectedMonthName,
+            targetUid,
+            profile.fullName || profile.uid,
+            profile.designation || 'FIELD OFFICER'
+          );
         }
       }
     } catch {}
@@ -350,8 +401,17 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       if (cached) {
         const parsed = JSON.parse(cached);
         if (parsed && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
-          setSheet(parsed);
-          setRatePerKm(parsed.ratePerKm || 3.5);
+          const normalizedCached = normalizeTravelSheet(
+            parsed,
+            selectedYearNumber,
+            selectedMonthIndex,
+            selectedMonthName,
+            targetUid,
+            profile.fullName || targetUid,
+            profile.designation || 'FIELD OFFICER'
+          );
+          setSheet(normalizedCached);
+          setRatePerKm(normalizedCached.ratePerKm || 3.5);
         }
       }
     } catch {}
@@ -401,9 +461,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       };
 
       setSheet(updatedSheet);
-      try {
-        localStorage.setItem(cacheKey, JSON.stringify(updatedSheet));
-      } catch {}
+      safeLocalStorageSet(cacheKey, JSON.stringify(updatedSheet));
     };
 
     const ensureBlankSheetIfEmpty = () => {
@@ -434,9 +492,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
           averageCostPerKm: 0,
           totalExpensesAmount: 0
         };
-        try {
-          localStorage.setItem(cacheKey, JSON.stringify(newSheet));
-        } catch {}
+        safeLocalStorageSet(cacheKey, JSON.stringify(newSheet));
         return newSheet;
       });
     };
@@ -480,8 +536,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
         }
         setLoading(false);
       }, (err) => {
-        const msg = String(err?.message || '').toLowerCase();
-        if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+        if (isQuotaExceededError(err)) {
           setQuotaBlocked(15 * 60 * 1000);
         }
         console.warn('Travel sheet snapshot notice:', err);
@@ -553,14 +608,15 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     try {
       const sheetMonthKey = `${sheet.yearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
       const cacheKey = `travel_sheet_${sheet.userId}_${sheetMonthKey}`;
-      localStorage.setItem(cacheKey, JSON.stringify(updatedSheet));
-      localStorage.setItem(`travel_sheet_${sheet.userId}`, JSON.stringify(updatedSheet));
+      safeLocalStorageSet(cacheKey, JSON.stringify(updatedSheet));
+      safeLocalStorageSet(`travel_sheet_${sheet.userId}`, JSON.stringify(updatedSheet));
       const cachedAllRaw = localStorage.getItem('blackworm_cached_travel_sheets');
       let cachedAll: any[] = cachedAllRaw ? JSON.parse(cachedAllRaw) : [];
+      if (!Array.isArray(cachedAll)) cachedAll = [];
       const idx = cachedAll.findIndex((s: any) => s.id === sheet.id || s._id === sheet.id);
       if (idx >= 0) cachedAll[idx] = updatedSheet;
       else cachedAll.push(updatedSheet);
-      localStorage.setItem('blackworm_cached_travel_sheets', JSON.stringify(cachedAll));
+      safeLocalStorageSet('blackworm_cached_travel_sheets', JSON.stringify(cachedAll));
     } catch {}
   };
 
@@ -574,8 +630,8 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     setSheet(updatedSheet);
     try {
       const sheetMonthKey = `${sheet.yearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
-      localStorage.setItem(`travel_sheet_${sheet.userId}_${sheetMonthKey}`, JSON.stringify(updatedSheet));
-      localStorage.setItem(`travel_sheet_${sheet.userId}`, JSON.stringify(updatedSheet));
+      safeLocalStorageSet(`travel_sheet_${sheet.userId}_${sheetMonthKey}`, JSON.stringify(updatedSheet));
+      safeLocalStorageSet(`travel_sheet_${sheet.userId}`, JSON.stringify(updatedSheet));
     } catch {}
   };
 
@@ -586,17 +642,18 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     const sheetMonthKey = `${sheet.yearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
     const cacheKey = `travel_sheet_${sheet.userId}_${sheetMonthKey}`;
     try {
-      localStorage.setItem(cacheKey, JSON.stringify(sheet));
-      localStorage.setItem(`travel_sheet_${sheet.userId}`, JSON.stringify(sheet));
+      safeLocalStorageSet(cacheKey, JSON.stringify(sheet));
+      safeLocalStorageSet(`travel_sheet_${sheet.userId}`, JSON.stringify(sheet));
       const cachedAllRaw = localStorage.getItem('blackworm_cached_travel_sheets');
       let cachedAll: any[] = cachedAllRaw ? JSON.parse(cachedAllRaw) : [];
+      if (!Array.isArray(cachedAll)) cachedAll = [];
       const idx = cachedAll.findIndex((s: any) => s.id === sheet.id || s._id === sheet.id);
       if (idx >= 0) {
         cachedAll[idx] = sheet;
       } else {
         cachedAll.push(sheet);
       }
-      localStorage.setItem('blackworm_cached_travel_sheets', JSON.stringify(cachedAll));
+      safeLocalStorageSet('blackworm_cached_travel_sheets', JSON.stringify(cachedAll));
     } catch {}
 
     try {
@@ -959,7 +1016,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
           {/* 2. Banner: Month & Year Full Statement */}
           <div className="bg-slate-900 text-white font-black px-2 py-2 flex items-center justify-center border-b-2 border-black">
             <span className="text-xs sm:text-sm tracking-widest uppercase whitespace-nowrap text-center">
-              MONTHLY TRAVEL EXPENSE STATEMENT - {sheet.monthName.toUpperCase()} {sheet.yearNumber}
+              MONTHLY TRAVEL EXPENSE STATEMENT - {String(sheet.monthName || selectedMonthName || '').toUpperCase()} {sheet.yearNumber || selectedYearNumber}
             </span>
           </div>
 
@@ -1035,7 +1092,9 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                       {/* Date */}
                       <td className="p-1 border-r-2 border-black text-center font-black align-middle">
                         <span className="font-mono text-[10px] whitespace-nowrap">
-                          {row.date.slice(8, 10)}/{row.date.slice(5, 7)}/{row.date.slice(0, 4)}
+                          {String(row.date || '').length >= 10
+                            ? `${String(row.date).slice(8, 10)}/${String(row.date).slice(5, 7)}/${String(row.date).slice(0, 4)}`
+                            : (row.date || '-')}
                         </span>
                       </td>
 
@@ -1120,7 +1179,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                       {/* Subtotal (Amount + Other Expenses) */}
                       <td className="p-1 text-center font-mono font-black text-emerald-800 bg-emerald-50/50 align-middle whitespace-nowrap">
                         <span className="inline-flex items-center justify-center gap-0.5 whitespace-nowrap tabular-nums">
-                          ₹ {row.subtotal ? row.subtotal.toFixed(2) : '0.00'}
+                          ₹ {(Number(row.subtotal) || 0).toFixed(2)}
                         </span>
                       </td>
                     </tr>
@@ -1134,20 +1193,20 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                   </td>
                   <td className="p-2 text-center border-r-2 border-black font-mono font-black whitespace-nowrap">-</td>
                   <td className="p-2 text-center border-r-2 border-black font-mono font-black whitespace-nowrap">-</td>
-                  <td className="p-2 text-center border-r-2 border-black font-mono font-black whitespace-nowrap">{sheet.totalKm}</td>
+                  <td className="p-2 text-center border-r-2 border-black font-mono font-black whitespace-nowrap">{Number(sheet.totalKm) || 0}</td>
                   <td className="p-2 text-center border-r-2 border-black font-mono font-black whitespace-nowrap">
                     <span className="inline-flex items-center justify-center gap-0.5 whitespace-nowrap tabular-nums">
-                      ₹ {sheet.totalAmount.toFixed(2)}
+                      ₹ {(Number(sheet.totalAmount) || 0).toFixed(2)}
                     </span>
                   </td>
                   <td className="p-2 text-center border-r-2 border-black font-mono font-black whitespace-nowrap">
                     <span className="inline-flex items-center justify-center gap-0.5 whitespace-nowrap tabular-nums">
-                      ₹ {sheet.totalOtherExpenses.toFixed(2)}
+                      ₹ {(Number(sheet.totalOtherExpenses) || 0).toFixed(2)}
                     </span>
                   </td>
                   <td className="p-2 text-center font-mono font-black bg-red-600 text-white whitespace-nowrap">
                     <span className="inline-flex items-center justify-center gap-0.5 whitespace-nowrap tabular-nums">
-                      ₹ {sheet.subtotalAmount.toFixed(2)}
+                      ₹ {(Number(sheet.subtotalAmount) || 0).toFixed(2)}
                     </span>
                   </td>
                 </tr>
@@ -1163,7 +1222,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
               <span className="text-[10px] text-slate-700 uppercase tracking-tight">Subtotal</span>
               <span className="text-base font-mono text-slate-900 font-black mt-0.5 whitespace-nowrap inline-flex items-center justify-center gap-1 tabular-nums">
                 <span>₹</span>
-                <span>{sheet.subtotalAmount.toFixed(2)}</span>
+                <span>{(Number(sheet.subtotalAmount) || 0).toFixed(2)}</span>
               </span>
             </div>
 
@@ -1172,7 +1231,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
               <span className="text-[10px] text-red-700 uppercase tracking-tight">Total Expenses Amount</span>
               <span className="text-lg font-mono text-red-700 font-black mt-0.5 whitespace-nowrap inline-flex items-center justify-center gap-1 tabular-nums">
                 <span>₹</span>
-                <span>{sheet.totalExpensesAmount.toFixed(2)}</span>
+                <span>{(Number(sheet.totalExpensesAmount) || 0).toFixed(2)}</span>
               </span>
             </div>
           </div>

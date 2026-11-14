@@ -1,14 +1,28 @@
 import React, { Component, ErrorInfo, ReactNode } from 'react';
-import { AlertTriangle, RefreshCw, Home } from 'lucide-react';
+import { AlertTriangle, RefreshCw, ShieldCheck } from 'lucide-react';
+import { getFriendlyErrorMessage } from '../firebase';
+import { safeClearTransientCaches } from '../lib/localVault';
 
 interface Props {
   children: ReactNode;
+  resetKey?: string | number;
 }
 
 interface State {
   hasError: boolean;
   error: Error | null;
   errorInfo: ErrorInfo | null;
+}
+
+function isDynamicImportOrChunkError(error: Error | null): boolean {
+  if (!error) return false;
+  const msg = (error.message || String(error)).toLowerCase();
+  return (
+    msg.includes('chunkloaderror') ||
+    msg.includes('loading chunk') ||
+    msg.includes('dynamically imported module') ||
+    msg.includes('failed to fetch module')
+  );
 }
 
 export class ErrorBoundary extends Component<Props, State> {
@@ -22,8 +36,29 @@ export class ErrorBoundary extends Component<Props, State> {
     return { hasError: true, error, errorInfo: null };
   }
 
+  public componentDidUpdate(prevProps: Props) {
+    if (this.state.hasError && this.props.resetKey !== undefined && prevProps.resetKey !== this.props.resetKey) {
+      this.setState({ hasError: false, error: null, errorInfo: null });
+    }
+  }
+
   public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
     console.error('Uncaught error caught by ErrorBoundary:', error, errorInfo);
+
+    // Auto-recover once if stale Vite module / chunk load error occurs after an update
+    if (isDynamicImportOrChunkError(error)) {
+      try {
+        const lastReload = Number(sessionStorage.getItem('blackworm_chunk_reload_at') || '0');
+        if (Date.now() - lastReload > 15000) {
+          sessionStorage.setItem('blackworm_chunk_reload_at', String(Date.now()));
+          void safeClearTransientCaches().finally(() => {
+            window.location.reload();
+          });
+          return;
+        }
+      } catch {}
+    }
+
     this.setState({ error, errorInfo });
   }
 
@@ -36,15 +71,24 @@ export class ErrorBoundary extends Component<Props, State> {
     window.location.reload();
   };
 
-  private handleHardReset = () => {
+  private handleSafeCacheRepair = async () => {
     try {
-      sessionStorage.clear();
-      // Keep user login profile so user isn't logged out unnecessarily
-      const profile = localStorage.getItem('blackworm_user_profile');
-      localStorage.clear();
-      if (profile) {
-        localStorage.setItem('blackworm_user_profile', profile);
+      await safeClearTransientCaches();
+      // Remove only disposable display caches; NEVER delete blackworm_pending_sync or blackworm_user_profile
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (!k) continue;
+        if (
+          k.startsWith('blackworm_report_') ||
+          k === 'blackworm_quota_blocked_until' ||
+          k === 'blackworm_all_dealers' ||
+          k === 'blackworm_cached_travel_sheets'
+        ) {
+          keysToRemove.push(k);
+        }
       }
+      keysToRemove.forEach((k) => localStorage.removeItem(k));
     } catch {}
     this.setState({ hasError: false, error: null, errorInfo: null });
     window.location.reload();
@@ -52,28 +96,26 @@ export class ErrorBoundary extends Component<Props, State> {
 
   public render() {
     if (this.state.hasError) {
-      const errMsg = this.state.error?.message || String(this.state.error || 'Unknown technical error');
+      const friendlyMessage = getFriendlyErrorMessage(
+        this.state.error,
+        'तात्पुरत्या तांत्रिक कारणामुळे ही स्क्रीन लोड होऊ शकली नाही. तुमचा सर्व डेटा सुरक्षित आहे.'
+      );
+
       return (
-        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-          <div className="max-w-md w-full bg-white rounded-2xl border-2 border-red-200 shadow-xl p-6 text-center space-y-4">
-            <div className="w-14 h-14 bg-red-100 text-red-600 rounded-2xl flex items-center justify-center mx-auto shadow-inner">
+        <div className="min-h-[60vh] bg-slate-50 flex items-center justify-center p-4">
+          <div className="max-w-md w-full bg-white rounded-2xl border-2 border-amber-200 shadow-xl p-6 text-center space-y-4">
+            <div className="w-14 h-14 bg-amber-100 text-amber-600 rounded-2xl flex items-center justify-center mx-auto shadow-inner">
               <AlertTriangle className="w-7 h-7" />
             </div>
 
-            <div className="space-y-1">
+            <div className="space-y-1.5">
               <h2 className="text-lg font-black text-slate-900">
-                काहीतरी तांत्रिक अडचण आली
+                स्क्रीन पुन्हा लोड करा
               </h2>
-              <p className="text-xs text-slate-500">
-                ॲप क्रॅश होण्यापासून सुरक्षित ठेवण्यात आले आहे. खालीलपैकी योग्य पर्याय निवडा:
+              <p className="text-xs text-slate-600 leading-relaxed">
+                {friendlyMessage}
               </p>
             </div>
-
-            {errMsg && (
-              <div className="p-2.5 bg-slate-100 rounded-xl text-left overflow-x-auto max-h-28 text-[11px] font-mono text-slate-700 border border-slate-200 break-words">
-                {errMsg}
-              </div>
-            )}
 
             <div className="flex flex-wrap items-center justify-center gap-2 pt-2">
               <button
@@ -96,11 +138,11 @@ export class ErrorBoundary extends Component<Props, State> {
 
               <button
                 type="button"
-                onClick={this.handleHardReset}
+                onClick={() => void this.handleSafeCacheRepair()}
                 className="flex items-center gap-1.5 px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold border border-slate-200 transition active:scale-95 cursor-pointer"
               >
-                <Home className="w-3.5 h-3.5" />
-                <span>कॅश रीसेट करा</span>
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                <span>कॅश दुरुस्त करा</span>
               </button>
             </div>
           </div>

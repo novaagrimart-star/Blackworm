@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { getFriendlyErrorMessage } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { logAudit, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, getLocalDateStr } from '../../lib/dataService';
 import { useSharedCollectionEntries, useSharedOrders, useSharedDealers } from '../../lib/realtimeStore';
@@ -302,10 +303,10 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
     if (search.trim()) {
       const q = search.toLowerCase().trim();
       result = result.filter(d => 
-        d.firmName.toLowerCase().includes(q) ||
-        d.dealerCode.toLowerCase().includes(q) ||
-        d.village.toLowerCase().includes(q) ||
-        d.proprietorName.toLowerCase().includes(q)
+        (d.firmName || '').toLowerCase().includes(q) ||
+        (d.dealerCode || '').toLowerCase().includes(q) ||
+        (d.village || '').toLowerCase().includes(q) ||
+        (d.proprietorName || '').toLowerCase().includes(q)
       );
     }
 
@@ -520,9 +521,9 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       
       const dealerOrders = accessibleOrders
         .filter(o => {
-          const match = (o.dealerName || '').trim().toUpperCase() === entry.dealerName.trim().toUpperCase() ||
+          const match = (o.dealerName || '').trim().toUpperCase() === (entry.dealerName || '').trim().toUpperCase() ||
                         (o.dealerId && entry.dealerId && o.dealerId === entry.dealerId);
-          return match && o.paidAmount > 0;
+          return match && (Number(o.paidAmount) || 0) > 0;
         })
         .sort((a, b) => toTimestampMs(b.updatedAt || b.createdAt) - toTimestampMs(a.updatedAt || a.createdAt));
 
@@ -561,11 +562,11 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         profile
       );
 
-      setSuccessToast(`पावती ₹${entry.amount.toLocaleString()} यशस्वीरित्या हटवली आणि बॅलन्स पूर्ववत केला.`);
+      setSuccessToast(`पावती ₹${(Number(entry.amount) || 0).toLocaleString()} यशस्वीरित्या हटवली आणि बॅलन्स पूर्ववत केला.`);
       setTimeout(() => setSuccessToast(''), 4000);
     } catch (err: any) {
       console.error('Delete error:', err);
-      setSuccessToast('पावती हटवताना त्रुटी: ' + (err.message || 'Error'));
+      setSuccessToast(getFriendlyErrorMessage(err, 'पावती हटवताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'));
       setTimeout(() => setSuccessToast(''), 4000);
     }
   };
@@ -576,7 +577,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       isOpen: true,
       type: 'confirm',
       title: 'पावती हटवा (Delete Receipt)',
-      message: `तुम्हाला खात्री आहे की तुम्ही ₹${entry.amount.toLocaleString()} ची ही पावती हटवू इच्छिता? यामुळे संबंधित ऑर्डरचा बॅलन्स पूर्ववत केला जाईल.`,
+      message: `तुम्हाला खात्री आहे की तुम्ही ₹${(Number(entry.amount) || 0).toLocaleString()} ची ही पावती हटवू इच्छिता? यामुळे संबंधित ऑर्डरचा बॅलन्स पूर्ववत केला जाईल.`,
       confirmText: 'हटवा (Delete)',
       cancelText: 'रद्द करा (Cancel)',
       onConfirm: () => {
@@ -627,17 +628,17 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
           let remaining = diff;
           const dealerOrders = accessibleOrders
             .filter(o => {
-              const match = (o.dealerName || '').trim().toUpperCase() === editingReceipt.dealerName.trim().toUpperCase() ||
+              const match = (o.dealerName || '').trim().toUpperCase() === (editingReceipt.dealerName || '').trim().toUpperCase() ||
                             (o.dealerId && editingReceipt.dealerId && o.dealerId === editingReceipt.dealerId);
-              return match && o.balanceAmount > 0;
+              return match && (Number(o.balanceAmount) || 0) > 0;
             })
             .sort((a, b) => toTimestampMs(a.createdAt) - toTimestampMs(b.createdAt));
 
           for (const ord of dealerOrders) {
             if (remaining <= 0) break;
-            const deduction = Math.min(remaining, ord.balanceAmount);
-            const newPaid = ord.paidAmount + deduction;
-            const newBal = ord.balanceAmount - deduction;
+            const deduction = Math.min(remaining, Number(ord.balanceAmount) || 0);
+            const newPaid = (Number(ord.paidAmount) || 0) + deduction;
+            const newBal = Math.max(0, (Number(ord.balanceAmount) || 0) - deduction);
             const newStatus = newBal <= 0 ? 'collected' : ord.status;
             await safeFirestoreSet('orders', ord.id, {
               paidAmount: newPaid,
@@ -653,9 +654,9 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
           let toRevert = Math.abs(diff);
           const dealerOrders = accessibleOrders
             .filter(o => {
-              const match = (o.dealerName || '').trim().toUpperCase() === editingReceipt.dealerName.trim().toUpperCase() ||
+              const match = (o.dealerName || '').trim().toUpperCase() === (editingReceipt.dealerName || '').trim().toUpperCase() ||
                             (o.dealerId && editingReceipt.dealerId && o.dealerId === editingReceipt.dealerId);
-              return match && o.paidAmount > 0;
+              return match && (Number(o.paidAmount) || 0) > 0;
             })
             .sort((a, b) => toTimestampMs(b.updatedAt || b.createdAt) - toTimestampMs(a.updatedAt || a.createdAt));
 
@@ -704,7 +705,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       setTimeout(() => setSuccessToast(''), 4000);
     } catch (err: any) {
       console.error('Update error:', err);
-      setSuccessToast('पावती अपडेट करताना त्रुटी: ' + (err.message || 'त्रुटी'));
+      setSuccessToast(getFriendlyErrorMessage(err, 'पावती अपडेट करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'));
       setTimeout(() => setSuccessToast(''), 4000);
     } finally {
       setIsSubmitting(false);
@@ -836,7 +837,7 @@ Blackworm Agritech Pvt. Ltd.`;
               Standing Due
             </span>
             <div className="text-xl font-black font-mono text-rose-700 mt-0.5">
-              ₹{totalStanding.toLocaleString()}
+              ₹{(Number(totalStanding) || 0).toLocaleString()}
             </div>
           </div>
           <div className="w-9 h-9 rounded-lg bg-rose-50 text-rose-600 flex items-center justify-center">
@@ -850,7 +851,7 @@ Blackworm Agritech Pvt. Ltd.`;
               Collected Amount
             </span>
             <div className="text-xl font-black font-mono text-emerald-700 mt-0.5">
-              ₹{totalCollected.toLocaleString()}
+              ₹{(Number(totalCollected) || 0).toLocaleString()}
             </div>
           </div>
           <div className="w-9 h-9 rounded-lg bg-emerald-50 text-emerald-600 flex items-center justify-center">
@@ -864,7 +865,7 @@ Blackworm Agritech Pvt. Ltd.`;
               Total Billed
             </span>
             <div className="text-xl font-black font-mono text-slate-900 mt-0.5">
-              ₹{totalBilled.toLocaleString()}
+              ₹{(Number(totalBilled) || 0).toLocaleString()}
             </div>
           </div>
           <div className="w-9 h-9 rounded-lg bg-slate-100 text-slate-700 flex items-center justify-center">
@@ -996,7 +997,7 @@ Blackworm Agritech Pvt. Ltd.`;
             <div className="bg-slate-900 text-white font-black px-3 sm:px-4 py-2 flex items-center justify-between border-b-2 border-black text-xs uppercase tracking-wider whitespace-nowrap">
               <span>DEALER STANDING AMOUNT STATEMENT</span>
               <span className="font-mono text-emerald-400">
-                Total Standing: ₹{totalStanding.toLocaleString()}
+                Total Standing: ₹{(Number(totalStanding) || 0).toLocaleString()}
               </span>
             </div>
 
@@ -1057,10 +1058,10 @@ Blackworm Agritech Pvt. Ltd.`;
                           type="button"
                           onClick={(e) => handleSendPaymentReminder(item, e)}
                           className="px-2 py-0.5 rounded text-rose-700 hover:text-rose-900 font-black bg-rose-100 hover:bg-rose-200 border border-rose-300 transition-all inline-flex items-center gap-1.5 shadow-2xs active:scale-95 cursor-pointer group"
-                          title={`क्लिक करा: थकबाकी ₹${item.standingAmount.toLocaleString()} चा व्हॉट्सॲप मेसेज पाठवा`}
+                          title={`क्लिक करा: थकबाकी ₹${(Number(item.standingAmount) || 0).toLocaleString()} चा व्हॉट्सॲप मेसेज पाठवा`}
                         >
                           <MessageCircle className="w-3.5 h-3.5 text-emerald-600 fill-emerald-500 shrink-0 group-hover:scale-110 transition-transform" />
-                          <span>₹{item.standingAmount.toLocaleString()}</span>
+                          <span>₹{(Number(item.standingAmount) || 0).toLocaleString()}</span>
                         </button>
                       ) : (
                         <span className="px-2 py-0.5 rounded text-emerald-700 bg-emerald-50 border border-emerald-200">
@@ -1105,7 +1106,7 @@ Blackworm Agritech Pvt. Ltd.`;
                     TOTAL STANDING AMOUNT:
                   </td>
                   <td className="p-2.5 text-right font-mono font-black text-emerald-400 text-sm">
-                    ₹{totalStanding.toLocaleString()}
+                    ₹{(Number(totalStanding) || 0).toLocaleString()}
                   </td>
                   <td className="p-2.5 no-print"></td>
                 </tr>
@@ -1218,8 +1219,8 @@ Blackworm Agritech Pvt. Ltd.`;
               if (!search.trim()) return true;
               const q = search.toLowerCase().trim();
               return (
-                o.dealerName.toLowerCase().includes(q) ||
-                o.orderNumber.toLowerCase().includes(q)
+                (o.dealerName || '').toLowerCase().includes(q) ||
+                (o.orderNumber || '').toLowerCase().includes(q)
               );
             })
             .map((o) => (
@@ -1227,7 +1228,7 @@ Blackworm Agritech Pvt. Ltd.`;
                 <div className="flex justify-between items-start gap-2">
                   <div className="min-w-0 flex-1">
                     <span className="text-[10px] font-mono font-bold text-slate-400 uppercase tracking-widest block">
-                      Order: #{o.orderNumber}
+                      Order: #{o.orderNumber || '-'}
                     </span>
                     <h3 className="text-sm font-bold text-slate-900 truncate" title={o.dealerName}>
                       {o.dealerName}
@@ -1235,26 +1236,26 @@ Blackworm Agritech Pvt. Ltd.`;
                   </div>
                   <div className={cn(
                     "px-2 py-0.5 rounded text-[10px] font-bold uppercase shrink-0",
-                    o.balanceAmount <= 0 ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-rose-50 text-rose-700 border border-rose-200"
+                    (Number(o.balanceAmount) || 0) <= 0 ? "bg-emerald-50 text-emerald-700 border border-emerald-200" : "bg-rose-50 text-rose-700 border border-rose-200"
                   )}>
-                    {o.balanceAmount <= 0 ? 'Full Paid' : 'Outstanding'}
+                    {(Number(o.balanceAmount) || 0) <= 0 ? 'Full Paid' : 'Outstanding'}
                   </div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-2 text-center text-xs">
                   <div className="bg-slate-50 p-2 rounded-lg">
                     <span className="text-[10px] text-slate-400 block uppercase font-bold">Total Bill</span>
-                    <span className="font-bold text-slate-900">₹{o.totalAmount.toLocaleString()}</span>
+                    <span className="font-bold text-slate-900">₹{(Number(o.totalAmount) || 0).toLocaleString()}</span>
                   </div>
                   <div className="bg-emerald-50 p-2 rounded-lg">
                     <span className="text-[10px] text-emerald-600 block uppercase font-bold">Received</span>
-                    <span className="font-bold text-emerald-700">₹{o.paidAmount.toLocaleString()}</span>
+                    <span className="font-bold text-emerald-700">₹{(Number(o.paidAmount) || 0).toLocaleString()}</span>
                   </div>
                 </div>
 
                 <div className="flex justify-between items-center pt-1">
                   <div className="text-xs font-bold text-rose-600 font-mono">
-                    Balance: ₹{o.balanceAmount.toLocaleString()}
+                    Balance: ₹{(Number(o.balanceAmount) || 0).toLocaleString()}
                   </div>
                   {o.balanceAmount > 0 && (
                     <button
@@ -1316,7 +1317,7 @@ Blackworm Agritech Pvt. Ltd.`;
                   <option value="">-- Select Party / Dealer --</option>
                   {dealersStandingList.map((d) => (
                     <option key={d.id} value={d.id}>
-                      {d.firmName} {d.dealerCode ? `(#${d.dealerCode})` : ''} - Due: ₹{d.standingAmount.toLocaleString()}
+                      {d.firmName} {d.dealerCode ? `(#${d.dealerCode})` : ''} - Due: ₹{(Number(d.standingAmount) || 0).toLocaleString()}
                     </option>
                   ))}
                 </select>
@@ -1330,7 +1331,7 @@ Blackworm Agritech Pvt. Ltd.`;
                       Current Standing Due
                     </span>
                     <span className="font-mono font-black text-rose-700 text-sm">
-                      ₹{currentSelectedDealer.standingAmount.toLocaleString()}
+                      ₹{(Number(currentSelectedDealer.standingAmount) || 0).toLocaleString()}
                     </span>
                   </div>
                   {currentSelectedDealer.standingAmount > 0 && (

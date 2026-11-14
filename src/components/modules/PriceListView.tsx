@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { collection, query, onSnapshot, doc, setDoc, getDoc, getDocs, writeBatch, limit, orderBy } from 'firebase/firestore';
-import { db } from '../../firebase';
+import { db, getFriendlyErrorMessage, isQuotaExceededError } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { Language } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
@@ -31,7 +31,9 @@ import {
   getLocalDateStr,
   safeFirestoreSet,
   isQuotaBlocked,
-  setQuotaBlocked
+  setQuotaBlocked,
+  formatDisplayDate,
+  safeLocalStorageSet
 } from '../../lib/dataService';
 import { useBranding } from '../../lib/branding';
 import { pushBatchToSecondary, fetchSecondaryCollection, subscribeSecondaryCollection } from '../../lib/secondaryDb';
@@ -678,20 +680,16 @@ export async function savePriceListPermanently(
   }
 
   // 1. Instant local caching for 0ms refresh / offline / mobile sync
-  try {
-    localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanProducts));
-    localStorage.setItem('blackworm_master_pricelist', JSON.stringify({
-      products: cleanProducts,
-      validityDate: validityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
-      updatedAt: new Date().toISOString(),
-      updatedByUid: profile.uid,
-      updatedByName: profile.fullName || 'Admin',
-      isCustomUploaded: true,
-      totalProducts: cleanProducts.length,
-    }));
-  } catch (e) {
-    console.warn('Local storage write notice:', e);
-  }
+  safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(cleanProducts));
+  safeLocalStorageSet('blackworm_master_pricelist', JSON.stringify({
+    products: cleanProducts,
+    validityDate: validityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
+    updatedAt: new Date().toISOString(),
+    updatedByUid: profile.uid,
+    updatedByName: profile.fullName || 'Admin',
+    isCustomUploaded: true,
+    totalProducts: cleanProducts.length,
+  }));
   // 2. Automated Permanent Backup of previous state
   try {
     const backupId = `backup_${Date.now()}`;
@@ -786,7 +784,8 @@ export async function savePriceListPermanently(
         });
         await archiveBatch.commit();
       }
-    } catch (archErr) {
+    } catch (archErr: any) {
+      if (isQuotaExceededError(archErr)) setQuotaBlocked(15 * 60 * 1000);
       console.warn('Soft-archive notice:', archErr);
     }
   }
@@ -834,9 +833,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         if (masterSnap.exists() && Array.isArray(masterSnap.data()?.products) && masterSnap.data().products.length > 0) {
           const validList = deduplicateProducts(masterSnap.data().products.filter((p: any) => !p.isArchived));
           setProducts(validList);
-          try {
-            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(validList));
-          } catch {}
+          safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(validList));
           return;
         }
       }
@@ -846,9 +843,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       if (secMaster && Array.isArray(secMaster.products) && secMaster.products.length > 0) {
         const validList = deduplicateProducts(secMaster.products.filter((p: any) => !p.isArchived));
         setProducts(validList);
-        try {
-          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(validList));
-        } catch {}
+        safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(validList));
         return;
       }
 
@@ -862,14 +857,11 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         if (pList.length > 0) {
           const cleanPList = deduplicateProducts(pList);
           setProducts(cleanPList);
-          try {
-            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanPList));
-          } catch {}
+          safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(cleanPList));
         }
       }
     } catch (e: any) {
-      const msg = String(e?.message || '').toLowerCase();
-      if (msg.includes('quota') || msg.includes('resource_exhausted')) setQuotaBlocked(15 * 60 * 1000);
+      if (isQuotaExceededError(e)) setQuotaBlocked(15 * 60 * 1000);
       console.warn('Manual refresh notice:', e);
     } finally {
       setTimeout(() => setIsRefreshing(false), 400);
@@ -951,10 +943,8 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
     const applyMasterData = (data: any) => {
       if (data && Array.isArray(data.products) && data.products.length > 0) {
         const clean = deduplicateProducts(data.products);
-        try {
-          localStorage.setItem('blackworm_master_pricelist', JSON.stringify({ ...data, products: clean }));
-          localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(clean));
-        } catch {}
+        safeLocalStorageSet('blackworm_master_pricelist', JSON.stringify({ ...data, products: clean }));
+        safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(clean));
         setProducts(clean);
         if (data.validityDate) setValidityDate(data.validityDate);
         if (clean.length < data.products.length && isAdmin(profile)) {
@@ -1013,9 +1003,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
             return (a.orderIndex || 0) - (b.orderIndex || 0);
           });
           setProducts(cleanList);
-          try {
-            localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(cleanList));
-          } catch {}
+          safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(cleanList));
         } else {
           const cached = getInitialCachedProducts();
           if (cached.length > 0) {
@@ -1084,16 +1072,20 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       );
 
       if (!isQuotaBlocked()) {
-        for (const item of initialProducts) {
-          await setDoc(doc(db, 'products_pricelist_v2', item.id), item, { merge: true });
+        try {
+          for (const item of initialProducts) {
+            await setDoc(doc(db, 'products_pricelist_v2', item.id), item, { merge: true });
+          }
+        } catch (seedErr: any) {
+          if (isQuotaExceededError(seedErr)) setQuotaBlocked(15 * 60 * 1000);
+          console.warn('Initial pricelist seed notice:', seedErr);
         }
       }
       setProducts(initialProducts);
-      try {
-        localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(initialProducts));
-      } catch {}
-    } catch (err) {
-      console.error('Safe seed notice:', err);
+      safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(initialProducts));
+    } catch (err: any) {
+      if (isQuotaExceededError(err)) setQuotaBlocked(15 * 60 * 1000);
+      console.warn('Safe seed notice:', err);
     }
   };
 
@@ -1102,20 +1094,26 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
     setIsLoadingBackups(true);
     try {
       if (!isQuotaBlocked()) {
-        const qBackups = query(collection(db, 'pricelist_backups'), orderBy('createdAt', 'desc'), limit(15));
-        const snap = await getDocs(qBackups);
-        const list: any[] = [];
-        snap.forEach(d => list.push({ id: d.id, ...d.data() }));
-        if (list.length > 0) {
-          setBackupList(list);
-          return;
+        try {
+          const qBackups = query(collection(db, 'pricelist_backups'), orderBy('createdAt', 'desc'), limit(15));
+          const snap = await getDocs(qBackups);
+          const list: any[] = [];
+          snap.forEach(d => list.push({ id: d.id, ...d.data() }));
+          if (list.length > 0) {
+            setBackupList(list);
+            return;
+          }
+        } catch (fbErr: any) {
+          if (isQuotaExceededError(fbErr)) setQuotaBlocked(15 * 60 * 1000);
+          console.warn('Primary backups fetch notice:', fbErr);
         }
       }
       const sec = await fetchSecondaryCollection('pricelist_backups', { limit: 15 });
       if (sec.ok && sec.items.length > 0) {
         setBackupList(sec.items);
       }
-    } catch (e) {
+    } catch (e: any) {
+      if (isQuotaExceededError(e)) setQuotaBlocked(15 * 60 * 1000);
       console.warn('Fetch backups notice:', e);
     } finally {
       setIsLoadingBackups(false);
@@ -1140,7 +1138,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       isOpen: true,
       type: 'confirm',
       title: 'प्राईस लिस्ट रिस्टोर निश्चित करा',
-      message: `तुम्ही "${new Date(b.createdAt).toLocaleString('en-IN')}" रोजीचा ${b.previousProducts.length} प्रॉडक्ट्सचा बॅकअप रिस्टोर करू इच्छिता का? फाईलमधील सर्व प्रॉडक्ट्स व दर ॲपमध्ये लागू होतील.`,
+      message: `तुम्ही "${formatDisplayDate(b.createdAt, true) || '-'}" रोजीचा ${b.previousProducts.length} प्रॉडक्ट्सचा बॅकअप रिस्टोर करू इच्छिता का? फाईलमधील सर्व प्रॉडक्ट्स व दर ॲपमध्ये लागू होतील.`,
       confirmText: 'होय, रिस्टोर करा',
       cancelText: 'रद्द करा',
       onConfirm: async () => {
@@ -1169,7 +1167,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
             isOpen: true,
             type: 'alert',
             title: 'रिस्टोर अयशस्वी',
-            message: err.message || 'रिस्टोर करताना त्रुटी आली.',
+            message: getFriendlyErrorMessage(err, 'रिस्टोर करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'),
             confirmText: 'ठीक आहे',
             onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
           });
@@ -1368,10 +1366,14 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       });
     } catch (err: any) {
       console.error('File parse error:', err);
-      const rawMsg = err.message || '';
-      let cleanDisplayMsg = rawMsg;
+      const rawMsg = String(err?.message || '');
+      let cleanDisplayMsg = '';
       if (rawMsg.includes('503') || rawMsg.includes('UNAVAILABLE') || rawMsg.includes('overloaded')) {
         cleanDisplayMsg = 'AI सर्व्हरवर सध्या खूप जास्त लोड (High Demand) आहे. सिस्टीमने स्वयंचलित २-३ वेळा प्रयत्न केले, परंतु सर्व्हर तात्पुरता व्यस्त आहे.\n\nटीप: आपली जुनी प्राईस लिस्ट पूर्णपणे सुरक्षित आहे. आपण १-२ मिनिटांनंतर पुन्हा प्रयत्न करू शकता किंवा थेट एक्सेल (.xlsx) फाईल अपलोड करू शकता जी कोणत्याही सर्व्हर लोडशिवाय त्वरित सेव्ह होते.';
+      } else if (/[\u0900-\u097F]/.test(rawMsg)) {
+        cleanDisplayMsg = rawMsg;
+      } else {
+        cleanDisplayMsg = getFriendlyErrorMessage(err, 'फाईल अपलोड करताना तांत्रिक अडचण आली. कृपया वैध एक्सेल (.xlsx) किंवा PDF फाईल निवडा.');
       }
 
       setDialogConfig({
@@ -1709,7 +1711,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
 
                             {/* 4. Basic Rate (In front of corresponding packing) */}
                             <td className="border-r border-black py-2 px-3 text-center font-black text-black align-middle whitespace-nowrap">
-                              {pk.rate > 0 ? `₹ ${pk.rate.toLocaleString('en-IN')}/-` : '-'}
+                              {(Number(pk.rate) || 0) > 0 ? `₹ ${(Number(pk.rate) || 0).toLocaleString('en-IN')}/-` : '-'}
                             </td>
 
                             {/* 5. GST Rate (Spans across all packings) */}
@@ -1724,12 +1726,12 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
 
                             {/* 6. With GST Rate (Calculated Basic Rate + GST % in front of corresponding packing) */}
                             <td className="border-r border-black py-2 px-3 text-center font-black text-emerald-800 align-middle whitespace-nowrap bg-emerald-50/30">
-                              {withGst > 0 ? `₹ ${withGst.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/-` : '-'}
+                              {(Number(withGst) || 0) > 0 ? `₹ ${(Number(withGst) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/-` : '-'}
                             </td>
 
                             {/* 7. MRP (In front of corresponding packing) */}
                             <td className="py-2 px-3 text-center font-black text-black align-middle whitespace-nowrap">
-                              {pk.mrp > 0 ? `₹ ${pk.mrp.toLocaleString('en-IN')}/-` : '-'}
+                              {(Number(pk.mrp) || 0) > 0 ? `₹ ${(Number(pk.mrp) || 0).toLocaleString('en-IN')}/-` : '-'}
                             </td>
                           </tr>
                         );
@@ -1809,7 +1811,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
                   <div>
                     <div className="font-bold text-slate-900 flex items-center gap-1.5 text-xs">
                       <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
-                      <span>{new Date(b.createdAt).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}</span>
+                      <span>{formatDisplayDate(b.createdAt, true) || '-'}</span>
                     </div>
                     <div className="text-[11px] text-slate-500 mt-0.5">
                       {b.previousProductsCount || b.previousProducts?.length || 0} प्रॉडक्ट्स • स्रोत: {b.source || 'Upload'} • युजर: {b.performedByName || 'Admin'}

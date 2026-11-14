@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { collection, getDocs } from 'firebase/firestore';
-import { db } from '../firebase';
+import { db, getFriendlyErrorMessage, isQuotaExceededError } from '../firebase';
 import { UserProfile } from '../lib/auth';
 import { User, Lock, ArrowRight, AlertCircle, ShieldCheck, Eye, EyeOff, Loader2, Key } from 'lucide-react';
 import {
@@ -9,6 +9,7 @@ import {
   trackFirestoreUsage,
   safeFirestoreSet,
   mergeWithLocalData,
+  safeLocalStorageSet,
 } from '../lib/dataService';
 import { fetchSecondaryCollection, bootstrapCollectionToSecondary } from '../lib/secondaryDb';
 import { useBranding } from '../lib/branding';
@@ -62,14 +63,11 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
             allUsers = usersSnap.docs
               .map(d => ({ ...d.data(), uid: d.id, id: d.id }))
               .filter((u: any) => !u.isArchived);
-            try {
-              localStorage.setItem('blackworm_cached_users', JSON.stringify(allUsers));
-            } catch {}
+            safeLocalStorageSet('blackworm_cached_users', JSON.stringify(allUsers));
             bootstrapCollectionToSecondary('users', allUsers);
           }
         } catch (networkErr: any) {
-          const msg = String(networkErr?.message || '').toLowerCase();
-          if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+          if (isQuotaExceededError(networkErr)) {
             setQuotaBlocked(15 * 60 * 1000);
           }
           console.warn('Primary login lookup fallback:', networkErr);
@@ -84,9 +82,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
             allUsers = secRes.items
               .filter((u: any) => !u.isArchived)
               .map((u: any) => ({ ...u, uid: u.uid || u.id, id: u.id || u.uid }));
-            try {
-              localStorage.setItem('blackworm_cached_users', JSON.stringify(allUsers));
-            } catch {}
+            safeLocalStorageSet('blackworm_cached_users', JSON.stringify(allUsers));
           }
         } catch {}
       }
@@ -121,9 +117,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
         };
         await safeFirestoreSet('users', initialOwner.uid, initialOwner, { merge: true });
         allUsers = [initialOwner];
-        try {
-          localStorage.setItem('blackworm_cached_users', JSON.stringify(allUsers));
-        } catch {}
+        safeLocalStorageSet('blackworm_cached_users', JSON.stringify(allUsers));
       }
 
       // 4. Local cache / LocalStorage fallback (3rd tier offline resilience)
@@ -180,7 +174,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
       }
     } catch (err: any) {
       console.error('Login error:', err);
-      setError(err.message || 'Error signing in. Please try again.');
+      setError(getFriendlyErrorMessage(err, 'लॉगिन करताना अडचण आली. कृपया पुन्हा प्रयत्न करा.'));
     } finally {
       setLoading(false);
     }

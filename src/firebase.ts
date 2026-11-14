@@ -59,26 +59,96 @@ export interface FirestoreErrorInfo {
   };
 }
 
+function extractErrorParts(error: unknown) {
+  const errObj = error as { message?: unknown; code?: unknown; name?: unknown } | null | undefined;
+  const rawMessage =
+    error instanceof Error
+      ? error.message
+      : errObj && typeof errObj === 'object' && errObj.message !== undefined
+        ? String(errObj.message)
+        : String(error || '');
+  return {
+    msg: rawMessage.toLowerCase(),
+    name: String(errObj?.name || '').toLowerCase(),
+    code: String(errObj?.code || '').toLowerCase(),
+  };
+}
+
 export function isQuotaExceededError(error: unknown): boolean {
-  const msg = error instanceof Error ? error.message : String(error);
+  const { msg, name, code } = extractErrorParts(error);
   return (
-    msg.toLowerCase().includes('quota') ||
-    msg.toLowerCase().includes('resource-exhausted') ||
-    msg.toLowerCase().includes('daily read units') ||
-    msg.toLowerCase().includes('free tier database')
+    msg.includes('quota') ||
+    msg.includes('resource-exhausted') ||
+    msg.includes('resource_exhausted') ||
+    msg.includes('daily read units') ||
+    msg.includes('free tier database') ||
+    name.includes('quotaexceeded') ||
+    code.includes('resource-exhausted')
   );
 }
 
-export function getFriendlyErrorMessage(error: unknown, fallbackMessage = 'डेटा सध्या उपलब्ध नाही. कृपया काही वेळाने पुन्हा प्रयत्न करा.'): string {
+export function getFriendlyErrorMessage(
+  error: unknown,
+  fallbackMessage = 'तात्पुरती तांत्रिक अडचण आली. डेटा सुरक्षित आहे, कृपया पुन्हा प्रयत्न करा.'
+): string {
+  const { msg, name, code } = extractErrorParts(error);
+
+  if (
+    name.includes('quotaexceeded') ||
+    msg.includes('quotaexceedederror') ||
+    msg.includes('exceeded the quota') ||
+    (msg.includes('storage') && msg.includes('quota'))
+  ) {
+    return 'डिव्हाइसवरील तात्पुरती कॅश जागा भरली आहे. कृपया थोड्या वेळाने पुन्हा प्रयत्न करा.';
+  }
   if (isQuotaExceededError(error)) {
-    return 'डेटा सध्या उपलब्ध नाही. कृपया काही वेळाने पुन्हा प्रयत्न करा.';
+    return 'सध्या डेटाबेस लोड जास्त असल्यामुळे बॅकअप सर्व्हर व ऑफलाइन कॅश कार्यरत आहे. तुमचा डेटा पूर्णपणे सुरक्षित आहे.';
   }
-  const msg = error instanceof Error ? error.message : String(error);
-  if (msg.includes('offline') || msg.includes('network') || msg.includes('unavailable')) {
-    return 'इंटरनेट कनेक्शन उपलब्ध नाही. ऑफलाइन कॅश डेटा दर्शवला जात आहे.';
+  if (
+    name.includes('chunkload') ||
+    msg.includes('chunkloaderror') ||
+    msg.includes('dynamically imported module') ||
+    msg.includes('loading chunk') ||
+    msg.includes('failed to fetch module')
+  ) {
+    return 'ॲपची नवीन आवृत्ती उपलब्ध आहे. कृपया रिफ्रेश / पुन्हा प्रयत्न करा.';
   }
-  if (msg.includes('permission') || msg.includes('PERMISSION_DENIED')) {
+  if (
+    msg.includes('offline') ||
+    msg.includes('network') ||
+    msg.includes('unavailable') ||
+    msg.includes('failed to fetch') ||
+    msg.includes('aborted') ||
+    msg.includes('deadline-exceeded') ||
+    code.includes('unavailable') ||
+    code.includes('aborted') ||
+    code.includes('deadline-exceeded')
+  ) {
+    return 'इंटरनेट कनेक्शन तात्पुरते उपलब्ध नाही. डेटा स्थानिक सुरक्षित मेमरीमध्ये जतन केला जात आहे.';
+  }
+  if (msg.includes('permission') || msg.includes('permission_denied') || code.includes('permission-denied')) {
     return 'या माहितीसाठी आवश्यक परवानगी उपलब्ध नाही.';
+  }
+  if (
+    msg.includes('failed-precondition') ||
+    code.includes('failed-precondition') ||
+    msg.includes('index') ||
+    msg.includes('internal') ||
+    code.includes('internal')
+  ) {
+    return fallbackMessage;
+  }
+  // Never expose raw JS TypeError / FirebaseError stack codes to the user
+  if (
+    name.includes('typeerror') ||
+    name.includes('syntaxerror') ||
+    msg.includes('cannot read properties') ||
+    msg.includes('is not a function') ||
+    msg.includes('firebaseerror') ||
+    msg.includes('syntaxerror') ||
+    msg.includes('typeerror')
+  ) {
+    return fallbackMessage;
   }
   return fallbackMessage;
 }

@@ -172,8 +172,36 @@ export function getPendingSyncIdSet(colName: string): Set<string> {
 export function safeLocalStorageSet(key: string, value: string): boolean {
   try {
     if (typeof window === 'undefined') return false;
-    localStorage.setItem(key, value);
-    return true;
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch (firstErr: any) {
+      // Auto-evict disposable/duplicate caches when browser localStorage hits quota limits (~5MB)
+      const disposableKeys = [
+        'BLACKWORM_LOCAL_DATA_MIRROR',
+        'blackworm_report_static_cache_v4',
+        'blackworm_all_dealers',
+        'blackworm_cached_travel_sheets',
+        'blackworm_cached_pricelist',
+        'blackworm_master_pricelist',
+      ];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('blackworm_report_daily_v4_')) {
+          disposableKeys.push(k);
+        }
+      }
+      for (const dk of disposableKeys) {
+        if (dk !== key) {
+          try {
+            localStorage.removeItem(dk);
+          } catch {}
+        }
+      }
+      // Retry write after pruning duplicate caches (IndexedDB vault keeps full datasets)
+      localStorage.setItem(key, value);
+      return true;
+    }
   } catch (e) {
     console.warn(`LocalStorage write notice for ${key}:`, e);
     return false;
@@ -311,7 +339,7 @@ export function removeFromCollectionCache(colName: string, docId: string): void 
       const map = JSON.parse(raw);
       if (map && typeof map === 'object' && docId in map) {
         delete map[docId];
-        localStorage.setItem(storageKey, JSON.stringify(map));
+        safeLocalStorageSet(storageKey, JSON.stringify(map));
       }
     }
     if (colName === 'dealers_application') {
@@ -319,7 +347,7 @@ export function removeFromCollectionCache(colName: string, docId: string): void 
       if (allRaw) {
         const list = JSON.parse(allRaw);
         if (Array.isArray(list)) {
-          localStorage.setItem('blackworm_all_dealers', JSON.stringify(list.filter((d: any) => d?.id !== docId)));
+          safeLocalStorageSet('blackworm_all_dealers', JSON.stringify(list.filter((d: any) => d?.id !== docId)));
         }
       }
     } else if (colName === 'users') {
@@ -327,7 +355,7 @@ export function removeFromCollectionCache(colName: string, docId: string): void 
       if (cachedUsersRaw) {
         const list = JSON.parse(cachedUsersRaw);
         if (Array.isArray(list)) {
-          localStorage.setItem('blackworm_cached_users', JSON.stringify(list.filter((u: any) => u?.uid !== docId && u?.id !== docId)));
+          safeLocalStorageSet('blackworm_cached_users', JSON.stringify(list.filter((u: any) => u?.uid !== docId && u?.id !== docId)));
         }
       }
     } else if (colName === 'outstanding_records') {
@@ -335,7 +363,7 @@ export function removeFromCollectionCache(colName: string, docId: string): void 
       if (savedOutRaw) {
         const list = JSON.parse(savedOutRaw);
         if (Array.isArray(list)) {
-          localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(list.filter((r: any) => r?.id !== docId)));
+          safeLocalStorageSet('blackworm_saved_outstanding_records', JSON.stringify(list.filter((r: any) => r?.id !== docId)));
         }
       }
     }
@@ -1634,9 +1662,7 @@ export function mergeWithLocalData<T extends { id: string }>(
     });
 
     if (mapMutated) {
-      try {
-        localStorage.setItem(storageKey, JSON.stringify(map));
-      } catch {}
+      safeLocalStorageSet(storageKey, JSON.stringify(map));
     }
 
     // Overlay locally saved items ONLY when they are genuinely pending sync (prevents clock skew overwriting fresh server updates)

@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { getFriendlyErrorMessage } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { softDeleteRecord, logAudit, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, formatDisplayDate, triggerBlobDownload, deduplicateProducts } from '../../lib/dataService';
 import { useSharedOrders, useSharedDealers, useSharedUsers, useSharedMasterPricelist } from '../../lib/realtimeStore';
@@ -799,11 +800,11 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       if (!dealerSearchQuery.trim()) return true;
       const queryStr = dealerSearchQuery.toLowerCase();
       return (
-        d.firmName.toLowerCase().includes(queryStr) ||
-        d.proprietorName.toLowerCase().includes(queryStr) ||
-        d.contactNumber.includes(queryStr) ||
-        d.dealerCode.toLowerCase().includes(queryStr) ||
-        d.village.toLowerCase().includes(queryStr)
+        String(d.firmName || '').toLowerCase().includes(queryStr) ||
+        String(d.proprietorName || '').toLowerCase().includes(queryStr) ||
+        String(d.contactNumber || '').includes(queryStr) ||
+        String(d.dealerCode || '').toLowerCase().includes(queryStr) ||
+        String(d.village || '').toLowerCase().includes(queryStr)
       );
     });
   }, [scopedDealers, dealerSearchQuery]);
@@ -1053,7 +1054,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     let dealerToUse = selectedDealer;
     if (!dealerToUse && dealerSearchQuery.trim()) {
       const match = scopedDealers.find(
-        (d) => d.firmName.toLowerCase() === dealerSearchQuery.trim().toLowerCase()
+        (d) => String(d.firmName || '').toLowerCase() === dealerSearchQuery.trim().toLowerCase()
       );
       if (match) {
         dealerToUse = match;
@@ -1267,7 +1268,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       setSuccessOrder(newOrder);
     } catch (err: any) {
       console.error('Error generating order:', err);
-      setFormError('ऑर्डर सेव्ह करताना त्रुटी आली: ' + (err?.message || 'कृपया इंटरनेट तपासून पुन्हा प्रयत्न करा.'));
+      setFormError(getFriendlyErrorMessage(err, 'ऑर्डर सेव्ह करताना अडचण आली. कृपया पुन्हा प्रयत्न करा.'));
     } finally {
       setIsSubmittingOrder(false);
     }
@@ -1605,11 +1606,11 @@ ${itemsListText}
 
     const queryStr = search.toLowerCase();
     const matchSearch =
-      o.dealerName.toLowerCase().includes(queryStr) ||
-      o.orderNumber.toLowerCase().includes(queryStr) ||
-      (o.dealerContact || '').includes(queryStr) ||
-      (o.farmerName || '').toLowerCase().includes(queryStr) ||
-      (o.items && o.items.some((it) => it.productName.toLowerCase().includes(queryStr)));
+      String(o.dealerName || '').toLowerCase().includes(queryStr) ||
+      String(o.orderNumber || '').toLowerCase().includes(queryStr) ||
+      String(o.dealerContact || '').includes(queryStr) ||
+      String(o.farmerName || '').toLowerCase().includes(queryStr) ||
+      (Array.isArray(o.items) && o.items.some((it) => String(it?.productName || '').toLowerCase().includes(queryStr)));
 
     if (!matchSearch) return false;
 
@@ -1838,7 +1839,7 @@ ${itemsListText}
                             <div key={idx} className="flex justify-between items-center text-[10.5px] font-semibold text-slate-700">
                               <span className="truncate pr-2 font-bold text-sky-700">• {it.gradeName || it.productName} ({it.packingSize})</span>
                               <span className="shrink-0 font-mono text-slate-900 font-bold">
-                                {it.quantity} {getOrderLineUnit(it)} x ₹{it.rate} = ₹{it.subtotal.toLocaleString()}
+                                {it.quantity} {getOrderLineUnit(it)} x ₹{Number(it.rate) || 0} = ₹{(Number(it.subtotal) || 0).toLocaleString()}
                               </span>
                             </div>
                           ))}
@@ -1860,14 +1861,14 @@ ${itemsListText}
                   <div className="flex items-center gap-1.5">
                     <span className="text-[9.5px] font-bold text-slate-500">Total Bill:</span>
                     <span className="text-xs font-black text-purple-900 font-mono">
-                      ₹{o.totalAmount.toLocaleString()}
+                      ₹{(Number(o.totalAmount) || 0).toLocaleString()}
                     </span>
                   </div>
 
-                  {o.paidAmount > 0 ? (
+                  {(Number(o.paidAmount) || 0) > 0 ? (
                     <div className="flex items-center gap-2 text-[9.5px] font-bold">
-                      <span className="text-emerald-700">Paid: ₹{o.paidAmount.toLocaleString()}</span>
-                      <span className="text-slate-500">Bal: ₹{o.balanceAmount.toLocaleString()}</span>
+                      <span className="text-emerald-700">Paid: ₹{(Number(o.paidAmount) || 0).toLocaleString()}</span>
+                      <span className="text-slate-500">Bal: ₹{(Number(o.balanceAmount) || 0).toLocaleString()}</span>
                     </div>
                   ) : (
                     <span className="text-[9px] font-bold text-amber-800 bg-amber-100/60 px-1.5 py-0.2 rounded font-sans">
@@ -2300,7 +2301,7 @@ ${itemsListText}
                             "font-mono text-[9px] px-1 py-0.2 rounded font-black",
                             selectedPacking === pk.packingSize ? "bg-white/20 text-white" : "bg-black/5 text-slate-800"
                           )}>
-                            ₹{pkComputedRate.toLocaleString('en-IN')}{pkIsBox ? '/Box' : ''}
+                            ₹{(Number(pkComputedRate) || 0).toLocaleString('en-IN')}{pkIsBox ? '/Box' : ''}
                           </span>
                         </button>
                       );
@@ -2420,12 +2421,12 @@ ${itemsListText}
                           </span>
                         )}
                         <span className="mx-1.5">•</span>
-                        Base: <span className="font-mono">₹{gross.toLocaleString()}</span>
+                        Base: <span className="font-mono">₹{(Number(gross) || 0).toLocaleString()}</span>
                       </span>
                       {dAmt > 0 && (
-                        <span className="text-rose-600 font-medium">सूट: -₹{dAmt.toLocaleString()}</span>
+                        <span className="text-rose-600 font-medium">सूट: -₹{(Number(dAmt) || 0).toLocaleString()}</span>
                       )}
-                      <span>एकूण (Subtotal): <span className="font-mono text-purple-700 font-black text-xs">₹{net.toLocaleString()}</span></span>
+                      <span>एकूण (Subtotal): <span className="font-mono text-purple-700 font-black text-xs">₹{(Number(net) || 0).toLocaleString()}</span></span>
                     </div>
                   );
                 })()}
@@ -2455,7 +2456,7 @@ ${itemsListText}
               </span>
               {orderItems.length > 0 && (
                 <span className="text-xs font-black text-purple-700 font-mono">
-                  Total: ₹{totalBillAmount.toLocaleString()}
+                  Total: ₹{(Number(totalBillAmount) || 0).toLocaleString()}
                 </span>
               )}
             </div>
@@ -2619,11 +2620,11 @@ ${itemsListText}
                         <div className="flex justify-between items-center text-[10.5px] pt-1 border-t border-slate-100">
                           <span className="font-bold text-slate-500">
                             {item.quantity} {itemUnit}
-                            {' '}× ₹{item.rate.toLocaleString('en-IN')}
+                            {' '}× ₹{(Number(item.rate) || 0).toLocaleString('en-IN')}
                             {(item.discount || 0) > 0 ? ` - ₹${item.discount}` : ''}
                           </span>
                           <span className="font-mono font-black text-purple-700 text-xs">
-                            ₹{item.subtotal.toLocaleString('en-IN')}
+                            ₹{(Number(item.subtotal) || 0).toLocaleString('en-IN')}
                           </span>
                         </div>
                       </div>
@@ -2650,10 +2651,10 @@ ${itemsListText}
                     </span>
                     {allDiscountsTotal > 0 && (
                       <span className="text-[10.5px] text-rose-700">
-                        Total Disc: -₹{allDiscountsTotal.toLocaleString()}
+                        Total Disc: -₹{(Number(allDiscountsTotal) || 0).toLocaleString()}
                       </span>
                     )}
-                    <span className="font-mono text-sm">Total: ₹{totalBillAmount.toLocaleString()}</span>
+                    <span className="font-mono text-sm">Total: ₹{(Number(totalBillAmount) || 0).toLocaleString()}</span>
                   </div>
                 </div>
               </div>
@@ -2993,8 +2994,8 @@ ${itemsListText}
                             <span className="text-[9.5px] text-slate-400">{it.packingSize}</span>
                           </td>
                           <td className="p-1.5 text-center font-mono whitespace-nowrap">{it.quantity} {getOrderLineUnit(it)}</td>
-                          <td className="p-1.5 text-right font-mono">₹{it.rate}</td>
-                          <td className="p-1.5 text-right font-mono font-bold">₹{it.subtotal.toLocaleString()}</td>
+                          <td className="p-1.5 text-right font-mono">₹{Number(it.rate) || 0}</td>
+                          <td className="p-1.5 text-right font-mono font-bold">₹{(Number(it.subtotal) || 0).toLocaleString()}</td>
                         </tr>
                       );
                     })}
@@ -3004,17 +3005,17 @@ ${itemsListText}
                       <>
                         <tr>
                           <td colSpan={3} className="p-1.5 text-right text-slate-600 font-bold">Gross Amount:</td>
-                          <td className="p-1.5 text-right font-mono">₹{(selectedOrderDetails.grossAmount || (selectedOrderDetails.totalAmount + selectedOrderDetails.discountAmount)).toLocaleString()}</td>
+                          <td className="p-1.5 text-right font-mono">₹{(Number(selectedOrderDetails.grossAmount || ((Number(selectedOrderDetails.totalAmount) || 0) + (Number(selectedOrderDetails.discountAmount) || 0))) || 0).toLocaleString()}</td>
                         </tr>
                         <tr>
                           <td colSpan={3} className="p-1.5 text-right text-rose-700 font-bold">Discount Applied:</td>
-                          <td className="p-1.5 text-right font-mono text-rose-700 font-bold">-₹{selectedOrderDetails.discountAmount.toLocaleString()}</td>
+                          <td className="p-1.5 text-right font-mono text-rose-700 font-bold">-₹{(Number(selectedOrderDetails.discountAmount) || 0).toLocaleString()}</td>
                         </tr>
                       </>
                     ) : null}
                     <tr className="border-t border-purple-200">
                       <td colSpan={3} className="p-1.5 text-right uppercase">Net Bill Amount:</td>
-                      <td className="p-1.5 text-right font-mono text-sm font-bold text-purple-950">₹{selectedOrderDetails.totalAmount.toLocaleString()}</td>
+                      <td className="p-1.5 text-right font-mono text-sm font-bold text-purple-950">₹{(Number(selectedOrderDetails.totalAmount) || 0).toLocaleString()}</td>
                     </tr>
                   </tfoot>
                 </table>

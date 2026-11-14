@@ -8,7 +8,7 @@ import {
   getDocFromServer,
   getDocsFromServer,
 } from 'firebase/firestore';
-import { db } from '../firebase';
+import { db, isQuotaExceededError } from '../firebase';
 import { UserProfile } from './auth';
 import {
   mergeWithLocalData,
@@ -22,6 +22,7 @@ import {
   toTimestampMs,
   isQuotaBlocked,
   setQuotaBlocked,
+  safeLocalStorageSet,
 } from './dataService';
 import { loadCollectionFromVault } from './localVault';
 import {
@@ -97,8 +98,7 @@ function subscribeChannel<T>(
 }
 
 function isQuotaError(err: any): boolean {
-  const msg = String(err?.message || err || '').toLowerCase();
-  return msg.includes('quota') || msg.includes('resource_exhausted') || msg.includes('resource-exhausted');
+  return isQuotaExceededError(err);
 }
 
 function applyIncrementalSnapshot(
@@ -266,9 +266,7 @@ function finalizeUsersList(rawItems: any[], archivedIds: Set<string>, authoritat
     authoritativeServer: authoritative,
   }).map((u: any) => ({ ...u, uid: u.uid || u.id, id: u.id || u.uid }));
   const sorted = sortUsers(merged as UserProfile[]);
-  try {
-    localStorage.setItem('blackworm_cached_users', JSON.stringify(sorted));
-  } catch {}
+  safeLocalStorageSet('blackworm_cached_users', JSON.stringify(sorted));
   return sorted;
 }
 
@@ -336,9 +334,7 @@ export function useSharedUsers() {
 
   const setUsersOptimistic = (updater: (prev: UserProfile[]) => UserProfile[]) => {
     const next = sortUsers(updater(usersChannel.data));
-    try {
-      localStorage.setItem('blackworm_cached_users', JSON.stringify(next));
-    } catch {}
+    safeLocalStorageSet('blackworm_cached_users', JSON.stringify(next));
     notifyChannel(usersChannel, next, usersChannel.loaded);
   };
 
@@ -379,9 +375,7 @@ function finalizeDealersList(rawItems: any[], archivedIds: Set<string>, authorit
     authoritativeServer: authoritative,
   });
   const sorted = sortDealers(deduplicateDealers(merged));
-  try {
-    localStorage.setItem('blackworm_all_dealers', JSON.stringify(sorted));
-  } catch {}
+  safeLocalStorageSet('blackworm_all_dealers', JSON.stringify(sorted));
   return sorted;
 }
 
@@ -814,9 +808,7 @@ function finalizeTravelSheetsList(rawItems: any[], archivedIds: Set<string>, aut
     archivedIds,
     authoritativeServer: authoritative,
   }).map((s: any) => ({ ...s, _id: s._id || s.id }));
-  try {
-    localStorage.setItem('blackworm_cached_travel_sheets', JSON.stringify(merged));
-  } catch {}
+  safeLocalStorageSet('blackworm_cached_travel_sheets', JSON.stringify(merged));
   return merged;
 }
 
@@ -914,10 +906,8 @@ function applyMasterPricelistDoc(data: any) {
     products: clean,
     validityDate: data.validityDate || '',
   };
-  try {
-    localStorage.setItem('blackworm_master_pricelist', JSON.stringify({ ...data, products: clean }));
-    localStorage.setItem('blackworm_cached_pricelist', JSON.stringify(clean));
-  } catch {}
+  safeLocalStorageSet('blackworm_master_pricelist', JSON.stringify({ ...data, products: clean }));
+  safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(clean));
   notifyChannel(masterPricelistChannel, nextState, true);
 }
 
@@ -1016,9 +1006,7 @@ function finalizeOutstandingList(rawItems: any[], archivedIds: Set<string>, auth
     archivedIds,
     authoritativeServer: authoritative,
   });
-  try {
-    localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(merged));
-  } catch {}
+  safeLocalStorageSet('blackworm_saved_outstanding_records', JSON.stringify(merged));
   return merged;
 }
 
@@ -1075,9 +1063,7 @@ export function useSharedOutstandingRecords() {
 
   const setOutstandingOptimistic = (updater: (prev: any[]) => any[]) => {
     const next = updater(outstandingChannel.data);
-    try {
-      localStorage.setItem('blackworm_saved_outstanding_records', JSON.stringify(next));
-    } catch {}
+    safeLocalStorageSet('blackworm_saved_outstanding_records', JSON.stringify(next));
     notifyChannel(outstandingChannel, next, outstandingChannel.loaded);
   };
 
@@ -1103,9 +1089,7 @@ const schemeDiscountsChannel = createChannel<Record<string, number>>(loadInitial
 function applySchemeDiscountsDoc(data: any) {
   if (data && data.discounts && typeof data.discounts === 'object') {
     const next = { ...data.discounts };
-    try {
-      localStorage.setItem(SCHEME_DISCOUNTS_KEY, JSON.stringify(next));
-    } catch {}
+    safeLocalStorageSet(SCHEME_DISCOUNTS_KEY, JSON.stringify(next));
     notifyChannel(schemeDiscountsChannel, next, true);
   }
 }
@@ -1178,9 +1162,7 @@ export function useSharedSchemeDiscounts() {
 
   const setDiscountsOptimistic = (updater: (prev: Record<string, number>) => Record<string, number>) => {
     const next = updater(schemeDiscountsChannel.data);
-    try {
-      localStorage.setItem(SCHEME_DISCOUNTS_KEY, JSON.stringify(next));
-    } catch {}
+    safeLocalStorageSet(SCHEME_DISCOUNTS_KEY, JSON.stringify(next));
     notifyChannel(schemeDiscountsChannel, next, schemeDiscountsChannel.loaded);
   };
 

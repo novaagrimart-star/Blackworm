@@ -9,11 +9,38 @@ import { registerSW } from 'virtual:pwa-register';
 if (typeof window !== 'undefined') {
   // Prevent unhandled promise rejections from killing the app
   window.addEventListener('unhandledrejection', (event) => {
+    const reasonMsg = String((event.reason as any)?.message || event.reason || '').toLowerCase();
+    if (
+      reasonMsg.includes('dynamically imported module') ||
+      reasonMsg.includes('chunkloaderror') ||
+      reasonMsg.includes('loading chunk')
+    ) {
+      try {
+        const lastReload = Number(sessionStorage.getItem('blackworm_chunk_reload_at') || '0');
+        if (Date.now() - lastReload > 15000) {
+          sessionStorage.setItem('blackworm_chunk_reload_at', String(Date.now()));
+          window.location.reload();
+          return;
+        }
+      } catch {}
+    }
     console.warn('Caught unhandled promise rejection:', event.reason);
     event.preventDefault();
   });
 
-  // Catch global errors safely
+  // Automatically recover once if Vite preload / chunk error triggers
+  window.addEventListener('vite:preloadError', (event) => {
+    event.preventDefault();
+    try {
+      const lastReload = Number(sessionStorage.getItem('blackworm_chunk_reload_at') || '0');
+      if (Date.now() - lastReload > 15000) {
+        sessionStorage.setItem('blackworm_chunk_reload_at', String(Date.now()));
+        window.location.reload();
+      }
+    } catch {}
+  });
+
+  // Catch global errors safely without leaking uncaught crashes
   window.addEventListener('error', (event) => {
     console.warn('Caught window error:', event.error || event.message);
   });

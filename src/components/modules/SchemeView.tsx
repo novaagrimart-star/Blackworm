@@ -741,7 +741,7 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
                               {/* 4. With GST Rate (Clean amount with billing discount applied: A=0%, S=0%, B=10%, C=20%, without any badge text) */}
                               <td className="border-r border-black p-2 text-center align-middle whitespace-nowrap bg-slate-50/60 font-mono">
                                 <span className="text-slate-900 font-black text-xs sm:text-[13px]">
-                                  ₹{withGstRate.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                  ₹{(Number(withGstRate) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                 </span>
                               </td>
 
@@ -749,12 +749,12 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
                               <td className="p-2 text-center align-middle whitespace-nowrap bg-emerald-50/40 font-mono">
                                 <div className="flex flex-col items-center justify-center">
                                   <span className="text-emerald-950 font-black text-xs sm:text-[13px]">
-                                    ₹{finalSchemeWithGst.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                    ₹{(Number(finalSchemeWithGst) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                   </span>
                                   {extraDisc > 0 && (
                                     <div className="flex items-center gap-1 mt-0.5">
                                       <span className="text-[10px] text-slate-400 line-through">
-                                        ₹{withGstRate.toFixed(2)}
+                                        ₹{(Number(withGstRate) || 0).toFixed(2)}
                                       </span>
                                       <span className="text-[9px] font-black text-rose-600 bg-rose-50 px-1 rounded">
                                         -{extraDisc}%

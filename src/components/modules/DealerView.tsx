@@ -14,9 +14,9 @@ import {
   writeBatch,
   startAfter
 } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../../firebase';
+import { db, handleFirestoreError, OperationType, getFriendlyErrorMessage, isQuotaExceededError } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { logAudit, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, getLocalDateStr, mergeWithLocalData, isQuotaBlocked, setQuotaBlocked, deduplicateDealers } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, getLocalDateStr, mergeWithLocalData, isQuotaBlocked, setQuotaBlocked, deduplicateDealers, safeLocalStorageSet } from '../../lib/dataService';
 import { subscribeSecondaryCollection, fetchSecondaryCollection } from '../../lib/secondaryDb';
 import { useSharedUsers, useSharedDealers } from '../../lib/realtimeStore';
 import { toTitleCase } from '../../lib/utils';
@@ -317,8 +317,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           setGlobalSequence(val);
         }
       }, (err) => {
-        const msg = String(err?.message || '').toLowerCase();
-        if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+        if (isQuotaExceededError(err)) {
           setQuotaBlocked(15 * 60 * 1000);
         }
         console.warn('Dealer sequence sync notice:', err);
@@ -347,7 +346,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
               itemsList.push({ ...data, id: d.id });
             }
           });
-        } catch (e) {
+        } catch (e: any) {
+          if (isQuotaExceededError(e)) setQuotaBlocked(15 * 60 * 1000);
           console.warn('Server fetch for reindex skipped:', e);
         }
       }
@@ -373,8 +373,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
       // 3. Sort strictly by creation time
       itemsList.sort((a, b) => {
-        const timeA = toTimestampMs(a.createdAt) || parseInt((a.id.match(/\d+/) || ['0'])[0], 10);
-        const timeB = toTimestampMs(b.createdAt) || parseInt((b.id.match(/\d+/) || ['0'])[0], 10);
+        const timeA = toTimestampMs(a.createdAt) || parseInt((String(a.id || '').match(/\d+/) || ['0'])[0], 10);
+        const timeB = toTimestampMs(b.createdAt) || parseInt((String(b.id || '').match(/\d+/) || ['0'])[0], 10);
         if (timeA !== timeB) return timeA - timeB;
         const numA = parseInt(String(a.dealerCode || '').replace(/\D/g, ''), 10) || 0;
         const numB = parseInt(String(b.dealerCode || '').replace(/\D/g, ''), 10) || 0;
@@ -410,9 +410,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         }
       }
 
-      try {
-        localStorage.setItem(localStorageKey, JSON.stringify(localMap));
-      } catch {}
+      safeLocalStorageSet(localStorageKey, JSON.stringify(localMap));
 
       const totalDealers = itemsList.length;
       setGlobalSequence(totalDealers);
@@ -445,7 +443,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           isOpen: true,
           type: 'alert',
           title: 'त्रुटी',
-          message: 'सिरीयल नंबर सिंक करताना अडचण आली: ' + (err.message || err),
+          message: getFriendlyErrorMessage(err, 'सिरीयल नंबर सिंक करताना अडचण आली. कृपया पुन्हा प्रयत्न करा.'),
           onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
         });
       }
@@ -568,8 +566,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
           { merge: true }
         ).catch(() => {});
       } catch (txErr: any) {
-        const msg = String(txErr?.message || '').toLowerCase();
-        if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+        if (isQuotaExceededError(txErr)) {
           setQuotaBlocked(15 * 60 * 1000);
         }
         console.warn('Atomic transaction sequence fallback (offline or quota retry):', txErr);
@@ -890,7 +887,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         isOpen: true,
         type: 'alert',
         title: 'सेव्ह करताना त्रुटी (Save Error)',
-        message: `माहिती सेव्ह करताना अडचण आली: ${err.message || err}`,
+        message: getFriendlyErrorMessage(err, 'माहिती सेव्ह करताना अडचण आली. कृपया पुन्हा प्रयत्न करा.'),
         confirmText: 'समजले (OK)',
         onConfirm: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
       });
