@@ -61,10 +61,10 @@ export function formatAmount(val: number | string | undefined | null, showZero =
 /**
  * Formats a percentage value with strictly 1 decimal place (e.g. "116.2%", "177.0%", "0.0%").
  */
-export function formatPercent(val: number | string | undefined | null): string {
-  if (val === undefined || val === null || val === '') return '0.0%';
+export function formatPercent(val: number | string | undefined | null, showZero = true): string {
+  if (val === undefined || val === null || val === '') return showZero ? '0.0%' : '';
   const num = Number(val);
-  if (isNaN(num) || !isFinite(num) || num <= 0) return '0.0%';
+  if (isNaN(num) || !isFinite(num) || num <= 0) return showZero ? '0.0%' : '';
   const rounded = Math.round((num + Number.EPSILON) * 10) / 10;
   return `${rounded.toFixed(1)}%`;
 }
@@ -72,10 +72,14 @@ export function formatPercent(val: number | string | undefined | null): string {
 /**
  * Calculates (achieved / target) * 100 and formats to 1 decimal place.
  */
-export function calcPercent(achieved: number | string | undefined | null, target: number | string | undefined | null): string {
+export function calcPercent(
+  achieved: number | string | undefined | null,
+  target: number | string | undefined | null,
+  showZero = true
+): string {
   const ach = toDecimal2(achieved);
   const tgt = toDecimal2(target);
-  if (tgt <= 0 || isNaN(tgt)) return '0.0%';
+  if (tgt <= 0 || isNaN(tgt) || ach <= 0) return showZero ? '0.0%' : '';
   const pct = (ach / tgt) * 100;
-  return formatPercent(pct);
+  return formatPercent(pct, showZero);
 }

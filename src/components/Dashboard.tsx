@@ -258,8 +258,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
 
   return (
     <div className="flex flex-col min-h-dvh bg-slate-50 mobile-safe-container">
-      <header className="bg-white border-b border-slate-200 px-4 py-2.5 flex items-center justify-between sticky top-0 z-10 shadow-xs mobile-safe-header">
-        <div className="flex items-center gap-3">
+      <header className="bg-white border-b border-slate-200 px-3 sm:px-4 py-1.5 sm:py-2 flex items-center justify-between gap-2 sticky top-0 z-10 shadow-xs mobile-safe-header">
+        <div className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1">
           {activeTab !== 'dashboard' && (
             <button
               onClick={() => handleTabChange('dashboard')}
@@ -270,18 +270,18 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
             </button>
           )}
           
-          {/* Logo with dedicated room - Clear and Bigger */}
-          <div className="w-14 h-14 sm:w-16 sm:h-16 shrink-0 flex items-center justify-center p-0.5">
+          {/* Logo with dedicated room - Clear and Slightly Larger */}
+          <div className="h-16 sm:h-20 w-auto max-w-[116px] sm:max-w-[148px] shrink-0 flex items-center justify-center">
             <img 
               src={logoUrl || '/logo.jpg'} 
               alt="Blackworm Agritech Logo"
-              className="max-w-full max-h-full object-contain drop-shadow-xs"
+              className="h-full w-auto max-w-full object-contain drop-shadow-xs"
             />
           </div>
 
-          {/* Company Title - Updated to full name with increased font size */}
-          <div className="flex flex-col justify-center min-w-0">
-            <h1 className="text-sm sm:text-base md:text-lg lg:text-xl font-black text-rose-600 tracking-tight leading-tight uppercase break-words sm:whitespace-nowrap">
+          {/* Company Title - Normal readable size increase in bold red */}
+          <div className="flex flex-col justify-center min-w-0 flex-1">
+            <h1 className="text-lg sm:text-xl md:text-2xl font-black text-red-600 tracking-tight leading-tight uppercase break-words sm:whitespace-nowrap">
               BLACKWORM AGRITECH PVT LTD
             </h1>
           </div>

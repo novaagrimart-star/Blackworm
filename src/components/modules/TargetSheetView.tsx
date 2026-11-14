@@ -93,20 +93,20 @@ const CellInput: React.FC<{
   className?: string;
   placeholder?: string;
   colorClass?: string;
-}> = ({ value, disabled, isPdfOrPrint, onChange, className, placeholder = "0.00", colorClass = "text-slate-900" }) => {
+}> = ({ value, disabled, isPdfOrPrint, onChange, className, placeholder = "", colorClass = "text-slate-900" }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [text, setText] = useState('');
 
   useEffect(() => {
     if (!isEditing) {
-      setText(formatAmount(value));
+      setText(formatAmount(value, false));
     }
   }, [value, isEditing]);
 
   if (disabled || isPdfOrPrint) {
     return (
-      <span className={cn("inline-block w-full text-center font-bold font-mono text-xs sm:text-[13px] select-text tracking-tight", colorClass)}>
-        {formatAmount(value)}
+      <span className={cn("inline-block w-full text-center font-bold font-mono text-xs sm:text-[13px] select-text tracking-tight min-h-[18px]", colorClass)}>
+        {formatAmount(value, false)}
       </span>
     );
   }
@@ -115,7 +115,7 @@ const CellInput: React.FC<{
     <input
       type="text"
       inputMode="decimal"
-      value={isEditing ? text : formatAmount(value)}
+      value={isEditing ? text : formatAmount(value, false)}
       onFocus={() => {
         setIsEditing(true);
         setText(value === 0 ? '' : String(value));
@@ -797,7 +797,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
 
               {/* Company Info centered right next to the logo */}
               <div className="text-center space-y-1">
-                <h1 className="text-xl sm:text-2xl font-black text-slate-900 tracking-wide uppercase leading-tight">
+                <h1 className="text-xl sm:text-2xl font-black text-red-600 tracking-wide uppercase leading-tight">
                   BLACKWORM AGRITECH PVT LTD
                 </h1>
                 <div className="text-[11px] font-bold text-slate-800 tracking-tight flex items-center justify-center gap-2.5">
@@ -932,8 +932,10 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-slate-50">
                 <span className="font-extrabold text-slate-900 w-28 shrink-0 px-2.5 tracking-tight whitespace-nowrap text-[9.5px]">Curr. Outstd -</span>
                 <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center justify-center px-1">
-                  <span className="w-full font-extrabold text-slate-950 font-mono text-center">
-                    {formatAmount(subtractDecimal2(sheet.lastYearOutstanding, sheet.lastYearCollection))}
+                  <span className="w-full font-extrabold text-slate-950 font-mono text-center min-h-[18px]">
+                    {sheet.lastYearOutstanding === 0 && sheet.lastYearCollection === 0
+                      ? ''
+                      : formatAmount(subtractDecimal2(sheet.lastYearOutstanding, sheet.lastYearCollection), true)}
                   </span>
                   <span className="font-bold text-slate-700 text-[8.5px] uppercase ml-0.5 shrink-0">Lakh</span>
                 </div>
@@ -943,8 +945,8 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                 <span className="font-extrabold text-blue-950 w-28 shrink-0 px-2.5 tracking-tight whitespace-nowrap">Coll. Target -</span>
                 <div className="flex-1 border-l-2 border-slate-300 min-h-[38px] flex items-center justify-center px-1">
                   {isOwnerView || isGeneratingPdf ? (
-                    <span className="w-full font-extrabold text-blue-950 font-mono text-center">
-                      {sheet.collectionPercent || 0}%
+                    <span className="w-full font-extrabold text-blue-950 font-mono text-center min-h-[18px]">
+                      {sheet.collectionPercent > 0 ? sheet.collectionPercent : ''}
                     </span>
                   ) : (
                     <input 
@@ -957,7 +959,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                           updateSheet({ collectionPercent: val === '' ? 0 : Number(val) || 0 });
                         }
                       }} 
-                      placeholder="0"
+                      placeholder=""
                       className="w-full bg-transparent font-extrabold text-blue-950 focus:outline-none font-mono text-center" 
                     />
                   )}
@@ -984,8 +986,8 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
               </thead>
               <tbody className="text-slate-900 font-medium">
                 {sheet.months.map((m, idx) => {
-                  const achPercentStr = calcPercent(m.achievement, m.target);
-                  const collPercentStr = calcPercent(m.actualCollection, m.collection);
+                  const achPercentStr = calcPercent(m.achievement, m.target, false);
+                  const collPercentStr = calcPercent(m.actualCollection, m.collection, false);
                   return (
                     <React.Fragment key={m.month}>
                       <tr className="hover:bg-slate-50/80 transition-colors">
@@ -1012,7 +1014,7 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                         <td className="p-1.5 border-r border-b border-slate-300 text-center font-bold font-mono text-xs sm:text-[13px] text-slate-900">{achPercentStr}</td>
                         {/* Collection in Lakh: strictly auto-calculated based on Target & Percentage, non-editable */}
                         <td className="p-1.5 border-r border-b border-slate-300 text-center font-mono font-bold text-xs sm:text-[13px] text-slate-900 bg-slate-50/90">
-                          {formatAmount(m.collection)}
+                          {formatAmount(m.collection, false)}
                         </td>
                         {/* Actual Collection: remains editable */}
                         <td className="p-1 border-r border-b border-slate-300">
@@ -1036,12 +1038,12 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                             const q = idx === 2 ? Q1 : idx === 5 ? Q2 : idx === 8 ? Q3 : Q4;
                             return (
                               <>
-                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{formatAmount(q.target)}</td>
-                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono text-blue-900 font-extrabold text-xs sm:text-[13px]">{formatAmount(q.achievement)}</td>
-                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{calcPercent(q.achievement, q.target)}</td>
-                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{formatAmount(q.collection)}</td>
-                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono text-emerald-900 font-extrabold text-xs sm:text-[13px]">{formatAmount(q.actual)}</td>
-                                <td className="p-2 border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px] px-2">{calcPercent(q.actual, q.collection)}</td>
+                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{formatAmount(q.target, false)}</td>
+                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono text-blue-900 font-extrabold text-xs sm:text-[13px]">{formatAmount(q.achievement, false)}</td>
+                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{calcPercent(q.achievement, q.target, false)}</td>
+                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px]">{formatAmount(q.collection, false)}</td>
+                                <td className="p-2 border-r border-b border-slate-400 text-center font-mono text-emerald-900 font-extrabold text-xs sm:text-[13px]">{formatAmount(q.actual, false)}</td>
+                                <td className="p-2 border-b border-slate-400 text-center font-mono font-extrabold text-xs sm:text-[13px] px-2">{calcPercent(q.actual, q.collection, false)}</td>
                               </>
                             );
                           })()}
@@ -1055,12 +1057,12 @@ export const TargetSheetView: React.FC<Props> = ({ profile }) => {
                   <td colSpan={2} className="p-2.5 text-center tracking-normal border-r border-slate-600 font-extrabold">
                     Grand Total 2026-27
                   </td>
-                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.target)}</td>
-                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.achievement)}</td>
-                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{calcPercent(Total.achievement, Total.target)}</td>
-                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.collection)}</td>
-                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.actual)}</td>
-                  <td className="p-2.5 text-center font-mono font-extrabold text-xs sm:text-sm px-2">{calcPercent(Total.actual, Total.collection)}</td>
+                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.target, false)}</td>
+                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.achievement, false)}</td>
+                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{calcPercent(Total.achievement, Total.target, false)}</td>
+                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.collection, false)}</td>
+                  <td className="p-2.5 text-center border-r border-slate-600 font-mono font-extrabold text-xs sm:text-sm">{formatAmount(Total.actual, false)}</td>
+                  <td className="p-2.5 text-center font-mono font-extrabold text-xs sm:text-sm px-2">{calcPercent(Total.actual, Total.collection, false)}</td>
                 </tr>
               </tbody>
             </table>
