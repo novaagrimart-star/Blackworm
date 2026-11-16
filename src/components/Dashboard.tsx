@@ -35,6 +35,7 @@ import { CollectionView } from './modules/CollectionView';
 import { OutstandingView } from './modules/OutstandingView';
 import { PriceListView } from './modules/PriceListView';
 import { DealerView } from './modules/DealerView';
+import { LocationView } from './modules/LocationView';
 import { TravelView } from './modules/TravelView';
 import { SchemeView } from './modules/SchemeView';
 import { ReportView } from './modules/ReportView';
@@ -50,6 +51,7 @@ interface DashboardProps {
 export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, onProfileUpdate }) => {
   const t = translations[lang];
   const [activeTab, setActiveTab] = useState<string>('dashboard');
+  const [pendingOpenDealerId, setPendingOpenDealerId] = useState<string | null>(null);
   const { logoUrl, logoSize } = useBranding();
   const [currentUserData, setCurrentUserData] = useState<any>(profile);
 
@@ -98,6 +100,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     { id: 'calculator', label: t.outstanding || 'Outstanding', icon: FileText, color: 'text-teal-600', bg: 'bg-teal-50' },
     { id: 'price', label: t.priceList, icon: FileText, color: 'text-sky-500', bg: 'bg-sky-50' },
     { id: 'dealer', label: t.dealer, icon: Users, color: 'text-rose-500', bg: 'bg-rose-50' },
+    { id: 'location', label: t.location || 'Location Mapping', icon: MapPin, color: 'text-orange-600', bg: 'bg-orange-50' },
     { id: 'travel', label: 'Traveling', icon: Bike, color: 'text-amber-500', bg: 'bg-amber-50' },
     { id: 'scheme', label: t.scheme, icon: Gift, color: 'text-fuchsia-500', bg: 'bg-fuchsia-50' },
     { id: 'report', label: t.report, icon: BarChart3, color: 'text-indigo-500', bg: 'bg-indigo-50' },
@@ -191,7 +194,24 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
         case 'outstanding':
         case 'calculator': return <OutstandingView profile={currentUserData} lang={lang} />;
         case 'price': return <PriceListView profile={currentUserData} lang={lang} />;
-        case 'dealer': return <DealerView profile={currentUserData} lang={lang} />;
+        case 'dealer': return (
+          <DealerView
+            profile={currentUserData}
+            lang={lang}
+            initialDealerId={pendingOpenDealerId}
+            onConsumeInitialDealerId={() => setPendingOpenDealerId(null)}
+          />
+        );
+        case 'location': return (
+          <LocationView
+            profile={currentUserData}
+            lang={lang}
+            onOpenDealer={(dealerId) => {
+              setPendingOpenDealerId(dealerId);
+              handleTabChange('dealer');
+            }}
+          />
+        );
         case 'travel': return <TravelView profile={currentUserData} lang={lang} />;
         case 'scheme': return <SchemeView profile={currentUserData} lang={lang} />;
         case 'report': return <ReportView profile={currentUserData} lang={lang} />;

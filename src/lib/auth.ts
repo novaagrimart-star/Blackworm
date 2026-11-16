@@ -51,6 +51,21 @@ export function isAdmin(user?: Partial<UserProfile> | null): boolean {
 }
 
 /**
+ * Checks whether the logged-in user is strictly EMP 002 (e.g. "EMP 002", "EMP-002", "EMP002", "EMP-02").
+ * Only this login ID may view the on-demand employee location option.
+ */
+export function isLocationViewerUser(user?: Partial<UserProfile> | null): boolean {
+  if (!user) return false;
+  const candidates = [user.loginId, user.userCode, user.uid]
+    .filter(Boolean)
+    .map((v) => String(v).trim().toUpperCase());
+  return candidates.some((val) => {
+    const compact = val.replace(/[^A-Z0-9]/g, '');
+    return compact === 'EMP002' || compact === 'EMP02';
+  });
+}
+
+/**
  * Checks if a user is permitted to access a given module ID.
  * Admins/Owners get access to all modules.
  * Other users strictly get access ONLY if the module was granted by Admin in allowedModules.
@@ -61,6 +76,9 @@ export function canAccessModule(user: Partial<UserProfile> | null | undefined, m
   // User data should be visible to every user as requested
   if (moduleId === 'user') return true;
   if (!user.allowedModules || !Array.isArray(user.allowedModules)) return false;
+  if (moduleId === 'location') {
+    return user.allowedModules.includes('location') || user.allowedModules.includes('dealer');
+  }
   return user.allowedModules.includes(moduleId);
 }
 

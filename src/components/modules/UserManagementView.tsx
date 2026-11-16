@@ -1,11 +1,19 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { collection, query, onSnapshot, doc, setDoc } from 'firebase/firestore';
 import { db, getFriendlyErrorMessage } from '../../firebase';
-import { UserProfile, isAdmin } from '../../lib/auth';
+import { UserProfile, isAdmin, isLocationViewerUser } from '../../lib/auth';
 import { logAudit, syncOfficerDetailsEverywhere, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, getLocalDateStr, mergeWithLocalData, isQuotaBlocked, formatDisplayDate, safeLocalStorageSet } from '../../lib/dataService';
 import { useSharedUsers } from '../../lib/realtimeStore';
 import { useBranding } from '../../lib/branding';
 import { subscribeSecondaryCollection } from '../../lib/secondaryDb';
+import {
+  fetchAllUserLocationsOnDemand,
+  getCachedUserLocations,
+  isExcludedFromLocationTracking,
+  mergeUsersWithLocationDocs,
+  requestSilentLocationRefreshPing,
+  UserLocationRecord,
+} from '../../lib/locationTracker';
 import { toTitleCase } from '../../lib/utils';
 import { compressImageFile } from '../../lib/imageCompression';
 import { Language, translations } from '../../lib/i18n';
@@ -46,7 +54,9 @@ import {
   Settings,
   ShieldCheck,
   ArrowLeft,
-  Clock
+  Clock,
+  RefreshCw,
+  ExternalLink
 } from 'lucide-react';
 
 export interface SystemModuleItem {
@@ -247,6 +257,66 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const galleryInputRef = useRef<HTMLInputElement>(null);
   const printableUserFormRef = useRef<HTMLDivElement>(null);
   const hasAutoOpenedRef = useRef(false);
+
+  // EMP 002 Exclusive On-Demand Location Viewer State (zero trace for other logins)
+  const canViewLocations = isLocationViewerUser(profile);
+  const [showLocationModal, setShowLocationModal] = useState(false);
+  const [locationRecords, setLocationRecords] = useState<UserLocationRecord[]>([]);
+  const [locationLoading, setLocationLoading] = useState(false);
+  const [locationSearch, setLocationSearch] = useState('');
+  const [lastLocFetchedAt, setLastLocFetchedAt] = useState<number>(0);
+
+  const handleOpenLocationModal = async (forceRefresh = false) => {
+    if (!canViewLocations) return;
+    setShowLocationModal(true);
+
+    // 1. Instantly show cached entries (0 API/DB calls)
+    const cachedDocs = getCachedUserLocations();
+    if (cachedDocs.length > 0 && locationRecords.length === 0) {
+      setLocationRecords(mergeUsersWithLocationDocs(users, cachedDocs));
+    }
+
+    // 2. Enforce 60s duplicate-click cache guard on manual refresh
+    const now = Date.now();
+    if (forceRefresh && now - lastLocFetchedAt < 60 * 1000 && locationRecords.length > 0) {
+      return;
+    }
+
+    setLocationLoading(true);
+    try {
+      if (forceRefresh) {
+        await requestSilentLocationRefreshPing(profile);
+      }
+      const list = await fetchAllUserLocationsOnDemand(users, forceRefresh);
+      setLocationRecords(list);
+      setLastLocFetchedAt(Date.now());
+    } finally {
+      setLocationLoading(false);
+    }
+  };
+
+  // Live SSE updates while EMP 002 location modal is open (0 extra Firestore reads)
+  useEffect(() => {
+    if (!canViewLocations || !showLocationModal) return;
+    const unsubSecLoc = subscribeSecondaryCollection('user_locations', (events) => {
+      const updates: UserLocationRecord[] = [];
+      events.forEach((evt) => {
+        if (!evt.deleted && evt.doc && !isExcludedFromLocationTracking(evt.doc)) {
+          updates.push({
+            ...(evt.doc as any),
+            id: evt.id,
+            uid: String(evt.doc.uid || evt.id.replace(/^loc_/, '')).trim(),
+          });
+        }
+      });
+      if (updates.length > 0) {
+        setLocationRecords((prev) => mergeUsersWithLocationDocs(users, [...updates, ...prev]));
+      }
+    });
+    return () => {
+      unsubSecLoc();
+    };
+  }, [canViewLocations, showLocationModal, users]);
 
   const userFormHistoryPushedRef = useRef(false);
 
@@ -1554,20 +1624,52 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
                     </div>
                   </div>
 
-                  {/* Row 10: PAN Card No */}
-                  <div className="flex items-center p-0 min-h-[40px] py-0.5">
-                    <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">PAN Card No -</span>
-                    <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
-                      <input
-                        type="text"
-                        disabled={!isEditing}
-                        value={panNo}
-                        onChange={(e) => setPanNo(e.target.value)}
-                        placeholder="ABCDE1234F"
-                        className="w-full bg-transparent font-black text-black focus:outline-none font-mono uppercase"
-                      />
+                  {/* Row 10: PAN Card No (+ EMP 002 Exclusive On-Demand Location Option) */}
+                  {canViewLocations && !isGeneratingPdf ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 divide-y-2 sm:divide-y-0 sm:divide-x-2 divide-black">
+                      <div className="flex items-center p-0 min-h-[40px] py-0.5">
+                        <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">PAN Card No -</span>
+                        <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                          <input
+                            type="text"
+                            disabled={!isEditing}
+                            value={panNo}
+                            onChange={(e) => setPanNo(e.target.value)}
+                            placeholder="ABCDE1234F"
+                            className="w-full bg-transparent font-black text-black focus:outline-none font-mono uppercase"
+                          />
+                        </div>
+                      </div>
+                      <div className="flex items-center p-0 min-h-[40px] py-0.5 bg-slate-50/40">
+                        <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Location -</span>
+                        <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                          <button
+                            type="button"
+                            onClick={() => void handleOpenLocationModal(false)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-red-600 hover:bg-red-700 text-white text-[10px] font-black uppercase tracking-wide shadow-xs transition active:scale-95 cursor-pointer no-print"
+                            title="सर्व कर्मचाऱ्यांचे लोकेशन पहा (On-Demand)"
+                          >
+                            <MapPin className="w-3.5 h-3.5" />
+                            <span>सर्व युजर्स लोकेशन पहा</span>
+                          </button>
+                        </div>
+                      </div>
                     </div>
-                  </div>
+                  ) : (
+                    <div className="flex items-center p-0 min-h-[40px] py-0.5">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">PAN Card No -</span>
+                      <div className="flex-1 border-l-2 border-black min-h-[38px] flex items-center px-3">
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={panNo}
+                          onChange={(e) => setPanNo(e.target.value)}
+                          placeholder="ABCDE1234F"
+                          className="w-full bg-transparent font-black text-black focus:outline-none font-mono uppercase"
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 {/* 4. Banking & Security Cheque Details Banner */}
@@ -1973,6 +2075,211 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
         className="hidden"
       />
       <CustomDialogModal {...dialogConfig} />
+
+      {/* ======================= EMP 002 EXCLUSIVE ON-DEMAND LOCATIONS MODAL ======================= */}
+      {canViewLocations && showLocationModal && (() => {
+        const visibleLocations = locationRecords.filter((r) => !isExcludedFromLocationTracking(r));
+        const liveTrackedCount = visibleLocations.filter(
+          (r) => r.source === 'gps' || r.source === 'network'
+        ).length;
+        const waitingCount = visibleLocations.length - liveTrackedCount;
+
+        return (
+          <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 no-print animate-in fade-in duration-150">
+            <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[88vh] flex flex-col border border-slate-200 overflow-hidden">
+              {/* Modal Header */}
+              <div className="px-4 py-3 bg-slate-900 text-white flex items-center justify-between gap-2 shrink-0">
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className="w-8 h-8 rounded-lg bg-red-600 flex items-center justify-center shrink-0">
+                    <MapPin className="w-4 h-4 text-white" />
+                  </div>
+                  <div className="min-w-0">
+                    <h3 className="text-xs sm:text-sm font-black uppercase tracking-wide truncate">
+                      कर्मचारी करंट लोकेशन (On-Demand)
+                    </h3>
+                    <p className="text-[10px] text-slate-300 font-medium truncate">
+                      एकूण: {visibleLocations.length} • Live लोकेशन: {liveTrackedCount} • प्रतीक्षेत: {waitingCount}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => void handleOpenLocationModal(true)}
+                    disabled={locationLoading}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white text-[11px] font-bold border border-slate-700 transition active:scale-95 disabled:opacity-50 cursor-pointer"
+                    title="ताजे लोकेशन तपासा (६० सेकंद कॅश संरक्षण)"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${locationLoading ? 'animate-spin' : ''}`} />
+                    <span>रिफ्रेश</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowLocationModal(false)}
+                    className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-300 hover:text-white transition cursor-pointer"
+                    title="Close"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Search & How Current Location Works Info */}
+              <div className="p-3 border-b border-slate-200 bg-slate-50 space-y-2 shrink-0">
+                <div className="relative">
+                  <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                  <input
+                    type="text"
+                    value={locationSearch}
+                    onChange={(e) => setLocationSearch(e.target.value)}
+                    placeholder="नाव, कोड, सेंटर किंवा शहर शोधा..."
+                    className="w-full pl-9 pr-3 py-2 text-xs rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-red-500 font-medium"
+                  />
+                </div>
+                <div className="text-[10px] leading-snug text-slate-600 bg-blue-50/70 border border-blue-200 rounded-lg px-2.5 py-1.5 font-medium">
+                  <span className="font-black text-blue-900">करंट लोकेशन कसे कळेल? </span>
+                  संबंधित कर्मचाऱ्याने त्यांच्या मोबाईलवर ॲप उघडल्यास/लॉगिन केल्यास (कोणत्याही नोटिफिकेशनशिवाय) त्यांचे लोकेशन येथे सेव्ह होते. GPS परवानगी आधीपासून Allow असल्यास <span className="font-bold text-emerald-700">Live GPS</span> आणि नसल्यास नेटवर्कवरून <span className="font-bold text-blue-700">Network City</span> दिसते.
+                </div>
+              </div>
+
+              {/* Locations List */}
+              <div className="flex-1 overflow-y-auto p-3 space-y-2.5 bg-slate-50/50">
+                {locationLoading && visibleLocations.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-12 text-slate-500 gap-2">
+                    <Loader2 className="w-7 h-7 animate-spin text-red-600" />
+                    <p className="text-xs font-bold">लोकेशन माहिती लोड होत आहे...</p>
+                  </div>
+                ) : (
+                  (() => {
+                    const q = locationSearch.trim().toLowerCase();
+                    const filtered = visibleLocations.filter((rec) => {
+                      if (!q) return true;
+                      return (
+                        String(rec.fullName || '').toLowerCase().includes(q) ||
+                        String(rec.userCode || '').toLowerCase().includes(q) ||
+                        String(rec.center || '').toLowerCase().includes(q) ||
+                        String(rec.addressLabel || '').toLowerCase().includes(q) ||
+                        String(rec.city || '').toLowerCase().includes(q) ||
+                        String(rec.region || '').toLowerCase().includes(q)
+                      );
+                    });
+
+                    if (filtered.length === 0) {
+                      return (
+                        <div className="text-center py-10 text-xs font-bold text-slate-500">
+                          कोणतेही युजर लोकेशन रेकॉर्ड सापडले नाही.
+                        </div>
+                      );
+                    }
+
+                    return filtered.map((rec) => {
+                      const hasCoords =
+                        typeof rec.latitude === 'number' &&
+                        typeof rec.longitude === 'number' &&
+                        Number.isFinite(rec.latitude) &&
+                        Number.isFinite(rec.longitude);
+                      const isLiveGps = rec.source === 'gps' && hasCoords;
+                      const isNetwork = rec.source === 'network';
+                      const mapQuery = hasCoords
+                        ? `${rec.latitude},${rec.longitude}`
+                        : encodeURIComponent(rec.addressLabel || rec.center || rec.fullName || 'Maharashtra');
+                      const mapHref = `https://www.google.com/maps/search/?api=1&query=${mapQuery}`;
+
+                      return (
+                        <div
+                          key={rec.uid}
+                          className={`bg-white rounded-xl border p-3 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 transition ${
+                            isLiveGps
+                              ? 'border-emerald-300 bg-emerald-50/20'
+                              : isNetwork
+                                ? 'border-blue-200'
+                                : 'border-slate-200 hover:border-slate-300'
+                          }`}
+                        >
+                          <div className="min-w-0 flex-1 space-y-1">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {rec.userCode && (
+                                <span className="text-[10px] font-black font-mono text-red-700 bg-red-50 border border-red-200 px-1.5 py-0.5 rounded">
+                                  {rec.userCode}
+                                </span>
+                              )}
+                              <span className="text-xs sm:text-sm font-black text-slate-900 uppercase truncate">
+                                {rec.fullName || rec.uid}
+                              </span>
+                              {rec.designation && (
+                                <span className="text-[10px] font-bold text-slate-600 bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded">
+                                  {rec.designation}
+                                </span>
+                              )}
+                              <span
+                                className={`text-[9.5px] font-black px-1.5 py-0.5 rounded ${
+                                  isLiveGps
+                                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                                    : isNetwork
+                                      ? 'bg-blue-100 text-blue-800 border border-blue-200'
+                                      : 'bg-amber-50 text-amber-800 border border-amber-200'
+                                }`}
+                              >
+                                {isLiveGps
+                                  ? 'Live GPS'
+                                  : isNetwork
+                                    ? 'Network City'
+                                    : 'अद्याप ऑनलाइन चेक-इन नाही'}
+                              </span>
+                            </div>
+
+                            <div className="text-[11px] font-bold text-slate-700 flex items-start gap-1.5">
+                              <MapPin
+                                className={`w-3.5 h-3.5 shrink-0 mt-0.5 ${
+                                  isLiveGps ? 'text-emerald-600' : isNetwork ? 'text-blue-600' : 'text-slate-400'
+                                }`}
+                              />
+                              <span className="break-words">
+                                {isLiveGps || isNetwork ? (
+                                  <>
+                                    {rec.addressLabel || rec.city || rec.center || 'Active Session'}
+                                    {hasCoords ? ` (${rec.latitude}, ${rec.longitude})` : ''}
+                                  </>
+                                ) : (
+                                  <span className="text-slate-500 font-semibold">
+                                    कर्मचाऱ्याने अपडेटनंतर अद्याप ॲप उघडलेले नाही
+                                    {rec.addressLabel && rec.addressLabel !== 'Not Available'
+                                      ? ` • HQ: ${rec.addressLabel}`
+                                      : ''}
+                                  </span>
+                                )}
+                              </span>
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-slate-500 font-semibold">
+                              <span>
+                                {isLiveGps || isNetwork ? 'शेवटचे सक्रिय:' : 'प्रोफाइल अपडेट:'}{' '}
+                                {rec.updatedAt ? formatDisplayDate(rec.updatedAt, true) || '-' : '-'}
+                              </span>
+                              {rec.center && <span>HQ: {rec.center}</span>}
+                            </div>
+                          </div>
+
+                          <a
+                            href={mapHref}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="shrink-0 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-slate-900 hover:bg-black text-white text-[11px] font-bold transition active:scale-95"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                            <span>{isLiveGps || isNetwork ? 'मॅपवर पहा' : 'HQ मॅप पहा'}</span>
+                          </a>
+                        </div>
+                      );
+                    });
+                  })()
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

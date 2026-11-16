@@ -411,6 +411,318 @@ async function createServer() {
     }
   });
 
+  // Silent Employee Location Check-In (24h IP-geo & reverse-geo cached, zero client alerts/notifications)
+  const ipGeoCache = new Map<
+    string,
+    {
+      city: string;
+      region: string;
+      country: string;
+      latitude: number | null;
+      longitude: number | null;
+      expiresAt: number;
+    }
+  >();
+
+  const reverseGeoCache = new Map<
+    string,
+    {
+      city: string;
+      region: string;
+      country: string;
+      addressLabel: string;
+      expiresAt: number;
+    }
+  >();
+
+  const isExcludedLocationSubject = (body: any): boolean => {
+    const norm = (v: any) =>
+      String(v || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const fullName = norm(body?.fullName);
+    const loginId = norm(body?.loginId);
+    const userCode = norm(body?.userCode);
+    const combined = `${fullName} ${loginId} ${userCode}`;
+
+    if (
+      combined.includes('blackworm') ||
+      combined.includes('black worm') ||
+      combined.includes('agritech') ||
+      loginId === 'admin'
+    ) {
+      return true;
+    }
+    if ((fullName.includes('pravin') || fullName.includes('praveen')) && fullName.includes('waghmare')) {
+      return true;
+    }
+    if ((loginId.includes('pravin') || loginId.includes('praveen')) && loginId.includes('waghmare')) {
+      return true;
+    }
+    if (
+      (fullName.includes('shridhar') || fullName.includes('shidhar') || fullName.includes('sridhar')) &&
+      fullName.includes('shinde')
+    ) {
+      return true;
+    }
+    if (
+      (loginId.includes('shridhar') || loginId.includes('shidhar') || loginId.includes('sridhar')) &&
+      loginId.includes('shinde')
+    ) {
+      return true;
+    }
+    return false;
+  };
+
+  app.post('/api/location/silent-checkin', async (req, res) => {
+    try {
+      const body = req.body || {};
+      const uid = String(body.uid || '').trim();
+      if (!uid) {
+        return res.status(400).json({ ok: false, error: 'uid is required' });
+      }
+
+      if (isExcludedLocationSubject(body)) {
+        // Ensure excluded subjects do not linger in user_locations
+        secondarySyncDb.upsert({
+          collection: 'user_locations',
+          id: `loc_${uid}`,
+          doc: {},
+          updatedAtMs: Date.now(),
+          deleted: true,
+          merge: false,
+        });
+        return res.json({ ok: true, excluded: true });
+      }
+
+      let latitude: number | null =
+        typeof body.latitude === 'number' && Number.isFinite(body.latitude) ? body.latitude : null;
+      let longitude: number | null =
+        typeof body.longitude === 'number' && Number.isFinite(body.longitude) ? body.longitude : null;
+      const accuracy: number | null =
+        typeof body.accuracy === 'number' && Number.isFinite(body.accuracy) ? body.accuracy : null;
+
+      let source: 'gps' | 'network' | 'profile' =
+        latitude !== null && longitude !== null ? 'gps' : 'profile';
+      let city = '';
+      let region = '';
+      let country = 'India';
+      let gpsResolvedAddress = '';
+
+      if (source === 'gps' && latitude !== null && longitude !== null) {
+        const gridKey = `${latitude.toFixed(2)},${longitude.toFixed(2)}`;
+        const cachedRev = reverseGeoCache.get(gridKey);
+        if (cachedRev && cachedRev.expiresAt > Date.now()) {
+          city = cachedRev.city;
+          region = cachedRev.region;
+          country = cachedRev.country;
+          gpsResolvedAddress = cachedRev.addressLabel;
+        } else {
+          try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 2500);
+            const revResp = await fetch(
+              `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${encodeURIComponent(
+                String(latitude)
+              )}&longitude=${encodeURIComponent(String(longitude))}&localityLanguage=en`,
+              { signal: ctrl.signal }
+            );
+            clearTimeout(timer);
+            if (revResp.ok) {
+              const rev = (await revResp.json()) as any;
+              const locality = String(rev?.locality || rev?.city || '').trim();
+              const subDiv = String(rev?.principalSubdivision || '').trim();
+              const cntry = String(rev?.countryName || 'India').trim();
+              const parts = Array.from(new Set([locality, subDiv, cntry].filter(Boolean)));
+              gpsResolvedAddress = parts.join(', ');
+              city = locality;
+              region = subDiv;
+              country = cntry;
+              if (gpsResolvedAddress) {
+                reverseGeoCache.set(gridKey, {
+                  city,
+                  region,
+                  country,
+                  addressLabel: gpsResolvedAddress,
+                  expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+                });
+              }
+            }
+          } catch {
+            // Silent fallback to GPS coordinates string
+          }
+        }
+      } else {
+        const xff = String(
+          req.headers['x-forwarded-for'] ||
+            req.headers['cf-connecting-ip'] ||
+            req.headers['x-real-ip'] ||
+            ''
+        )
+          .split(',')[0]
+          .trim();
+        const rawIp = xff || String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+        const isPrivate =
+          !rawIp ||
+          rawIp === '127.0.0.1' ||
+          rawIp === '::1' ||
+          rawIp.startsWith('10.') ||
+          rawIp.startsWith('192.168.') ||
+          /^172\.(1[6-9]|2\d|3[01])\./.test(rawIp);
+
+        if (!isPrivate) {
+          const cached = ipGeoCache.get(rawIp);
+          if (cached && cached.expiresAt > Date.now()) {
+            if (cached.latitude !== null && cached.longitude !== null) {
+              latitude = cached.latitude;
+              longitude = cached.longitude;
+              source = 'network';
+            }
+            if (cached.city) city = cached.city;
+            if (cached.region) region = cached.region;
+            if (cached.country) country = cached.country;
+          } else {
+            // Provider 1: ipwho.is (free, no key)
+            let resolvedFromIp = false;
+            try {
+              const ctrl = new AbortController();
+              const timer = setTimeout(() => ctrl.abort(), 2500);
+              const geoResp = await fetch(`https://ipwho.is/${encodeURIComponent(rawIp)}`, {
+                signal: ctrl.signal,
+              });
+              clearTimeout(timer);
+              if (geoResp.ok) {
+                const geo = (await geoResp.json()) as any;
+                if (geo && geo.success !== false && (geo.city || geo.latitude)) {
+                  const latNum = typeof geo.latitude === 'number' ? Number(geo.latitude.toFixed(5)) : null;
+                  const lngNum = typeof geo.longitude === 'number' ? Number(geo.longitude.toFixed(5)) : null;
+                  const geoCity = String(geo.city || '').trim();
+                  const geoRegion = String(geo.region || '').trim();
+                  const geoCountry = String(geo.country || 'India').trim();
+                  ipGeoCache.set(rawIp, {
+                    city: geoCity,
+                    region: geoRegion,
+                    country: geoCountry,
+                    latitude: latNum,
+                    longitude: lngNum,
+                    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+                  });
+                  if (latNum !== null && lngNum !== null) {
+                    latitude = latNum;
+                    longitude = lngNum;
+                    source = 'network';
+                  }
+                  if (geoCity) city = geoCity;
+                  if (geoRegion) region = geoRegion;
+                  if (geoCountry) country = geoCountry;
+                  resolvedFromIp = true;
+                }
+              }
+            } catch {}
+
+            // Provider 2 fallback: get.geojs.io (free, no key)
+            if (!resolvedFromIp) {
+              try {
+                const ctrl2 = new AbortController();
+                const timer2 = setTimeout(() => ctrl2.abort(), 2500);
+                const geoResp2 = await fetch(`https://get.geojs.io/v1/ip/geo/${encodeURIComponent(rawIp)}.json`, {
+                  signal: ctrl2.signal,
+                });
+                clearTimeout(timer2);
+                if (geoResp2.ok) {
+                  const geo2 = (await geoResp2.json()) as any;
+                  const latNum = geo2?.latitude ? Number(Number(geo2.latitude).toFixed(5)) : null;
+                  const lngNum = geo2?.longitude ? Number(Number(geo2.longitude).toFixed(5)) : null;
+                  const geoCity = String(geo2?.city || '').trim();
+                  const geoRegion = String(geo2?.region || '').trim();
+                  const geoCountry = String(geo2?.country || 'India').trim();
+                  if (geoCity || (latNum !== null && lngNum !== null)) {
+                    ipGeoCache.set(rawIp, {
+                      city: geoCity,
+                      region: geoRegion,
+                      country: geoCountry,
+                      latitude: latNum,
+                      longitude: lngNum,
+                      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+                    });
+                    if (latNum !== null && lngNum !== null) {
+                      latitude = latNum;
+                      longitude = lngNum;
+                      source = 'network';
+                    }
+                    if (geoCity) city = geoCity;
+                    if (geoRegion) region = geoRegion;
+                    if (geoCountry) country = geoCountry;
+                  }
+                }
+              } catch {
+                // Silent fallback to profile center
+              }
+            }
+          }
+        }
+      }
+
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      const profileParts = [body.village, body.taluka, body.center, body.district, body.state]
+        .filter(Boolean)
+        .map((s: any) => String(s).trim());
+      const geoParts =
+        source === 'network' || city || region ? [city, region, country].filter(Boolean) : [];
+      const uniqueParts = Array.from(
+        new Set(
+          source === 'gps'
+            ? gpsResolvedAddress
+              ? [gpsResolvedAddress]
+              : [`GPS (${latitude}, ${longitude})`]
+            : geoParts.length > 0
+              ? geoParts
+              : profileParts
+        )
+      );
+      const addressLabel = uniqueParts.join(', ') || String(body.center || 'Active Session');
+
+      if (!city) city = String(body.village || body.center || '').trim();
+      if (!region) region = String(body.district || body.state || '').trim();
+
+      const record = {
+        id: `loc_${uid}`,
+        uid,
+        userCode: String(body.userCode || ''),
+        fullName: String(body.fullName || ''),
+        designation: String(body.designation || ''),
+        center: String(body.center || ''),
+        mobileNumber: String(body.mobileNumber || ''),
+        latitude,
+        longitude,
+        accuracy,
+        city,
+        region,
+        country,
+        addressLabel,
+        source,
+        updatedAt: nowIso,
+        updatedAtMs: nowMs,
+      };
+
+      secondarySyncDb.upsert({
+        collection: 'user_locations',
+        id: record.id,
+        doc: record,
+        updatedAtMs: nowMs,
+        deleted: false,
+        merge: true,
+      });
+
+      res.json({ ok: true, record });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Silent checkin failed' });
+    }
+  });
+
   // Return clean JSON 404 for unmatched API routes before SPA middlewares handle them
   app.all('/api/*', (_req, res) => {
     res.status(404).json({ error: 'API route not found' });

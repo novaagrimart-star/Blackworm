@@ -2089,6 +2089,8 @@ export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{ 
   const collectionsToBackup = [
     'users',
     'dealers_application',
+    'location_villages',
+    'location_talukas',
     'orders',
     'collection_entries',
     'travel_sheets',

@@ -18,7 +18,28 @@ import { db, handleFirestoreError, OperationType, getFriendlyErrorMessage, isQuo
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { logAudit, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, getLocalDateStr, mergeWithLocalData, isQuotaBlocked, setQuotaBlocked, deduplicateDealers, safeLocalStorageSet } from '../../lib/dataService';
 import { subscribeSecondaryCollection, fetchSecondaryCollection } from '../../lib/secondaryDb';
-import { useSharedUsers, useSharedDealers } from '../../lib/realtimeStore';
+import { useSharedUsers, useSharedDealers, useSharedLocationVillages, useSharedLocationTalukas, ensureLocationVillageLinked } from '../../lib/realtimeStore';
+import {
+  DEFAULT_STATE,
+  LGD_STATES,
+  canonicalizeDistrictName,
+  canonicalizeTalukaName,
+  getDistrictDisplayLabel,
+  getDistrictMeta,
+  getDistrictsForState,
+  getStateMeta,
+  getTalukaMeta,
+  getTalukaMetasForDistrict,
+  getTalukasForDistrict,
+  inferTalukaFromLocation,
+  normalizeLocationKey,
+  normalizeStateName,
+} from '../../lib/maharashtraLocations';
+import {
+  loadLgdStateVillages,
+  getOfficialVillagesByTalukaSync,
+  findOfficialLgdVillageSync,
+} from '../../lib/lgdCache';
 import { toTitleCase } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
 import { compressImageFile } from '../../lib/imageCompression';
@@ -61,6 +82,7 @@ export interface DealershipFormItem {
   created_by_user_id?: string;
   created_by_name?: string;
   village: string;
+  taluka?: string;
   securityDeposit: string;
   firmName: string;
   proprietorName: string;
@@ -75,6 +97,10 @@ export interface DealershipFormItem {
   dateOfBirth: string;
   gstNo: string;
   pinCode: string;
+  stateLgdCode?: string;
+  districtLgdCode?: string;
+  talukaLgdCode?: string;
+  villageLgdCode?: string;
   dealershipAddressPhoto?: string;
   
   // Bank Details
@@ -136,12 +162,17 @@ const formatDisplayDateTime = (dateVal?: string, timeVal?: string) => {
 interface Props {
   profile: UserProfile;
   lang: Language;
+  initialDealerId?: string | null;
+  onConsumeInitialDealerId?: () => void;
 }
 
-export const DealerView: React.FC<Props> = ({ profile }) => {
+export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsumeInitialDealerId }) => {
   const { dealers, setDealersOptimistic } = useSharedDealers();
+  const { locationVillages } = useSharedLocationVillages();
+  const { locationTalukas } = useSharedLocationTalukas();
   const { officers, usersMap } = useSharedUsers();
   const [searchQuery, setSearchQuery] = useState('');
+  const [lgdRevision, setLgdRevision] = useState(0);
   
   const [viewMode, setViewMode] = useState<'list' | 'form'>('list');
   const [isEditing, setIsEditing] = useState(true);
@@ -158,11 +189,13 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const [shopOpeningDate, setShopOpeningDate] = useState('2021-09-04');
   const [dealerCode, setDealerCode] = useState('');
   const [village, setVillage] = useState('');
+  const [villageLgdCode, setVillageLgdCode] = useState('');
+  const [taluka, setTaluka] = useState('');
   const [securityDeposit, setSecurityDeposit] = useState('NA');
   const [dealershipAddressPhoto, setDealershipAddressPhoto] = useState('');
   const [firmName, setFirmName] = useState('');
   const [proprietorName, setProprietorName] = useState('');
-  const [stateName, setStateName] = useState('Maharashtra');
+  const [stateName, setStateName] = useState(DEFAULT_STATE);
   const [contactNumber, setContactNumber] = useState('');
   const [emailId, setEmailId] = useState('');
   const [responsiblePerson, setResponsiblePerson] = useState('');
@@ -173,6 +206,8 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
   const [dateOfBirth, setDateOfBirth] = useState('');
   const [gstNo, setGstNo] = useState('');
   const [pinCode, setPinCode] = useState('');
+  const [showVillagePicker, setShowVillagePicker] = useState(false);
+  const [villagePickerQuery, setVillagePickerQuery] = useState('');
 
   const [bankName, setBankName] = useState('');
   const [bankAddress, setBankAddress] = useState('');
@@ -461,11 +496,27 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         setShopOpeningDate(item.shopOpeningDate || '');
         setDealerCode(item.dealerCode || '');
         setVillage(item.village || '');
+        setVillageLgdCode(item.villageLgdCode || '');
+        const resolvedState = normalizeStateName(item.state || DEFAULT_STATE);
+        const resolvedDistrict = canonicalizeDistrictName(item.district || '', resolvedState) || item.district || '';
+        const savedLocMatch = !item.taluka && resolvedDistrict && item.village
+          ? locationVillages.find(
+              (lv) =>
+                normalizeLocationKey(lv.district) === normalizeLocationKey(resolvedDistrict) &&
+                normalizeLocationKey(lv.village) === normalizeLocationKey(item.village)
+            )
+          : undefined;
+        setTaluka(
+          item.taluka ||
+            savedLocMatch?.taluka ||
+            inferTalukaFromLocation(resolvedDistrict, item.village, item.center, resolvedState) ||
+            ''
+        );
         setSecurityDeposit(item.securityDeposit || 'NA');
         setDealershipAddressPhoto(item.dealershipAddressPhoto || '');
         setFirmName(item.firmName || '');
         setProprietorName(item.proprietorName || '');
-        setStateName(item.state || 'Maharashtra');
+        setStateName(resolvedState);
         setContactNumber(item.contactNumber || '');
         setEmailId(item.emailId || '');
         setResponsiblePerson(item.responsiblePerson || '');
@@ -620,11 +671,15 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     setShopOpeningDate(getLocalDateStr());
     setDealerCode(previewCode);
     setVillage('');
+    setVillageLgdCode('');
+    setTaluka('');
+    setShowVillagePicker(false);
+    setVillagePickerQuery('');
     setSecurityDeposit('NA');
     setDealershipAddressPhoto('');
     setFirmName('');
     setProprietorName('');
-    setStateName('Maharashtra');
+    setStateName(DEFAULT_STATE);
     setContactNumber('');
     setEmailId('');
     setResponsiblePerson('');
@@ -674,11 +729,29 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
     setShopOpeningDate(item.shopOpeningDate || '');
     setDealerCode(item.dealerCode || '');
     setVillage(item.village || '');
+    setVillageLgdCode(item.villageLgdCode || '');
+    setShowVillagePicker(false);
+    setVillagePickerQuery('');
+    const resolvedState = normalizeStateName(item.state || DEFAULT_STATE);
+    const resolvedDistrict = canonicalizeDistrictName(item.district || '', resolvedState) || item.district || '';
+    const savedLocMatch = !item.taluka && resolvedDistrict && item.village
+      ? locationVillages.find(
+          (lv) =>
+            normalizeLocationKey(lv.district) === normalizeLocationKey(resolvedDistrict) &&
+            normalizeLocationKey(lv.village) === normalizeLocationKey(item.village)
+        )
+      : undefined;
+    setTaluka(
+      item.taluka ||
+        savedLocMatch?.taluka ||
+        inferTalukaFromLocation(resolvedDistrict, item.village, item.center, resolvedState) ||
+        ''
+    );
     setSecurityDeposit(item.securityDeposit || 'NA');
     setDealershipAddressPhoto(item.dealershipAddressPhoto || '');
     setFirmName(item.firmName || '');
     setProprietorName(item.proprietorName || '');
-    setStateName(item.state || 'Maharashtra');
+    setStateName(resolvedState);
     setContactNumber(item.contactNumber || '');
     setEmailId(item.emailId || '');
     setResponsiblePerson(item.responsiblePerson || '');
@@ -714,6 +787,15 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       window.scrollTo({ top: 0, behavior: 'instant' });
     }
   };
+
+  useEffect(() => {
+    if (!initialDealerId || dealers.length === 0) return;
+    const match = dealers.find((d) => d.id === initialDealerId);
+    if (match) {
+      loadDealerToForm(match, true);
+      onConsumeInitialDealerId?.();
+    }
+  }, [initialDealerId, dealers]);
 
   const [dialogConfig, setDialogConfig] = useState<{
     isOpen: boolean;
@@ -775,6 +857,46 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       const finalCreatorId = currentId ? (createdByUserId || profile.uid) : profile.uid;
       const finalCreatorName = currentId ? (createdByName || finalOfficer) : (profile.fullName || profile.loginId || 'OFFICER');
 
+      const resolvedStateMeta = getStateMeta(stateName || DEFAULT_STATE);
+      const resolvedStateName = resolvedStateMeta?.name || normalizeStateName(stateName || DEFAULT_STATE);
+      const resolvedDistrictCanonical = canonicalizeDistrictName(district || '', resolvedStateName);
+      const resolvedDistrictMeta = getDistrictMeta(resolvedDistrictCanonical || district, resolvedStateMeta?.code);
+      const resolvedTalukaCanonical =
+        canonicalizeTalukaName(resolvedDistrictCanonical || district, taluka, resolvedStateName) ||
+        inferTalukaFromLocation(resolvedDistrictCanonical || district, village, center, resolvedStateName) ||
+        (taluka || '').trim();
+      const resolvedTalukaMeta = getTalukaMeta(
+        resolvedDistrictMeta?.code || resolvedDistrictCanonical || district,
+        resolvedTalukaCanonical,
+        resolvedStateMeta?.code
+      );
+      const customTalukaMatch = !resolvedTalukaMeta
+        ? locationTalukas.find(
+            (lt) =>
+              normalizeLocationKey(lt.district) === normalizeLocationKey(resolvedDistrictCanonical) &&
+              normalizeLocationKey(lt.taluka) === normalizeLocationKey(resolvedTalukaCanonical)
+          )
+        : undefined;
+      const officialVillageMatch = findOfficialLgdVillageSync({
+        stateCode: resolvedStateMeta?.code,
+        talukaCode: resolvedTalukaMeta?.code,
+        villageCode: villageLgdCode,
+        villageName: village.trim(),
+      });
+      const customVillageMatch = !officialVillageMatch
+        ? locationVillages.find(
+            (lv) =>
+              normalizeLocationKey(lv.district) === normalizeLocationKey(resolvedDistrictCanonical) &&
+              normalizeLocationKey(lv.village) === normalizeLocationKey(village.trim())
+          )
+        : undefined;
+
+      const resolvedStateCode = resolvedStateMeta?.code || '';
+      const resolvedDistrictCode = resolvedDistrictMeta?.code || '';
+      const resolvedTalukaCode = resolvedTalukaMeta?.code || customTalukaMatch?.talukaCode || '';
+      const resolvedVillageCode =
+        officialVillageMatch?.villageCode || customVillageMatch?.villageCode || villageLgdCode || '';
+
       const existingDealerRec = currentId ? dealers.find(d => d.id === currentId) : undefined;
       const payload: DealershipFormItem = {
         id,
@@ -782,21 +904,26 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         shopOpeningDate: shopOpeningDate || getLocalDateStr(),
         dealerCode: finalCode || 'AUTO',
         village: (village || '').trim(),
+        taluka: resolvedTalukaCanonical.toUpperCase(),
         securityDeposit: (securityDeposit || 'NA').trim(),
         dealershipAddressPhoto: dealershipAddressPhoto || '',
         firmName: (firmName || '').trim().toUpperCase(),
         proprietorName: (proprietorName || '').trim().toUpperCase(),
         contactNumber: (contactNumber || '').trim(),
-        state: (stateName || 'Maharashtra').trim(),
+        state: resolvedStateName,
         emailId: (emailId || '').trim(),
         responsiblePerson: (responsiblePerson || '').trim().toUpperCase(),
         responsibleContact: (responsibleContact || '').trim(),
         aadhaarNo: (aadhaarNo || '').trim(),
-        district: (district || '').trim().toUpperCase(),
+        district: (resolvedDistrictCanonical || district || '').trim().toUpperCase(),
         panNo: (panNo || '').trim().toUpperCase(),
         dateOfBirth: dateOfBirth || '',
         gstNo: (gstNo || '').trim().toUpperCase(),
-        pinCode: (pinCode || '').trim(),
+        pinCode: (pinCode || officialVillageMatch?.pinCode || '').trim(),
+        ...(resolvedStateCode ? { stateLgdCode: resolvedStateCode } : {}),
+        ...(resolvedDistrictCode ? { districtLgdCode: resolvedDistrictCode } : {}),
+        ...(resolvedTalukaCode ? { talukaLgdCode: resolvedTalukaCode } : {}),
+        ...(resolvedVillageCode ? { villageLgdCode: resolvedVillageCode } : {}),
         bankName: (bankName || '').trim().toUpperCase(),
         bankAddress: (bankAddress || '').trim().toUpperCase(),
         accountNo: (accountNo || '').trim(),
@@ -825,6 +952,21 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
       }
 
       const saveRes = await safeFirestoreSet('dealers_application', id, payload, { merge: true });
+      // Auto-link Dealer Village/Location to Location Mapping (zero duplicate writes if in official LGD Master or cached)
+      if (payload.village && payload.district) {
+        void ensureLocationVillageLinked({
+          state: payload.state,
+          stateCode: resolvedStateCode,
+          district: payload.district,
+          districtCode: resolvedDistrictCode,
+          taluka: payload.taluka,
+          talukaCode: resolvedTalukaCode,
+          village: payload.village,
+          villageCode: resolvedVillageCode,
+          pinCode: payload.pinCode,
+          user: profile,
+        }).catch(() => {});
+      }
       await logAudit(
         isNewRecord ? 'CREATE' : 'UPDATE',
         'dealers_application',
@@ -1036,6 +1178,144 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
 
   const officerDealersCount = officerScopedDealers.length;
 
+  const activeFormStateMeta = useMemo(
+    () => getStateMeta(stateName || DEFAULT_STATE),
+    [stateName]
+  );
+
+  // One-time IndexedDB LGD load whenever Dealer form opens for Maharashtra ('27') or Karnataka ('29')
+  useEffect(() => {
+    const code = activeFormStateMeta?.code;
+    if (viewMode === 'form' && (code === '27' || code === '29')) {
+      void loadLgdStateVillages(code).then((res) => {
+        if (res) setLgdRevision((r) => r + 1);
+      });
+    }
+  }, [viewMode, activeFormStateMeta?.code]);
+
+  const districtsForFormState = useMemo(
+    () => getDistrictsForState(activeFormStateMeta?.code || stateName || DEFAULT_STATE),
+    [activeFormStateMeta?.code, stateName]
+  );
+
+  const canonicalFormDistrict = useMemo(
+    () => canonicalizeDistrictName(district || '', stateName),
+    [district, stateName]
+  );
+
+  const formDistrictMeta = useMemo(
+    () => getDistrictMeta(canonicalFormDistrict || district, activeFormStateMeta?.code),
+    [canonicalFormDistrict, district, activeFormStateMeta?.code]
+  );
+
+  const availableTalukaOptions = useMemo(() => {
+    const map = new Map<string, { name: string; code: string }>();
+    const official = getTalukaMetasForDistrict(canonicalFormDistrict || district, activeFormStateMeta?.code);
+    official.forEach((t) => {
+      map.set(normalizeLocationKey(t.name), { name: t.name, code: t.code });
+    });
+
+    const dKey = normalizeLocationKey(canonicalFormDistrict);
+    locationTalukas.forEach((lt) => {
+      if (dKey && normalizeLocationKey(lt.district) === dKey && lt.taluka) {
+        const tk = normalizeLocationKey(lt.taluka);
+        if (!map.has(tk)) {
+          map.set(tk, { name: lt.taluka, code: lt.talukaCode || '' });
+        }
+      }
+    });
+
+    locationVillages.forEach((lv) => {
+      if (
+        dKey &&
+        normalizeLocationKey(lv.district) === dKey &&
+        lv.taluka &&
+        lv.taluka !== 'Other'
+      ) {
+        const tk = normalizeLocationKey(lv.taluka);
+        if (!map.has(tk)) {
+          map.set(tk, { name: lv.taluka, code: lv.talukaCode || '' });
+        }
+      }
+    });
+
+    return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+  }, [canonicalFormDistrict, district, activeFormStateMeta?.code, locationTalukas, locationVillages]);
+
+  const formTalukaMeta = useMemo(
+    () => getTalukaMeta(formDistrictMeta?.code || canonicalFormDistrict || district, taluka, activeFormStateMeta?.code),
+    [formDistrictMeta?.code, canonicalFormDistrict, district, taluka, activeFormStateMeta?.code]
+  );
+
+  const suggestedVillagesForForm = useMemo(() => {
+    const seen = new Map<string, { village: string; pinCode?: string; taluka?: string; villageCode?: string }>();
+    const sCode = activeFormStateMeta?.code || '';
+    const dKey = normalizeLocationKey(canonicalFormDistrict || district);
+    const tKey = normalizeLocationKey(formTalukaMeta?.name || taluka);
+
+    // 1. Official LGD villages for selected Taluka (from IndexedDB cache)
+    if (sCode && formTalukaMeta?.code) {
+      const officialList = getOfficialVillagesByTalukaSync(sCode, formTalukaMeta.code);
+      officialList.forEach((ov) => {
+        const vKey = normalizeLocationKey(ov.villageName);
+        if (vKey && !seen.has(vKey)) {
+          seen.set(vKey, {
+            village: ov.villageName,
+            pinCode: ov.pinCode || undefined,
+            taluka: ov.talukaName,
+            villageCode: ov.villageCode,
+          });
+        }
+      });
+    }
+
+    // 2. Admin-added custom saved villages
+    locationVillages.forEach((lv) => {
+      if (dKey && normalizeLocationKey(lv.district) !== dKey) return;
+      if (tKey && normalizeLocationKey(lv.taluka) !== tKey) return;
+      const vKey = normalizeLocationKey(lv.village);
+      if (vKey && !seen.has(vKey)) {
+        seen.set(vKey, {
+          village: lv.village,
+          pinCode: lv.pinCode,
+          taluka: lv.taluka,
+          villageCode: lv.villageCode,
+        });
+      }
+    });
+
+    // 3. Existing dealer villages
+    dealers.forEach((d) => {
+      if (!d || d.isArchived || !d.village) return;
+      if (dKey && normalizeLocationKey(canonicalizeDistrictName(d.district || '', d.state)) !== dKey) return;
+      if (tKey && d.taluka && normalizeLocationKey(d.taluka) !== tKey) return;
+      const vKey = normalizeLocationKey(d.village);
+      if (vKey && !seen.has(vKey)) {
+        seen.set(vKey, {
+          village: d.village,
+          pinCode: d.pinCode,
+          taluka: d.taluka,
+          villageCode: d.villageLgdCode,
+        });
+      }
+    });
+
+    return Array.from(seen.values()).sort((a, b) => a.village.localeCompare(b.village));
+  }, [activeFormStateMeta?.code, formTalukaMeta?.code, formTalukaMeta?.name, canonicalFormDistrict, district, taluka, locationVillages, dealers, lgdRevision]);
+
+  const filteredPickerVillages = useMemo(() => {
+    const pq = villagePickerQuery.toLowerCase().trim();
+    const list = pq
+      ? suggestedVillagesForForm.filter(
+          (sv) =>
+            sv.village.toLowerCase().includes(pq) ||
+            (sv.villageCode || '').includes(pq) ||
+            (sv.pinCode || '').includes(pq)
+        )
+      : suggestedVillagesForForm;
+    return list.slice(0, 80);
+  }, [suggestedVillagesForForm, villagePickerQuery]);
+
   const filteredDealers = useMemo(() => {
     let list = officerScopedDealers.filter((d) => {
       const q = searchQuery.toLowerCase().trim();
@@ -1044,7 +1324,14 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
         (d.dealerCode || '').toLowerCase().includes(q) ||
         (d.firmName || '').toLowerCase().includes(q) ||
         (d.proprietorName || '').toLowerCase().includes(q) ||
-        (d.village || '').toLowerCase().includes(q)
+        (d.village || '').toLowerCase().includes(q) ||
+        (d.taluka || '').toLowerCase().includes(q) ||
+        (d.district || '').toLowerCase().includes(q) ||
+        (d.pinCode || '').toLowerCase().includes(q) ||
+        (d.state || '').toLowerCase().includes(q) ||
+        (d.villageLgdCode || '').toLowerCase().includes(q) ||
+        (d.talukaLgdCode || '').toLowerCase().includes(q) ||
+        (d.districtLgdCode || '').toLowerCase().includes(q)
       );
     });
 
@@ -1250,7 +1537,9 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                         {toTitleCase((d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'Officer')}
                       </td>
                       <td className="p-3 text-slate-600">
-                        {toTitleCase(d.village || d.center || '-')}
+                        {toTitleCase(
+                          [d.village || d.center, d.taluka, d.district].filter(Boolean).join(', ') || '-'
+                        )}
                       </td>
                       <td className="p-3 text-center">
                         <button
@@ -1284,6 +1573,10 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
             <div className="space-y-2">
               {filteredDealers.map((d) => {
                 const displayCode = d.dealerCode ? d.dealerCode.replace(/^#/, '') : 'DEALER';
+                const locationSubtitle = [d.village || d.center, d.taluka, d.district]
+                  .filter(Boolean)
+                  .map((p) => toTitleCase(p))
+                  .join(', ');
                 return (
                   <div
                     key={d.id}
@@ -1305,7 +1598,7 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                         {toTitleCase(d.firmName) || 'Unnamed Dealership'}
                       </span>
                       <span className="text-[10px] text-slate-500 font-semibold block truncate">
-                        {toTitleCase(d.village || d.center || '')}
+                        {locationSubtitle}
                         <span className="text-slate-700 font-bold ml-1">
                           ({toTitleCase((d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'Officer')})
                         </span>
@@ -1549,16 +1842,105 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                             />
                           </div>
                         </div>
-                        <div className="flex items-center p-0 min-h-[38px] py-0.5">
+                        <div className="flex items-center p-0 min-h-[38px] py-0.5 relative">
                           <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Village</span>
-                          <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
+                          <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center gap-1 px-3 relative">
                             <input
                               type="text"
+                              list="dealer-village-options"
                               disabled={!isEditing}
                               value={village}
-                              onChange={(e) => setVillage(e.target.value)}
+                              onChange={(e) => {
+                                const nextVal = e.target.value;
+                                setVillage(nextVal);
+                                const matched = suggestedVillagesForForm.find(
+                                  (sv) => normalizeLocationKey(sv.village) === normalizeLocationKey(nextVal)
+                                );
+                                if (matched) {
+                                  if (matched.villageCode) {
+                                    setVillageLgdCode(matched.villageCode);
+                                  }
+                                  if (matched.pinCode && !pinCode.trim()) {
+                                    setPinCode(matched.pinCode);
+                                  }
+                                  if (matched.taluka && !taluka.trim()) {
+                                    setTaluka(matched.taluka);
+                                  }
+                                } else {
+                                  setVillageLgdCode('');
+                                }
+                              }}
+                              placeholder={isEditing ? 'Enter or Select Village' : ''}
                               className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
                             />
+                            {isEditing && suggestedVillagesForForm.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setVillagePickerQuery('');
+                                  setShowVillagePicker((prev) => !prev);
+                                }}
+                                className="no-print shrink-0 px-1.5 py-0.5 text-[9px] font-black bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded text-slate-700 flex items-center gap-0.5 cursor-pointer"
+                                title="Select from official LGD village list"
+                              >
+                                <span>{suggestedVillagesForForm.length}</span>
+                                <ChevronDown className="w-3 h-3" />
+                              </button>
+                            )}
+                            <datalist id="dealer-village-options">
+                              {suggestedVillagesForForm.map((sv) => (
+                                <option key={`${sv.villageCode || sv.village}`} value={sv.village.toUpperCase()} />
+                              ))}
+                            </datalist>
+                            {isEditing && showVillagePicker && (
+                              <div className="no-print absolute left-0 right-0 top-full mt-1 z-40 bg-white border border-slate-300 rounded-xl shadow-xl p-2 space-y-1.5 max-h-60 flex flex-col">
+                                <div className="flex items-center gap-1.5 border-b border-slate-100 pb-1.5">
+                                  <Search className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                                  <input
+                                    type="text"
+                                    value={villagePickerQuery}
+                                    onChange={(e) => setVillagePickerQuery(e.target.value)}
+                                    placeholder="गाव / LGD Code शोधा..."
+                                    className="w-full text-[11px] font-bold text-slate-800 focus:outline-none"
+                                    autoFocus
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => setShowVillagePicker(false)}
+                                    className="text-slate-400 hover:text-slate-700 p-0.5 cursor-pointer"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                                <div className="overflow-y-auto divide-y divide-slate-100 max-h-44">
+                                  {filteredPickerVillages.map((sv) => (
+                                    <button
+                                      key={`${sv.villageCode || sv.village}`}
+                                      type="button"
+                                      onClick={() => {
+                                        setVillage(sv.village.toUpperCase());
+                                        setVillageLgdCode(sv.villageCode || '');
+                                        if (sv.pinCode && !pinCode.trim()) setPinCode(sv.pinCode);
+                                        if (sv.taluka && !taluka.trim()) setTaluka(sv.taluka);
+                                        setShowVillagePicker(false);
+                                      }}
+                                      className="w-full text-left px-2 py-1.5 hover:bg-red-50 flex items-center justify-between gap-2 text-[11px] font-bold text-slate-800 cursor-pointer"
+                                    >
+                                      <span className="truncate">{sv.village.toUpperCase()}</span>
+                                      <span className="text-[9px] font-mono text-slate-500 shrink-0">
+                                        {sv.villageCode ? `LGD:${sv.villageCode}` : ''}
+                                        {sv.pinCode ? ` • ${sv.pinCode}` : ''}
+                                      </span>
+                                    </button>
+                                  ))}
+                                  {filteredPickerVillages.length === 0 && (
+                                    <div className="p-2 text-[11px] text-slate-400 text-center font-semibold">
+                                      कोणतेही जुळणारे गाव सापडले नाही
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            )}
                           </div>
                         </div>
                         <div className="flex items-center p-0 min-h-[38px] py-0.5">
@@ -1623,30 +2005,99 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                     <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">State</span>
                       <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
-                        <input
-                          type="text"
-                          disabled={!isEditing}
-                          value={stateName}
-                          onChange={(e) => setStateName(e.target.value)}
-                          className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
-                        />
+                        {isEditing ? (
+                          <select
+                            value={activeFormStateMeta?.name || stateName || DEFAULT_STATE}
+                            onChange={(e) => {
+                              const nextState = e.target.value;
+                              setStateName(nextState);
+                              const nextDists = getDistrictsForState(nextState);
+                              const curDistMatches = nextDists.some(
+                                (d) =>
+                                  normalizeLocationKey(d.name) ===
+                                  normalizeLocationKey(canonicalizeDistrictName(district, nextState))
+                              );
+                              if (!curDistMatches) {
+                                setDistrict('');
+                                setTaluka('');
+                                setVillage('');
+                                setVillageLgdCode('');
+                              }
+                            }}
+                            className="w-full bg-transparent font-black text-black focus:outline-none uppercase cursor-pointer"
+                          >
+                            {LGD_STATES.map((st) => (
+                              <option key={st.code} value={st.name}>
+                                {st.name.toUpperCase()}
+                              </option>
+                            ))}
+                            {stateName &&
+                              !LGD_STATES.some(
+                                (st) => normalizeLocationKey(st.name) === normalizeLocationKey(stateName)
+                              ) && <option value={stateName}>{stateName.toUpperCase()}</option>}
+                          </select>
+                        ) : (
+                          <span className="w-full font-black text-black uppercase">{stateName || DEFAULT_STATE}</span>
+                        )}
                       </div>
                     </div>
                   </div>
 
-                  {/* Row 6: E-mail ID */}
-                  <div className="flex items-center p-0 min-h-[38px] py-0.5">
-                    <span className="font-black text-black w-44 shrink-0 flex items-center gap-1 px-2 uppercase tracking-tighter">
-                      <Mail className="w-3 h-3 text-red-600" /> E-mail ID -
-                    </span>
-                    <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
-                      <input
-                        type="email"
-                        disabled={!isEditing}
-                        value={emailId}
-                        onChange={(e) => setEmailId(e.target.value)}
-                        className="w-full bg-transparent font-black text-black focus:outline-none"
-                      />
+                  {/* Row 6: E-mail ID & Taluka */}
+                  <div className="grid grid-cols-2 divide-x-2 divide-black">
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
+                      <span className="font-black text-black w-44 shrink-0 flex items-center gap-1 px-2 uppercase tracking-tighter">
+                        <Mail className="w-3 h-3 text-red-600" /> E-mail ID -
+                      </span>
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
+                        <input
+                          type="email"
+                          disabled={!isEditing}
+                          value={emailId}
+                          onChange={(e) => setEmailId(e.target.value)}
+                          className="w-full bg-transparent font-black text-black focus:outline-none"
+                        />
+                      </div>
+                    </div>
+                    <div className="flex items-center p-0 min-h-[38px] py-0.5">
+                      <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">Taluka</span>
+                      <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
+                        {isEditing ? (
+                          availableTalukaOptions.length > 0 ? (
+                            <select
+                              value={canonicalizeTalukaName(canonicalFormDistrict || district, taluka, stateName) || taluka}
+                              onChange={(e) => {
+                                setTaluka(e.target.value);
+                                setVillageLgdCode('');
+                              }}
+                              className="w-full bg-transparent font-black text-black focus:outline-none uppercase cursor-pointer"
+                            >
+                              <option value="">-- SELECT TALUKA --</option>
+                              {availableTalukaOptions.map((tOpt) => (
+                                <option key={`${tOpt.code || tOpt.name}`} value={tOpt.name}>
+                                  {tOpt.name.toUpperCase()}
+                                </option>
+                              ))}
+                              {taluka &&
+                                !availableTalukaOptions.some(
+                                  (t) =>
+                                    normalizeLocationKey(t.name) ===
+                                    normalizeLocationKey(canonicalizeTalukaName(canonicalFormDistrict || district, taluka, stateName))
+                                ) && <option value={taluka}>{taluka.toUpperCase()}</option>}
+                            </select>
+                          ) : (
+                            <input
+                              type="text"
+                              value={taluka}
+                              onChange={(e) => setTaluka(e.target.value)}
+                              placeholder="Enter Taluka"
+                              className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
+                            />
+                          )
+                        ) : (
+                          <span className="w-full font-black text-black uppercase">{taluka || ''}</span>
+                        )}
+                      </div>
                     </div>
                   </div>
 
@@ -1695,13 +2146,38 @@ export const DealerView: React.FC<Props> = ({ profile }) => {
                     <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">District</span>
                       <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
-                        <input
-                          type="text"
-                          disabled={!isEditing}
-                          value={district}
-                          onChange={(e) => setDistrict(e.target.value)}
-                          className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
-                        />
+                        {isEditing ? (
+                          <select
+                            value={canonicalFormDistrict || district}
+                            onChange={(e) => {
+                              const nextDist = e.target.value;
+                              setDistrict(nextDist.toUpperCase());
+                              const nextTalukas = getTalukasForDistrict(nextDist, stateName);
+                              if (
+                                taluka &&
+                                nextTalukas.length > 0 &&
+                                !nextTalukas.some((t) => normalizeLocationKey(t) === normalizeLocationKey(taluka))
+                              ) {
+                                setTaluka('');
+                                setVillageLgdCode('');
+                              }
+                            }}
+                            className="w-full bg-transparent font-black text-black focus:outline-none uppercase cursor-pointer"
+                          >
+                            <option value="">-- SELECT DISTRICT --</option>
+                            {districtsForFormState.map((dMeta) => (
+                              <option key={dMeta.code} value={dMeta.name}>
+                                {getDistrictDisplayLabel(dMeta.name).toUpperCase()}
+                              </option>
+                            ))}
+                            {district &&
+                              !districtsForFormState.some(
+                                (dMeta) => normalizeLocationKey(dMeta.name) === normalizeLocationKey(canonicalFormDistrict)
+                              ) && <option value={district}>{district.toUpperCase()}</option>}
+                          </select>
+                        ) : (
+                          <span className="w-full font-black text-black uppercase">{district || ''}</span>
+                        )}
                       </div>
                     </div>
                   </div>

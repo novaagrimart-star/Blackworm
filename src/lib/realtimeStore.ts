@@ -23,7 +23,25 @@ import {
   isQuotaBlocked,
   setQuotaBlocked,
   safeLocalStorageSet,
+  safeFirestoreSet,
 } from './dataService';
+import {
+  DEFAULT_STATE,
+  LocationTalukaItem,
+  LocationVillageItem,
+  canonicalizeDistrictName,
+  canonicalizeTalukaName,
+  deduplicateLocationTalukas,
+  deduplicateLocationVillages,
+  getDistrictMeta,
+  getLocationTalukaDocId,
+  getLocationVillageDocId,
+  getStateMeta,
+  getTalukaMeta,
+  normalizeLocationKey,
+  normalizeStateName,
+} from './maharashtraLocations';
+import { findOfficialLgdVillageSync, loadLgdStateVillages } from './lgdCache';
 import { loadCollectionFromVault } from './localVault';
 import {
   subscribeSecondaryCollection,
@@ -1168,3 +1186,318 @@ export function useSharedSchemeDiscounts() {
 
   return { discounts, loaded, setDiscountsOptimistic };
 }
+
+// ---------------------------------------------------------------------------
+// 10. SHARED LOCATION VILLAGES STORE (Primary + Secondary Real-Time Sync)
+// ---------------------------------------------------------------------------
+const LOCATION_VILLAGES_CACHE_KEY = 'blackworm_cached_location_villages';
+
+function loadInitialLocationVillages(): LocationVillageItem[] {
+  try {
+    if (typeof window === 'undefined') return [];
+    const local = mergeWithLocalData<any>('location_villages', []);
+    if (local.length > 0) return deduplicateLocationVillages(local);
+    const cached = localStorage.getItem(LOCATION_VILLAGES_CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed)) return deduplicateLocationVillages(parsed);
+    }
+  } catch {}
+  return [];
+}
+
+const locationVillagesChannel = createChannel<LocationVillageItem[]>(loadInitialLocationVillages());
+
+function finalizeLocationVillagesList(
+  rawItems: any[],
+  archivedIds: Set<string>,
+  authoritative: boolean
+): LocationVillageItem[] {
+  const merged = mergeWithLocalData<any>('location_villages', rawItems, {
+    archivedIds,
+    authoritativeServer: authoritative,
+  });
+  const deduped = deduplicateLocationVillages(merged);
+  safeLocalStorageSet(LOCATION_VILLAGES_CACHE_KEY, JSON.stringify(deduped));
+  return deduped;
+}
+
+function startLocationVillagesListener() {
+  if (!locationVillagesChannel.secUnsub) {
+    locationVillagesChannel.secUnsub = subscribeSecondaryCollection('location_villages', (events) => {
+      const updated = applySecondaryDeltas(locationVillagesChannel, 'location_villages', events);
+      if (updated) {
+        notifyChannel(
+          locationVillagesChannel,
+          finalizeLocationVillagesList(updated, locationVillagesChannel.archivedIds, false),
+          true
+        );
+      }
+    });
+  }
+
+  if (locationVillagesChannel.unsub) return;
+  if (isQuotaBlocked()) {
+    void pullSecondaryIntoChannel(locationVillagesChannel, 'location_villages', finalizeLocationVillagesList);
+    return;
+  }
+
+  try {
+    const q = query(collection(db, 'location_villages'), limit(2000));
+    locationVillagesChannel.unsub = onSnapshot(
+      q,
+      (snap) => {
+        const { items } = applyIncrementalSnapshot(locationVillagesChannel, 'location_villages', snap);
+        const sorted = finalizeLocationVillagesList(
+          items,
+          locationVillagesChannel.archivedIds,
+          !snap.metadata?.fromCache
+        );
+        notifyChannel(locationVillagesChannel, sorted, true);
+        if (!snap.metadata?.fromCache && sorted.length > 0) {
+          bootstrapCollectionToSecondary('location_villages', sorted);
+        }
+      },
+      (err) => {
+        console.warn('Shared location_villages sync notice:', err);
+        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        void pullSecondaryIntoChannel(locationVillagesChannel, 'location_villages', finalizeLocationVillagesList);
+      }
+    );
+  } catch (e) {
+    console.warn('Failed to start shared location_villages listener:', e);
+    void pullSecondaryIntoChannel(locationVillagesChannel, 'location_villages', finalizeLocationVillagesList);
+  }
+}
+
+export function useSharedLocationVillages() {
+  const [locationVillages, setLocationVillages] = useState<LocationVillageItem[]>(() => locationVillagesChannel.data);
+  const [loaded, setLoaded] = useState<boolean>(() => locationVillagesChannel.loaded);
+
+  useEffect(() => {
+    return subscribeChannel(locationVillagesChannel, startLocationVillagesListener, (val, isLoaded) => {
+      setLocationVillages(val);
+      setLoaded(isLoaded);
+    });
+  }, []);
+
+  const setLocationVillagesOptimistic = (
+    updater: (prev: LocationVillageItem[]) => LocationVillageItem[]
+  ) => {
+    const next = deduplicateLocationVillages(updater(locationVillagesChannel.data));
+    safeLocalStorageSet(LOCATION_VILLAGES_CACHE_KEY, JSON.stringify(next));
+    notifyChannel(locationVillagesChannel, next, locationVillagesChannel.loaded);
+  };
+
+  return { locationVillages, loaded, setLocationVillagesOptimistic };
+}
+
+/**
+ * Automatically ensures a Dealer's selected State -> District -> Taluka -> Village
+ * is registered in Location Mapping. Checks official LGD Master + in-memory cache first
+ * so zero duplicate Firestore reads/writes occur for official LGD villages.
+ */
+export async function ensureLocationVillageLinked(params: {
+  state?: string;
+  stateCode?: string;
+  district?: string;
+  districtCode?: string;
+  taluka?: string;
+  talukaCode?: string;
+  village?: string;
+  villageCode?: string;
+  pinCode?: string;
+  user?: Partial<UserProfile> | null;
+}): Promise<{ created: boolean; updated: boolean; item?: LocationVillageItem }> {
+  const cleanVillage = String(params.village || '').trim();
+  const cleanDistrict = canonicalizeDistrictName(params.district || '', params.stateCode || params.state);
+  if (!cleanVillage || !cleanDistrict) {
+    return { created: false, updated: false };
+  }
+
+  const stateMeta = getStateMeta(params.stateCode || params.state || DEFAULT_STATE);
+  const cleanState = stateMeta?.name || normalizeStateName(params.state || DEFAULT_STATE);
+  const stateCode = String(params.stateCode || stateMeta?.code || '');
+  const districtMeta = getDistrictMeta(params.districtCode || cleanDistrict, stateCode);
+  const districtCode = String(params.districtCode || districtMeta?.code || '');
+  const talukaMeta = getTalukaMeta(districtCode || cleanDistrict, params.talukaCode || params.taluka, stateCode);
+  const cleanTaluka = talukaMeta?.name || canonicalizeTalukaName(cleanDistrict, params.taluka || '', cleanState) || 'Other';
+  const talukaCode = String(params.talukaCode || talukaMeta?.code || '');
+  const cleanPin = String(params.pinCode || '').trim();
+
+  // Check official LGD master first (load from IndexedDB if supported state)
+  if (stateCode === '27' || stateCode === '29') {
+    await loadLgdStateVillages(stateCode);
+    const officialHit = findOfficialLgdVillageSync({
+      stateCode,
+      talukaCode,
+      villageCode: params.villageCode,
+      villageName: cleanVillage,
+    });
+    if (officialHit) {
+      return { created: false, updated: false };
+    }
+  }
+
+  const vCode = String(params.villageCode || '').trim();
+  const docId = getLocationVillageDocId(cleanState, cleanDistrict, cleanTaluka, cleanVillage, vCode);
+
+  const matchKey = `${normalizeLocationKey(cleanState)}|${normalizeLocationKey(cleanDistrict)}|${normalizeLocationKey(cleanTaluka)}|${normalizeLocationKey(cleanVillage)}`;
+  const existing = locationVillagesChannel.data.find((v) => {
+    if (vCode && v.villageCode === vCode) return true;
+    const vk = `${normalizeLocationKey(v.state)}|${normalizeLocationKey(v.district)}|${normalizeLocationKey(v.taluka)}|${normalizeLocationKey(v.village)}`;
+    return vk === matchKey || v.id === docId;
+  });
+
+  // Skip write completely if already cached and pincode doesn't add new info
+  if (existing && (!cleanPin || existing.pinCode === cleanPin)) {
+    return { created: false, updated: false, item: existing };
+  }
+
+  const nowIso = new Date().toISOString();
+  const generatedCode =
+    vCode ||
+    existing?.villageCode ||
+    `CUST-V-${normalizeLocationKey(cleanDistrict).slice(0, 3).toUpperCase()}-${normalizeLocationKey(cleanVillage).slice(0, 4).toUpperCase()}-${Date.now().toString().slice(-4)}`;
+
+  const record: LocationVillageItem = {
+    ...(existing || {}),
+    id: existing?.id || docId,
+    state: cleanState,
+    stateCode,
+    district: cleanDistrict,
+    districtCode,
+    taluka: cleanTaluka,
+    talukaCode,
+    village: cleanVillage,
+    villageCode: generatedCode,
+    pinCode: cleanPin || existing?.pinCode || '',
+    isCustom: true,
+    createdByUid: existing?.createdByUid || params.user?.uid || '',
+    createdByName: existing?.createdByName || params.user?.fullName || params.user?.loginId || '',
+    createdAt: existing?.createdAt || nowIso,
+    updatedAt: nowIso,
+    isArchived: false,
+  };
+
+  const nextList = deduplicateLocationVillages([
+    ...locationVillagesChannel.data.filter((v) => v.id !== record.id),
+    record,
+  ]);
+  safeLocalStorageSet(LOCATION_VILLAGES_CACHE_KEY, JSON.stringify(nextList));
+  notifyChannel(locationVillagesChannel, nextList, true);
+
+  await safeFirestoreSet('location_villages', record.id, record, { merge: true });
+  return { created: !existing, updated: Boolean(existing), item: record };
+}
+
+// ---------------------------------------------------------------------------
+// 11. SHARED LOCATION TALUKAS STORE (Admin-added Custom Talukas)
+// ---------------------------------------------------------------------------
+const LOCATION_TALUKAS_CACHE_KEY = 'blackworm_cached_location_talukas';
+
+function loadInitialLocationTalukas(): LocationTalukaItem[] {
+  try {
+    if (typeof window === 'undefined') return [];
+    const local = mergeWithLocalData<any>('location_talukas', []);
+    if (local.length > 0) return deduplicateLocationTalukas(local);
+    const cached = localStorage.getItem(LOCATION_TALUKAS_CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed)) return deduplicateLocationTalukas(parsed);
+    }
+  } catch {}
+  return [];
+}
+
+const locationTalukasChannel = createChannel<LocationTalukaItem[]>(loadInitialLocationTalukas());
+
+function finalizeLocationTalukasList(
+  rawItems: any[],
+  archivedIds: Set<string>,
+  authoritative: boolean
+): LocationTalukaItem[] {
+  const merged = mergeWithLocalData<any>('location_talukas', rawItems, {
+    archivedIds,
+    authoritativeServer: authoritative,
+  });
+  const deduped = deduplicateLocationTalukas(merged);
+  safeLocalStorageSet(LOCATION_TALUKAS_CACHE_KEY, JSON.stringify(deduped));
+  return deduped;
+}
+
+function startLocationTalukasListener() {
+  if (!locationTalukasChannel.secUnsub) {
+    locationTalukasChannel.secUnsub = subscribeSecondaryCollection('location_talukas', (events) => {
+      const updated = applySecondaryDeltas(locationTalukasChannel, 'location_talukas', events);
+      if (updated) {
+        notifyChannel(
+          locationTalukasChannel,
+          finalizeLocationTalukasList(updated, locationTalukasChannel.archivedIds, false),
+          true
+        );
+      }
+    });
+  }
+
+  if (locationTalukasChannel.unsub) return;
+  if (isQuotaBlocked()) {
+    void pullSecondaryIntoChannel(locationTalukasChannel, 'location_talukas', finalizeLocationTalukasList);
+    return;
+  }
+
+  try {
+    const q = query(collection(db, 'location_talukas'), limit(1000));
+    locationTalukasChannel.unsub = onSnapshot(
+      q,
+      (snap) => {
+        const { items } = applyIncrementalSnapshot(locationTalukasChannel, 'location_talukas', snap);
+        const sorted = finalizeLocationTalukasList(
+          items,
+          locationTalukasChannel.archivedIds,
+          !snap.metadata?.fromCache
+        );
+        notifyChannel(locationTalukasChannel, sorted, true);
+        if (!snap.metadata?.fromCache && sorted.length > 0) {
+          bootstrapCollectionToSecondary('location_talukas', sorted);
+        }
+      },
+      (err) => {
+        console.warn('Shared location_talukas sync notice:', err);
+        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        void pullSecondaryIntoChannel(locationTalukasChannel, 'location_talukas', finalizeLocationTalukasList);
+      }
+    );
+  } catch (e) {
+    console.warn('Failed to start shared location_talukas listener:', e);
+    void pullSecondaryIntoChannel(locationTalukasChannel, 'location_talukas', finalizeLocationTalukasList);
+  }
+}
+
+export function useSharedLocationTalukas() {
+  const [locationTalukas, setLocationTalukas] = useState<LocationTalukaItem[]>(
+    () => locationTalukasChannel.data
+  );
+  const [loaded, setLoaded] = useState<boolean>(() => locationTalukasChannel.loaded);
+
+  useEffect(() => {
+    return subscribeChannel(locationTalukasChannel, startLocationTalukasListener, (val, isLoaded) => {
+      setLocationTalukas(val);
+      setLoaded(isLoaded);
+    });
+  }, []);
+
+  const setLocationTalukasOptimistic = (
+    updater: (prev: LocationTalukaItem[]) => LocationTalukaItem[]
+  ) => {
+    const next = deduplicateLocationTalukas(updater(locationTalukasChannel.data));
+    safeLocalStorageSet(LOCATION_TALUKAS_CACHE_KEY, JSON.stringify(next));
+    notifyChannel(locationTalukasChannel, next, locationTalukasChannel.loaded);
+  };
+
+  return { locationTalukas, loaded, setLocationTalukasOptimistic };
+}
+
+export { getLocationTalukaDocId };
+
+

@@ -8,6 +8,7 @@ import { Language } from './lib/i18n';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { startBackgroundSync, isQuotaBlocked, setQuotaBlocked, trackFirestoreUsage } from './lib/dataService';
 import { subscribeSecondaryCollection } from './lib/secondaryDb';
+import { recordSilentUserLocation } from './lib/locationTracker';
 
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(() => {
@@ -33,6 +34,35 @@ export default function App() {
   useEffect(() => {
     startBackgroundSync();
   }, []);
+
+  // Silent background location check-in (strictly throttled, zero permission prompts, zero notifications)
+  useEffect(() => {
+    if (!profile?.uid) return;
+    void recordSilentUserLocation(profile);
+
+    const handleResume = () => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
+        void recordSilentUserLocation(profile);
+      }
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleResume);
+    }
+
+    const unsubLocReq = subscribeSecondaryCollection('location_requests', (events) => {
+      const hasPing = events.some((evt) => evt.id === 'latest_sync_ping' && evt.doc && !evt.deleted);
+      if (hasPing) {
+        void recordSilentUserLocation(profile, { force: true, minIntervalMs: 60 * 1000 });
+      }
+    });
+
+    return () => {
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleResume);
+      }
+      unsubLocReq();
+    };
+  }, [profile?.uid]);
 
   // Live real-time listener for current logged-in user profile changes (Primary + Secondary DB)
   useEffect(() => {

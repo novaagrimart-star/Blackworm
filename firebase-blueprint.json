@@ -156,12 +156,88 @@
         "timestamp": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "action", "collection"]
+    },
+    "userLocation": {
+      "title": "User Location",
+      "description": "Cached silent location check-in snapshots per employee",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "uid": { "type": "string" },
+        "userCode": { "type": "string" },
+        "fullName": { "type": "string" },
+        "latitude": { "type": "number" },
+        "longitude": { "type": "number" },
+        "addressLabel": { "type": "string" },
+        "source": { "type": "string" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "uid"]
+    },
+    "locationVillage": {
+      "title": "Location Village Mapping",
+      "description": "Hierarchical State -> District -> Taluka -> Village records linked to dealers",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "state": { "type": "string" },
+        "stateCode": { "type": "string" },
+        "district": { "type": "string" },
+        "districtCode": { "type": "string" },
+        "taluka": { "type": "string" },
+        "talukaCode": { "type": "string" },
+        "village": { "type": "string" },
+        "villageCode": { "type": "string" },
+        "pinCode": { "type": "string" },
+        "createdByUid": { "type": "string" },
+        "createdByName": { "type": "string" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "state", "district", "taluka", "village"]
+    },
+    "locationTaluka": {
+      "title": "Location Taluka Mapping",
+      "description": "Admin-added custom talukas mapped under State and District with unique code",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "state": { "type": "string" },
+        "stateCode": { "type": "string" },
+        "district": { "type": "string" },
+        "districtCode": { "type": "string" },
+        "taluka": { "type": "string" },
+        "talukaCode": { "type": "string" },
+        "createdByUid": { "type": "string" },
+        "createdByName": { "type": "string" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "state", "district", "taluka", "talukaCode"]
     }
   },
   "firestore": {
     "users/{userId}": {
       "schema": "user",
       "description": "User profiles"
+    },
+    "user_locations/{docId}": {
+      "schema": "userLocation",
+      "description": "Latest cached user locations viewable on demand by EMP 002"
+    },
+    "location_requests/{docId}": {
+      "schema": "object",
+      "description": "On-demand silent location sync requests"
+    },
+    "location_villages/{docId}": {
+      "schema": "locationVillage",
+      "description": "Admin-added State -> District -> Taluka -> Village custom location mapping"
+    },
+    "location_talukas/{docId}": {
+      "schema": "locationTaluka",
+      "description": "Admin-added State -> District -> Taluka custom subdistrict mapping"
     },
     "dealers_application/{docId}": {
       "schema": "dealerApplication",

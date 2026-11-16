@@ -13,6 +13,7 @@ export const translations = {
     outstanding: 'Outstanding',
     priceList: 'Price List',
     dealer: 'Dealer Management',
+    location: 'Location Mapping',
     travel: 'Travel Log',
     scheme: 'Schemes',
     report: 'Reports',
