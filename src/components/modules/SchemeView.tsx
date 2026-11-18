@@ -533,7 +533,7 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
         <div className="bg-emerald-50 border border-emerald-300 text-emerald-800 px-4 py-2.5 rounded-xl text-xs font-bold flex items-center justify-between shadow-xs animate-in fade-in">
           <div className="flex items-center gap-2">
             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-            <span>स्कीम डिस्काउंट यशस्वीरीत्या सेव्ह झाले आहेत! (Saved successfully)</span>
+            <span>Saved</span>
           </div>
         </div>
       )}

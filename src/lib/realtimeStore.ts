@@ -24,6 +24,7 @@ import {
   setQuotaBlocked,
   safeLocalStorageSet,
   safeFirestoreSet,
+  getPendingSyncMap,
 } from './dataService';
 import {
   DEFAULT_STATE,
@@ -51,7 +52,7 @@ import {
   SecondaryDeltaEvent,
 } from './secondaryDb';
 
-const LINGER_UNSUB_MS = 60000; // Keep shared listeners warm for 60s across tab navigation (0 re-reads!)
+const TAB_STALE_PULL_MS = 12000;
 
 interface StoreChannel<T> {
   data: T;
@@ -59,28 +60,53 @@ interface StoreChannel<T> {
   subscribers: Set<(val: T, loaded: boolean) => void>;
   unsub: (() => void) | null;
   secUnsub: (() => void) | null;
+  secPulledOnce?: boolean;
+  lastSecPullAtMs: number;
   lingerTimer: ReturnType<typeof setTimeout> | null;
   docMap: Map<string, any>;
   archivedIds: Set<string>;
+  secIds: Set<string>;
+  hasServerSnapshot?: boolean;
 }
 
 function createChannel<T>(initial: T): StoreChannel<T> {
+  const docMap = new Map<string, any>();
+  if (Array.isArray(initial)) {
+    initial.forEach((it: any) => {
+      const id = it?.id || it?.uid;
+      if (id && !it?.isArchived) {
+        docMap.set(String(id), { ...it, id: String(id) });
+      }
+    });
+  }
   return {
     data: initial,
     loaded: false,
     subscribers: new Set(),
     unsub: null,
     secUnsub: null,
+    secPulledOnce: false,
+    lastSecPullAtMs: 0,
     lingerTimer: null,
-    docMap: new Map(),
+    docMap,
     archivedIds: new Set(),
+    secIds: new Set(),
+    hasServerSnapshot: false,
   };
+}
+
+function getDocSyncTs(docObj: any): number {
+  if (!docObj) return 0;
+  return Math.max(
+    Number(docObj._syncUpdatedAtMs) || 0,
+    toTimestampMs(docObj.updatedAt || docObj.markedAt || docObj.createdAt)
+  );
 }
 
 function notifyChannel<T>(ch: StoreChannel<T>, next: T, loaded = true) {
   ch.data = next;
-  ch.loaded = loaded;
-  ch.subscribers.forEach((cb) => cb(next, loaded));
+  ch.loaded = Boolean(loaded || ch.loaded);
+  ch.subscribers.forEach((cb) => cb(next, ch.loaded));
 }
 
 function subscribeChannel<T>(
@@ -92,26 +118,17 @@ function subscribeChannel<T>(
     clearTimeout(ch.lingerTimer);
     ch.lingerTimer = null;
   }
+  // If user switched tabs and returns after >12s, refresh from Secondary DB without re-reading Firebase
+  if (ch.secPulledOnce && Date.now() - ch.lastSecPullAtMs > TAB_STALE_PULL_MS) {
+    ch.secPulledOnce = false;
+  }
   ch.subscribers.add(onChange);
   starter();
   onChange(ch.data, ch.loaded);
 
   return () => {
     ch.subscribers.delete(onChange);
-    if (ch.subscribers.size === 0 && (ch.unsub || ch.secUnsub)) {
-      ch.lingerTimer = setTimeout(() => {
-        if (ch.subscribers.size === 0) {
-          if (ch.unsub) {
-            ch.unsub();
-            ch.unsub = null;
-          }
-          if (ch.secUnsub) {
-            ch.secUnsub();
-            ch.secUnsub = null;
-          }
-        }
-      }, LINGER_UNSUB_MS);
-    }
+    // Keep session onSnapshot & SSE listeners warm across tab switches so Firebase NEVER re-reads entire collections!
   };
 }
 
@@ -122,41 +139,76 @@ function isQuotaError(err: any): boolean {
 function applyIncrementalSnapshot(
   ch: StoreChannel<any[]>,
   colName: string,
-  snap: any
+  snap: any,
+  queryLimit = 0
 ): { items: any[]; changedCount: number } {
   const changes = typeof snap.docChanges === 'function' ? snap.docChanges() : [];
   let changedCount = changes.length;
+  const fromCache = Boolean(snap?.metadata?.fromCache);
+  const pendingMap = getPendingSyncMap(colName);
 
-  if (ch.docMap.size === 0 && snap.docs) {
-    snap.docs.forEach((d: any) => {
-      const data = d.data();
-      if (data?.isArchived) {
-        ch.archivedIds.add(d.id);
-        ch.docMap.delete(d.id);
-        removeFromCollectionCache(colName, d.id);
-      } else {
-        ch.archivedIds.delete(d.id);
-        ch.docMap.set(d.id, { ...data, id: d.id });
+  const upsertWithLww = (id: string, data: any) => {
+    const pendingMeta = pendingMap.get(id);
+    if (data?.isArchived) {
+      if (pendingMeta && !pendingMeta.deleted) {
+        const archTs = toTimestampMs(data.archivedAt || data.updatedAt || data._syncUpdatedAtMs);
+        if (pendingMeta.ts > archTs) return;
       }
-    });
+      ch.archivedIds.add(id);
+      ch.secIds.delete(id);
+      ch.docMap.delete(id);
+      removeFromCollectionCache(colName, id);
+      return;
+    }
+
+    ch.archivedIds.delete(id);
+    const incoming = { ...data, id };
+    const existing = ch.docMap.get(id);
+    if (existing) {
+      const incomingTs = getDocSyncTs(incoming);
+      const existingTs = getDocSyncTs(existing);
+      if (pendingMeta) {
+        // Protect locally queued edits that haven't completed syncing yet
+        if (pendingMeta.ts > incomingTs) return;
+      } else if (fromCache) {
+        if (existingTs >= incomingTs) return;
+      } else if (ch.secIds.has(id) && existingTs > incomingTs + 500) {
+        // Secondary DB has a strictly newer write (e.g. saved while Firebase quota was blocked on another device)
+        return;
+      }
+    }
+    ch.docMap.set(id, incoming);
+  };
+
+  if (!fromCache && !ch.hasServerSnapshot && Array.isArray(snap.docs)) {
+    // First authoritative server snapshot: only prune stale pre-seeded cache items that are NOT live in Secondary DB
+    ch.hasServerSnapshot = true;
+    const isFullServerView = !queryLimit || snap.docs.length < queryLimit;
+    if (isFullServerView) {
+      const serverIds = new Set<string>(snap.docs.map((d: any) => String(d.id)));
+      Array.from(ch.docMap.keys()).forEach((existingId) => {
+        if (!serverIds.has(existingId) && !pendingMap.has(existingId) && !ch.secIds.has(existingId)) {
+          ch.docMap.delete(existingId);
+          removeFromCollectionCache(colName, existingId);
+        }
+      });
+    }
+    snap.docs.forEach((d: any) => upsertWithLww(d.id, d.data()));
+    changedCount = snap.docs.length || 1;
+  } else if (ch.docMap.size === 0 && snap.docs) {
+    snap.docs.forEach((d: any) => upsertWithLww(d.id, d.data()));
     changedCount = snap.docs.length || 1;
   } else {
     changes.forEach((change: any) => {
       const id = change.doc.id;
       if (change.type === 'removed') {
-        ch.docMap.delete(id);
-        ch.archivedIds.add(id);
-        removeFromCollectionCache(colName, id);
-      } else {
-        const data = change.doc.data();
-        if (data?.isArchived) {
+        if (!pendingMap.has(id) && !ch.secIds.has(id)) {
           ch.docMap.delete(id);
           ch.archivedIds.add(id);
           removeFromCollectionCache(colName, id);
-        } else {
-          ch.archivedIds.delete(id);
-          ch.docMap.set(id, { ...data, id });
         }
+      } else {
+        upsertWithLww(id, change.doc.data());
       }
     });
   }
@@ -174,6 +226,7 @@ function applySecondaryDeltas(
   events.forEach((evt) => {
     if (!evt || evt.collection !== colName || !evt.id) return;
     if (evt.deleted || evt.doc?.isArchived) {
+      ch.secIds.delete(evt.id);
       if (ch.docMap.has(evt.id) || !ch.archivedIds.has(evt.id)) {
         ch.docMap.delete(evt.id);
         ch.archivedIds.add(evt.id);
@@ -184,10 +237,15 @@ function applySecondaryDeltas(
     }
 
     if (evt.doc) {
-      const incoming: Record<string, any> = { ...evt.doc, id: evt.id };
+      ch.secIds.add(evt.id);
+      const incoming: Record<string, any> = {
+        ...evt.doc,
+        id: evt.id,
+        ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}),
+      };
       const existing = ch.docMap.get(evt.id);
-      const existingTs = toTimestampMs(existing?.updatedAt || existing?.createdAt);
-      const incomingTs = evt.updatedAtMs || toTimestampMs(incoming.updatedAt || incoming.createdAt);
+      const existingTs = getDocSyncTs(existing);
+      const incomingTs = Math.max(evt.updatedAtMs || 0, getDocSyncTs(incoming));
 
       if (!existing || incomingTs >= existingTs) {
         ch.archivedIds.delete(evt.id);
@@ -198,9 +256,7 @@ function applySecondaryDeltas(
   });
 
   if (!mutated) return null;
-  const arr = Array.from(ch.docMap.values());
-  updateCollectionCache(colName, arr);
-  return arr;
+  return Array.from(ch.docMap.values());
 }
 
 async function pullSecondaryIntoChannel(
@@ -208,37 +264,52 @@ async function pullSecondaryIntoChannel(
   colName: string,
   transform: (items: any[], archivedIds: Set<string>, authoritative: boolean) => any[]
 ) {
+  ch.lastSecPullAtMs = Date.now();
   try {
     const sec = await fetchSecondaryCollection(colName, { limit: 2000 });
-    if (sec.ok && (sec.items.length > 0 || sec.archivedIds.length > 0)) {
+    if (sec.ok) {
       sec.archivedIds.forEach((id) => {
         ch.archivedIds.add(id);
+        ch.secIds.delete(id);
         ch.docMap.delete(id);
         removeFromCollectionCache(colName, id);
       });
       sec.items.forEach((it) => {
         if (!it || !it.id) return;
+        ch.secIds.add(it.id);
         const existing = ch.docMap.get(it.id);
-        const existingTs = toTimestampMs(existing?.updatedAt || existing?.createdAt);
-        const incomingTs = toTimestampMs(it.updatedAt || it.createdAt || it._syncUpdatedAtMs);
+        const existingTs = getDocSyncTs(existing);
+        const incomingTs = getDocSyncTs(it);
         if (!existing || incomingTs >= existingTs) {
           ch.archivedIds.delete(it.id);
           ch.docMap.set(it.id, existing ? { ...existing, ...it } : it);
         }
       });
-      const finalList = transform(Array.from(ch.docMap.values()), ch.archivedIds, false);
-      notifyChannel(ch, finalList, true);
-      return;
+      if (sec.items.length > 0 || sec.archivedIds.length > 0 || ch.docMap.size > 0 || isQuotaBlocked()) {
+        const finalList = transform(Array.from(ch.docMap.values()), ch.archivedIds, false);
+        notifyChannel(ch, finalList, true);
+        if (sec.items.length > 0) return;
+      }
     }
   } catch {}
 
-  // Fallback to IndexedDB vault if LocalStorage missed older/large datasets
+  // Fallback to IndexedDB vault — always merge into ch.docMap rather than overwriting live server records
   try {
     const vaultMap = await loadCollectionFromVault(colName);
     if (vaultMap) {
       const vaultItems = Object.values(vaultMap).filter((it: any) => it && !it.isArchived);
       if (vaultItems.length > 0) {
-        const finalList = transform(vaultItems, ch.archivedIds, false);
+        vaultItems.forEach((it: any) => {
+          const id = String(it?.id || it?.uid || '').trim();
+          if (!id || ch.archivedIds.has(id)) return;
+          const existing = ch.docMap.get(id);
+          const existingTs = getDocSyncTs(existing);
+          const incomingTs = getDocSyncTs(it);
+          if (!existing || incomingTs >= existingTs) {
+            ch.docMap.set(id, existing ? { ...existing, ...it, id } : { ...it, id });
+          }
+        });
+        const finalList = transform(Array.from(ch.docMap.values()), ch.archivedIds, false);
         notifyChannel(ch, finalList, true);
       }
     }
@@ -289,6 +360,7 @@ function finalizeUsersList(rawItems: any[], archivedIds: Set<string>, authoritat
 }
 
 function startUsersListener() {
+  ensureGlobalResyncListeners();
   if (!usersChannel.secUnsub) {
     usersChannel.secUnsub = subscribeSecondaryCollection('users', (events) => {
       const updated = applySecondaryDeltas(usersChannel, 'users', events);
@@ -296,6 +368,11 @@ function startUsersListener() {
         notifyChannel(usersChannel, finalizeUsersList(updated, usersChannel.archivedIds, false), true);
       }
     });
+  }
+
+  if (!usersChannel.secPulledOnce) {
+    usersChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(usersChannel, 'users', finalizeUsersList);
   }
 
   if (usersChannel.unsub) return;
@@ -317,12 +394,17 @@ function startUsersListener() {
       },
       (err) => {
         console.warn('Shared users sync notice:', err);
+        if (usersChannel.unsub) {
+          try { usersChannel.unsub(); } catch {}
+          usersChannel.unsub = null;
+        }
         if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
         void pullSecondaryIntoChannel(usersChannel, 'users', finalizeUsersList);
       }
     );
   } catch (e) {
     console.warn('Failed to start shared users listener:', e);
+    usersChannel.unsub = null;
     void pullSecondaryIntoChannel(usersChannel, 'users', finalizeUsersList);
   }
 }
@@ -345,13 +427,21 @@ export function useSharedUsers() {
     const id = u.uid || (u as any).id;
     if (u.fullName && id) {
       usersMap[id] = u.fullName;
-      if (u.loginId) usersMap[u.loginId.toLowerCase()] = u.fullName;
-      if (u.userCode) usersMap[u.userCode.toLowerCase()] = u.fullName;
+      if (u.loginId) usersMap[String(u.loginId).toLowerCase()] = u.fullName;
+      if (u.userCode) usersMap[String(u.userCode).toLowerCase()] = u.fullName;
     }
   });
 
   const setUsersOptimistic = (updater: (prev: UserProfile[]) => UserProfile[]) => {
+    const nowMs = Date.now();
     const next = sortUsers(updater(usersChannel.data));
+    next.forEach((u: any) => {
+      const id = u?.uid || u?.id;
+      if (id) {
+        usersChannel.archivedIds.delete(id);
+        usersChannel.docMap.set(id, { ...u, id, uid: id, _syncUpdatedAtMs: Math.max(Number(u._syncUpdatedAtMs) || 0, nowMs) });
+      }
+    });
     safeLocalStorageSet('blackworm_cached_users', JSON.stringify(next));
     notifyChannel(usersChannel, next, usersChannel.loaded);
   };
@@ -398,6 +488,7 @@ function finalizeDealersList(rawItems: any[], archivedIds: Set<string>, authorit
 }
 
 function startDealersListener() {
+  ensureGlobalResyncListeners();
   if (!dealersChannel.secUnsub) {
     dealersChannel.secUnsub = subscribeSecondaryCollection('dealers_application', (events) => {
       const updated = applySecondaryDeltas(dealersChannel, 'dealers_application', events);
@@ -405,6 +496,11 @@ function startDealersListener() {
         notifyChannel(dealersChannel, finalizeDealersList(updated, dealersChannel.archivedIds, false), true);
       }
     });
+  }
+
+  if (!dealersChannel.secPulledOnce) {
+    dealersChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(dealersChannel, 'dealers_application', finalizeDealersList);
   }
 
   if (dealersChannel.unsub) return;
@@ -418,7 +514,7 @@ function startDealersListener() {
     dealersChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(dealersChannel, 'dealers_application', snap);
+        const { items } = applyIncrementalSnapshot(dealersChannel, 'dealers_application', snap, 1000);
         const sorted = finalizeDealersList(items, dealersChannel.archivedIds, !snap.metadata?.fromCache);
         notifyChannel(dealersChannel, sorted, true);
         if (!snap.metadata?.fromCache) {
@@ -427,12 +523,17 @@ function startDealersListener() {
       },
       (err) => {
         console.warn('Shared dealers sync notice:', err);
+        if (dealersChannel.unsub) {
+          try { dealersChannel.unsub(); } catch {}
+          dealersChannel.unsub = null;
+        }
         if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
         void pullSecondaryIntoChannel(dealersChannel, 'dealers_application', finalizeDealersList);
       }
     );
   } catch (e) {
     console.warn('Failed to start shared dealers listener:', e);
+    dealersChannel.unsub = null;
     void pullSecondaryIntoChannel(dealersChannel, 'dealers_application', finalizeDealersList);
   }
 }
@@ -449,7 +550,20 @@ export function useSharedDealers() {
   }, []);
 
   const updateLocalDealersOptimistic = (updater: (prev: any[]) => any[]) => {
+    const nowMs = Date.now();
     const next = sortDealers(deduplicateDealers(updater(dealersChannel.data)));
+    const nextIds = new Set<string>();
+    next.forEach((d: any) => {
+      if (d?.id) {
+        nextIds.add(d.id);
+        dealersChannel.archivedIds.delete(d.id);
+        dealersChannel.docMap.set(d.id, { ...d, _syncUpdatedAtMs: Math.max(Number(d._syncUpdatedAtMs) || 0, nowMs) });
+      }
+    });
+    Array.from(dealersChannel.docMap.keys()).forEach((k) => {
+      if (!nextIds.has(k)) dealersChannel.docMap.delete(k);
+    });
+    safeLocalStorageSet('blackworm_all_dealers', JSON.stringify(next));
     notifyChannel(dealersChannel, next, dealersChannel.loaded);
   };
 
@@ -479,6 +593,7 @@ function finalizeOrdersList(rawItems: any[], archivedIds: Set<string>, authorita
 }
 
 function startOrdersListener() {
+  ensureGlobalResyncListeners();
   if (!ordersChannel.secUnsub) {
     ordersChannel.secUnsub = subscribeSecondaryCollection('orders', (events) => {
       const updated = applySecondaryDeltas(ordersChannel, 'orders', events);
@@ -486,6 +601,11 @@ function startOrdersListener() {
         notifyChannel(ordersChannel, finalizeOrdersList(updated, ordersChannel.archivedIds, false), true);
       }
     });
+  }
+
+  if (!ordersChannel.secPulledOnce) {
+    ordersChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(ordersChannel, 'orders', finalizeOrdersList);
   }
 
   if (ordersChannel.unsub) return;
@@ -499,7 +619,7 @@ function startOrdersListener() {
     ordersChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(ordersChannel, 'orders', snap);
+        const { items } = applyIncrementalSnapshot(ordersChannel, 'orders', snap, 1000);
         const sorted = finalizeOrdersList(items, ordersChannel.archivedIds, !snap.metadata?.fromCache);
         notifyChannel(ordersChannel, sorted, true);
         if (!snap.metadata?.fromCache) {
@@ -508,12 +628,17 @@ function startOrdersListener() {
       },
       (err) => {
         console.warn('Shared orders sync notice:', err);
+        if (ordersChannel.unsub) {
+          try { ordersChannel.unsub(); } catch {}
+          ordersChannel.unsub = null;
+        }
         if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
         void pullSecondaryIntoChannel(ordersChannel, 'orders', finalizeOrdersList);
       }
     );
   } catch (e) {
     console.warn('Failed to start shared orders listener:', e);
+    ordersChannel.unsub = null;
     void pullSecondaryIntoChannel(ordersChannel, 'orders', finalizeOrdersList);
   }
 }
@@ -530,9 +655,21 @@ export function useSharedOrders() {
   }, []);
 
   const setOrdersOptimistic = (updater: (prev: any[]) => any[]) => {
+    const nowMs = Date.now();
     const next = deduplicateOrders(updater(ordersChannel.data)).sort(
       (a, b) => toTimestampMs(b.createdAt) - toTimestampMs(a.createdAt)
     );
+    const nextIds = new Set<string>();
+    next.forEach((o: any) => {
+      if (o?.id) {
+        nextIds.add(o.id);
+        ordersChannel.archivedIds.delete(o.id);
+        ordersChannel.docMap.set(o.id, { ...o, _syncUpdatedAtMs: Math.max(Number(o._syncUpdatedAtMs) || 0, nowMs) });
+      }
+    });
+    Array.from(ordersChannel.docMap.keys()).forEach((k) => {
+      if (!nextIds.has(k)) ordersChannel.docMap.delete(k);
+    });
     notifyChannel(ordersChannel, next, ordersChannel.loaded);
   };
 
@@ -566,6 +703,7 @@ function finalizeCollectionsList(rawItems: any[], archivedIds: Set<string>, auth
 }
 
 function startCollectionsListener() {
+  ensureGlobalResyncListeners();
   if (!collectionsChannel.secUnsub) {
     collectionsChannel.secUnsub = subscribeSecondaryCollection('collection_entries', (events) => {
       const updated = applySecondaryDeltas(collectionsChannel, 'collection_entries', events);
@@ -573,6 +711,11 @@ function startCollectionsListener() {
         notifyChannel(collectionsChannel, finalizeCollectionsList(updated, collectionsChannel.archivedIds, false), true);
       }
     });
+  }
+
+  if (!collectionsChannel.secPulledOnce) {
+    collectionsChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(collectionsChannel, 'collection_entries', finalizeCollectionsList);
   }
 
   if (collectionsChannel.unsub) return;
@@ -586,7 +729,7 @@ function startCollectionsListener() {
     collectionsChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(collectionsChannel, 'collection_entries', snap);
+        const { items } = applyIncrementalSnapshot(collectionsChannel, 'collection_entries', snap, 1000);
         const sorted = finalizeCollectionsList(items, collectionsChannel.archivedIds, !snap.metadata?.fromCache);
         notifyChannel(collectionsChannel, sorted, true);
         if (!snap.metadata?.fromCache) {
@@ -595,12 +738,17 @@ function startCollectionsListener() {
       },
       (err) => {
         console.warn('Shared collections sync notice:', err);
+        if (collectionsChannel.unsub) {
+          try { collectionsChannel.unsub(); } catch {}
+          collectionsChannel.unsub = null;
+        }
         if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
         void pullSecondaryIntoChannel(collectionsChannel, 'collection_entries', finalizeCollectionsList);
       }
     );
   } catch (e) {
     console.warn('Failed to start shared collections listener:', e);
+    collectionsChannel.unsub = null;
     void pullSecondaryIntoChannel(collectionsChannel, 'collection_entries', finalizeCollectionsList);
   }
 }
@@ -617,9 +765,21 @@ export function useSharedCollectionEntries() {
   }, []);
 
   const setCollectionsOptimistic = (updater: (prev: any[]) => any[]) => {
+    const nowMs = Date.now();
     const next = deduplicateCollections(updater(collectionsChannel.data)).sort(
       (a, b) => toTimestampMs(b.createdAt || b.date) - toTimestampMs(a.createdAt || a.date)
     );
+    const nextIds = new Set<string>();
+    next.forEach((c: any) => {
+      if (c?.id) {
+        nextIds.add(c.id);
+        collectionsChannel.archivedIds.delete(c.id);
+        collectionsChannel.docMap.set(c.id, { ...c, _syncUpdatedAtMs: Math.max(Number(c._syncUpdatedAtMs) || 0, nowMs) });
+      }
+    });
+    Array.from(collectionsChannel.docMap.keys()).forEach((k) => {
+      if (!nextIds.has(k)) collectionsChannel.docMap.delete(k);
+    });
     notifyChannel(collectionsChannel, next, collectionsChannel.loaded);
   };
 
@@ -647,6 +807,7 @@ function finalizeYearlyTargetsList(rawItems: any[], archivedIds: Set<string>, au
 }
 
 function startYearlyTargetsListener() {
+  ensureGlobalResyncListeners();
   if (!yearlyTargetsChannel.secUnsub) {
     yearlyTargetsChannel.secUnsub = subscribeSecondaryCollection('yearly_targets', (events) => {
       const updated = applySecondaryDeltas(yearlyTargetsChannel, 'yearly_targets', events);
@@ -654,6 +815,11 @@ function startYearlyTargetsListener() {
         notifyChannel(yearlyTargetsChannel, finalizeYearlyTargetsList(updated, yearlyTargetsChannel.archivedIds, false), true);
       }
     });
+  }
+
+  if (!yearlyTargetsChannel.secPulledOnce) {
+    yearlyTargetsChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(yearlyTargetsChannel, 'yearly_targets', finalizeYearlyTargetsList);
   }
 
   if (yearlyTargetsChannel.unsub) return;
@@ -675,12 +841,17 @@ function startYearlyTargetsListener() {
       },
       (err) => {
         console.warn('Shared yearly_targets sync notice:', err);
+        if (yearlyTargetsChannel.unsub) {
+          try { yearlyTargetsChannel.unsub(); } catch {}
+          yearlyTargetsChannel.unsub = null;
+        }
         if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
         void pullSecondaryIntoChannel(yearlyTargetsChannel, 'yearly_targets', finalizeYearlyTargetsList);
       }
     );
   } catch (e) {
     console.warn('Failed to start shared yearly_targets listener:', e);
+    yearlyTargetsChannel.unsub = null;
     void pullSecondaryIntoChannel(yearlyTargetsChannel, 'yearly_targets', finalizeYearlyTargetsList);
   }
 }
@@ -697,71 +868,108 @@ export function useSharedYearlyTargets() {
   }, []);
 
   const refreshYearlyTargetDocFromServer = async (docId: string) => {
-    if (!isQuotaBlocked()) {
-      try {
-        const docSnap = await getDocFromServer(doc(db, 'yearly_targets', docId));
-        trackFirestoreUsage('read', 1);
-        if (docSnap.exists()) {
-          const data = { ...docSnap.data(), id: docSnap.id, _id: docSnap.id };
-          yearlyTargetsChannel.docMap.set(docSnap.id, data);
-          const merged = finalizeYearlyTargetsList(
-            Array.from(yearlyTargetsChannel.docMap.values()),
-            yearlyTargetsChannel.archivedIds,
-            true
-          );
-          notifyChannel(yearlyTargetsChannel, merged, true);
-          return data;
+    let fbData: any = null;
+    let secData: any = null;
+
+    await Promise.all([
+      (async () => {
+        if (isQuotaBlocked()) return;
+        try {
+          const docSnap = await getDocFromServer(doc(db, 'yearly_targets', docId));
+          trackFirestoreUsage('read', 1);
+          if (docSnap.exists()) {
+            fbData = { ...docSnap.data(), id: docSnap.id, _id: docSnap.id };
+          }
+        } catch (err) {
+          if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+          console.warn('Refresh target doc notice:', err);
         }
-      } catch (err) {
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
-        console.warn('Refresh target doc notice:', err);
+      })(),
+      (async () => {
+        try {
+          const sec = await fetchSecondaryCollection('yearly_targets', { limit: 500 });
+          if (sec.ok) {
+            const found = sec.items.find((it) => it.id === docId);
+            if (found) secData = { ...found, _id: found.id };
+          }
+        } catch {}
+      })(),
+    ]);
+
+    const best =
+      fbData && secData
+        ? getDocSyncTs(secData) >= getDocSyncTs(fbData)
+          ? { ...fbData, ...secData }
+          : { ...secData, ...fbData }
+        : secData || fbData;
+
+    if (best) {
+      const existing = yearlyTargetsChannel.docMap.get(docId);
+      if (!existing || getDocSyncTs(best) >= getDocSyncTs(existing)) {
+        yearlyTargetsChannel.docMap.set(docId, best);
       }
-    }
-    const sec = await fetchSecondaryCollection('yearly_targets', { limit: 500 });
-    if (sec.ok) {
-      const found = sec.items.find((it) => it.id === docId);
-      if (found) {
-        const data = { ...found, _id: found.id };
-        yearlyTargetsChannel.docMap.set(found.id, data);
-        const merged = finalizeYearlyTargetsList(
-          Array.from(yearlyTargetsChannel.docMap.values()),
-          yearlyTargetsChannel.archivedIds,
-          false
-        );
-        notifyChannel(yearlyTargetsChannel, merged, true);
-        return data;
-      }
+      const merged = finalizeYearlyTargetsList(
+        Array.from(yearlyTargetsChannel.docMap.values()),
+        yearlyTargetsChannel.archivedIds,
+        false
+      );
+      notifyChannel(yearlyTargetsChannel, merged, true);
+      return yearlyTargetsChannel.docMap.get(docId) || best;
     }
     return null;
   };
 
   const refreshAllYearlyTargetsFromServer = async () => {
-    if (!isQuotaBlocked()) {
-      try {
-        const snap = await getDocsFromServer(collection(db, 'yearly_targets'));
-        trackFirestoreUsage('read', Math.max(1, snap.docs.length));
-        snap.docs.forEach((d) => {
-          const data = { ...d.data(), id: d.id, _id: d.id };
-          yearlyTargetsChannel.docMap.set(d.id, data);
-        });
-        const merged = finalizeYearlyTargetsList(
-          Array.from(yearlyTargetsChannel.docMap.values()),
-          yearlyTargetsChannel.archivedIds,
-          true
-        );
-        notifyChannel(yearlyTargetsChannel, merged, true);
-        return;
-      } catch (err) {
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
-        console.warn('Refresh all targets notice:', err);
+    await Promise.all([
+      (async () => {
+        if (isQuotaBlocked()) return;
+        try {
+          const snap = await getDocsFromServer(collection(db, 'yearly_targets'));
+          trackFirestoreUsage('read', Math.max(1, snap.docs.length));
+          snap.docs.forEach((d) => {
+            const incoming = { ...d.data(), id: d.id, _id: d.id };
+            const existing = yearlyTargetsChannel.docMap.get(d.id);
+            if (!existing || getDocSyncTs(incoming) >= getDocSyncTs(existing)) {
+              yearlyTargetsChannel.docMap.set(d.id, existing ? { ...existing, ...incoming } : incoming);
+            }
+          });
+        } catch (err) {
+          if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+          console.warn('Refresh all targets notice:', err);
+        }
+      })(),
+      pullSecondaryIntoChannel(yearlyTargetsChannel, 'yearly_targets', finalizeYearlyTargetsList),
+    ]);
+
+    const merged = finalizeYearlyTargetsList(
+      Array.from(yearlyTargetsChannel.docMap.values()),
+      yearlyTargetsChannel.archivedIds,
+      false
+    );
+    notifyChannel(yearlyTargetsChannel, merged, true);
+  };
+
+  const setYearlyTargetsOptimistic = (updater: (prev: any[]) => any[]) => {
+    const nowMs = Date.now();
+    const next = updater(yearlyTargetsChannel.data).map((t: any) => ({
+      ...t,
+      _id: t._id || t.id,
+      _syncUpdatedAtMs: Math.max(Number(t._syncUpdatedAtMs) || 0, nowMs),
+    }));
+    next.forEach((t: any) => {
+      const id = t?.id || t?._id;
+      if (id) {
+        yearlyTargetsChannel.archivedIds.delete(id);
+        yearlyTargetsChannel.docMap.set(id, t);
       }
-    }
-    await pullSecondaryIntoChannel(yearlyTargetsChannel, 'yearly_targets', finalizeYearlyTargetsList);
+    });
+    notifyChannel(yearlyTargetsChannel, next, true);
   };
 
   return {
     yearlyTargets,
     loaded,
+    setYearlyTargetsOptimistic,
     refreshYearlyTargetDocFromServer,
     refreshAllYearlyTargetsFromServer,
   };
@@ -773,31 +981,32 @@ export function findYearlySheetForUser<T extends { id?: string; userId?: string;
   yearKey = '2026_27'
 ): T | undefined {
   if (!sheets || sheets.length === 0 || !user) return undefined;
-  const uid = (user.uid || '').trim();
+  const uid = String(user.uid || '').trim();
   const uidLower = uid.toLowerCase();
-  const loginLower = (user.loginId || '').trim().toLowerCase();
-  const nameUpper = (user.fullName || '').trim().toUpperCase();
+  const loginLower = String(user.loginId || '').trim().toLowerCase();
+  const nameUpper = String(user.fullName || '').trim().toUpperCase();
 
   if (uid) {
     const exactId = `yearly_${uid}_${yearKey}`;
-    const byId = sheets.find((s) => s.id === exactId);
+    const byId = sheets.find((s) => s && s.id === exactId);
     if (byId) return byId;
   }
   if (uidLower) {
-    const byUid = sheets.find((s) => (s.userId || '').trim().toLowerCase() === uidLower);
+    const byUid = sheets.find((s) => s && String(s.userId || '').trim().toLowerCase() === uidLower);
     if (byUid) return byUid;
   }
   if (loginLower) {
     const byLogin = sheets.find(
       (s) =>
-        (s.loginId || '').trim().toLowerCase() === loginLower ||
-        (s.userId || '').trim().toLowerCase() === loginLower ||
-        s.id === `yearly_${loginLower}_${yearKey}`
+        s &&
+        (String(s.loginId || '').trim().toLowerCase() === loginLower ||
+          String(s.userId || '').trim().toLowerCase() === loginLower ||
+          s.id === `yearly_${loginLower}_${yearKey}`)
     );
     if (byLogin) return byLogin;
   }
   if (nameUpper) {
-    return sheets.find((s) => (s.fullName || '').trim().toUpperCase() === nameUpper);
+    return sheets.find((s) => s && String(s.fullName || '').trim().toUpperCase() === nameUpper);
   }
   return undefined;
 }
@@ -831,6 +1040,7 @@ function finalizeTravelSheetsList(rawItems: any[], archivedIds: Set<string>, aut
 }
 
 function startTravelSheetsListener() {
+  ensureGlobalResyncListeners();
   if (!travelSheetsChannel.secUnsub) {
     travelSheetsChannel.secUnsub = subscribeSecondaryCollection('travel_sheets', (events) => {
       const updated = applySecondaryDeltas(travelSheetsChannel, 'travel_sheets', events);
@@ -838,6 +1048,11 @@ function startTravelSheetsListener() {
         notifyChannel(travelSheetsChannel, finalizeTravelSheetsList(updated, travelSheetsChannel.archivedIds, false), true);
       }
     });
+  }
+
+  if (!travelSheetsChannel.secPulledOnce) {
+    travelSheetsChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(travelSheetsChannel, 'travel_sheets', finalizeTravelSheetsList);
   }
 
   if (travelSheetsChannel.unsub) return;
@@ -859,12 +1074,17 @@ function startTravelSheetsListener() {
       },
       (err) => {
         console.warn('Shared travel_sheets sync notice:', err);
+        if (travelSheetsChannel.unsub) {
+          try { travelSheetsChannel.unsub(); } catch {}
+          travelSheetsChannel.unsub = null;
+        }
         if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
         void pullSecondaryIntoChannel(travelSheetsChannel, 'travel_sheets', finalizeTravelSheetsList);
       }
     );
   } catch (e) {
     console.warn('Failed to start shared travel_sheets listener:', e);
+    travelSheetsChannel.unsub = null;
     void pullSecondaryIntoChannel(travelSheetsChannel, 'travel_sheets', finalizeTravelSheetsList);
   }
 }
@@ -880,7 +1100,25 @@ export function useSharedTravelSheets() {
     });
   }, []);
 
-  return { travelSheets, loaded };
+  const setTravelSheetsOptimistic = (updater: (prev: any[]) => any[]) => {
+    const nowMs = Date.now();
+    const next = updater(travelSheetsChannel.data).map((s: any) => ({
+      ...s,
+      _id: s._id || s.id,
+      _syncUpdatedAtMs: Math.max(Number(s._syncUpdatedAtMs) || 0, nowMs),
+    }));
+    next.forEach((s: any) => {
+      const id = s?.id || s?._id;
+      if (id) {
+        travelSheetsChannel.archivedIds.delete(id);
+        travelSheetsChannel.docMap.set(id, s);
+      }
+    });
+    safeLocalStorageSet('blackworm_cached_travel_sheets', JSON.stringify(next));
+    notifyChannel(travelSheetsChannel, next, true);
+  };
+
+  return { travelSheets, loaded, setTravelSheetsOptimistic };
 }
 
 // ---------------------------------------------------------------------------
@@ -917,8 +1155,15 @@ function loadInitialMasterPricelist(): MasterPricelistState {
 
 const masterPricelistChannel = createChannel<MasterPricelistState>(loadInitialMasterPricelist());
 
-function applyMasterPricelistDoc(data: any) {
+let masterPricelistDocTs = 0;
+
+function applyMasterPricelistDoc(data: any, authoritativeServer = false) {
   if (!data || !Array.isArray(data.products) || data.products.length === 0) return;
+  const incomingTs = getDocSyncTs(data);
+  if (!authoritativeServer && masterPricelistDocTs > 0 && incomingTs > 0 && masterPricelistDocTs > incomingTs + 500) {
+    return;
+  }
+  if (incomingTs > 0) masterPricelistDocTs = incomingTs;
   const clean = deduplicateProducts(data.products.filter((p: any) => !p.isArchived));
   const nextState: MasterPricelistState = {
     products: clean,
@@ -938,14 +1183,20 @@ function pullMasterPricelistFromSecondary() {
 }
 
 function startMasterPricelistListener() {
+  ensureGlobalResyncListeners();
   if (!masterPricelistChannel.secUnsub) {
     masterPricelistChannel.secUnsub = subscribeSecondaryCollection('config', (events) => {
       events.forEach((evt) => {
         if (evt.id === 'master_pricelist' && evt.doc && !evt.deleted) {
-          applyMasterPricelistDoc(evt.doc);
+          applyMasterPricelistDoc({ ...evt.doc, ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}) });
         }
       });
     });
+  }
+
+  if (!masterPricelistChannel.secPulledOnce) {
+    masterPricelistChannel.secPulledOnce = true;
+    pullMasterPricelistFromSecondary();
   }
 
   if (masterPricelistChannel.unsub) return;
@@ -962,13 +1213,15 @@ function startMasterPricelistListener() {
         if (docSnap.exists()) {
           const data = docSnap.data();
           if (data && Array.isArray(data.products) && data.products.length > 0) {
-            applyMasterPricelistDoc(data);
-            void pushToSecondary({
-              collection: 'config',
-              id: 'master_pricelist',
-              doc: { ...data, id: 'master_pricelist' },
-              merge: true,
-            });
+            applyMasterPricelistDoc(data, !docSnap.metadata?.fromCache);
+            if (!docSnap.metadata?.fromCache) {
+              void pushToSecondary({
+                collection: 'config',
+                id: 'master_pricelist',
+                doc: { ...data, id: 'master_pricelist' },
+                merge: true,
+              });
+            }
             return;
           }
         }
@@ -976,12 +1229,17 @@ function startMasterPricelistListener() {
       },
       (err) => {
         console.warn('Shared master_pricelist sync notice:', err);
+        if (masterPricelistChannel.unsub) {
+          try { masterPricelistChannel.unsub(); } catch {}
+          masterPricelistChannel.unsub = null;
+        }
         if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
         pullMasterPricelistFromSecondary();
       }
     );
   } catch (e) {
     console.warn('Failed to start shared master_pricelist listener:', e);
+    masterPricelistChannel.unsub = null;
     pullMasterPricelistFromSecondary();
   }
 }
@@ -1029,6 +1287,7 @@ function finalizeOutstandingList(rawItems: any[], archivedIds: Set<string>, auth
 }
 
 function startOutstandingListener() {
+  ensureGlobalResyncListeners();
   if (!outstandingChannel.secUnsub) {
     outstandingChannel.secUnsub = subscribeSecondaryCollection('outstanding_records', (events) => {
       const updated = applySecondaryDeltas(outstandingChannel, 'outstanding_records', events);
@@ -1036,6 +1295,11 @@ function startOutstandingListener() {
         notifyChannel(outstandingChannel, finalizeOutstandingList(updated, outstandingChannel.archivedIds, false), true);
       }
     });
+  }
+
+  if (!outstandingChannel.secPulledOnce) {
+    outstandingChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(outstandingChannel, 'outstanding_records', finalizeOutstandingList);
   }
 
   if (outstandingChannel.unsub) return;
@@ -1049,7 +1313,7 @@ function startOutstandingListener() {
     outstandingChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(outstandingChannel, 'outstanding_records', snap);
+        const { items } = applyIncrementalSnapshot(outstandingChannel, 'outstanding_records', snap, 1000);
         const merged = finalizeOutstandingList(items, outstandingChannel.archivedIds, !snap.metadata?.fromCache);
         notifyChannel(outstandingChannel, merged, true);
         if (!snap.metadata?.fromCache && merged.length > 0) {
@@ -1058,12 +1322,17 @@ function startOutstandingListener() {
       },
       (err) => {
         console.warn('Shared outstanding_records sync notice:', err);
+        if (outstandingChannel.unsub) {
+          try { outstandingChannel.unsub(); } catch {}
+          outstandingChannel.unsub = null;
+        }
         if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
         void pullSecondaryIntoChannel(outstandingChannel, 'outstanding_records', finalizeOutstandingList);
       }
     );
   } catch (e) {
     console.warn('Failed to start shared outstanding_records listener:', e);
+    outstandingChannel.unsub = null;
     void pullSecondaryIntoChannel(outstandingChannel, 'outstanding_records', finalizeOutstandingList);
   }
 }
@@ -1080,7 +1349,19 @@ export function useSharedOutstandingRecords() {
   }, []);
 
   const setOutstandingOptimistic = (updater: (prev: any[]) => any[]) => {
+    const nowMs = Date.now();
     const next = updater(outstandingChannel.data);
+    const nextIds = new Set<string>();
+    next.forEach((r: any) => {
+      if (r?.id) {
+        nextIds.add(r.id);
+        outstandingChannel.archivedIds.delete(r.id);
+        outstandingChannel.docMap.set(r.id, { ...r, _syncUpdatedAtMs: Math.max(Number(r._syncUpdatedAtMs) || 0, nowMs) });
+      }
+    });
+    Array.from(outstandingChannel.docMap.keys()).forEach((k) => {
+      if (!nextIds.has(k)) outstandingChannel.docMap.delete(k);
+    });
     safeLocalStorageSet('blackworm_saved_outstanding_records', JSON.stringify(next));
     notifyChannel(outstandingChannel, next, outstandingChannel.loaded);
   };
@@ -1104,8 +1385,15 @@ function loadInitialSchemeDiscounts(): Record<string, number> {
 
 const schemeDiscountsChannel = createChannel<Record<string, number>>(loadInitialSchemeDiscounts());
 
-function applySchemeDiscountsDoc(data: any) {
+let schemeDiscountsDocTs = 0;
+
+function applySchemeDiscountsDoc(data: any, authoritativeServer = false) {
   if (data && data.discounts && typeof data.discounts === 'object') {
+    const incomingTs = getDocSyncTs(data);
+    if (!authoritativeServer && schemeDiscountsDocTs > 0 && incomingTs > 0 && schemeDiscountsDocTs > incomingTs + 500) {
+      return;
+    }
+    if (incomingTs > 0) schemeDiscountsDocTs = incomingTs;
     const next = { ...data.discounts };
     safeLocalStorageSet(SCHEME_DISCOUNTS_KEY, JSON.stringify(next));
     notifyChannel(schemeDiscountsChannel, next, true);
@@ -1121,14 +1409,20 @@ function pullSchemeDiscountsFromSecondary() {
 }
 
 function startSchemeDiscountsListener() {
+  ensureGlobalResyncListeners();
   if (!schemeDiscountsChannel.secUnsub) {
     schemeDiscountsChannel.secUnsub = subscribeSecondaryCollection('config', (events) => {
       events.forEach((evt) => {
         if (evt.id === 'schemes_extra_discounts' && evt.doc && !evt.deleted) {
-          applySchemeDiscountsDoc(evt.doc);
+          applySchemeDiscountsDoc({ ...evt.doc, ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}) });
         }
       });
     });
+  }
+
+  if (!schemeDiscountsChannel.secPulledOnce) {
+    schemeDiscountsChannel.secPulledOnce = true;
+    pullSchemeDiscountsFromSecondary();
   }
 
   if (schemeDiscountsChannel.unsub) return;
@@ -1144,25 +1438,32 @@ function startSchemeDiscountsListener() {
         trackFirestoreUsage('read', 1);
         if (snap.exists()) {
           const data = snap.data();
-          applySchemeDiscountsDoc(data);
-          void pushToSecondary({
-            collection: 'config',
-            id: 'schemes_extra_discounts',
-            doc: { ...data, id: 'schemes_extra_discounts' },
-            merge: true,
-          });
+          applySchemeDiscountsDoc(data, !snap.metadata?.fromCache);
+          if (!snap.metadata?.fromCache) {
+            void pushToSecondary({
+              collection: 'config',
+              id: 'schemes_extra_discounts',
+              doc: { ...data, id: 'schemes_extra_discounts' },
+              merge: true,
+            });
+          }
         } else {
           notifyChannel(schemeDiscountsChannel, schemeDiscountsChannel.data, true);
         }
       },
       (err) => {
         console.warn('Shared schemes_extra_discounts sync notice:', err);
+        if (schemeDiscountsChannel.unsub) {
+          try { schemeDiscountsChannel.unsub(); } catch {}
+          schemeDiscountsChannel.unsub = null;
+        }
         if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
         pullSchemeDiscountsFromSecondary();
       }
     );
   } catch (e) {
     console.warn('Failed to start shared schemes_extra_discounts listener:', e);
+    schemeDiscountsChannel.unsub = null;
     pullSchemeDiscountsFromSecondary();
   }
 }
@@ -1223,6 +1524,7 @@ function finalizeLocationVillagesList(
 }
 
 function startLocationVillagesListener() {
+  ensureGlobalResyncListeners();
   if (!locationVillagesChannel.secUnsub) {
     locationVillagesChannel.secUnsub = subscribeSecondaryCollection('location_villages', (events) => {
       const updated = applySecondaryDeltas(locationVillagesChannel, 'location_villages', events);
@@ -1236,6 +1538,11 @@ function startLocationVillagesListener() {
     });
   }
 
+  if (!locationVillagesChannel.secPulledOnce) {
+    locationVillagesChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(locationVillagesChannel, 'location_villages', finalizeLocationVillagesList);
+  }
+
   if (locationVillagesChannel.unsub) return;
   if (isQuotaBlocked()) {
     void pullSecondaryIntoChannel(locationVillagesChannel, 'location_villages', finalizeLocationVillagesList);
@@ -1247,7 +1554,7 @@ function startLocationVillagesListener() {
     locationVillagesChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(locationVillagesChannel, 'location_villages', snap);
+        const { items } = applyIncrementalSnapshot(locationVillagesChannel, 'location_villages', snap, 2000);
         const sorted = finalizeLocationVillagesList(
           items,
           locationVillagesChannel.archivedIds,
@@ -1260,12 +1567,17 @@ function startLocationVillagesListener() {
       },
       (err) => {
         console.warn('Shared location_villages sync notice:', err);
+        if (locationVillagesChannel.unsub) {
+          try { locationVillagesChannel.unsub(); } catch {}
+          locationVillagesChannel.unsub = null;
+        }
         if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
         void pullSecondaryIntoChannel(locationVillagesChannel, 'location_villages', finalizeLocationVillagesList);
       }
     );
   } catch (e) {
     console.warn('Failed to start shared location_villages listener:', e);
+    locationVillagesChannel.unsub = null;
     void pullSecondaryIntoChannel(locationVillagesChannel, 'location_villages', finalizeLocationVillagesList);
   }
 }
@@ -1284,7 +1596,19 @@ export function useSharedLocationVillages() {
   const setLocationVillagesOptimistic = (
     updater: (prev: LocationVillageItem[]) => LocationVillageItem[]
   ) => {
+    const nowMs = Date.now();
     const next = deduplicateLocationVillages(updater(locationVillagesChannel.data));
+    const nextIds = new Set<string>();
+    next.forEach((v: any) => {
+      if (v?.id) {
+        nextIds.add(v.id);
+        locationVillagesChannel.archivedIds.delete(v.id);
+        locationVillagesChannel.docMap.set(v.id, { ...v, _syncUpdatedAtMs: Math.max(Number(v._syncUpdatedAtMs) || 0, nowMs) });
+      }
+    });
+    Array.from(locationVillagesChannel.docMap.keys()).forEach((k) => {
+      if (!nextIds.has(k)) locationVillagesChannel.docMap.delete(k);
+    });
     safeLocalStorageSet(LOCATION_VILLAGES_CACHE_KEY, JSON.stringify(next));
     notifyChannel(locationVillagesChannel, next, locationVillagesChannel.loaded);
   };
@@ -1427,6 +1751,7 @@ function finalizeLocationTalukasList(
 }
 
 function startLocationTalukasListener() {
+  ensureGlobalResyncListeners();
   if (!locationTalukasChannel.secUnsub) {
     locationTalukasChannel.secUnsub = subscribeSecondaryCollection('location_talukas', (events) => {
       const updated = applySecondaryDeltas(locationTalukasChannel, 'location_talukas', events);
@@ -1440,6 +1765,11 @@ function startLocationTalukasListener() {
     });
   }
 
+  if (!locationTalukasChannel.secPulledOnce) {
+    locationTalukasChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(locationTalukasChannel, 'location_talukas', finalizeLocationTalukasList);
+  }
+
   if (locationTalukasChannel.unsub) return;
   if (isQuotaBlocked()) {
     void pullSecondaryIntoChannel(locationTalukasChannel, 'location_talukas', finalizeLocationTalukasList);
@@ -1451,7 +1781,7 @@ function startLocationTalukasListener() {
     locationTalukasChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(locationTalukasChannel, 'location_talukas', snap);
+        const { items } = applyIncrementalSnapshot(locationTalukasChannel, 'location_talukas', snap, 1000);
         const sorted = finalizeLocationTalukasList(
           items,
           locationTalukasChannel.archivedIds,
@@ -1464,12 +1794,17 @@ function startLocationTalukasListener() {
       },
       (err) => {
         console.warn('Shared location_talukas sync notice:', err);
+        if (locationTalukasChannel.unsub) {
+          try { locationTalukasChannel.unsub(); } catch {}
+          locationTalukasChannel.unsub = null;
+        }
         if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
         void pullSecondaryIntoChannel(locationTalukasChannel, 'location_talukas', finalizeLocationTalukasList);
       }
     );
   } catch (e) {
     console.warn('Failed to start shared location_talukas listener:', e);
+    locationTalukasChannel.unsub = null;
     void pullSecondaryIntoChannel(locationTalukasChannel, 'location_talukas', finalizeLocationTalukasList);
   }
 }
@@ -1490,7 +1825,19 @@ export function useSharedLocationTalukas() {
   const setLocationTalukasOptimistic = (
     updater: (prev: LocationTalukaItem[]) => LocationTalukaItem[]
   ) => {
+    const nowMs = Date.now();
     const next = deduplicateLocationTalukas(updater(locationTalukasChannel.data));
+    const nextIds = new Set<string>();
+    next.forEach((t: any) => {
+      if (t?.id) {
+        nextIds.add(t.id);
+        locationTalukasChannel.archivedIds.delete(t.id);
+        locationTalukasChannel.docMap.set(t.id, { ...t, _syncUpdatedAtMs: Math.max(Number(t._syncUpdatedAtMs) || 0, nowMs) });
+      }
+    });
+    Array.from(locationTalukasChannel.docMap.keys()).forEach((k) => {
+      if (!nextIds.has(k)) locationTalukasChannel.docMap.delete(k);
+    });
     safeLocalStorageSet(LOCATION_TALUKAS_CACHE_KEY, JSON.stringify(next));
     notifyChannel(locationTalukasChannel, next, locationTalukasChannel.loaded);
   };
@@ -1499,5 +1846,481 @@ export function useSharedLocationTalukas() {
 }
 
 export { getLocationTalukaDocId };
+
+// ---------------------------------------------------------------------------
+// 12. SHARED OFFICE / FACTORY STAFF ROSTER (Godown Incharge & Admin)
+// ---------------------------------------------------------------------------
+export interface OfficeStaffMember {
+  id: string;
+  fullName: string;
+  category: 'Office Staff' | 'Factory Staff';
+  workRole?: string;
+  mobileNumber?: string;
+  joiningDate?: string;
+  status?: 'Active' | 'Inactive';
+  linkedUserUid?: string;
+  createdByUid?: string;
+  createdByName?: string;
+  isArchived?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+const OFFICE_STAFF_CACHE_KEY = 'blackworm_cached_office_staff';
+
+function normalizeOfficeStaffList(rawItems: any[]): OfficeStaffMember[] {
+  const map = new Map<string, OfficeStaffMember>();
+  rawItems.forEach((it) => {
+    if (!it || !it.id || it.isArchived) return;
+    const prev = map.get(it.id);
+    if (!prev || toTimestampMs(it.updatedAt || it.createdAt) >= toTimestampMs(prev.updatedAt || prev.createdAt)) {
+      map.set(it.id, {
+        ...it,
+        id: String(it.id),
+        fullName: String(it.fullName || '').trim(),
+        category: it.category === 'Factory Staff' ? 'Factory Staff' : 'Office Staff',
+        status: it.status === 'Inactive' ? 'Inactive' : 'Active',
+      });
+    }
+  });
+
+  // Deduplicate by linkedUserUid or normalized (fullName + category), preferring non-staff_user manual entries or newest timestamp
+  const deduped = new Map<string, OfficeStaffMember>();
+  Array.from(map.values()).forEach((item) => {
+    const normName = item.fullName.toLowerCase().replace(/\s+/g, ' ').trim();
+    const dedupKey = item.linkedUserUid
+      ? `uid:${item.linkedUserUid}`
+      : `name:${normName}|${item.category}`;
+    const existing = deduped.get(dedupKey);
+    if (!existing) {
+      deduped.set(dedupKey, item);
+      return;
+    }
+    const existingTs = toTimestampMs(existing.updatedAt || existing.createdAt);
+    const incomingTs = toTimestampMs(item.updatedAt || item.createdAt);
+    if (incomingTs >= existingTs) {
+      deduped.set(dedupKey, item);
+    }
+  });
+
+  return Array.from(deduped.values()).sort((a, b) => a.fullName.localeCompare(b.fullName));
+}
+
+function loadInitialOfficeStaff(): OfficeStaffMember[] {
+  try {
+    if (typeof window === 'undefined') return [];
+    const local = mergeWithLocalData<any>('office_staff_members', []);
+    if (local.length > 0) return normalizeOfficeStaffList(local);
+    const cached = localStorage.getItem(OFFICE_STAFF_CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed)) return normalizeOfficeStaffList(parsed);
+    }
+  } catch {}
+  return [];
+}
+
+const officeStaffChannel = createChannel<OfficeStaffMember[]>(loadInitialOfficeStaff());
+
+function finalizeOfficeStaffList(
+  rawItems: any[],
+  archivedIds: Set<string>,
+  authoritative: boolean
+): OfficeStaffMember[] {
+  const merged = mergeWithLocalData<any>('office_staff_members', rawItems, {
+    archivedIds,
+    authoritativeServer: authoritative,
+  });
+  const finalList = normalizeOfficeStaffList(merged);
+  safeLocalStorageSet(OFFICE_STAFF_CACHE_KEY, JSON.stringify(finalList));
+  return finalList;
+}
+
+function startOfficeStaffListener() {
+  ensureGlobalResyncListeners();
+  if (!officeStaffChannel.secUnsub) {
+    officeStaffChannel.secUnsub = subscribeSecondaryCollection('office_staff_members', (events) => {
+      const updated = applySecondaryDeltas(officeStaffChannel, 'office_staff_members', events);
+      if (updated) {
+        notifyChannel(
+          officeStaffChannel,
+          finalizeOfficeStaffList(updated, officeStaffChannel.archivedIds, false),
+          true
+        );
+      }
+    });
+  }
+
+  if (!officeStaffChannel.secPulledOnce) {
+    officeStaffChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(officeStaffChannel, 'office_staff_members', finalizeOfficeStaffList);
+  }
+
+  if (officeStaffChannel.unsub) return;
+  if (isQuotaBlocked()) {
+    void pullSecondaryIntoChannel(officeStaffChannel, 'office_staff_members', finalizeOfficeStaffList);
+    return;
+  }
+
+  try {
+    const q = query(collection(db, 'office_staff_members'), limit(500));
+    officeStaffChannel.unsub = onSnapshot(
+      q,
+      (snap) => {
+        const { items } = applyIncrementalSnapshot(officeStaffChannel, 'office_staff_members', snap, 500);
+        const finalList = finalizeOfficeStaffList(
+          items,
+          officeStaffChannel.archivedIds,
+          !snap.metadata?.fromCache
+        );
+        notifyChannel(officeStaffChannel, finalList, true);
+        if (!snap.metadata?.fromCache && finalList.length > 0) {
+          bootstrapCollectionToSecondary('office_staff_members', finalList);
+        }
+      },
+      (err) => {
+        console.warn('Shared office_staff_members sync notice:', err);
+        if (officeStaffChannel.unsub) {
+          try { officeStaffChannel.unsub(); } catch {}
+          officeStaffChannel.unsub = null;
+        }
+        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        void pullSecondaryIntoChannel(officeStaffChannel, 'office_staff_members', finalizeOfficeStaffList);
+      }
+    );
+  } catch (e) {
+    console.warn('Failed to start shared office_staff_members listener:', e);
+    officeStaffChannel.unsub = null;
+    void pullSecondaryIntoChannel(officeStaffChannel, 'office_staff_members', finalizeOfficeStaffList);
+  }
+}
+
+export function useSharedOfficeStaff() {
+  const [staffMembers, setStaffMembers] = useState<OfficeStaffMember[]>(() => officeStaffChannel.data);
+  const [loaded, setLoaded] = useState<boolean>(() => officeStaffChannel.loaded);
+
+  useEffect(() => {
+    return subscribeChannel(officeStaffChannel, startOfficeStaffListener, (val, isLoaded) => {
+      setStaffMembers(val);
+      setLoaded(isLoaded);
+    });
+  }, []);
+
+  const setOfficeStaffOptimistic = (
+    updater: (prev: OfficeStaffMember[]) => OfficeStaffMember[]
+  ) => {
+    const nowMs = Date.now();
+    const next = normalizeOfficeStaffList(updater(officeStaffChannel.data));
+    const nextIds = new Set<string>();
+    next.forEach((m: any) => {
+      if (m?.id) {
+        nextIds.add(m.id);
+        officeStaffChannel.archivedIds.delete(m.id);
+        officeStaffChannel.docMap.set(m.id, { ...m, _syncUpdatedAtMs: Math.max(Number(m._syncUpdatedAtMs) || 0, nowMs) });
+      }
+    });
+    Array.from(officeStaffChannel.docMap.keys()).forEach((k) => {
+      if (!nextIds.has(k)) officeStaffChannel.docMap.delete(k);
+    });
+    safeLocalStorageSet(OFFICE_STAFF_CACHE_KEY, JSON.stringify(next));
+    notifyChannel(officeStaffChannel, next, officeStaffChannel.loaded);
+  };
+
+  return { staffMembers, loaded, setOfficeStaffOptimistic };
+}
+
+// ---------------------------------------------------------------------------
+// 13. SHARED OFFICE / FACTORY STAFF ATTENDANCE (Godown Incharge & Admin)
+// ---------------------------------------------------------------------------
+export interface OfficeStaffAttendanceRecord {
+  id: string;
+  date: string; // YYYY-MM-DD
+  monthKey: string; // YYYY-MM
+  staffId: string;
+  staffName: string;
+  category: 'Office Staff' | 'Factory Staff';
+  workRole?: string;
+  status: 'present' | 'half_day' | 'absent' | 'leave';
+  note?: string;
+  markedByUid?: string;
+  markedByName?: string;
+  markedAt?: string;
+  isArchived?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+const OFFICE_ATTENDANCE_CACHE_KEY = 'blackworm_cached_office_attendance';
+
+function normalizeOfficeAttendanceList(rawItems: any[]): OfficeStaffAttendanceRecord[] {
+  const map = new Map<string, OfficeStaffAttendanceRecord>();
+  rawItems.forEach((it) => {
+    if (!it || !it.id || it.isArchived) return;
+    const prev = map.get(it.id);
+    if (!prev || toTimestampMs(it.updatedAt || it.markedAt || it.createdAt) >= toTimestampMs(prev.updatedAt || prev.markedAt || prev.createdAt)) {
+      const dateStr = String(it.date || '').slice(0, 10);
+      map.set(it.id, {
+        ...it,
+        id: String(it.id),
+        date: dateStr,
+        monthKey: String(it.monthKey || dateStr.slice(0, 7)),
+        staffId: String(it.staffId || ''),
+        staffName: String(it.staffName || '').trim(),
+        category: it.category === 'Factory Staff' ? 'Factory Staff' : 'Office Staff',
+        status:
+          it.status === 'half_day' || it.status === 'absent' || it.status === 'leave'
+            ? it.status
+            : 'present',
+      });
+    }
+  });
+  return Array.from(map.values()).sort((a, b) =>
+    toTimestampMs(b.updatedAt || b.markedAt || b.date) - toTimestampMs(a.updatedAt || a.markedAt || a.date)
+  );
+}
+
+function loadInitialOfficeAttendance(): OfficeStaffAttendanceRecord[] {
+  try {
+    if (typeof window === 'undefined') return [];
+    const local = mergeWithLocalData<any>('office_staff_attendance', []);
+    if (local.length > 0) return normalizeOfficeAttendanceList(local);
+    const cached = localStorage.getItem(OFFICE_ATTENDANCE_CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed)) return normalizeOfficeAttendanceList(parsed);
+    }
+  } catch {}
+  return [];
+}
+
+const officeAttendanceChannel = createChannel<OfficeStaffAttendanceRecord[]>(loadInitialOfficeAttendance());
+
+function finalizeOfficeAttendanceList(
+  rawItems: any[],
+  archivedIds: Set<string>,
+  authoritative: boolean
+): OfficeStaffAttendanceRecord[] {
+  const merged = mergeWithLocalData<any>('office_staff_attendance', rawItems, {
+    archivedIds,
+    authoritativeServer: authoritative,
+  });
+  const finalList = normalizeOfficeAttendanceList(merged);
+  safeLocalStorageSet(OFFICE_ATTENDANCE_CACHE_KEY, JSON.stringify(finalList));
+  return finalList;
+}
+
+function startOfficeAttendanceListener() {
+  ensureGlobalResyncListeners();
+  if (!officeAttendanceChannel.secUnsub) {
+    officeAttendanceChannel.secUnsub = subscribeSecondaryCollection('office_staff_attendance', (events) => {
+      const updated = applySecondaryDeltas(officeAttendanceChannel, 'office_staff_attendance', events);
+      if (updated) {
+        notifyChannel(
+          officeAttendanceChannel,
+          finalizeOfficeAttendanceList(updated, officeAttendanceChannel.archivedIds, false),
+          true
+        );
+      }
+    });
+  }
+
+  if (!officeAttendanceChannel.secPulledOnce) {
+    officeAttendanceChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(officeAttendanceChannel, 'office_staff_attendance', finalizeOfficeAttendanceList);
+  }
+
+  if (officeAttendanceChannel.unsub) return;
+  if (isQuotaBlocked()) {
+    void pullSecondaryIntoChannel(officeAttendanceChannel, 'office_staff_attendance', finalizeOfficeAttendanceList);
+    return;
+  }
+
+  try {
+    const q = query(collection(db, 'office_staff_attendance'), limit(2000));
+    officeAttendanceChannel.unsub = onSnapshot(
+      q,
+      (snap) => {
+        const { items } = applyIncrementalSnapshot(officeAttendanceChannel, 'office_staff_attendance', snap, 2000);
+        const finalList = finalizeOfficeAttendanceList(
+          items,
+          officeAttendanceChannel.archivedIds,
+          !snap.metadata?.fromCache
+        );
+        notifyChannel(officeAttendanceChannel, finalList, true);
+        if (!snap.metadata?.fromCache && finalList.length > 0) {
+          bootstrapCollectionToSecondary('office_staff_attendance', finalList);
+        }
+      },
+      (err) => {
+        console.warn('Shared office_staff_attendance sync notice:', err);
+        if (officeAttendanceChannel.unsub) {
+          try { officeAttendanceChannel.unsub(); } catch {}
+          officeAttendanceChannel.unsub = null;
+        }
+        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        void pullSecondaryIntoChannel(officeAttendanceChannel, 'office_staff_attendance', finalizeOfficeAttendanceList);
+      }
+    );
+  } catch (e) {
+    console.warn('Failed to start shared office_staff_attendance listener:', e);
+    officeAttendanceChannel.unsub = null;
+    void pullSecondaryIntoChannel(officeAttendanceChannel, 'office_staff_attendance', finalizeOfficeAttendanceList);
+  }
+}
+
+export function useSharedOfficeAttendance() {
+  const [attendanceRecords, setAttendanceRecords] = useState<OfficeStaffAttendanceRecord[]>(
+    () => officeAttendanceChannel.data
+  );
+  const [loaded, setLoaded] = useState<boolean>(() => officeAttendanceChannel.loaded);
+
+  useEffect(() => {
+    return subscribeChannel(officeAttendanceChannel, startOfficeAttendanceListener, (val, isLoaded) => {
+      setAttendanceRecords(val);
+      setLoaded(isLoaded);
+    });
+  }, []);
+
+  const setOfficeAttendanceOptimistic = (
+    updater: (prev: OfficeStaffAttendanceRecord[]) => OfficeStaffAttendanceRecord[]
+  ) => {
+    const nowMs = Date.now();
+    const next = normalizeOfficeAttendanceList(updater(officeAttendanceChannel.data));
+    const nextIds = new Set<string>();
+    next.forEach((a: any) => {
+      if (a?.id) {
+        nextIds.add(a.id);
+        officeAttendanceChannel.archivedIds.delete(a.id);
+        officeAttendanceChannel.docMap.set(a.id, { ...a, _syncUpdatedAtMs: Math.max(Number(a._syncUpdatedAtMs) || 0, nowMs) });
+      }
+    });
+    Array.from(officeAttendanceChannel.docMap.keys()).forEach((k) => {
+      if (!nextIds.has(k)) officeAttendanceChannel.docMap.delete(k);
+    });
+    safeLocalStorageSet(OFFICE_ATTENDANCE_CACHE_KEY, JSON.stringify(next));
+    notifyChannel(officeAttendanceChannel, next, officeAttendanceChannel.loaded);
+  };
+
+  return { attendanceRecords, loaded, setOfficeAttendanceOptimistic };
+}
+
+// ---------------------------------------------------------------------------
+// 14. GLOBAL MULTI-TIER FAILOVER RESYNC COORDINATOR
+// ---------------------------------------------------------------------------
+let globalResyncAttached = false;
+let lastGlobalPullAt = 0;
+
+export async function hydrateAllChannelsFromSecondary(force = false): Promise<void> {
+  const now = Date.now();
+  if (!force && now - lastGlobalPullAt < 2500) return;
+  lastGlobalPullAt = now;
+
+  const shouldPull = (ch: StoreChannel<any>) =>
+    force || ch.subscribers.size > 0 || ch.secPulledOnce || ch.lastSecPullAtMs > 0;
+
+  const jobs: Promise<any>[] = [];
+  if (shouldPull(usersChannel)) {
+    jobs.push(pullSecondaryIntoChannel(usersChannel, 'users', finalizeUsersList));
+  }
+  if (shouldPull(dealersChannel)) {
+    jobs.push(pullSecondaryIntoChannel(dealersChannel, 'dealers_application', finalizeDealersList));
+  }
+  if (shouldPull(ordersChannel)) {
+    jobs.push(pullSecondaryIntoChannel(ordersChannel, 'orders', finalizeOrdersList));
+  }
+  if (shouldPull(collectionsChannel)) {
+    jobs.push(pullSecondaryIntoChannel(collectionsChannel, 'collection_entries', finalizeCollectionsList));
+  }
+  if (shouldPull(yearlyTargetsChannel)) {
+    jobs.push(pullSecondaryIntoChannel(yearlyTargetsChannel, 'yearly_targets', finalizeYearlyTargetsList));
+  }
+  if (shouldPull(travelSheetsChannel)) {
+    jobs.push(pullSecondaryIntoChannel(travelSheetsChannel, 'travel_sheets', finalizeTravelSheetsList));
+  }
+  if (shouldPull(outstandingChannel)) {
+    jobs.push(pullSecondaryIntoChannel(outstandingChannel, 'outstanding_records', finalizeOutstandingList));
+  }
+  if (shouldPull(locationVillagesChannel)) {
+    jobs.push(pullSecondaryIntoChannel(locationVillagesChannel, 'location_villages', finalizeLocationVillagesList));
+  }
+  if (shouldPull(locationTalukasChannel)) {
+    jobs.push(pullSecondaryIntoChannel(locationTalukasChannel, 'location_talukas', finalizeLocationTalukasList));
+  }
+  if (shouldPull(officeStaffChannel)) {
+    jobs.push(pullSecondaryIntoChannel(officeStaffChannel, 'office_staff_members', finalizeOfficeStaffList));
+  }
+  if (shouldPull(officeAttendanceChannel)) {
+    jobs.push(pullSecondaryIntoChannel(officeAttendanceChannel, 'office_staff_attendance', finalizeOfficeAttendanceList));
+  }
+  if (shouldPull(masterPricelistChannel)) {
+    pullMasterPricelistFromSecondary();
+  }
+  if (shouldPull(schemeDiscountsChannel)) {
+    pullSchemeDiscountsFromSecondary();
+  }
+  await Promise.all(jobs);
+}
+
+function reattachAllActiveListeners() {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+  if (isQuotaBlocked()) return;
+  if (usersChannel.subscribers.size > 0 && !usersChannel.unsub) startUsersListener();
+  if (dealersChannel.subscribers.size > 0 && !dealersChannel.unsub) startDealersListener();
+  if (ordersChannel.subscribers.size > 0 && !ordersChannel.unsub) startOrdersListener();
+  if (collectionsChannel.subscribers.size > 0 && !collectionsChannel.unsub) startCollectionsListener();
+  if (yearlyTargetsChannel.subscribers.size > 0 && !yearlyTargetsChannel.unsub) startYearlyTargetsListener();
+  if (travelSheetsChannel.subscribers.size > 0 && !travelSheetsChannel.unsub) startTravelSheetsListener();
+  if (masterPricelistChannel.subscribers.size > 0 && !masterPricelistChannel.unsub) startMasterPricelistListener();
+  if (outstandingChannel.subscribers.size > 0 && !outstandingChannel.unsub) startOutstandingListener();
+  if (schemeDiscountsChannel.subscribers.size > 0 && !schemeDiscountsChannel.unsub) startSchemeDiscountsListener();
+  if (locationVillagesChannel.subscribers.size > 0 && !locationVillagesChannel.unsub) startLocationVillagesListener();
+  if (locationTalukasChannel.subscribers.size > 0 && !locationTalukasChannel.unsub) startLocationTalukasListener();
+  if (officeStaffChannel.subscribers.size > 0 && !officeStaffChannel.unsub) startOfficeStaffListener();
+  if (officeAttendanceChannel.subscribers.size > 0 && !officeAttendanceChannel.unsub) startOfficeAttendanceListener();
+}
+
+function ensureGlobalResyncListeners() {
+  if (typeof window === 'undefined' || globalResyncAttached) return;
+  globalResyncAttached = true;
+
+  window.addEventListener('blackworm_quota_blocked', () => {
+    void hydrateAllChannelsFromSecondary(true);
+  });
+  window.addEventListener('blackworm_data_refresh', () => {
+    reattachAllActiveListeners();
+    void hydrateAllChannelsFromSecondary(true);
+  });
+  window.addEventListener('blackworm_secondary_resync', (e: any) => {
+    const reason = e?.detail?.reason || '';
+    const isUrgent =
+      reason === 'epoch_changed' ||
+      reason === 'rev_regressed' ||
+      reason === 'rev_zero' ||
+      reason === 'packet_import' ||
+      reason === 'force_sync';
+    void hydrateAllChannelsFromSecondary(isUrgent);
+  });
+  window.addEventListener('blackworm_quota_cleared', () => {
+    reattachAllActiveListeners();
+  });
+  window.addEventListener('online', () => {
+    reattachAllActiveListeners();
+  });
+  window.addEventListener('focus', () => {
+    reattachAllActiveListeners();
+  });
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        reattachAllActiveListeners();
+      }
+    });
+  }
+  // Auto-recovery heartbeat: if any active channel lost its onSnapshot listener, re-attach automatically
+  setInterval(() => {
+    reattachAllActiveListeners();
+  }, 20000);
+}
+
 
 

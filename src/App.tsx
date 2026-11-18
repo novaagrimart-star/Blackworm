@@ -1,14 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import { doc, onSnapshot } from 'firebase/firestore';
-import { db } from './firebase';
+import { db, testFirestoreConnection } from './firebase';
 import { UserProfile } from './lib/auth';
 import { Dashboard } from './components/Dashboard';
 import { Login } from './components/Login';
 import { Language } from './lib/i18n';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { startBackgroundSync, isQuotaBlocked, setQuotaBlocked, trackFirestoreUsage } from './lib/dataService';
-import { subscribeSecondaryCollection } from './lib/secondaryDb';
-import { recordSilentUserLocation } from './lib/locationTracker';
+import { startBackgroundSync, isQuotaBlocked, setQuotaBlocked, trackFirestoreUsage, toTimestampMs } from './lib/dataService';
+import { subscribeSecondaryCollection, fetchSecondaryCollection, autoHydrateServerFromLocalCache } from './lib/secondaryDb';
+
+function sanitizeSessionProfile(p: Record<string, any>): UserProfile {
+  const { password: _omittedPassword, ...safe } = p;
+  return safe as UserProfile;
+}
 
 export default function App() {
   const [profile, setProfile] = useState<UserProfile | null>(() => {
@@ -17,7 +21,11 @@ export default function App() {
       if (saved) {
         const parsed = JSON.parse(saved);
         if (parsed && typeof parsed === 'object' && parsed.uid) {
-          return parsed;
+          const sanitized = sanitizeSessionProfile(parsed);
+          if ('password' in parsed) {
+            try { localStorage.setItem('blackworm_user_profile', JSON.stringify(sanitized)); } catch {}
+          }
+          return sanitized;
         }
         localStorage.removeItem('blackworm_user_profile');
       }
@@ -30,52 +38,36 @@ export default function App() {
   const lang: Language = 'en';
   const [loading, setLoading] = useState(false);
 
-  // Initialize background sync once on app load
+  // Initialize background sync & check Firestore connectivity once on app load
   useEffect(() => {
     startBackgroundSync();
-  }, []);
-
-  // Silent background location check-in (strictly throttled, zero permission prompts, zero notifications)
-  useEffect(() => {
-    if (!profile?.uid) return;
-    void recordSilentUserLocation(profile);
-
-    const handleResume = () => {
-      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
-        void recordSilentUserLocation(profile);
-      }
-    };
-    if (typeof document !== 'undefined') {
-      document.addEventListener('visibilitychange', handleResume);
+    if (!isQuotaBlocked()) {
+      void testFirestoreConnection();
     }
-
-    const unsubLocReq = subscribeSecondaryCollection('location_requests', (events) => {
-      const hasPing = events.some((evt) => evt.id === 'latest_sync_ping' && evt.doc && !evt.deleted);
-      if (hasPing) {
-        void recordSilentUserLocation(profile, { force: true, minIntervalMs: 60 * 1000 });
-      }
-    });
-
-    return () => {
-      if (typeof document !== 'undefined') {
-        document.removeEventListener('visibilitychange', handleResume);
-      }
-      unsubLocReq();
-    };
-  }, [profile?.uid]);
+  }, []);
 
   // Live real-time listener for current logged-in user profile changes (Primary + Secondary DB)
   useEffect(() => {
     const currentUid = profile?.uid;
     if (!currentUid) return;
 
-    const applyFreshProfile = (freshData: Record<string, any>) => {
+    const getProfileTs = (obj: any) =>
+      Math.max(Number(obj?._syncUpdatedAtMs) || 0, toTimestampMs(obj?.updatedAt || obj?.createdAt));
+
+    const applyFreshProfile = (freshData: Record<string, any>, authoritativeServer = false) => {
       setProfile((prev) => {
-        const merged: UserProfile = {
+        if (prev && !authoritativeServer) {
+          const prevTs = getProfileTs(prev);
+          const nextTs = getProfileTs(freshData);
+          if (prevTs > 0 && nextTs > 0 && prevTs > nextTs + 500) {
+            return prev; // Keep newer local/secondary profile update
+          }
+        }
+        const merged = sanitizeSessionProfile({
           ...(prev || {}),
           ...freshData,
           uid: currentUid,
-        } as UserProfile;
+        });
         try {
           localStorage.setItem('blackworm_user_profile', JSON.stringify(merged));
         } catch (e) {
@@ -85,44 +77,91 @@ export default function App() {
       });
     };
 
+    const pullProfileFromSecondary = () => {
+      void fetchSecondaryCollection('users', { limit: 1000 }).then((res) => {
+        if (!res.ok) return;
+        const found = res.items.find((it) => it && (it.id === currentUid || it.uid === currentUid) && !it.isArchived);
+        if (found) applyFreshProfile(found, false);
+      });
+    };
+
+    // Always pull latest user profile from Secondary on mount and hydrate server if cold
+    pullProfileFromSecondary();
+    void autoHydrateServerFromLocalCache(false);
+
+    let unsubFb: (() => void) | null = null;
+    const attachProfileListener = () => {
+      if (unsubFb || isQuotaBlocked()) return;
+      try {
+        unsubFb = onSnapshot(
+          doc(db, 'users', currentUid),
+          (snap) => {
+            trackFirestoreUsage('read', 1);
+            if (snap.exists() && !snap.metadata?.fromCache) {
+              applyFreshProfile(snap.data(), true);
+            }
+          },
+          (err) => {
+            if (unsubFb) {
+              try { unsubFb(); } catch {}
+              unsubFb = null;
+            }
+            const msg = String(err?.message || '').toLowerCase();
+            if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+              setQuotaBlocked(15 * 60 * 1000);
+            }
+            pullProfileFromSecondary();
+            console.warn('Real-time profile listener error:', err);
+          }
+        );
+      } catch {
+        unsubFb = null;
+      }
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        pullProfileFromSecondary();
+        attachProfileListener();
+      }
+    };
+    const handleQuotaCleared = () => {
+      attachProfileListener();
+    };
+    window.addEventListener('focus', pullProfileFromSecondary);
+    window.addEventListener('blackworm_data_refresh', pullProfileFromSecondary);
+    window.addEventListener('blackworm_secondary_resync', pullProfileFromSecondary);
+    window.addEventListener('blackworm_quota_blocked', pullProfileFromSecondary);
+    window.addEventListener('blackworm_quota_cleared', handleQuotaCleared);
+    document.addEventListener('visibilitychange', handleVisibility);
+
     const unsubSec = subscribeSecondaryCollection('users', (events) => {
       events.forEach((evt) => {
         if (evt.id === currentUid && evt.doc && !evt.deleted) {
-          applyFreshProfile(evt.doc);
+          applyFreshProfile({ ...evt.doc, ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}) }, false);
         }
       });
     });
 
-    let unsubFb: (() => void) | null = null;
-    if (!isQuotaBlocked()) {
-      unsubFb = onSnapshot(
-        doc(db, 'users', currentUid),
-        (snap) => {
-          trackFirestoreUsage('read', 1);
-          if (snap.exists()) {
-            applyFreshProfile(snap.data());
-          }
-        },
-        (err) => {
-          const msg = String(err?.message || '').toLowerCase();
-          if (msg.includes('quota') || msg.includes('resource_exhausted')) {
-            setQuotaBlocked(15 * 60 * 1000);
-          }
-          console.warn('Real-time profile listener error:', err);
-        }
-      );
-    }
+    attachProfileListener();
 
     return () => {
       unsubSec();
       if (unsubFb) unsubFb();
+      window.removeEventListener('focus', pullProfileFromSecondary);
+      window.removeEventListener('blackworm_data_refresh', pullProfileFromSecondary);
+      window.removeEventListener('blackworm_secondary_resync', pullProfileFromSecondary);
+      window.removeEventListener('blackworm_quota_blocked', pullProfileFromSecondary);
+      window.removeEventListener('blackworm_quota_cleared', handleQuotaCleared);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, [profile?.uid]);
 
   const handleUpdateProfile = (updatedProfile: UserProfile) => {
-    setProfile(updatedProfile);
+    const safe = sanitizeSessionProfile(updatedProfile);
+    setProfile(safe);
     try {
-      localStorage.setItem('blackworm_user_profile', JSON.stringify(updatedProfile));
+      localStorage.setItem('blackworm_user_profile', JSON.stringify(safe));
     } catch (e) {}
   };
 
@@ -135,9 +174,10 @@ export default function App() {
   }
 
   const handleLoginSuccess = (userProfile: UserProfile) => {
-    setProfile(userProfile);
+    const safe = sanitizeSessionProfile(userProfile);
+    setProfile(safe);
     try {
-      localStorage.setItem('blackworm_user_profile', JSON.stringify(userProfile));
+      localStorage.setItem('blackworm_user_profile', JSON.stringify(safe));
     } catch {}
   };
 

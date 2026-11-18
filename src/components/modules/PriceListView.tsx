@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { collection, query, onSnapshot, doc, setDoc, getDoc, getDocs, writeBatch, limit, orderBy } from 'firebase/firestore';
+import { collection, query, onSnapshot, doc, getDoc, getDocs, writeBatch, limit, orderBy } from 'firebase/firestore';
 import { db, getFriendlyErrorMessage, isQuotaExceededError } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { Language } from '../../lib/i18n';
@@ -33,7 +33,8 @@ import {
   isQuotaBlocked,
   setQuotaBlocked,
   formatDisplayDate,
-  safeLocalStorageSet
+  safeLocalStorageSet,
+  toTimestampMs
 } from '../../lib/dataService';
 import { useBranding } from '../../lib/branding';
 import { pushBatchToSecondary, fetchSecondaryCollection, subscribeSecondaryCollection } from '../../lib/secondaryDb';
@@ -690,118 +691,135 @@ export async function savePriceListPermanently(
     isCustomUploaded: true,
     totalProducts: cleanProducts.length,
   }));
-  // 2. Automated Permanent Backup of previous state
-  try {
-    const backupId = `backup_${Date.now()}`;
-    await safeFirestoreSet('pricelist_backups', backupId, {
-      id: backupId,
-      backupId,
-      createdAt: new Date().toISOString(),
-      performedByUid: profile.uid,
-      performedByName: profile.fullName || profile.loginId || 'Admin',
-      source: sourceLabel,
-      previousProductsCount: currentProducts.length,
-      previousProducts: currentProducts,
-    });
-  } catch (backupErr) {
-    console.warn('Pre-upload automatic backup notice:', backupErr);
-  }
-
-  // 3. Save to Master Document config/master_pricelist across Primary + Secondary DB
-  await safeFirestoreSet('config', 'master_pricelist', {
-    products: cleanProducts,
-    validityDate: validityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
-    updatedAt: new Date().toISOString(),
-    updatedByUid: profile.uid,
-    updatedByName: profile.fullName || 'Admin',
-    isCustomUploaded: true,
-    totalProducts: cleanProducts.length,
-    source: sourceLabel,
-  }, { merge: true });
-
-  if (validityDate) {
-    try {
-      await safeFirestoreSet('config', 'pricelist_meta', {
-        validityDate,
-        updatedAt: new Date().toISOString(),
-      }, { merge: true });
-    } catch {}
-  }
-
-  // 4. Batch Upsert products into Secondary DB and Primary products_pricelist_v2 in chunks of 400
+  // 2. Save Master Document config/master_pricelist + meta + Secondary Batch quickly
   const nowIso = new Date().toISOString();
-  await pushBatchToSecondary(
-    cleanProducts.map((item) => ({
-      collection: 'products_pricelist_v2',
-      id: item.id,
-      doc: { ...item, isArchived: false, updatedAt: nowIso },
-      merge: true,
-    }))
-  );
+  await Promise.all([
+    safeFirestoreSet('config', 'master_pricelist', {
+      products: cleanProducts,
+      validityDate: validityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
+      updatedAt: nowIso,
+      updatedByUid: profile.uid,
+      updatedByName: profile.fullName || 'Admin',
+      isCustomUploaded: true,
+      totalProducts: cleanProducts.length,
+      source: sourceLabel,
+    }, { merge: true }),
+    validityDate
+      ? safeFirestoreSet('config', 'pricelist_meta', {
+          validityDate,
+          updatedAt: nowIso,
+        }, { merge: true }).catch(() => {})
+      : Promise.resolve(),
+    pushBatchToSecondary(
+      cleanProducts.map((item) => ({
+        collection: 'products_pricelist_v2',
+        id: item.id,
+        doc: { ...item, isArchived: false, updatedAt: nowIso },
+        merge: true,
+      }))
+    ),
+  ]);
 
-  if (!isQuotaBlocked()) {
+  // 3. Run pre-upload backup, chunked primary batch upserts, stale-product archival & audit log in background so Save is instant
+  void (async () => {
     try {
-      const BATCH_SIZE = 400;
-      for (let i = 0; i < cleanProducts.length; i += BATCH_SIZE) {
-        const chunk = cleanProducts.slice(i, i + BATCH_SIZE);
-        const batch = writeBatch(db);
-        chunk.forEach(item => {
-          const itemRef = doc(db, 'products_pricelist_v2', item.id);
-          batch.set(itemRef, {
-            ...item,
-            isArchived: false,
-            updatedAt: nowIso,
-          }, { merge: true });
-        });
-        await batch.commit();
-      }
-    } catch (upsertErr: any) {
-      const msg = String(upsertErr?.message || '').toLowerCase();
-      if (msg.includes('quota') || msg.includes('resource_exhausted')) setQuotaBlocked(15 * 60 * 1000);
-      console.warn('Batch upsert products notice:', upsertErr);
-    }
-  }
-
-  // 5. Soft-archive any duplicate or superseded products in products_pricelist_v2 (chunked at 400 ops)
-  if (!isQuotaBlocked()) {
-    try {
-      const cleanIds = new Set(cleanProducts.map(p => p.id));
-      const cleanCanonicalKeys = new Set(cleanProducts.map(p => getCanonicalProductKey(p)));
-      const oldSnap = await getDocs(collection(db, 'products_pricelist_v2'));
-      const toArchiveRefs: any[] = [];
-      oldSnap.forEach(d => {
-        const data = d.data();
-        const dKey = getCanonicalProductKey(data);
-        if (!cleanIds.has(d.id) && (!data.isArchived || cleanCanonicalKeys.has(dKey))) {
-          toArchiveRefs.push(d.ref);
-        }
+      const backupId = `backup_${Date.now()}`;
+      await safeFirestoreSet('pricelist_backups', backupId, {
+        id: backupId,
+        backupId,
+        createdAt: nowIso,
+        performedByUid: profile.uid,
+        performedByName: profile.fullName || profile.loginId || 'Admin',
+        source: sourceLabel,
+        previousProductsCount: currentProducts.length,
+        previousProducts: currentProducts,
       });
-      for (let i = 0; i < toArchiveRefs.length; i += 400) {
-        const chunk = toArchiveRefs.slice(i, i + 400);
-        const archiveBatch = writeBatch(db);
-        chunk.forEach(ref => {
-          archiveBatch.update(ref, { isArchived: true, archivedAt: nowIso });
-        });
-        await archiveBatch.commit();
-      }
-    } catch (archErr: any) {
-      if (isQuotaExceededError(archErr)) setQuotaBlocked(15 * 60 * 1000);
-      console.warn('Soft-archive notice:', archErr);
+    } catch (backupErr) {
+      console.warn('Pre-upload automatic backup notice:', backupErr);
     }
-  }
 
-  // 6. Audit Log
-  try {
-    await logAudit(
-      'UPDATE',
-      'products_pricelist_v2',
-      'master_pricelist',
-      `Permanently saved and updated Price List (${newProducts.length} products) from ${sourceLabel}`,
-      profile
-    );
-  } catch (auditErr) {
-    console.warn('Audit log write notice:', auditErr);
-  }
+    if (!isQuotaBlocked()) {
+      try {
+        const BATCH_SIZE = 400;
+        for (let i = 0; i < cleanProducts.length; i += BATCH_SIZE) {
+          const chunk = cleanProducts.slice(i, i + BATCH_SIZE);
+          const batch = writeBatch(db);
+          chunk.forEach(item => {
+            const itemRef = doc(db, 'products_pricelist_v2', item.id);
+            batch.set(itemRef, {
+              ...item,
+              isArchived: false,
+              updatedAt: nowIso,
+            }, { merge: true });
+          });
+          await batch.commit();
+        }
+      } catch (upsertErr: any) {
+        const msg = String(upsertErr?.message || '').toLowerCase();
+        if (msg.includes('quota') || msg.includes('resource_exhausted')) setQuotaBlocked(15 * 60 * 1000);
+        console.warn('Batch upsert products notice:', upsertErr);
+      }
+    }
+
+    const cleanIds = new Set(cleanProducts.map(p => p.id));
+    const cleanCanonicalKeys = new Set(cleanProducts.map(p => getCanonicalProductKey(p)));
+
+    try {
+      const secExisting = await fetchSecondaryCollection('products_pricelist_v2', { limit: 2000 });
+      const secToArchive = (secExisting.ok ? secExisting.items : []).filter((d: any) => {
+        const dKey = getCanonicalProductKey(d);
+        return !cleanIds.has(d.id) && (!d.isArchived || cleanCanonicalKeys.has(dKey));
+      });
+      if (secToArchive.length > 0) {
+        await pushBatchToSecondary(
+          secToArchive.map((d: any) => ({
+            collection: 'products_pricelist_v2',
+            id: d.id,
+            doc: { ...d, isArchived: true, archivedAt: nowIso, updatedAt: nowIso },
+            deleted: true,
+            merge: true,
+          }))
+        );
+      }
+    } catch {}
+
+    if (!isQuotaBlocked()) {
+      try {
+        const oldSnap = await getDocs(collection(db, 'products_pricelist_v2'));
+        const toArchiveRefs: any[] = [];
+        oldSnap.forEach(d => {
+          const data = d.data();
+          const dKey = getCanonicalProductKey(data);
+          if (!cleanIds.has(d.id) && (!data.isArchived || cleanCanonicalKeys.has(dKey))) {
+            toArchiveRefs.push(d.ref);
+          }
+        });
+        for (let i = 0; i < toArchiveRefs.length; i += 400) {
+          const chunk = toArchiveRefs.slice(i, i + 400);
+          const archiveBatch = writeBatch(db);
+          chunk.forEach(ref => {
+            archiveBatch.update(ref, { isArchived: true, archivedAt: nowIso });
+          });
+          await archiveBatch.commit();
+        }
+      } catch (archErr: any) {
+        if (isQuotaExceededError(archErr)) setQuotaBlocked(15 * 60 * 1000);
+        console.warn('Soft-archive notice:', archErr);
+      }
+    }
+
+    try {
+      await logAudit(
+        'UPDATE',
+        'products_pricelist_v2',
+        'master_pricelist',
+        `Permanently saved and updated Price List (${newProducts.length} products) from ${sourceLabel}`,
+        profile
+      );
+    } catch (auditErr) {
+      console.warn('Audit log write notice:', auditErr);
+    }
+  })();
 
   return { success: true, count: newProducts.length };
 }
@@ -822,27 +840,54 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
   const [isRestoringBackup, setIsRestoringBackup] = useState<boolean>(false);
 
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
+  const [saveToast, setSaveToast] = useState<boolean>(false);
   const isUploadingRef = useRef<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleManualRefresh = async () => {
     setIsRefreshing(true);
     try {
-      if (!isQuotaBlocked()) {
-        const masterSnap = await getDoc(doc(db, 'config', 'master_pricelist'));
-        if (masterSnap.exists() && Array.isArray(masterSnap.data()?.products) && masterSnap.data().products.length > 0) {
-          const validList = deduplicateProducts(masterSnap.data().products.filter((p: any) => !p.isArchived));
-          setProducts(validList);
-          safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(validList));
-          return;
-        }
-      }
+      let fbMaster: any = null;
+      let secMaster: any = null;
 
-      const secCfg = await fetchSecondaryCollection('config', { limit: 50 });
-      const secMaster = secCfg.ok ? secCfg.items.find((it) => it?.id === 'master_pricelist') : null;
-      if (secMaster && Array.isArray(secMaster.products) && secMaster.products.length > 0) {
-        const validList = deduplicateProducts(secMaster.products.filter((p: any) => !p.isArchived));
+      await Promise.all([
+        (async () => {
+          if (isQuotaBlocked()) return;
+          try {
+            const masterSnap = await getDoc(doc(db, 'config', 'master_pricelist'));
+            if (masterSnap.exists() && Array.isArray(masterSnap.data()?.products) && masterSnap.data().products.length > 0) {
+              fbMaster = masterSnap.data();
+            }
+          } catch (fbErr: any) {
+            if (isQuotaExceededError(fbErr)) setQuotaBlocked(15 * 60 * 1000);
+          }
+        })(),
+        (async () => {
+          try {
+            const secCfg = await fetchSecondaryCollection('config', { limit: 50 });
+            if (secCfg.ok) {
+              const found = secCfg.items.find((it) => it?.id === 'master_pricelist');
+              if (found && Array.isArray(found.products) && found.products.length > 0) {
+                secMaster = found;
+              }
+            }
+          } catch {}
+        })(),
+      ]);
+
+      const getTs = (d: any) => Math.max(Number(d?._syncUpdatedAtMs) || 0, toTimestampMs(d?.updatedAt));
+      const bestMaster =
+        fbMaster && secMaster
+          ? getTs(secMaster) >= getTs(fbMaster)
+            ? secMaster
+            : fbMaster
+          : secMaster || fbMaster;
+
+      if (bestMaster) {
+        const validList = deduplicateProducts(bestMaster.products.filter((p: any) => !p.isArchived));
         setProducts(validList);
+        if (bestMaster.validityDate) setValidityDate(bestMaster.validityDate);
+        safeLocalStorageSet('blackworm_master_pricelist', JSON.stringify({ ...bestMaster, products: validList }));
         safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(validList));
         return;
       }
@@ -881,14 +926,8 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         products
       );
       setProducts(cleanList);
-      setDialogConfig({
-        isOpen: true,
-        type: 'success',
-        title: 'प्राईस लिस्ट स्वच्छ झाली (Cleaned)',
-        message: `प्राईस लिस्ट पूर्णपणे तपासली गेली आहे:\n• एकूण युनिक प्रॉडक्ट्स: ${cleanList.length}\n• सर्व डबल/डुप्लिकेट प्रॉडक्ट्स हटवण्यात आले आहेत.\n• सर्व दर (Rates) आणि एमआरपी (MRP) सुरक्षित आहेत.`,
-        confirmText: 'ठीक आहे',
-        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
-      });
+      setSaveToast(true);
+      setTimeout(() => setSaveToast(false), 3000);
     } catch (e: any) {
       console.error('Clean duplicates error:', e);
     } finally {
@@ -913,35 +952,90 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
 
   // 1. Validity Date (Primary + Secondary DB) — Branding uses shared useBranding() singleton!
   useEffect(() => {
+    let appliedMetaTs = 0;
+    const applyMeta = (data: any, authoritativeServer = false) => {
+      if (!data?.validityDate) return;
+      const incomingTs = Math.max(Number(data._syncUpdatedAtMs) || 0, toTimestampMs(data.updatedAt));
+      if (!authoritativeServer && appliedMetaTs > 0 && incomingTs > 0 && appliedMetaTs > incomingTs + 500) return;
+      if (incomingTs > 0) appliedMetaTs = incomingTs;
+      setValidityDate(data.validityDate);
+    };
+
+    const pullMetaFromSecondary = () => {
+      void fetchSecondaryCollection('config', { limit: 50 }).then((res) => {
+        if (!res.ok) return;
+        const found = res.items.find((it) => it?.id === 'pricelist_meta');
+        if (found) applyMeta(found, false);
+      });
+    };
+
     const unsubSecMeta = subscribeSecondaryCollection('config', (events) => {
       events.forEach((evt) => {
-        if (evt.id === 'pricelist_meta' && evt.doc?.validityDate) {
-          setValidityDate(evt.doc.validityDate);
+        if (evt.id === 'pricelist_meta' && evt.doc && !evt.deleted) {
+          applyMeta({ ...evt.doc, ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}) }, false);
         }
       });
     });
 
+    pullMetaFromSecondary();
+
     let unsubMeta: (() => void) | null = null;
-    if (!isQuotaBlocked()) {
-      unsubMeta = onSnapshot(doc(db, 'config', 'pricelist_meta'), (snap) => {
-        if (snap.exists() && snap.data().validityDate) {
-          setValidityDate(snap.data().validityDate);
-        }
-      }, (err) => {
-        console.warn('PriceList meta live sync notice:', err);
-      });
-    }
+    const attachMetaListener = () => {
+      if (unsubMeta || isQuotaBlocked()) return;
+      try {
+        unsubMeta = onSnapshot(doc(db, 'config', 'pricelist_meta'), (snap) => {
+          if (snap.exists() && !snap.metadata?.fromCache && snap.data().validityDate) {
+            applyMeta(snap.data(), true);
+          }
+        }, (err) => {
+          if (unsubMeta) {
+            try { unsubMeta(); } catch {}
+            unsubMeta = null;
+          }
+          const msg = String(err?.message || '').toLowerCase();
+          if (msg.includes('quota') || msg.includes('resource_exhausted')) {
+            setQuotaBlocked(15 * 60 * 1000);
+          }
+          pullMetaFromSecondary();
+          console.warn('PriceList meta live sync notice:', err);
+        });
+      } catch {
+        unsubMeta = null;
+      }
+    };
+
+    const handleMetaRefresh = () => { pullMetaFromSecondary(); attachMetaListener(); };
+    const handleMetaQuotaCleared = () => { attachMetaListener(); };
+    window.addEventListener('blackworm_data_refresh', handleMetaRefresh);
+    window.addEventListener('blackworm_secondary_resync', handleMetaRefresh);
+    window.addEventListener('blackworm_quota_blocked', pullMetaFromSecondary);
+    window.addEventListener('blackworm_quota_cleared', handleMetaQuotaCleared);
+
+    attachMetaListener();
 
     return () => {
       unsubSecMeta();
       if (unsubMeta) unsubMeta();
+      window.removeEventListener('blackworm_data_refresh', handleMetaRefresh);
+      window.removeEventListener('blackworm_secondary_resync', handleMetaRefresh);
+      window.removeEventListener('blackworm_quota_blocked', pullMetaFromSecondary);
+      window.removeEventListener('blackworm_quota_cleared', handleMetaQuotaCleared);
     };
   }, []);
 
   // 2. Real-time Listener with Dual Master-Doc, Secondary DB SSE & Collection Redundancy
   useEffect(() => {
-    const applyMasterData = (data: any) => {
+    let appliedMasterTs = 0;
+    let hasMasterData = false;
+
+    const applyMasterData = (data: any, authoritativeServer = false) => {
       if (data && Array.isArray(data.products) && data.products.length > 0) {
+        const incomingTs = Math.max(Number(data._syncUpdatedAtMs) || 0, toTimestampMs(data.updatedAt));
+        if (!authoritativeServer && appliedMasterTs > 0 && incomingTs > 0 && appliedMasterTs > incomingTs + 500) {
+          return;
+        }
+        if (incomingTs > 0) appliedMasterTs = incomingTs;
+        hasMasterData = true;
         const clean = deduplicateProducts(data.products);
         safeLocalStorageSet('blackworm_master_pricelist', JSON.stringify({ ...data, products: clean }));
         safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(clean));
@@ -953,84 +1047,136 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       }
     };
 
+    const pullMasterFromSecondary = () => {
+      void fetchSecondaryCollection('config', { limit: 50 }).then((res) => {
+        if (!res.ok) return;
+        const found = res.items.find((it) => it?.id === 'master_pricelist');
+        if (found) applyMasterData(found, false);
+      });
+    };
+
     const unsubSecMaster = subscribeSecondaryCollection('config', (events) => {
       events.forEach((evt) => {
         if (evt.id === 'master_pricelist' && evt.doc && !evt.deleted) {
-          applyMasterData(evt.doc);
+          applyMasterData({ ...evt.doc, ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}) }, false);
         }
       });
     });
 
+    // Always pull from Secondary even if Firebase isn't quota-blocked on THIS device yet
+    pullMasterFromSecondary();
+
     let unsubMaster: (() => void) | null = null;
     let unsub: (() => void) | null = null;
 
-    if (isQuotaBlocked()) {
-      void fetchSecondaryCollection('config', { limit: 50 }).then((res) => {
-        const found = res.items.find((it) => it?.id === 'master_pricelist');
-        if (found) applyMasterData(found);
-      });
-    } else {
-      unsubMaster = onSnapshot(doc(db, 'config', 'master_pricelist'), (docSnap) => {
-        if (docSnap.exists()) {
-          applyMasterData(docSnap.data());
-        }
-      }, (err) => {
-        const msg = String(err?.message || '').toLowerCase();
-        if (msg.includes('quota') || msg.includes('resource_exhausted')) setQuotaBlocked(15 * 60 * 1000);
-        console.warn('Master price list sync notice:', err);
-      });
-
-      const q = query(collection(db, 'products_pricelist_v2'));
-      unsub = onSnapshot(q, async (snap) => {
-        const list: DynamicPriceProduct[] = [];
-        snap.forEach((docSnap) => {
-          const data = docSnap.data() as DynamicPriceProduct;
-          if (!data.isArchived) {
-            list.push({ ...data, id: docSnap.id });
-          }
-        });
-
-        if (list.length > 0) {
-          const cleanList = deduplicateProducts(list);
-          cleanList.sort((a, b) => {
-            if (a.groupName !== b.groupName) {
-              if (a.groupName.includes('Group A')) return -1;
-              if (b.groupName.includes('Group A')) return 1;
-              if (a.groupName.includes('Specialty')) return -1;
-              if (b.groupName.includes('Specialty')) return 1;
-              return a.groupName.localeCompare(b.groupName);
+    const attachMasterListeners = () => {
+      if (isQuotaBlocked()) return;
+      if (!unsubMaster) {
+        try {
+          unsubMaster = onSnapshot(doc(db, 'config', 'master_pricelist'), (docSnap) => {
+            if (docSnap.exists() && !docSnap.metadata?.fromCache) {
+              applyMasterData(docSnap.data(), true);
             }
-            return (a.orderIndex || 0) - (b.orderIndex || 0);
+          }, (err) => {
+            if (unsubMaster) {
+              try { unsubMaster(); } catch {}
+              unsubMaster = null;
+            }
+            const msg = String(err?.message || '').toLowerCase();
+            if (msg.includes('quota') || msg.includes('resource_exhausted')) setQuotaBlocked(15 * 60 * 1000);
+            pullMasterFromSecondary();
+            console.warn('Master price list sync notice:', err);
           });
-          setProducts(cleanList);
-          safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(cleanList));
-        } else {
-          const cached = getInitialCachedProducts();
-          if (cached.length > 0) {
-            setProducts(cached);
-          } else {
-            await seedReferenceDataSafe();
-          }
+        } catch {
+          unsubMaster = null;
         }
-      }, (err) => {
-        console.warn('PriceList products live sync notice:', err);
-        const cached = getInitialCachedProducts();
-        if (cached.length > 0) {
-          setProducts(cached);
-        } else {
-          const fallback: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
-            ...item,
-            id: `ref_${idx + 1}`,
-          }));
-          setProducts(fallback);
+      }
+
+      if (!unsub) {
+        try {
+          const q = query(collection(db, 'products_pricelist_v2'));
+          unsub = onSnapshot(q, async (snap) => {
+            // Never let legacy products_pricelist_v2 overwrite master_pricelist once master_pricelist is active
+            if (hasMasterData) return;
+
+            const list: DynamicPriceProduct[] = [];
+            let maxSnapTs = 0;
+            snap.forEach((docSnap) => {
+              const data = docSnap.data() as DynamicPriceProduct;
+              const ts = Math.max(Number((data as any)._syncUpdatedAtMs) || 0, toTimestampMs((data as any).updatedAt));
+              if (ts > maxSnapTs) maxSnapTs = ts;
+              if (!data.isArchived) {
+                list.push({ ...data, id: docSnap.id });
+              }
+            });
+
+            if (list.length > 0) {
+              if (snap.metadata?.fromCache || (appliedMasterTs > 0 && (maxSnapTs === 0 || appliedMasterTs > maxSnapTs + 5000))) {
+                return;
+              }
+              const cleanList = deduplicateProducts(list);
+              cleanList.sort((a, b) => {
+                if (a.groupName !== b.groupName) {
+                  if (a.groupName.includes('Group A')) return -1;
+                  if (b.groupName.includes('Group A')) return 1;
+                  if (a.groupName.includes('Specialty')) return -1;
+                  if (b.groupName.includes('Specialty')) return 1;
+                  return a.groupName.localeCompare(b.groupName);
+                }
+                return (a.orderIndex || 0) - (b.orderIndex || 0);
+              });
+              setProducts(cleanList);
+              safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(cleanList));
+            } else if (!snap.metadata?.fromCache) {
+              const cached = getInitialCachedProducts();
+              if (cached.length > 0) {
+                setProducts(cached);
+              } else {
+                await seedReferenceDataSafe();
+              }
+            }
+          }, (err) => {
+            if (unsub) {
+              try { unsub(); } catch {}
+              unsub = null;
+            }
+            if (isQuotaExceededError(err)) setQuotaBlocked(15 * 60 * 1000);
+            pullMasterFromSecondary();
+            console.warn('PriceList products live sync notice:', err);
+            const cached = getInitialCachedProducts();
+            if (cached.length > 0) {
+              setProducts(cached);
+            } else {
+              const fallback: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
+                ...item,
+                id: `ref_${idx + 1}`,
+              }));
+              setProducts(fallback);
+            }
+          });
+        } catch {
+          unsub = null;
         }
-      });
-    }
+      }
+    };
+
+    const handleMasterRefresh = () => { pullMasterFromSecondary(); attachMasterListeners(); };
+    const handleMasterQuotaCleared = () => { attachMasterListeners(); };
+    window.addEventListener('blackworm_data_refresh', handleMasterRefresh);
+    window.addEventListener('blackworm_secondary_resync', handleMasterRefresh);
+    window.addEventListener('blackworm_quota_blocked', pullMasterFromSecondary);
+    window.addEventListener('blackworm_quota_cleared', handleMasterQuotaCleared);
+
+    attachMasterListeners();
 
     return () => {
       unsubSecMaster();
       if (unsubMaster) unsubMaster();
       if (unsub) unsub();
+      window.removeEventListener('blackworm_data_refresh', handleMasterRefresh);
+      window.removeEventListener('blackworm_secondary_resync', handleMasterRefresh);
+      window.removeEventListener('blackworm_quota_blocked', pullMasterFromSecondary);
+      window.removeEventListener('blackworm_quota_cleared', handleMasterQuotaCleared);
     };
   }, []);
 
@@ -1074,7 +1220,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       if (!isQuotaBlocked()) {
         try {
           for (const item of initialProducts) {
-            await setDoc(doc(db, 'products_pricelist_v2', item.id), item, { merge: true });
+            await safeFirestoreSet('products_pricelist_v2', item.id, item, { merge: true });
           }
         } catch (seedErr: any) {
           if (isQuotaExceededError(seedErr)) setQuotaBlocked(15 * 60 * 1000);
@@ -1154,14 +1300,8 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
           );
           setProducts(b.previousProducts);
           setShowBackupModal(false);
-          setDialogConfig({
-            isOpen: true,
-            type: 'success',
-            title: 'रिस्टोर यशस्वी',
-            message: `मागील बॅकअपमधून एकूण ${b.previousProducts.length} प्रॉडक्ट्स यशस्वीरित्या रिस्टोर झाले आहेत.`,
-            confirmText: 'ठीक आहे',
-            onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
-          });
+          setSaveToast(true);
+          setTimeout(() => setSaveToast(false), 3000);
         } catch (err: any) {
           setDialogConfig({
             isOpen: true,
@@ -1356,14 +1496,8 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         setValidityDate(newValidity);
       }
 
-      setDialogConfig({
-        isOpen: true,
-        type: 'success',
-        title: 'प्राईस लिस्ट यशस्वीरित्या अपडेट झाली',
-        message: `अपलोड केलेल्या फाईलनुसार प्राईस लिस्ट अपडेट झाली आहे:\n• नवीन ऍड झालेले प्रॉडक्ट्स: ${newAddedCount}\n• दर/पॅकिंग अपडेट झालेले प्रॉडक्ट्स: ${priceUpdatedCount}\n• एकूण उपलब्ध प्रॉडक्ट्स: ${merged.length}\n\nसर्व बदल डेटाबेसमध्ये कायमस्वरूपी सेव्ह करण्यात आले आहेत.`,
-        confirmText: 'ठीक आहे',
-        onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
-      });
+      setSaveToast(true);
+      setTimeout(() => setSaveToast(false), 3000);
     } catch (err: any) {
       console.error('File parse error:', err);
       const rawMsg = String(err?.message || '');
@@ -1442,6 +1576,17 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
 
   return (
     <div className="font-sans text-slate-900 space-y-4 relative">
+      {saveToast && (
+        <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl flex items-center justify-between no-print animate-in fade-in">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span className="font-bold">Saved</span>
+          </div>
+          <button type="button" onClick={() => setSaveToast(false)} className="text-emerald-700">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
       {/* ========================================================================= */}
       {/* STYLISH LOADING OVERLAY WITH USER-FRIENDLY STATUS & EXPONENTIAL RETRY     */}
       {/* ========================================================================= */}

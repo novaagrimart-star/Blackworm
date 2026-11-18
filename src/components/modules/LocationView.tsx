@@ -16,7 +16,7 @@ import {
   Save,
   Hash,
 } from 'lucide-react';
-import { UserProfile, isAdmin } from '../../lib/auth';
+import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { Language } from '../../lib/i18n';
 import { toTitleCase } from '../../lib/utils';
 import { safeFirestoreSet, safeFirestoreDelete, logAudit } from '../../lib/dataService';
@@ -84,12 +84,16 @@ interface VillageRow {
 const PAGE_STEP = 60;
 
 export const LocationView: React.FC<Props> = ({ profile, onOpenDealer }) => {
-  const { dealers } = useSharedDealers();
+  const { dealers: rawDealers } = useSharedDealers();
   const { locationVillages, setLocationVillagesOptimistic } = useSharedLocationVillages();
   const { locationTalukas, setLocationTalukasOptimistic } = useSharedLocationTalukas();
   const { usersMap } = useSharedUsers();
 
   const userIsAdmin = isAdmin(profile);
+  const dealers = useMemo(
+    () => (userIsAdmin ? rawDealers : rawDealers.filter((d) => isUserRecord(d, profile))),
+    [rawDealers, userIsAdmin, profile]
+  );
 
   const [selectedState, setSelectedState] = useState<string>(DEFAULT_STATE); // 'Maharashtra' | 'Karnataka' | 'all'
   const [selectedDistrict, setSelectedDistrict] = useState<string>('all');
@@ -844,20 +848,20 @@ export const LocationView: React.FC<Props> = ({ profile, onOpenDealer }) => {
 
       setLocationTalukasOptimistic((prev) => [...prev.filter((t) => t.id !== record.id), record]);
       await safeFirestoreSet('location_talukas', record.id, record, { merge: true });
-      await logAudit(
+      void logAudit(
         'CREATE',
         'location_talukas',
         record.id,
         `Admin added Taluka ${record.taluka} [${record.talukaCode}] in ${record.district}, ${record.state}`,
         profile
-      );
+      ).catch(() => {});
 
       setSelectedState(stMeta.name);
       setSelectedDistrict(cleanDist);
       setSelectedTaluka(record.taluka);
       setShowAddTalukaModal(false);
-      setStatusBanner(`नवीन तालुका "${record.taluka}" (${cleanDist}) यशस्वीरित्या Add केला!`);
-      setTimeout(() => setStatusBanner(null), 4000);
+      setStatusBanner('Saved');
+      setTimeout(() => setStatusBanner(null), 3000);
     } catch {
       setDialogConfig({
         isOpen: true,
@@ -975,20 +979,20 @@ export const LocationView: React.FC<Props> = ({ profile, onOpenDealer }) => {
 
       setLocationVillagesOptimistic((prev) => [...prev.filter((v) => v.id !== record.id), record]);
       await safeFirestoreSet('location_villages', record.id, record, { merge: true });
-      await logAudit(
+      void logAudit(
         existing ? 'UPDATE' : 'CREATE',
         'location_villages',
         record.id,
         `Admin ${existing ? 'updated' : 'added'} Village ${record.village} [${record.villageCode}] (${record.taluka}, ${record.district}, ${record.state})`,
         profile
-      );
+      ).catch(() => {});
 
       setSelectedState(stMeta.name);
       setSelectedDistrict(cleanDist);
       setSelectedTaluka(cleanTal);
       setShowAddVillageModal(false);
-      setStatusBanner(`नवीन गाव "${record.village}" (${cleanTal}, ${cleanDist}) यशस्वीरित्या Add केले!`);
-      setTimeout(() => setStatusBanner(null), 4000);
+      setStatusBanner('Saved');
+      setTimeout(() => setStatusBanner(null), 3000);
     } catch {
       setDialogConfig({
         isOpen: true,
@@ -1041,9 +1045,10 @@ export const LocationView: React.FC<Props> = ({ profile, onOpenDealer }) => {
 
   const getOfficerLabel = (d: any) => {
     const uid = d.created_by_user_id || d.createdByUid || d.userId || d.ownerId;
+    const loginKey = String(d.loginId || '').trim().toLowerCase();
     const raw =
       (uid && usersMap[uid]) ||
-      (d.loginId && usersMap[d.loginId.toLowerCase()]) ||
+      (loginKey && usersMap[loginKey]) ||
       d.officerName ||
       d.created_by_name ||
       '';

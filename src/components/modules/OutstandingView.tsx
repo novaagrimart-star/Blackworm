@@ -80,7 +80,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     setOutstandingOptimistic,
   } = useSharedOutstandingRecords();
   const dealers = sharedDealers as DealershipFormItem[];
-  const [loadingDealers, setLoadingDealers] = useState(!dealersLoaded || !outstandingLoaded);
+  const [loadingDealers, setLoadingDealers] = useState(!outstandingLoaded && sharedOutstandingRecords.length === 0);
 
   // Multi-PDF Parsing & File state (Persisted in Firestore, Secondary DB & LocalStorage)
   const [isParsing, setIsParsing] = useState(false);
@@ -203,11 +203,19 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
   };
 
   useEffect(() => {
+    if (rawRecords.length > 0) {
+      setLoadingDealers(false);
+      return;
+    }
     if (outstandingLoaded) {
       setLoadingDealers(false);
-      if (rawRecords.length === 0) {
-        void seedDefaultOutstandingRecords();
-      }
+      void (async () => {
+        try {
+          const secCheck = await fetchSecondaryCollection('outstanding_records', { limit: 10 });
+          if (secCheck.ok && secCheck.items.length > 0) return;
+        } catch {}
+        await seedDefaultOutstandingRecords();
+      })();
     }
   }, [outstandingLoaded, rawRecords.length]);
 
@@ -242,34 +250,58 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       });
     });
 
+    void pullMetaFromSecondary();
+
     let unsubMeta: (() => void) | null = null;
-    if (isQuotaBlocked()) {
-      void pullMetaFromSecondary();
-    } else {
-      unsubMeta = onSnapshot(doc(db, 'config', 'party_master_meta'), (docSnap) => {
-        trackFirestoreUsage('read', 1);
-        if (docSnap.exists()) {
-          applyMeta(docSnap.data());
-        }
-      }, (err) => {
-        if (isQuotaExceededError(err)) {
-          setQuotaBlocked(15 * 60 * 1000);
-        }
-        console.warn("Party master meta sync notice:", err);
-        void pullMetaFromSecondary();
-      });
-    }
+    const attachMetaListener = () => {
+      if (unsubMeta || isQuotaBlocked()) return;
+      try {
+        unsubMeta = onSnapshot(doc(db, 'config', 'party_master_meta'), (docSnap) => {
+          trackFirestoreUsage('read', 1);
+          if (docSnap.exists() && !docSnap.metadata?.fromCache) {
+            applyMeta(docSnap.data());
+          }
+        }, (err) => {
+          if (unsubMeta) {
+            try { unsubMeta(); } catch {}
+            unsubMeta = null;
+          }
+          if (isQuotaExceededError(err)) {
+            setQuotaBlocked(15 * 60 * 1000);
+          }
+          console.warn("Party master meta sync notice:", err);
+          void pullMetaFromSecondary();
+        });
+      } catch {
+        unsubMeta = null;
+      }
+    };
+
+    const handleResync = () => { void pullMetaFromSecondary(); attachMetaListener(); };
+    const handleQuotaCleared = () => { attachMetaListener(); };
+    window.addEventListener('blackworm_data_refresh', handleResync);
+    window.addEventListener('blackworm_secondary_resync', handleResync);
+    window.addEventListener('blackworm_quota_blocked', pullMetaFromSecondary);
+    window.addEventListener('blackworm_quota_cleared', handleQuotaCleared);
+
+    attachMetaListener();
 
     return () => {
       unsubSecMeta();
       if (unsubMeta) unsubMeta();
+      window.removeEventListener('blackworm_data_refresh', handleResync);
+      window.removeEventListener('blackworm_secondary_resync', handleResync);
+      window.removeEventListener('blackworm_quota_blocked', pullMetaFromSecondary);
+      window.removeEventListener('blackworm_quota_cleared', handleQuotaCleared);
     };
   }, []);
 
-  // All registered dealers (including Amir Nanavare's) provide contact enrichment across authorized logins;
-  // Admin can filter by specific officer.
+  // Non-admin users strictly see ONLY their own registered dealers; Admin sees all or filters by officer.
   const accessibleDealers = useMemo(() => {
-    if (isUserAdmin && selectedOfficer !== 'all') {
+    if (!isUserAdmin) {
+      return dealers.filter((d) => isUserRecord(d, profile));
+    }
+    if (selectedOfficer !== 'all') {
       return dealers.filter(d => {
         const officer = (d.officerName || d.created_by_name || '').toLowerCase();
         return officer.includes(selectedOfficer.toLowerCase()) ||
@@ -277,7 +309,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       });
     }
     return dealers;
-  }, [dealers, isUserAdmin, selectedOfficer]);
+  }, [dealers, isUserAdmin, selectedOfficer, profile]);
 
   // List of distinct officers for Admin dropdown
   const distinctOfficers = useMemo(() => {
@@ -325,7 +357,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
             updatedAt: new Date().toISOString()
           }, { merge: true });
 
-          showToast(nextLockState ? 'Party Master यशस्वीरित्या लॉक केला!' : 'Party Master अनलॉक केला.');
+          showToast('Saved');
         } catch (err: any) {
           console.error('Lock error:', err);
           showToast('लॉक स्थिती बदलताना त्रुटी आली.', 'info');
@@ -428,23 +460,25 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           }))
         );
         if (!isQuotaBlocked()) {
-          try {
-            for (let i = 0; i < currentRecords.length; i += 400) {
-              const chunk = currentRecords.slice(i, i + 400);
-              const batch = writeBatch(db);
-              chunk.forEach((rec) => {
-                const docRef = doc(db, 'outstanding_records', rec.id);
-                batch.set(docRef, {
-                  ...rec,
-                  updatedAt: nowIso,
-                  updatedBy: profile.fullName || 'User'
-                }, { merge: true });
-              });
-              await batch.commit();
+          void (async () => {
+            try {
+              for (let i = 0; i < currentRecords.length; i += 400) {
+                const chunk = currentRecords.slice(i, i + 400);
+                const batch = writeBatch(db);
+                chunk.forEach((rec) => {
+                  const docRef = doc(db, 'outstanding_records', rec.id);
+                  batch.set(docRef, {
+                    ...rec,
+                    updatedAt: nowIso,
+                    updatedBy: profile.fullName || 'User'
+                  }, { merge: true });
+                });
+                await batch.commit();
+              }
+            } catch (dbErr) {
+              console.warn('Failed to persist to Primary Firestore:', dbErr);
             }
-          } catch (dbErr) {
-            console.warn('Failed to persist to Primary Firestore:', dbErr);
-          }
+          })();
         }
 
         safeLocalStorageSet('blackworm_saved_outstanding_records', JSON.stringify(currentRecords));
@@ -467,9 +501,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           setSummaryModalTab('updated');
         }
 
-        showToast(
-          `Party Master अपडेट झाला! ${totalNewAdded} नवीन जोडल्या, ${totalUpdated} अपडेट, ${totalDuplicatesMerged} डुप्लिकेट्स रोखले.`
-        );
+        showToast('Saved');
       }
     } catch (err: any) {
       console.error('PDF parsing error:', err);
@@ -512,8 +544,12 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     });
   };
 
-  // Remove a specific PDF file and its records
+  // Remove a specific PDF file and its records (Admin-only)
   const handleRemoveFile = (fileNameToRemove: string) => {
+    if (!isUserAdmin || isPartyMasterLocked) {
+      showToast('फक्त ॲडमिनला PDF फाईल काढण्याची परवानगी आहे.', 'info');
+      return;
+    }
     setUploadedFiles(prev => prev.filter(f => f.name !== fileNameToRemove));
 
     const toDeleteIds: string[] = [];
@@ -651,7 +687,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           status: 'matched',
           whatsappSentAt: sentMap[rec.id],
         });
-      } else {
+      } else if (isUserAdmin || isUserRecord(rec, profile)) {
         matchedList.push({
           ...rec,
           contactNumber: overridePhone || rec.contactNumber || '',
@@ -693,7 +729,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     });
 
     return Array.from(deduplicatedMap.values());
-  }, [rawRecords, accessibleDealers, phoneOverrides, sentMap]);
+  }, [rawRecords, accessibleDealers, phoneOverrides, sentMap, isUserAdmin, profile]);
 
   // Filter according to search and officer permissions
   const filteredRecords = useMemo(() => {
@@ -893,17 +929,19 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
             </button>
           )}
 
-          <label
-            htmlFor="outstanding-pdf-upload"
-            className={cn(
-              "flex items-center gap-1.5 bg-red-600 hover:bg-red-700 active:scale-95 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-2xs transition cursor-pointer whitespace-nowrap",
-              (isPartyMasterLocked || !isUserAdmin) && "opacity-60"
-            )}
-            title="All Party Report PDF अपलोड करा"
-          >
-            <FileUp className="w-3.5 h-3.5" />
-            <span>{isParsing ? 'अपडेट करत आहे...' : '+ All Party PDF अपलोड करा'}</span>
-          </label>
+          {isUserAdmin && (
+            <label
+              htmlFor="outstanding-pdf-upload"
+              className={cn(
+                "flex items-center gap-1.5 bg-red-600 hover:bg-red-700 active:scale-95 text-white font-bold text-xs px-3 py-1.5 rounded-lg shadow-2xs transition cursor-pointer whitespace-nowrap",
+                isPartyMasterLocked && "opacity-60"
+              )}
+              title="All Party Report PDF अपलोड करा"
+            >
+              <FileUp className="w-3.5 h-3.5" />
+              <span>{isParsing ? 'अपडेट करत आहे...' : '+ All Party PDF अपलोड करा'}</span>
+            </label>
+          )}
 
           {rawRecords.length > 0 && (
             <>
@@ -953,8 +991,8 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
         </div>
       )}
 
-      {/* Multi-PDF Files Management & Strict Deduplication Strip */}
-      {uploadedFiles.length > 0 && (
+      {/* Multi-PDF Files Management & Strict Deduplication Strip (Admin Only) */}
+      {isUserAdmin && uploadedFiles.length > 0 && (
         <div className="bg-white p-3 rounded-2xl border border-slate-200 shadow-2xs space-y-2.5 no-print">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 flex-wrap">
@@ -1028,28 +1066,35 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
 
       {/* Empty State / Upload Callout if No PDF is Loaded */}
       {rawRecords.length === 0 && !isParsing && (
-        <div 
-          onClick={() => fileInputRef.current?.click()}
-          className="border-2 border-dashed border-red-300 hover:border-red-500 bg-red-50/30 hover:bg-red-50/50 transition p-8 sm:p-10 rounded-2xl text-center cursor-pointer space-y-3 no-print"
-        >
-          <div className="w-16 h-16 bg-white rounded-2xl shadow-sm border border-red-200 flex items-center justify-center mx-auto text-red-600">
-            <FileUp className="w-8 h-8" />
+        isUserAdmin ? (
+          <div 
+            onClick={() => fileInputRef.current?.click()}
+            className="border-2 border-dashed border-red-300 hover:border-red-500 bg-red-50/30 hover:bg-red-50/50 transition p-8 sm:p-10 rounded-2xl text-center cursor-pointer space-y-3 no-print"
+          >
+            <div className="w-16 h-16 bg-white rounded-2xl shadow-sm border border-red-200 flex items-center justify-center mx-auto text-red-600">
+              <FileUp className="w-8 h-8" />
+            </div>
+            <div>
+              <h3 className="text-sm sm:text-base font-black text-slate-900">
+                All Party Report / Outstanding PDF अपलोड करा
+              </h3>
+              <p className="text-xs text-slate-500 max-w-lg mx-auto mt-1 leading-relaxed">
+                PDF मधील <strong>Party Name</strong>, <strong>Contact Number</strong> व <strong>Receivable Balance</strong> अचूकपणे Party Master मध्ये नोंदवले जातील. आधीच्या पार्टींचे बॅलन्स अपडेट होईल व कोणताही डेटा डबल (Duplicate) होणार नाही!
+              </p>
+            </div>
+            <div className="pt-2 flex items-center justify-center gap-2 flex-wrap">
+              <span className="inline-flex items-center gap-1.5 px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-bold text-xs rounded-xl shadow-xs transition">
+                <FileUp className="w-4 h-4" />
+                + All Party PDF अपलोड करा
+              </span>
+            </div>
           </div>
-          <div>
-            <h3 className="text-sm sm:text-base font-black text-slate-900">
-              All Party Report / Outstanding PDF अपलोड करा
-            </h3>
-            <p className="text-xs text-slate-500 max-w-lg mx-auto mt-1 leading-relaxed">
-              PDF मधील <strong>Party Name</strong>, <strong>Contact Number</strong> व <strong>Receivable Balance</strong> अचूकपणे Party Master मध्ये नोंदवले जातील. आधीच्या पार्टींचे बॅलन्स अपडेट होईल व कोणताही डेटा डबल (Duplicate) होणार नाही!
-            </p>
+        ) : (
+          <div className="border border-slate-200 bg-white p-8 rounded-2xl text-center space-y-2 no-print">
+            <FileText className="w-8 h-8 text-slate-400 mx-auto" />
+            <p className="text-sm font-bold text-slate-700">सध्या थकीत येणेबाकी डेटा उपलब्ध नाही.</p>
           </div>
-          <div className="pt-2 flex items-center justify-center gap-2 flex-wrap">
-            <span className="inline-flex items-center gap-1.5 px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-bold text-xs rounded-xl shadow-xs transition">
-              <FileUp className="w-4 h-4" />
-              + All Party PDF अपलोड करा
-            </span>
-          </div>
-        </div>
+        )
       )}
 
       {/* Parsing Spinner */}
@@ -1201,14 +1246,16 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
                                     </span>
                                   )}
                                 </div>
-                                <button
-                                  type="button"
-                                  onClick={() => handleDeleteRecord(item.id, item.cleanedFirmName)}
-                                  className="no-print opacity-0 group-hover:opacity-100 p-1 text-slate-300 hover:text-rose-600 transition cursor-pointer"
-                                  title="ही नोंद काढून टाका"
-                                >
-                                  <Trash2 className="w-3 h-3" />
-                                </button>
+                                  {isUserAdmin && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteRecord(item.id, item.cleanedFirmName)}
+                                      className="no-print opacity-0 group-hover:opacity-100 p-1 text-slate-300 hover:text-rose-600 transition cursor-pointer"
+                                      title="ही नोंद काढून टाका"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  )}
                               </div>
                             </div>
                           </td>

@@ -50,19 +50,38 @@ export function isAdmin(user?: Partial<UserProfile> | null): boolean {
   return false;
 }
 
-/**
- * Checks whether the logged-in user is strictly EMP 002 (e.g. "EMP 002", "EMP-002", "EMP002", "EMP-02").
- * Only this login ID may view the on-demand employee location option.
- */
-export function isLocationViewerUser(user?: Partial<UserProfile> | null): boolean {
+export function isGodownIncharge(user?: Partial<UserProfile> | null): boolean {
   if (!user) return false;
-  const candidates = [user.loginId, user.userCode, user.uid]
-    .filter(Boolean)
-    .map((v) => String(v).trim().toUpperCase());
-  return candidates.some((val) => {
-    const compact = val.replace(/[^A-Z0-9]/g, '');
-    return compact === 'EMP002' || compact === 'EMP02';
-  });
+  const role = (user.role || '').toLowerCase().trim();
+  const designation = (user.designation || '').toLowerCase().trim();
+  return (
+    role === 'godown_incharge' ||
+    designation.includes('godown') ||
+    designation.includes('store incharge') ||
+    designation.includes('store in-charge')
+  );
+}
+
+export function isOfficeOrFactoryStaff(user?: Partial<UserProfile> | null): boolean {
+  if (!user) return false;
+  const role = (user.role || '').toLowerCase().trim();
+  const designation = (user.designation || '').toLowerCase().trim();
+  return (
+    role === 'office_staff' ||
+    role === 'factory_staff' ||
+    designation.includes('office staff') ||
+    designation.includes('factory staff')
+  );
+}
+
+/**
+ * True for non-admin Godown Incharge / Office Staff / Factory Staff logins
+ * who should receive Admin-approved orders strictly in the dispatch image-slip format
+ * (Product Name, Packing, Quantity in Box/Nos only — no rates/money).
+ */
+export function isGodownOrOfficeStaff(user?: Partial<UserProfile> | null): boolean {
+  if (!user || isAdmin(user)) return false;
+  return isGodownIncharge(user) || isOfficeOrFactoryStaff(user);
 }
 
 /**
@@ -75,6 +94,11 @@ export function canAccessModule(user: Partial<UserProfile> | null | undefined, m
   if (isAdmin(user)) return true;
   // User data should be visible to every user as requested
   if (moduleId === 'user') return true;
+  // Godown Incharge / Office Staff Attendance icon: ONLY Admin & Godown Incharge (or explicitly granted)
+  if (moduleId === 'office_staff') {
+    if (isGodownIncharge(user)) return true;
+    return Boolean(Array.isArray(user.allowedModules) && user.allowedModules.includes('office_staff'));
+  }
   if (!user.allowedModules || !Array.isArray(user.allowedModules)) return false;
   if (moduleId === 'location') {
     return user.allowedModules.includes('location') || user.allowedModules.includes('dealer');
@@ -95,31 +119,29 @@ export function isUserRecord(record: any, user?: Partial<UserProfile> | null): b
   const userUid = (user.uid || '').trim().toLowerCase();
   const userLoginId = (user.loginId || '').trim().toLowerCase();
   const userCode = (user.userCode || '').trim().toLowerCase();
-  const userName = (user.fullName || '').trim().toLowerCase();
+  const userName = (user.fullName || '').replace(/\s+/g, ' ').trim().toLowerCase();
   const userMobile = (user.mobileNumber || '').replace(/\D/g, '').slice(-10);
 
-  // 1. UID Check (Strongest match)
+  // 1. UID Check (Exact match)
   const recUid = (record.userId || record.ownerId || record.created_by_user_id || record.createdByUid || record.collectedByUid || record.uid || '').toString().trim().toLowerCase();
-  if (userUid && recUid && (recUid === userUid || recUid.includes(userUid) || userUid.includes(recUid))) return true;
+  if (userUid && recUid && recUid === userUid) return true;
 
-  // 2. Login ID Check
+  // 2. Login ID Check (Exact match, ignoring generic 'admin')
   const recLoginId = (record.loginId || '').toString().trim().toLowerCase();
-  if (userLoginId && recLoginId && (recLoginId === userLoginId || recLoginId.includes(userLoginId))) return true;
+  if (userLoginId && recLoginId && recLoginId !== 'admin' && recLoginId === userLoginId) return true;
 
-  // 3. User Code Check
+  // 3. User Code Check (Exact / normalized code match)
   const recCode = (record.userCode || record.createdByUserCode || '').toString().trim().toLowerCase();
   if (userCode && recCode && (recCode === userCode || recCode.replace(/^emp-/, '') === userCode.replace(/^emp-/, ''))) return true;
 
-  // 4. Name Match (Title Case / Uppercase agnostic)
-  const recName = (record.createdByName || record.created_by_name || record.officerName || record.collectedByName || record.userName || record.fullName || '').toString().trim().toLowerCase();
-  if (userName && recName && (recName === userName || recName.includes(userName) || userName.includes(recName))) return true;
+  // 4. Name Match (Exact normalized full-name match)
+  const recName = (record.createdByName || record.created_by_name || record.officerName || record.collectedByName || record.userName || record.fullName || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+  if (userName && recName && recName === userName) return true;
 
   // 5. Phone Match
   const recMobile = (record.mobileNumber || record.contactNumber || '').toString().replace(/\D/g, '').slice(-10);
   if (userMobile && recMobile && recMobile.length >= 10 && recMobile === userMobile) return true;
 
-  // 6. Default fallback for records missing specific ownership fields: 
-  // If it's a shared record or legacy data without UID, and user name matches even partially, allow it.
   return false;
 }
 

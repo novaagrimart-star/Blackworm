@@ -1,129 +1,395 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    
-    // Default Deny - Safety First
+
+    // =========================================================================
+    // GLOBAL DEFAULT DENY (Safety First Catch-All)
+    // =========================================================================
     match /{document=**} {
       allow read, write: if false;
     }
 
-    // Helper functions for robust access control
-    function isSignedIn() { return true; } // Placeholder since we use custom auth
-    function isAdmin() { return true; } // Placeholder until real auth is integrated
-
-    // OPEN ACCESS FOR SYNC (Since custom auth doesn't populate request.auth)
-    // We prioritize "Central Database Sync" as requested by the user.
-    // However, we restrict DELETE to prevent accidental data loss.
-
-    match /users/{userId} {
-      allow read, write: if true;
-      allow delete: if false; // Data Permanently Safe
+    // =========================================================================
+    // HARDENED VALIDATION PRIMITIVES
+    // Note: Application uses custom Login ID + Password auth (request.auth is null).
+    // Security enforces strict collection allowlisting, path ID bounds,
+    // payload shape/type/size validation, audit immutability, and delete protection.
+    // =========================================================================
+    function incoming() {
+      return request.resource.data;
     }
 
-    match /user_locations/{docId} {
-      allow read, write: if true;
+    function isValidDocId(docId) {
+      return docId is string
+        && docId.size() >= 1
+        && docId.size() <= 180
+        && !docId.matches('.*(/|\\\\|\\.\\.).*');
+    }
+
+    function isOptStr(d, key, maxLen) {
+      return !(key in d) || d[key] == null || (d[key] is string && d[key].size() <= maxLen);
+    }
+
+    function isOptStrOrNum(d, key, maxLen) {
+      return !(key in d) || d[key] == null || (d[key] is string && d[key].size() <= maxLen) || d[key] is int || d[key] is float;
+    }
+
+    function isOptNum(d, key) {
+      return !(key in d) || d[key] == null || d[key] is int || d[key] is float;
+    }
+
+    function isOptBool(d, key) {
+      return !(key in d) || d[key] == null || d[key] is bool;
+    }
+
+    function isOptList(d, key, maxItems) {
+      return !(key in d) || d[key] == null || (d[key] is list && d[key].size() <= maxItems);
+    }
+
+    function isOptTimestampLike(d, key) {
+      return !(key in d)
+        || d[key] == null
+        || (d[key] is string && d[key].size() <= 64)
+        || d[key] is timestamp
+        || d[key] is int
+        || d[key] is float
+        || d[key] is map;
+    }
+
+    function isValidBaseWrite(d) {
+      return d is map
+        && d.keys().size() <= 140
+        && isOptBool(d, 'isArchived')
+        && isOptStr(d, 'id', 180)
+        && isOptTimestampLike(d, 'createdAt')
+        && isOptTimestampLike(d, 'updatedAt')
+        && isOptTimestampLike(d, 'archivedAt');
+    }
+
+    function isValidUser(d) {
+      return isValidBaseWrite(d)
+        && isOptStr(d, 'uid', 180)
+        && isOptStr(d, 'fullName', 200)
+        && isOptStr(d, 'loginId', 120)
+        && isOptStr(d, 'password', 200)
+        && isOptStr(d, 'role', 60)
+        && isOptStrOrNum(d, 'mobileNumber', 40)
+        && isOptStr(d, 'emailId', 200)
+        && isOptStr(d, 'designation', 120)
+        && isOptStr(d, 'center', 120)
+        && isOptStrOrNum(d, 'userCode', 80)
+        && isOptList(d, 'allowedModules', 40)
+        && (!( 'status' in d ) || d.status == null || d.status in ['Active', 'Inactive']);
+    }
+
+    function isValidDealer(d) {
+      return isValidBaseWrite(d)
+        && isOptStr(d, 'firmName', 250)
+        && isOptStr(d, 'proprietorName', 200)
+        && isOptStrOrNum(d, 'dealerCode', 80)
+        && isOptStr(d, 'village', 150)
+        && isOptStr(d, 'taluka', 150)
+        && isOptStr(d, 'district', 150)
+        && isOptStr(d, 'state', 150)
+        && isOptStrOrNum(d, 'contactNumber', 40)
+        && isOptStr(d, 'officerName', 200)
+        && isOptStr(d, 'userId', 180)
+        && isOptStr(d, 'ownerId', 180)
+        && isOptStr(d, 'status', 60);
+    }
+
+    function isValidOrder(d) {
+      return isValidBaseWrite(d)
+        && isOptStrOrNum(d, 'orderNumber', 100)
+        && isOptStr(d, 'dealerId', 180)
+        && isOptStr(d, 'dealerName', 250)
+        && isOptStr(d, 'userId', 180)
+        && isOptStr(d, 'ownerId', 180)
+        && isOptStr(d, 'status', 60)
+        && isOptNum(d, 'totalAmount')
+        && isOptNum(d, 'paidAmount')
+        && isOptNum(d, 'balanceAmount')
+        && isOptList(d, 'items', 500);
+    }
+
+    function isValidCollectionEntry(d) {
+      return isValidBaseWrite(d)
+        && isOptNum(d, 'amount')
+        && isOptTimestampLike(d, 'date')
+        && isOptStr(d, 'paymentMode', 60)
+        && isOptStr(d, 'dealerId', 180)
+        && isOptStr(d, 'orderId', 180)
+        && isOptStr(d, 'collectedByUid', 180);
+    }
+
+    function isValidOutstanding(d) {
+      return isValidBaseWrite(d)
+        && isOptStr(d, 'firmName', 250)
+        && isOptStr(d, 'cleanedFirmName', 250)
+        && isOptNum(d, 'amount')
+        && isOptStr(d, 'formattedAmount', 80)
+        && isOptStrOrNum(d, 'contactNumber', 40)
+        && isOptStr(d, 'village', 150)
+        && isOptStr(d, 'district', 150)
+        && isOptStr(d, 'matchedDealerId', 180)
+        && isOptStr(d, 'sourceFile', 500);
+    }
+
+    function isValidLocationRecord(d) {
+      return isValidBaseWrite(d)
+        && isOptStr(d, 'state', 150)
+        && isOptStrOrNum(d, 'stateCode', 40)
+        && isOptStr(d, 'district', 150)
+        && isOptStrOrNum(d, 'districtCode', 40)
+        && isOptStr(d, 'taluka', 150)
+        && isOptStrOrNum(d, 'talukaCode', 40)
+        && isOptStr(d, 'village', 180)
+        && isOptStrOrNum(d, 'villageCode', 40)
+        && isOptStrOrNum(d, 'pinCode', 20);
+    }
+
+    function isValidOfficeStaffMember(d) {
+      return isValidBaseWrite(d)
+        && isOptStr(d, 'fullName', 200)
+        && isOptStr(d, 'workRole', 120)
+        && isOptStrOrNum(d, 'mobileNumber', 40)
+        && (!( 'category' in d ) || d.category == null || d.category in ['Office Staff', 'Factory Staff'])
+        && (!( 'status' in d ) || d.status == null || d.status in ['Active', 'Inactive']);
+    }
+
+    function isValidOfficeStaffAttendance(d) {
+      return isValidBaseWrite(d)
+        && isOptTimestampLike(d, 'date')
+        && isOptStr(d, 'monthKey', 20)
+        && isOptStr(d, 'staffId', 180)
+        && isOptStr(d, 'staffName', 200)
+        && isOptStr(d, 'note', 500)
+        && (!( 'status' in d ) || d.status == null || d.status in ['present', 'half_day', 'absent', 'leave']);
+    }
+
+    function isValidTarget(d) {
+      return isValidBaseWrite(d)
+        && isOptStr(d, 'userId', 180)
+        && isOptStr(d, 'userName', 200)
+        && isOptStr(d, 'officerName', 200)
+        && isOptStr(d, 'financialYear', 40)
+        && isOptStrOrNum(d, 'month', 40)
+        && isOptStrOrNum(d, 'year', 20)
+        && isOptNum(d, 'targetSales')
+        && isOptNum(d, 'achievedSales')
+        && isOptNum(d, 'targetCollection')
+        && isOptNum(d, 'achievedCollection');
+    }
+
+    function isValidTravel(d) {
+      return isValidBaseWrite(d)
+        && isOptStr(d, 'userId', 180)
+        && isOptStr(d, 'officerName', 200)
+        && isOptStr(d, 'monthYear', 40)
+        && isOptNum(d, 'totalKm')
+        && isOptNum(d, 'totalAmount')
+        && isOptList(d, 'entries', 500)
+        && isOptList(d, 'rows', 500);
+    }
+
+    function isValidProductOrScheme(d) {
+      return isValidBaseWrite(d)
+        && isOptStr(d, 'name', 250)
+        && isOptStr(d, 'title', 250)
+        && isOptStr(d, 'category', 120)
+        && isOptNum(d, 'dealerRate')
+        && isOptNum(d, 'mrp')
+        && isOptNum(d, 'discountPercent');
+    }
+
+    function isValidConfig(d) {
+      return isValidBaseWrite(d)
+        && isOptBool(d, 'isLocked')
+        && isOptNum(d, 'nextSequence')
+        && isOptList(d, 'products', 5000);
+    }
+
+    function isValidApprovalRequest(d) {
+      return isValidBaseWrite(d)
+        && isOptStr(d, 'targetUserId', 180)
+        && isOptStr(d, 'targetUserName', 200)
+        && (!( 'status' in d ) || d.status == null || d.status in ['pending', 'approved', 'rejected', 'approved_direct']);
+    }
+
+    function isValidAuditLog(d) {
+      return isValidBaseWrite(d)
+        && isOptStr(d, 'action', 40)
+        && isOptStr(d, 'collection', 80)
+        && isOptStr(d, 'recordId', 180)
+        && isOptStr(d, 'recordSummary', 1000)
+        && isOptStr(d, 'performedByUid', 180)
+        && isOptStr(d, 'performedByName', 200)
+        && isOptTimestampLike(d, 'timestamp');
+    }
+
+    // =========================================================================
+    // EXPLICIT COLLECTION RULES
+    // =========================================================================
+
+    match /users/{userId} {
+      allow get: if isValidDocId(userId);
+      allow list: if true;
+      allow create, update: if isValidDocId(userId) && isValidUser(incoming());
       allow delete: if false;
     }
 
-    match /location_requests/{docId} {
-      allow read, write: if true;
-      allow delete: if true;
-    }
-
     match /location_villages/{docId} {
-      allow read, write: if true;
-      allow delete: if false; // Use Soft Delete (isArchived)
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidLocationRecord(incoming());
+      allow delete: if false;
     }
 
     match /location_talukas/{docId} {
-      allow read, write: if true;
-      allow delete: if false; // Use Soft Delete (isArchived)
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidLocationRecord(incoming());
+      allow delete: if false;
+    }
+
+    match /office_staff_members/{docId} {
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidOfficeStaffMember(incoming());
+      allow delete: if false;
+    }
+
+    match /office_staff_attendance/{docId} {
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidOfficeStaffAttendance(incoming());
+      allow delete: if false;
     }
 
     match /dealers_application/{docId} {
-      allow read, write: if true;
-      allow delete: if false; // Use Soft Delete (isArchived)
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidDealer(incoming());
+      allow delete: if false;
     }
 
     match /dealers/{docId} {
-      allow read, write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidDealer(incoming());
       allow delete: if false;
     }
 
     match /outstanding_records/{docId} {
-      allow read, write: if true;
-      allow delete: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidOutstanding(incoming());
+      allow delete: if isValidDocId(docId);
     }
 
     match /orders/{docId} {
-      allow read, write: if true;
-      allow delete: if false; // Use Soft Delete (isArchived)
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidOrder(incoming());
+      allow delete: if false;
     }
 
     match /collection_entries/{docId} {
-      allow read, write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidCollectionEntry(incoming());
       allow delete: if false;
     }
 
     match /targets/{docId} {
-      allow read, write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidTarget(incoming());
       allow delete: if false;
     }
 
     match /yearly_targets/{docId} {
-      allow read, write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidTarget(incoming());
       allow delete: if false;
     }
 
     match /travel_sheets/{docId} {
-      allow read, write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidTravel(incoming());
       allow delete: if false;
     }
-    
+
     match /travel_records/{docId} {
-      allow read, write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidTravel(incoming());
       allow delete: if false;
     }
 
     match /products_pricelist_v2/{docId} {
-      allow read: if true;
-      allow write: if true; // Admin managed
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidProductOrScheme(incoming());
+      allow delete: if false;
     }
 
     match /products/{docId} {
-      allow read, write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidProductOrScheme(incoming());
+      allow delete: if false;
     }
 
     match /schemes/{docId} {
-      allow read, write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidProductOrScheme(incoming());
+      allow delete: if false;
     }
 
     match /config/{docId} {
-      allow read: if true;
-      allow write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidConfig(incoming());
+      allow delete: if false;
     }
 
     match /audit_logs/{docId} {
-      allow read: if true;
-      allow create: if true;
-      allow update, delete: if false; // Immutable audit trail
-    }
-
-    match /deleted_records/{docId} {
-      allow read, create: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create: if isValidDocId(docId) && isValidAuditLog(incoming());
       allow update, delete: if false;
     }
 
+    match /deleted_records/{docId} {
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidBaseWrite(incoming());
+      allow delete: if false;
+    }
+
     match /user_approval_requests/{docId} {
-      allow read, write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidApprovalRequest(incoming());
+      allow delete: if false;
     }
 
     match /pricelist_backups/{docId} {
-      allow read, write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidConfig(incoming());
+      allow delete: if false;
     }
-    
+
     match /test/{docId} {
-      allow read, write: if true;
+      allow get: if isValidDocId(docId);
+      allow list: if false;
+      allow create, update: if docId == 'connection' && isValidBaseWrite(incoming());
+      allow delete: if false;
     }
   }
 }

@@ -1,8 +1,8 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Language } from '../../lib/i18n';
-import { UserProfile, isAdmin } from '../../lib/auth';
+import { UserProfile, isAdmin, isGodownIncharge, isOfficeOrFactoryStaff } from '../../lib/auth';
 import { toTitleCase } from '../../lib/utils';
-import { mergeWithLocalData, triggerBlobDownload, startBackgroundSync, safeLocalStorageSet } from '../../lib/dataService';
+import { mergeWithLocalData, triggerBlobDownload, startBackgroundSync, safeLocalStorageSet, getPendingSyncMap, toTimestampMs } from '../../lib/dataService';
 import { useSharedUsers, useSharedTravelSheets, useSharedYearlyTargets, useSharedCollectionEntries } from '../../lib/realtimeStore';
 import html2canvas from 'html2canvas-pro';
 import { 
@@ -104,6 +104,39 @@ export async function preloadReportData(_profile?: any): Promise<void> {
   // Live onSnapshot listeners now handle instantaneous background updates
 }
 
+function isExcludedNameOrLogin(name?: string | null, loginId?: string | null): boolean {
+  const normName = String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const normLogin = String(loginId || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!normName && !normLogin) return false;
+  if (
+    normName.includes('blackwormagritech') ||
+    (normName.includes('blackworm') && normName.includes('pvt')) ||
+    normName === 'blackworm' ||
+    normLogin === 'blackworm' ||
+    normLogin === 'blackwormagritech'
+  ) {
+    return true;
+  }
+  if (
+    normName.includes('godownincharge') ||
+    normName.includes('officestaff') ||
+    normName.includes('factorystaff')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function isEligibleSalesOfficer(u?: Partial<UserProfile> & { status?: string; isArchived?: boolean } | null): boolean {
+  if (!u || u.isArchived) return false;
+  if (String(u.status || '').toLowerCase().trim() === 'inactive') return false;
+  const r = String(u.role || '').toLowerCase().trim();
+  if (r === 'owner' || r === 'admin' || r === 'dealer' || r === 'farmer') return false;
+  if (isAdmin(u) || isGodownIncharge(u) || isOfficeOrFactoryStaff(u)) return false;
+  if (isExcludedNameOrLogin(u.fullName, u.loginId)) return false;
+  return true;
+}
+
 export function buildReportRows(
   allUsers: UserProfile[],
   allTravelSheets: any[],
@@ -117,29 +150,27 @@ export function buildReportRows(
   const userIsAdmin = isAdmin(profile);
 
   // 1. Role-based scoping:
-  // - Regular field officer / employee: ONLY see their own report! (User request: "युजर आहेत त्यांना फक्त त्यांचाच रिपोर्ट दिसावा सर्वांचा दिसणार नाही याची काळजी घे")
-  // - Admin / Owner: See all officers for the selected date! (User request: "ज्या तारखेचा डाटा आहे त्याच तारखेचा डाटा ऍडमिनला सर्व ऑफिसर यांचा दिसावा")
+  // - Regular sales officer: ONLY see their own report.
+  // - Admin / Owner: ONLY active Sales Team officers (excludes Office Staff, Factory Staff, Godown Incharge, Owners, Dealers, and Blackworm Agritech Pvt Ltd).
   let officers: UserProfile[] = [];
 
   if (!userIsAdmin) {
-    officers = [profile];
+    officers = isEligibleSalesOfficer(profile) ? [profile] : [];
   } else {
-    officers = allUsers.filter((u) => {
-      const r = (u.role || '').toLowerCase().trim();
-      return r !== 'owner' && r !== 'dealer';
+    officers = allUsers.filter((u) => isEligibleSalesOfficer(u));
+
+    // Build lookup of known allUsers so travel sheets belonging to excluded roles/companies are NEVER re-injected
+    const knownUsersByKey = new Map<string, UserProfile>();
+    allUsers.forEach((u) => {
+      if (u.uid) knownUsersByKey.set(String(u.uid).toLowerCase(), u);
+      if (u.loginId) knownUsersByKey.set(String(u.loginId).toLowerCase(), u);
+      if (u.fullName) knownUsersByKey.set(String(u.fullName).trim().toLowerCase(), u);
     });
 
-    if (officers.length === 0) {
-      officers = allUsers.filter((u) => (u.role || '').toLowerCase() !== 'owner');
-    }
-    if (officers.length === 0) {
-      officers = [profile];
-    }
-
-    // 2. Also ensure any officer who submitted a travel sheet for this date/month is included
+    // 2. Also ensure any Sales officer who submitted a travel sheet for this date/month is included
     allTravelSheets.forEach((s) => {
       const sId = (s.id || s._id || '') as string;
-      const isThisMonth = 
+      const isThisMonth =
         sId.includes(sheetMonthKey) ||
         (s.yearNumber && Number(s.yearNumber) === year && (Number(s.monthIndex) === monthIndex || String(s.monthName || '').toLowerCase() === targetMonthName.toLowerCase()));
 
@@ -148,10 +179,16 @@ export function buildReportRows(
       const officerUid = s.userId || (sId.startsWith('travel_') ? sId.split('_')[1] : null);
       if (!officerUid) return;
 
-      const alreadyInList = officers.some(o => 
-        o.uid === officerUid || 
-        (o.loginId && o.loginId.toLowerCase() === officerUid.toLowerCase()) ||
-        (o.fullName && s.officerName && o.fullName.trim().toLowerCase() === s.officerName.trim().toLowerCase())
+      if (isExcludedNameOrLogin(s.officerName, officerUid)) return;
+      const matchedKnown =
+        knownUsersByKey.get(String(officerUid).toLowerCase()) ||
+        (s.officerName ? knownUsersByKey.get(String(s.officerName).trim().toLowerCase()) : undefined);
+      if (matchedKnown && !isEligibleSalesOfficer(matchedKnown)) return;
+
+      const alreadyInList = officers.some((o) =>
+        o.uid === officerUid ||
+        (o.loginId && String(o.loginId).toLowerCase() === String(officerUid).toLowerCase()) ||
+        (o.fullName && s.officerName && String(o.fullName).trim().toLowerCase() === String(s.officerName).trim().toLowerCase())
       );
 
       if (!alreadyInList) {
@@ -160,7 +197,7 @@ export function buildReportRows(
           fullName: s.officerName || officerUid,
           role: 'field_officer',
           emailId: null,
-          createdAt: ''
+          createdAt: '',
         });
       }
     });
@@ -169,6 +206,7 @@ export function buildReportRows(
   // Deduplicate officers so no officer is duplicated in the table
   const uniqueOfficersMap = new Map<string, UserProfile>();
   officers.forEach(o => {
+    if (!isEligibleSalesOfficer(o)) return;
     const key = (o.uid || o.loginId || o.fullName || '').toLowerCase().trim();
     if (!uniqueOfficersMap.has(key)) {
       uniqueOfficersMap.set(key, o);
@@ -182,31 +220,21 @@ export function buildReportRows(
     if (t._id) yearlyTargetMap.set(t._id, t);
     if (t.id) yearlyTargetMap.set(t.id, t);
     if (t.userId) yearlyTargetMap.set(t.userId, t);
-    if (t.loginId) yearlyTargetMap.set(t.loginId.toLowerCase(), t);
+    if (t.loginId) yearlyTargetMap.set(String(t.loginId).toLowerCase(), t);
   });
 
   const targetFallbackMap = new Map<string, any>();
   allTargets.forEach((t) => {
     if (t.userId) targetFallbackMap.set(t.userId, t);
-    if (t.loginId) targetFallbackMap.set(t.loginId.toLowerCase(), t);
+    if (t.loginId) targetFallbackMap.set(String(t.loginId).toLowerCase(), t);
   });
 
   return uniqueOfficers.map((officer, i) => {
     // Collect ONLY candidate sheets that belong to THIS officer AND THIS MONTH (sheetMonthKey)
     const candidateSheets: any[] = [];
 
-    // Local storage exact month sheet has highest priority (immediate offline edits)
-    try {
-      const cachedExact = localStorage.getItem(`travel_sheet_${officer.uid}_${sheetMonthKey}`) ||
-                          (officer.loginId ? localStorage.getItem(`travel_sheet_${officer.loginId}_${sheetMonthKey}`) : null);
-      if (cachedExact) {
-        const parsed = JSON.parse(cachedExact);
-        if (parsed && Array.isArray(parsed.rows)) {
-          candidateSheets.push(parsed);
-        }
-      }
-    } catch (e) {}
-
+    // Always prioritize live server travelSheets first; only prefer localStorage if it has an active unsynced write
+    const matchingLiveSheets: any[] = [];
     allTravelSheets.forEach(s => {
       const sId = (s.id || s._id || '') as string;
       const cleanOfficerName = (officer.fullName || '').trim().toLowerCase();
@@ -217,10 +245,13 @@ export function buildReportRows(
         s.userId === officer.uid ||
         sId === `travel_${officer.uid}_${sheetMonthKey}` ||
         sId.startsWith(`travel_${officer.uid}_`);
-      const matchesLogin = officer.loginId && (
-        s.userId?.toLowerCase() === officer.loginId.toLowerCase() ||
-        sId.toLowerCase() === `travel_${officer.loginId.toLowerCase()}_${sheetMonthKey}` ||
-        sId.toLowerCase().startsWith(`travel_${officer.loginId.toLowerCase()}_`)
+      const officerLoginLower = String(officer.loginId || '').toLowerCase();
+      const sUserLower = String(s.userId || '').toLowerCase();
+      const sIdLower = String(sId || '').toLowerCase();
+      const matchesLogin = Boolean(officerLoginLower) && (
+        sUserLower === officerLoginLower ||
+        sIdLower === `travel_${officerLoginLower}_${sheetMonthKey}` ||
+        sIdLower.startsWith(`travel_${officerLoginLower}_`)
       );
       const matchesName = cleanOfficerName && cleanSheetName && (cleanOfficerName === cleanSheetName || cleanOfficerName.includes(cleanSheetName) || cleanSheetName.includes(cleanOfficerName));
 
@@ -233,9 +264,41 @@ export function buildReportRows(
         (Array.isArray(s.rows) && s.rows.some((r: any) => r && r.date && r.date.trim() === selectedDate.trim()));
 
       if (matchesMonthYear) {
-        candidateSheets.push(s);
+        matchingLiveSheets.push(s);
       }
     });
+
+    matchingLiveSheets.sort((a, b) => {
+      const tsA = Math.max(Number(a?._syncUpdatedAtMs) || 0, toTimestampMs(a?.updatedAt || a?.createdAt));
+      const tsB = Math.max(Number(b?._syncUpdatedAtMs) || 0, toTimestampMs(b?.updatedAt || b?.createdAt));
+      return tsB - tsA;
+    });
+
+    const pendingTravelMap = getPendingSyncMap('travel_sheets');
+    const exactSheetId = `travel_${officer.uid}_${sheetMonthKey}`;
+    const hasPendingLocalTravel =
+      pendingTravelMap.has(exactSheetId) ||
+      (officer.loginId ? pendingTravelMap.has(`travel_${officer.loginId}_${sheetMonthKey}`) : false);
+
+    let cachedSheetParsed: any = null;
+    try {
+      const cachedExact = localStorage.getItem(`travel_sheet_${officer.uid}_${sheetMonthKey}`) ||
+                          (officer.loginId ? localStorage.getItem(`travel_sheet_${officer.loginId}_${sheetMonthKey}`) : null);
+      if (cachedExact) {
+        const parsed = JSON.parse(cachedExact);
+        if (parsed && Array.isArray(parsed.rows)) {
+          cachedSheetParsed = parsed;
+        }
+      }
+    } catch (e) {}
+
+    if (hasPendingLocalTravel && cachedSheetParsed) {
+      candidateSheets.push(cachedSheetParsed, ...matchingLiveSheets);
+    } else if (matchingLiveSheets.length > 0) {
+      candidateSheets.push(...matchingLiveSheets);
+    } else if (cachedSheetParsed) {
+      candidateSheets.push(cachedSheetParsed);
+    }
 
     // Find the exact row for selectedDate
     let dayRow: any = null;
@@ -304,15 +367,15 @@ export function buildReportRows(
         return (
           d.collectedByUid === officer.uid ||
           d.userId === officer.uid ||
-          (d.loginId && officer.loginId && d.loginId.toLowerCase() === officer.loginId.toLowerCase()) ||
-          (d.collectedByName && officer.fullName && d.collectedByName.trim().toLowerCase() === officer.fullName.trim().toLowerCase())
+          (d.loginId && officer.loginId && String(d.loginId).toLowerCase() === String(officer.loginId).toLowerCase()) ||
+          (d.collectedByName && officer.fullName && String(d.collectedByName).trim().toLowerCase() === String(officer.fullName).trim().toLowerCase())
         );
       })
       .reduce((acc: number, d: any) => acc + (Number(d.amount) || 0), 0);
 
     let monthlySalesTarget = 0, monthlyAchievement = 0;
     const targetSheetId = `yearly_${officer.uid}_2026_27`;
-    const targetData = yearlyTargetMap.get(targetSheetId) || yearlyTargetMap.get(officer.uid) || (officer.loginId ? yearlyTargetMap.get(officer.loginId.toLowerCase()) : null);
+    const targetData = yearlyTargetMap.get(targetSheetId) || yearlyTargetMap.get(officer.uid) || (officer.loginId ? yearlyTargetMap.get(String(officer.loginId).toLowerCase()) : null);
     if (targetData && targetData.months) {
       const monthData = (targetData.months || []).find((m: any) => (m.month || '').toLowerCase() === targetMonthName.toLowerCase());
       if (monthData) {
@@ -384,8 +447,8 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
   const printableSheetRef = useRef<HTMLDivElement>(null);
 
   const { users, loaded: usersLoaded } = useSharedUsers();
-  const { travelSheets } = useSharedTravelSheets();
-  const { yearlyTargets, refreshAllYearlyTargetsFromServer } = useSharedYearlyTargets();
+  const { travelSheets, loaded: travelLoaded } = useSharedTravelSheets();
+  const { yearlyTargets, loaded: targetsLoaded, refreshAllYearlyTargetsFromServer } = useSharedYearlyTargets();
   const { collectionEntries } = useSharedCollectionEntries();
 
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -396,9 +459,9 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
     const activeDate = /^\d{4}-\d{2}-\d{2}$/.test(String(selectedDate || '').trim())
       ? selectedDate
       : getTodayLocalDate();
-    const resolvedUsers = users.length > 0 ? users : getInitialCachedUsers();
-    const resolvedTravel = travelSheets.length > 0 ? travelSheets : getInitialCachedTravel();
-    const resolvedTargets = yearlyTargets.length > 0 ? yearlyTargets : (reportStaticCache?.yearlyTargets || []);
+    const resolvedUsers = usersLoaded || users.length > 0 ? users : getInitialCachedUsers();
+    const resolvedTravel = travelLoaded || travelSheets.length > 0 ? travelSheets : getInitialCachedTravel();
+    const resolvedTargets = targetsLoaded || yearlyTargets.length > 0 ? yearlyTargets : (reportStaticCache?.yearlyTargets || []);
 
     const rows = buildReportRows(
       resolvedUsers,
@@ -411,7 +474,7 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
     );
     safeLocalStorageSet(`${LOCAL_STORAGE_DAILY_PREFIX}${activeDate}`, JSON.stringify(rows));
     return rows;
-  }, [users, travelSheets, yearlyTargets, collectionEntries, selectedDate, profile]);
+  }, [users, usersLoaded, travelSheets, travelLoaded, yearlyTargets, targetsLoaded, collectionEntries, selectedDate, profile]);
 
   const loading = !usersLoaded && reportData.length === 0;
 

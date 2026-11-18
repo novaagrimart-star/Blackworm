@@ -5,9 +5,9 @@ import {
 } from 'firebase/firestore';
 import { db, isQuotaExceededError } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import { logAudit, safeFirestoreSet, getLocalDateStr, getPendingSyncIdSet, trackFirestoreUsage, isQuotaBlocked, setQuotaBlocked, safeLocalStorageSet } from '../../lib/dataService';
+import { logAudit, safeFirestoreSet, getLocalDateStr, getPendingSyncMap, toTimestampMs, trackFirestoreUsage, isQuotaBlocked, setQuotaBlocked, safeLocalStorageSet } from '../../lib/dataService';
 import { subscribeSecondaryCollection, fetchSecondaryCollection } from '../../lib/secondaryDb';
-import { useSharedUsers } from '../../lib/realtimeStore';
+import { useSharedUsers, useSharedTravelSheets } from '../../lib/realtimeStore';
 import { Language, translations } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
@@ -172,6 +172,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const t = translations[lang];
   const userIsAdmin = isAdmin(profile);
   const { fieldOfficers: users } = useSharedUsers();
+  const { setTravelSheetsOptimistic } = useSharedTravelSheets();
   const usersRef = useRef<UserProfile[]>(users);
   usersRef.current = users;
   const [selectedUserId, setSelectedUserId] = useState<string>(() => {
@@ -301,6 +302,8 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
 
   const printableSheetRef = useRef<HTMLDivElement>(null);
   const suppressedCommaMap = useRef<Record<number, boolean>>({});
+  const hasUnsavedEditsRef = useRef(false);
+  const lastLocalEditAtRef = useRef(0);
 
   // Village name formatter: First letter Capital, rest lowercase (Title Case)
   const formatRouteVillages = (str: string): string => {
@@ -378,6 +381,10 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     }
   }, [users, profile.role, profile.uid, selectedUserId]);
 
+  const { travelSheets: sharedTravelSheets } = useSharedTravelSheets();
+  const sharedTravelSheetsRef = useRef<any[]>(sharedTravelSheets);
+  sharedTravelSheetsRef.current = sharedTravelSheets;
+
   // Fetch or initialize sheet with instant cache-first and live sync (stable deps: no listener churn)
   useEffect(() => {
     const currentUsers = usersRef.current;
@@ -390,12 +397,30 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       return;
     }
 
+    hasUnsavedEditsRef.current = false;
+    lastLocalEditAtRef.current = 0;
+
     const targetUid = selectedUserId;
     const sheetMonthKey = `${selectedYearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
     const sheetId = `travel_${targetUid}_${sheetMonthKey}`;
     const cacheKey = `travel_sheet_${targetUid}_${sheetMonthKey}`;
 
-    // 1. Immediately read from localStorage if present
+    const hasPopulatedRows = (s?: Partial<TravelSheetData> | null) =>
+      Boolean(
+        s &&
+          Array.isArray(s.rows) &&
+          s.rows.some(
+            (r) =>
+              (Number(r?.openingKm) || 0) > 0 ||
+              (Number(r?.closingKm) || 0) > 0 ||
+              (Number(r?.km) || 0) > 0 ||
+              (Number(r?.otherExpenses) || 0) > 0 ||
+              Boolean(String(r?.route || '').trim())
+          )
+      );
+
+    // 1. Immediately hydrate from localStorage OR shared travelSheetsChannel so remount shows 0ms live data
+    let initialPopulated = false;
     try {
       const cached = localStorage.getItem(cacheKey);
       if (cached) {
@@ -412,19 +437,47 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
           );
           setSheet(normalizedCached);
           setRatePerKm(normalizedCached.ratePerKm || 3.5);
+          initialPopulated = hasPopulatedRows(normalizedCached);
         }
       }
     } catch {}
 
+    const sharedMatch = sharedTravelSheetsRef.current.find((s) => s && (s.id === sheetId || s._id === sheetId));
+    if (sharedMatch && Array.isArray(sharedMatch.rows) && (!initialPopulated || hasPopulatedRows(sharedMatch))) {
+      const normalizedShared = normalizeTravelSheet(
+        sharedMatch,
+        selectedYearNumber,
+        selectedMonthIndex,
+        selectedMonthName,
+        targetUid,
+        sharedMatch.officerName || profile.fullName || targetUid,
+        sharedMatch.designation || profile.designation || 'FIELD OFFICER'
+      );
+      setSheet(normalizedShared);
+      setRatePerKm(normalizedShared.ratePerKm || 3.5);
+    }
+
     const currentRate = 3.5;
 
-    const applyTravelSheetPayload = (data: TravelSheetData) => {
-      const selectedUser = usersRef.current.find(u => u.uid === targetUid) || profile;
-      const hasPendingWrite = getPendingSyncIdSet('travel_sheets').has(sheetId);
-      if (hasPendingWrite) {
+    let appliedSheetTs = 0;
+
+    const applyTravelSheetPayload = (data: TravelSheetData & { _syncUpdatedAtMs?: number }, authoritativeServer = false) => {
+      if (hasUnsavedEditsRef.current && Date.now() - lastLocalEditAtRef.current < 120000) {
         setLoading(false);
         return;
       }
+      const selectedUser = usersRef.current.find(u => u.uid === targetUid) || profile;
+      const incomingTs = Math.max(Number(data?._syncUpdatedAtMs) || 0, toTimestampMs((data as any)?.updatedAt));
+      const pendingMeta = getPendingSyncMap('travel_sheets').get(sheetId);
+      if (pendingMeta && pendingMeta.ts > incomingTs) {
+        setLoading(false);
+        return;
+      }
+      if (!authoritativeServer && appliedSheetTs > 0 && incomingTs > 0 && appliedSheetTs > incomingTs + 500) {
+        setLoading(false);
+        return;
+      }
+      if (incomingTs > 0) appliedSheetTs = incomingTs;
       const rRate = data.ratePerKm || currentRate;
       setRatePerKm(rRate);
       const fullRows = generateMonthRows(
@@ -467,8 +520,20 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     const ensureBlankSheetIfEmpty = () => {
       const selectedUser = usersRef.current.find(u => u.uid === targetUid) || profile;
       setSheet((prevSheet) => {
-        if (prevSheet && prevSheet.id === sheetId && prevSheet.rows.some(r => r.openingKm > 0 || r.closingKm > 0 || r.route)) {
+        if (prevSheet && prevSheet.id === sheetId && (hasPopulatedRows(prevSheet) || prevSheet.rows.length > 0)) {
           return prevSheet;
+        }
+        const sharedExisting = sharedTravelSheetsRef.current.find((s) => s && (s.id === sheetId || s._id === sheetId));
+        if (sharedExisting && hasPopulatedRows(sharedExisting)) {
+          return normalizeTravelSheet(
+            sharedExisting,
+            selectedYearNumber,
+            selectedMonthIndex,
+            selectedMonthName,
+            targetUid,
+            selectedUser.fullName || targetUid,
+            selectedUser.designation || 'FIELD OFFICER'
+          );
         }
         const fullRows = generateMonthRows(
           selectedYearNumber,
@@ -492,7 +557,6 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
           averageCostPerKm: 0,
           totalExpensesAmount: 0
         };
-        safeLocalStorageSet(cacheKey, JSON.stringify(newSheet));
         return newSheet;
       });
     };
@@ -516,42 +580,67 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     const unsubSec = subscribeSecondaryCollection('travel_sheets', (events) => {
       events.forEach((evt) => {
         if (evt.id === sheetId && evt.doc && !evt.deleted) {
-          applyTravelSheetPayload(evt.doc as TravelSheetData);
+          applyTravelSheetPayload({ ...evt.doc, ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}) } as TravelSheetData);
           setLoading(false);
         }
       });
     });
 
+    // Always pull latest sheet from Secondary even if Firebase isn't quota-blocked on THIS device yet
+    void pullTravelFromSecondary();
+
     let unsubFb: (() => void) | null = null;
-    if (isQuotaBlocked()) {
-      void pullTravelFromSecondary();
-    } else {
-      unsubFb = onSnapshot(doc(db, 'travel_sheets', sheetId), (docSnap) => {
-        trackFirestoreUsage('read', 1);
-        if (docSnap.exists()) {
-          applyTravelSheetPayload(docSnap.data() as TravelSheetData);
-        } else {
+    const attachTravelListener = () => {
+      if (unsubFb || isQuotaBlocked()) return;
+      try {
+        unsubFb = onSnapshot(doc(db, 'travel_sheets', sheetId), (docSnap) => {
+          trackFirestoreUsage('read', 1);
+          if (docSnap.exists() && !docSnap.metadata?.fromCache) {
+            applyTravelSheetPayload(docSnap.data() as TravelSheetData, true);
+          } else if (!docSnap.exists()) {
+            void pullTravelFromSecondary();
+            return;
+          }
+          setLoading(false);
+        }, (err) => {
+          if (unsubFb) {
+            try { unsubFb(); } catch {}
+            unsubFb = null;
+          }
+          if (isQuotaExceededError(err)) {
+            setQuotaBlocked(15 * 60 * 1000);
+          }
+          console.warn('Travel sheet snapshot notice:', err);
           void pullTravelFromSecondary();
-          return;
-        }
-        setLoading(false);
-      }, (err) => {
-        if (isQuotaExceededError(err)) {
-          setQuotaBlocked(15 * 60 * 1000);
-        }
-        console.warn('Travel sheet snapshot notice:', err);
-        void pullTravelFromSecondary();
-      });
-    }
+        });
+      } catch {
+        unsubFb = null;
+      }
+    };
+
+    const handleResync = () => { void pullTravelFromSecondary(); attachTravelListener(); };
+    const handleQuotaCleared = () => { attachTravelListener(); };
+    window.addEventListener('blackworm_data_refresh', handleResync);
+    window.addEventListener('blackworm_secondary_resync', handleResync);
+    window.addEventListener('blackworm_quota_blocked', handleResync);
+    window.addEventListener('blackworm_quota_cleared', handleQuotaCleared);
+
+    attachTravelListener();
 
     return () => {
       unsubSec();
       if (unsubFb) unsubFb();
+      window.removeEventListener('blackworm_data_refresh', handleResync);
+      window.removeEventListener('blackworm_secondary_resync', handleResync);
+      window.removeEventListener('blackworm_quota_blocked', handleResync);
+      window.removeEventListener('blackworm_quota_cleared', handleQuotaCleared);
     };
   }, [selectedUserId, selectedYearNumber, selectedMonthIndex, profile.role, profile.uid]);
 
   const updateRow = (index: number, updates: Partial<TravelRow>) => {
     if (!sheet) return;
+    hasUnsavedEditsRef.current = true;
+    lastLocalEditAtRef.current = Date.now();
     const newRows = [...sheet.rows];
     const currentRow = newRows[index];
     const updated = { ...currentRow, ...updates };
@@ -622,6 +711,8 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
 
   const handleRateChange = (newRate: number) => {
     if (!sheet) return;
+    hasUnsavedEditsRef.current = true;
+    lastLocalEditAtRef.current = Date.now();
     setRatePerKm(newRate);
     const updatedSheet: TravelSheetData = {
       ...sheet,
@@ -636,46 +727,54 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   };
 
   const handleSave = async () => {
-    if (!sheet) return;
+    if (!sheet || saving) return;
+    hasUnsavedEditsRef.current = false;
+    lastLocalEditAtRef.current = 0;
     setSaving(true);
-    // Instant local caching so data is never lost even if network cuts out or quota limits hit
-    const sheetMonthKey = `${sheet.yearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
-    const cacheKey = `travel_sheet_${sheet.userId}_${sheetMonthKey}`;
+    const nowIso = new Date().toISOString();
+    const sheetToSave: TravelSheetData = { ...sheet, updatedAt: nowIso };
+    // Instant local caching + shared store optimistic update so Report view & refreshes never lose rows
+    const sheetMonthKey = `${sheetToSave.yearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
+    const cacheKey = `travel_sheet_${sheetToSave.userId}_${sheetMonthKey}`;
     try {
-      safeLocalStorageSet(cacheKey, JSON.stringify(sheet));
-      safeLocalStorageSet(`travel_sheet_${sheet.userId}`, JSON.stringify(sheet));
+      safeLocalStorageSet(cacheKey, JSON.stringify(sheetToSave));
+      safeLocalStorageSet(`travel_sheet_${sheetToSave.userId}`, JSON.stringify(sheetToSave));
       const cachedAllRaw = localStorage.getItem('blackworm_cached_travel_sheets');
       let cachedAll: any[] = cachedAllRaw ? JSON.parse(cachedAllRaw) : [];
       if (!Array.isArray(cachedAll)) cachedAll = [];
-      const idx = cachedAll.findIndex((s: any) => s.id === sheet.id || s._id === sheet.id);
+      const idx = cachedAll.findIndex((s: any) => s.id === sheetToSave.id || s._id === sheetToSave.id);
       if (idx >= 0) {
-        cachedAll[idx] = sheet;
+        cachedAll[idx] = sheetToSave;
       } else {
-        cachedAll.push(sheet);
+        cachedAll.push(sheetToSave);
       }
       safeLocalStorageSet('blackworm_cached_travel_sheets', JSON.stringify(cachedAll));
     } catch {}
 
-    try {
-      await safeFirestoreSet('travel_sheets', sheet.id, {
-        ...sheet,
-        updatedAt: new Date().toISOString()
-      }, { merge: true });
+    setTravelSheetsOptimistic((prev) => {
+      const idx = prev.findIndex((s: any) => s.id === sheetToSave.id || s._id === sheetToSave.id);
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = sheetToSave;
+        return next;
+      }
+      return [sheetToSave, ...prev];
+    });
 
-      try {
-        await logAudit(
-          'UPDATE', 
-          'travel_sheets', 
-          sheet.id, 
-          `Saved Travelling Sheet for ${sheet.officerName} (${sheet.monthName} ${sheet.yearNumber})`, 
-          profile
-        );
-      } catch {}
+    try {
+      await safeFirestoreSet('travel_sheets', sheetToSave.id, sheetToSave, { merge: true });
+
+      void logAudit(
+        'UPDATE',
+        'travel_sheets',
+        sheetToSave.id,
+        `Saved Travelling Sheet for ${sheetToSave.officerName} (${sheetToSave.monthName} ${sheetToSave.yearNumber})`,
+        profile
+      ).catch(() => {});
       setShowSuccess(true);
       setTimeout(() => setShowSuccess(false), 3000);
     } catch (err) {
       console.warn('Firestore save notice:', err);
-      // Since it is saved locally, still notify user that changes are retained safely
       setShowSuccess(true);
       setTimeout(() => setShowSuccess(false), 3000);
     } finally {
@@ -821,9 +920,9 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                 onClick={() => setIsUserDropdownOpen(!isUserDropdownOpen)}
                 className="w-full bg-slate-50 border border-slate-300 text-slate-800 py-1.5 px-2 xs:px-2.5 rounded-lg text-left flex items-center justify-between gap-1.5 cursor-pointer hover:bg-slate-100 transition shadow-2xs min-w-0"
               >
-                <div className="min-w-0 flex-1 flex items-center gap-1.5">
+                <div className="min-w-0 flex-1 flex items-center gap-1.5 overflow-x-auto">
                   <UserIcon className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                  <span className="text-[11px] xs:text-xs font-bold text-slate-900 leading-tight break-words line-clamp-1 flex-1">
+                  <span className="text-[11px] sm:text-xs font-bold text-slate-900 leading-tight whitespace-nowrap">
                     {users.find(u => u.uid === selectedUserId)?.fullName || (profile.role !== 'owner' ? profile.fullName : 'अधिकारी निवडा')}
                   </span>
                 </div>
@@ -883,10 +982,10 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
               )}
             </div>
           ) : (
-            <div className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-100 border border-slate-200 rounded-lg text-xs font-black uppercase text-slate-800">
+            <div className="flex items-center gap-1.5 px-2 py-1 bg-slate-100 border border-slate-200 rounded-lg text-[11px] sm:text-xs font-black uppercase text-slate-800 max-w-full overflow-x-auto">
               <UserIcon className="w-3 h-3 text-slate-500 shrink-0" />
-              <span className="font-black text-slate-900 truncate">{profile.fullName || 'OFFICER'}</span>
-              <span className="text-[9px] font-bold text-slate-500 bg-white border border-slate-200 px-1 py-0.2 rounded shrink-0">
+              <span className="font-black text-slate-900 whitespace-nowrap">{profile.fullName || 'OFFICER'}</span>
+              <span className="text-[9px] font-bold text-slate-500 bg-white border border-slate-200 px-1 py-0.2 rounded shrink-0 whitespace-nowrap">
                 ({profile.designation || 'OFFICER'})
               </span>
             </div>
@@ -933,10 +1032,10 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
               type="button"
               onClick={handleDownloadPdf}
               disabled={isGeneratingPdf}
-              className="bg-blue-600 hover:bg-blue-700 text-white px-2.5 py-1 rounded-lg text-xs font-black transition flex items-center gap-1 shadow-xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
+              className="bg-blue-600 hover:bg-blue-700 text-white px-1.5 py-0.5 sm:px-2 sm:py-1 rounded text-[9px] sm:text-[10px] font-black transition flex items-center gap-0.5 shadow-xs active:scale-95 disabled:opacity-50 cursor-pointer whitespace-nowrap"
               title="Save PDF"
             >
-              {isGeneratingPdf ? <Loader2 className="w-3 h-3 animate-spin" /> : <Download className="w-3 h-3" />}
+              {isGeneratingPdf ? <Loader2 className="w-2.5 h-2.5 animate-spin" /> : <Download className="w-2.5 h-2.5" />}
               <span>PDF</span>
             </button>
           </div>
@@ -947,11 +1046,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
         <div className="fixed bottom-6 right-6 z-50 bg-emerald-700 text-white p-3.5 px-5 rounded-2xl shadow-2xl flex items-center justify-between gap-3 text-xs font-black animate-in fade-in slide-in-from-bottom-5 no-print border border-emerald-500">
           <div className="flex items-center gap-2">
             <CheckCircle2 className="w-5 h-5 text-white shrink-0" />
-            <span>
-              {typeof navigator !== 'undefined' && !navigator.onLine 
-                ? 'ट्रॅव्हलिंग शीट स्थानिक सुरक्षित सेव्ह झाली! (इंटरनेट आल्यावर सिंक होईल)' 
-                : 'ट्रॅव्हलिंग शीट यशस्वीरित्या सेव्ह झाली आहे!'}
-            </span>
+            <span>Saved</span>
           </div>
           <button onClick={() => setShowSuccess(false)} className="text-white/80 hover:text-white p-1 cursor-pointer">
             <X className="w-4 h-4" />

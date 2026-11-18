@@ -10,6 +10,7 @@ import {
   safeFirestoreSet,
   mergeWithLocalData,
   safeLocalStorageSet,
+  toTimestampMs,
 } from '../lib/dataService';
 import { fetchSecondaryCollection, bootstrapCollectionToSecondary } from '../lib/secondaryDb';
 import { useBranding } from '../lib/branding';
@@ -47,48 +48,127 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
         return;
       }
 
+      const isOnline = typeof navigator === 'undefined' || navigator.onLine;
+
+      // Fast server-side credential verification when online (keeps raw passwords off login responses)
+      if (isOnline) {
+        try {
+          const authController = new AbortController();
+          const authTimer = setTimeout(() => authController.abort(), 3000);
+          const authResp = await fetch('/api/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ loginId: trimmedId, password: trimmedPass }),
+            signal: authController.signal,
+          });
+          clearTimeout(authTimer);
+          const authJson = await authResp.json().catch(() => null);
+          if (authJson?.status === 'verified' && authJson?.profile) {
+            onLoginSuccess(authJson.profile as UserProfile);
+            return;
+          }
+          if (authJson?.status === 'inactive') {
+            setError('Account is Inactive. Please contact administrator.');
+            return;
+          }
+          // If Secondary DB had the user and password didn't match, still double-check Firestore below ONLY in case password was just changed on Firestore
+        } catch {}
+      }
+
       const lowerId = trimmedId.toLowerCase();
       const numericDigits = trimmedId.replace(/\D/g, ''); // Extract numbers only
       const last10Digits = numericDigits.length >= 10 ? numericDigits.slice(-10) : numericDigits;
 
-      // 1. Primary lookup: Try Firebase if online & not quota-blocked
-      let allUsers: any[] = [];
+      // 1 & 2. Parallel lookup from Primary (Firebase) + Secondary (SQLite WAL / External Mirror)
+      // Always query Secondary even if Firebase isn't flagged as quota-blocked yet, because another device may have written updates only to Secondary DB!
+      let fbUsers: any[] = [];
+      let secUsers: any[] = [];
+      const archivedSet = new Set<string>();
       let firebaseChecked = false;
-      if (!isQuotaBlocked() && (typeof navigator === 'undefined' || navigator.onLine)) {
-        try {
-          const usersSnap = await getDocs(collection(db, 'users'));
-          trackFirestoreUsage('read', Math.max(1, usersSnap.docs.length));
-          firebaseChecked = true;
-          if (!usersSnap.empty) {
-            allUsers = usersSnap.docs
-              .map(d => ({ ...d.data(), uid: d.id, id: d.id }))
-              .filter((u: any) => !u.isArchived);
-            safeLocalStorageSet('blackworm_cached_users', JSON.stringify(allUsers));
-            bootstrapCollectionToSecondary('users', allUsers);
-          }
-        } catch (networkErr: any) {
-          if (isQuotaExceededError(networkErr)) {
-            setQuotaBlocked(15 * 60 * 1000);
-          }
-          console.warn('Primary login lookup fallback:', networkErr);
-        }
-      }
 
-      // 2. Secondary DB failover lookup (SQLite WAL / Supabase mirror)
-      if (allUsers.length === 0) {
-        try {
-          const secRes = await fetchSecondaryCollection('users', { limit: 1000 });
-          if (secRes.ok && secRes.items.length > 0) {
-            allUsers = secRes.items
-              .filter((u: any) => !u.isArchived)
-              .map((u: any) => ({ ...u, uid: u.uid || u.id, id: u.id || u.uid }));
-            safeLocalStorageSet('blackworm_cached_users', JSON.stringify(allUsers));
+      await Promise.all([
+        (async () => {
+          if (!isQuotaBlocked() && isOnline) {
+            try {
+              const fbPromise = getDocs(collection(db, 'users'));
+              const usersSnap = await Promise.race([
+                fbPromise,
+                new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
+              ]);
+              if (usersSnap) {
+                trackFirestoreUsage('read', Math.max(1, usersSnap.docs.length));
+                firebaseChecked = true;
+                if (!usersSnap.empty) {
+                  usersSnap.docs.forEach((d) => {
+                    const data = d.data();
+                    if (data?.isArchived) archivedSet.add(d.id);
+                    else fbUsers.push({ ...data, uid: d.id, id: d.id });
+                  });
+                  if (!usersSnap.metadata?.fromCache && fbUsers.length > 0) {
+                    bootstrapCollectionToSecondary('users', fbUsers);
+                  }
+                }
+              } else {
+                // Background reconcile without stalling login UI
+                void fbPromise
+                  .then((lateSnap) => {
+                    if (lateSnap && !lateSnap.empty && !lateSnap.metadata?.fromCache) {
+                      const lateUsers = lateSnap.docs
+                        .map((d) => ({ ...d.data(), uid: d.id, id: d.id }))
+                        .filter((u: any) => !u.isArchived);
+                      if (lateUsers.length > 0) {
+                        bootstrapCollectionToSecondary('users', lateUsers);
+                      }
+                    }
+                  })
+                  .catch((err) => {
+                    if (isQuotaExceededError(err)) setQuotaBlocked(15 * 60 * 1000);
+                  });
+              }
+            } catch (networkErr: any) {
+              if (isQuotaExceededError(networkErr)) {
+                setQuotaBlocked(15 * 60 * 1000);
+              }
+              console.warn('Primary login lookup fallback:', networkErr);
+            }
           }
-        } catch {}
+        })(),
+        (async () => {
+          if (isOnline) {
+            try {
+              const secRes = await fetchSecondaryCollection('users', { limit: 1000 });
+              if (secRes.ok) {
+                (secRes.archivedIds || []).forEach((id) => archivedSet.add(id));
+                secUsers = (secRes.items || [])
+                  .filter((u: any) => u && !u.isArchived)
+                  .map((u: any) => ({ ...u, uid: u.uid || u.id, id: u.id || u.uid }));
+              }
+            } catch {}
+          }
+        })(),
+      ]);
+
+      // Merge Firebase + Secondary choosing newest timestamp per user UID
+      const userMap = new Map<string, any>();
+      const getUserTs = (u: any) =>
+        Math.max(Number(u?._syncUpdatedAtMs) || 0, toTimestampMs(u?.updatedAt || u?.createdAt));
+
+      [...fbUsers, ...secUsers].forEach((u) => {
+        const uid = String(u?.uid || u?.id || '').trim();
+        if (!uid || archivedSet.has(uid) || u?.isArchived) return;
+        const prev = userMap.get(uid);
+        if (!prev || getUserTs(u) >= getUserTs(prev)) {
+          userMap.set(uid, prev ? { ...prev, ...u, uid, id: uid } : { ...u, uid, id: uid });
+        }
+      });
+
+      let allUsers: any[] = Array.from(userMap.values());
+      if (allUsers.length > 0) {
+        safeLocalStorageSet('blackworm_cached_users', JSON.stringify(allUsers));
       }
 
       // 3. Seed initial owner only when BOTH Firebase and Secondary are genuinely empty
-      if (allUsers.length === 0 && firebaseChecked) {
+      if (allUsers.length === 0 && firebaseChecked && secUsers.length === 0) {
         const initialOwner = {
           uid: 'user_1791302472208',
           userCode: 'EMP-001',
@@ -168,7 +248,8 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
       const isPasswordCorrect = (trimmedPass === userStoredPass);
 
       if (isPasswordCorrect) {
-        onLoginSuccess(foundUser as UserProfile);
+        const { password: _omittedPass, ...safeUser } = foundUser;
+        onLoginSuccess(safeUser as UserProfile);
       } else {
         setError('Incorrect Password. Please check and try again.');
       }

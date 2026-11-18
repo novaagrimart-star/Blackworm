@@ -18,7 +18,8 @@ import {
   Bike,
   ShieldCheck,
   Phone,
-  Key
+  Key,
+  Warehouse
 } from 'lucide-react';
 import { cn, toTitleCase } from '../lib/utils';
 import { UserProfile, isAdmin, canAccessModule } from '../lib/auth';
@@ -40,6 +41,7 @@ import { TravelView } from './modules/TravelView';
 import { SchemeView } from './modules/SchemeView';
 import { ReportView } from './modules/ReportView';
 import { SettingView } from './modules/SettingView';
+import { GodownInchargeView } from './modules/GodownInchargeView';
 
 interface DashboardProps {
   profile: UserProfile;
@@ -95,6 +97,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
   const modules = [
     { id: 'target', label: t.targetSheet, icon: Target, color: 'text-blue-500', bg: 'bg-blue-50' },
     { id: 'user', label: 'User Form', icon: UserPlus, color: 'text-emerald-500', bg: 'bg-emerald-50' },
+    { id: 'office_staff', label: 'Godown Incharge', icon: Warehouse, color: 'text-indigo-600', bg: 'bg-indigo-50' },
     { id: 'order', label: t.orders, icon: ShoppingBag, color: 'text-purple-500', bg: 'bg-purple-50' },
     { id: 'collection', label: t.collections, icon: IndianRupee, color: 'text-emerald-600', bg: 'bg-emerald-50' },
     { id: 'calculator', label: t.outstanding || 'Outstanding', icon: FileText, color: 'text-teal-600', bg: 'bg-teal-50' },
@@ -133,24 +136,20 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     }
 
     const handlePopState = (e: PopStateEvent) => {
-      // If the back event is from an inner modal/subview inside the current tab (e.g., dealer form, user form, order modal), don't jump to dashboard
-      if (
-        e.state?.dealerFormOpen ||
-        e.state?.userFormOpen ||
-        e.state?.orderModalOpen ||
-        e.state?.payModalOpen ||
-        (e.state?.tab && e.state.tab === activeTab)
-      ) {
+      const targetTab = e.state?.tab;
+
+      // Stay on current tab if back navigation only closed an inner modal/form within this same tab
+      if (targetTab && targetTab === activeTab) {
         return;
       }
 
-      if (e.state?.tab && e.state.tab !== 'dashboard') {
-        setActiveTab(e.state.tab);
+      if (targetTab && targetTab !== 'dashboard') {
+        setActiveTab(targetTab);
       } else {
         if (activeTab !== 'dashboard') {
           setActiveTab('dashboard');
         } else {
-          // If already on dashboard, prevent app from closing immediately
+          // If already on dashboard, keep dashboard on top of history stack
           window.history.pushState({ tab: 'dashboard' }, '');
         }
       }
@@ -189,6 +188,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
       switch (activeTab) {
         case 'target': return <TargetSheetView profile={currentUserData} lang={lang} />;
         case 'user': return <UserManagementView profile={currentUserData} lang={lang} onProfileUpdate={onProfileUpdate} />;
+        case 'office_staff': return <GodownInchargeView profile={currentUserData} lang={lang} />;
         case 'order': return <OrderView profile={currentUserData} lang={lang} />;
         case 'collection': return <CollectionView profile={currentUserData} lang={lang} />;
         case 'outstanding':
@@ -229,17 +229,30 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     }
         return (
           <div className="space-y-6">
-            {/* Logged-In User Profile: Full Officer Name with Compressed Designation */}
-            <div className="flex items-center gap-3 mx-auto max-w-2xl px-2">
-              <div className="min-w-0 flex-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-                <span className="text-sm sm:text-base font-black text-slate-900 tracking-tight">
-                  {toTitleCase(currentUserData.fullName) || 'User'}
-                </span>
-                <span className="text-[10px] sm:text-xs font-bold text-slate-600 tracking-tight bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded">
-                  {isUserAdmin ? (currentUserData.role === 'owner' ? 'Owner (MD)' : 'Admin') : toTitleCase(currentUserData.designation || currentUserData.role)}
-                </span>
-              </div>
-            </div>
+            {/* Logged-In User Profile: Full Officer Name with Compressed Designation on Single Line */}
+            {(() => {
+              const displayName = toTitleCase(currentUserData.fullName) || 'User';
+              const displayRole = isUserAdmin
+                ? (currentUserData.role === 'owner' ? 'Owner (MD)' : 'Admin')
+                : toTitleCase(currentUserData.designation || currentUserData.role);
+              const showRoleChip =
+                Boolean(displayRole) &&
+                displayRole.trim().toLowerCase() !== displayName.trim().toLowerCase();
+              return (
+                <div className="flex items-center gap-2 mx-auto max-w-2xl px-1 sm:px-2">
+                  <div className="min-w-0 flex-1 flex flex-nowrap items-center gap-1.5 overflow-x-auto">
+                    <span className="text-[clamp(11px,3.5vw,15px)] sm:text-base font-black text-slate-900 tracking-tight whitespace-nowrap shrink-0">
+                      {displayName}
+                    </span>
+                    {showRoleChip && (
+                      <span className="text-[9px] sm:text-xs font-bold text-slate-600 tracking-tight bg-slate-100 border border-slate-200 px-1.5 py-0.5 rounded whitespace-nowrap shrink-0">
+                        {displayRole}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
 
             <div className="grid grid-cols-3 gap-3 max-w-2xl mx-auto">
               {visibleModules.map((module) => (
@@ -278,20 +291,27 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
 
   return (
     <div className="flex flex-col min-h-dvh bg-slate-50 mobile-safe-container">
-      <header className="bg-white border-b border-slate-200 px-3 sm:px-4 py-1.5 sm:py-2 flex items-center justify-between gap-2 sticky top-0 z-10 shadow-xs mobile-safe-header">
-        <div className="flex items-center gap-2.5 sm:gap-3 min-w-0 flex-1">
-          {activeTab !== 'dashboard' && (
-            <button
-              onClick={() => handleTabChange('dashboard')}
-              className="p-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 transition shrink-0 cursor-pointer"
-              title="Back to Dashboard"
-            >
-              <ArrowLeft className="w-5 h-5" />
-            </button>
-          )}
-          
-          {/* Logo with dedicated room - Clear and Slightly Larger */}
-          <div className="h-16 sm:h-20 w-auto max-w-[116px] sm:max-w-[148px] shrink-0 flex items-center justify-center">
+      <header className="bg-white border-b border-slate-200 px-3 sm:px-5 py-2 flex items-center justify-between gap-2 sticky top-0 z-10 shadow-xs mobile-safe-header">
+        {activeTab !== 'dashboard' && (
+          <button
+            onClick={() => handleTabChange('dashboard')}
+            className="p-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 transition shrink-0 cursor-pointer"
+            title="Back to Dashboard"
+          >
+            <ArrowLeft className="w-4 h-4 sm:w-5 sm:h-5" />
+          </button>
+        )}
+
+        <div className="flex items-center justify-center gap-2 sm:gap-3.5 min-w-0 flex-1 px-1 sm:px-3">
+          {/* Logo scales smoothly with screen size while keeping title on one line */}
+          <div
+            className={cn(
+              "w-auto shrink-0 flex items-center justify-center",
+              activeTab !== 'dashboard'
+                ? "h-11 sm:h-20 md:h-24 max-w-[66px] sm:max-w-[148px] md:max-w-[172px]"
+                : "h-12 sm:h-20 md:h-24 max-w-[74px] sm:max-w-[148px] md:max-w-[172px]"
+            )}
+          >
             <img 
               src={logoUrl || '/logo.jpg'} 
               alt="Blackworm Agritech Logo"
@@ -299,16 +319,21 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
             />
           </div>
 
-          {/* Company Title - Normal readable size increase in bold red */}
-          <div className="flex flex-col justify-center min-w-0 flex-1">
-            <h1 className="text-lg sm:text-xl md:text-2xl font-black text-red-600 tracking-tight leading-tight uppercase break-words sm:whitespace-nowrap">
-              BLACKWORM AGRITECH PVT LTD
-            </h1>
-          </div>
+          {/* Company Title - Larger readable responsive single-line title */}
+          <h1
+            className={cn(
+              "font-black text-red-600 tracking-tight leading-none uppercase whitespace-nowrap sm:text-xl md:text-2xl lg:text-[26px]",
+              activeTab !== 'dashboard'
+                ? "text-[clamp(10.5px,3.2vw,17px)]"
+                : "text-[clamp(11.5px,3.65vw,19px)]"
+            )}
+          >
+            BLACKWORM AGRITECH PVT LTD
+          </h1>
         </div>
 
         {/* Current Active Logged-In User Badge in Header */}
-        <div className="hidden sm:flex items-center gap-1.5 px-3">
+        <div className="hidden sm:flex items-center gap-1.5 px-2 shrink-0">
           <span className="text-xs font-black text-slate-900 leading-none">
             {toTitleCase(currentUserData.fullName) || 'User'}
           </span>
@@ -318,7 +343,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
         </div>
       </header>
 
-      <main className="px-3 sm:px-4 py-3 sm:py-6 flex-1 max-w-4xl mx-auto w-full">
+      <main className="px-2 sm:px-4 py-3 sm:py-6 flex-1 max-w-4xl mx-auto w-full">
         {renderContent()}
       </main>
 
@@ -340,6 +365,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
         )}
         {canAccessModule(currentUserData, 'travel') && (
           <NavItem icon={Bike} label={t.travel} active={activeTab === 'travel'} onClick={() => handleTabChange('travel')} />
+        )}
+        {!isUserAdmin && canAccessModule(currentUserData, 'office_staff') && (
+          <NavItem icon={Warehouse} label="Godown" active={activeTab === 'office_staff'} onClick={() => handleTabChange('office_staff')} />
         )}
       </nav>
       <CustomDialogModal {...dialogConfig} />

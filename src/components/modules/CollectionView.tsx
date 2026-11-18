@@ -198,8 +198,8 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
   const anyModalOpen = showReceivePaymentModal || showEditReceiptModal;
   useEffect(() => {
     if (anyModalOpen) {
-      if (!modalHistoryPushedRef.current) {
-        window.history.pushState({ tab: 'collection', modalOpen: true }, '');
+      if (!modalHistoryPushedRef.current && !window.history.state?.payModalOpen) {
+        window.history.pushState({ tab: 'collection', payModalOpen: true, modalOpen: true }, '');
         modalHistoryPushedRef.current = true;
       }
       const handlePopState = () => {
@@ -213,7 +213,7 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
       };
     } else if (modalHistoryPushedRef.current) {
       modalHistoryPushedRef.current = false;
-      if (window.history.state?.modalOpen) {
+      if (window.history.state?.payModalOpen || window.history.state?.modalOpen) {
         window.history.back();
       }
     }
@@ -221,8 +221,10 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
 
   // Collection entries, orders, and dealers are provided in real-time by shared realtimeStore channels (Dual-DB synced)
 
-  // All authorized employees & admins can view/collect for all registered company dealers (including Amir Nanavare's dealers)
-  const accessibleDealers = dealers;
+  // Non-admin users strictly see ONLY dealers they created; Admins see all dealers
+  const accessibleDealers = isAdmin(profile)
+    ? dealers
+    : dealers.filter((d) => isUserRecord(d, profile));
 
   const accessibleOrders = useMemo(() => {
     if (isAdmin(profile)) return orders;
@@ -429,6 +431,9 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         })
         .sort((a, b) => toTimestampMs(a.createdAt) - toTimestampMs(b.createdAt));
 
+      const orderUpdates: { id: string; paidAmount: number; balanceAmount: number; status: any; updatedAt: string }[] = [];
+      const nowIso = new Date().toISOString();
+
       for (const ord of dealerOrders) {
         if (remainingPayment <= 0) break;
 
@@ -440,23 +445,25 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         const newBal = Math.max(0, currentBal - deduction);
         const newStatus = newBal <= 0 ? 'collected' : ord.status;
 
-        try {
-          await safeFirestoreSet(
-            'orders',
-            ord.id,
-            {
-              paidAmount: newPaid,
-              balanceAmount: newBal,
-              status: newStatus,
-              updatedAt: new Date().toISOString(),
-            },
-            { merge: true }
-          );
-        } catch (ordErr) {
-          console.warn('Order balance update notice:', ordErr);
-        }
+        orderUpdates.push({
+          id: ord.id,
+          paidAmount: newPaid,
+          balanceAmount: newBal,
+          status: newStatus,
+          updatedAt: nowIso,
+        });
 
         remainingPayment -= deduction;
+      }
+
+      if (orderUpdates.length > 0) {
+        const updateMap = new Map(orderUpdates.map((u) => [u.id, u]));
+        setOrdersOptimistic((prev) =>
+          prev.map((o) => {
+            const u = updateMap.get(o.id);
+            return u ? { ...o, ...u } : o;
+          })
+        );
       }
 
       // 2. Create receipt in collection_entries
@@ -477,37 +484,45 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         notes: remarks.trim(),
         collectedByUid: profile.uid,
         collectedByName: profile.fullName || 'Officer',
-        createdAt: new Date().toISOString()
+        createdAt: nowIso
       };
 
       const fullEntry = { ...newEntry, id: entryId };
-      const saveRes = await safeFirestoreSet('collection_entries', entryId, fullEntry);
-
-      // Immediately add to shared state
       setCollectionsOptimistic((prev) => [fullEntry, ...prev]);
 
-      // 3. Audit Log
-      try {
-        await logAudit(
-          'CREATE',
-          'collection_entries',
-          entryId,
-          `Payment received: ₹${payVal} from ${firmName} via ${paymentMode}${referenceNo ? ` (Ref: ${referenceNo})` : ''}`,
-          profile
-        );
-      } catch {}
+      await Promise.all([
+        safeFirestoreSet('collection_entries', entryId, fullEntry),
+        ...orderUpdates.map((u) =>
+          safeFirestoreSet(
+            'orders',
+            u.id,
+            {
+              paidAmount: u.paidAmount,
+              balanceAmount: u.balanceAmount,
+              status: u.status,
+              updatedAt: u.updatedAt,
+            },
+            { merge: true }
+          ).catch((ordErr) => console.warn('Order balance update notice:', ordErr))
+        ),
+      ]);
+
+      // 3. Non-blocking Audit Log
+      void logAudit(
+        'CREATE',
+        'collection_entries',
+        entryId,
+        `Payment received: ₹${payVal} from ${firmName} via ${paymentMode}${referenceNo ? ` (Ref: ${referenceNo})` : ''}`,
+        profile
+      ).catch(() => {});
 
       setShowReceivePaymentModal(false);
-      setSuccessToast(
-        saveRes.isCachedLocally
-          ? `₹${payVal.toLocaleString()} जमा नोंद सुरक्षित सेव्ह झाली! (स्थानिक मेमरी)`
-          : `₹${payVal.toLocaleString()} जमा नोंद यशस्वीरित्या पूर्ण झाली!`
-      );
-      setTimeout(() => setSuccessToast(''), 4000);
+      setSuccessToast('Saved');
+      setTimeout(() => setSuccessToast(''), 3000);
     } catch (err: any) {
       console.warn('Payment saving notice:', err);
-      setSuccessToast('पेमेंट नोंद सुरक्षित सेव्ह झाली आहे.');
-      setTimeout(() => setSuccessToast(''), 4000);
+      setSuccessToast('Saved');
+      setTimeout(() => setSuccessToast(''), 3000);
     } finally {
       setIsSubmitting(false);
     }
@@ -527,6 +542,9 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         })
         .sort((a, b) => toTimestampMs(b.updatedAt || b.createdAt) - toTimestampMs(a.updatedAt || a.createdAt));
 
+      const nowIso = new Date().toISOString();
+      const orderUpdates: { id: string; paidAmount: number; balanceAmount: number; status: any; updatedAt: string }[] = [];
+
       for (const ord of dealerOrders) {
         if (amountToRevert <= 0) break;
 
@@ -538,32 +556,57 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         const newBal = currentBal + revertVal;
         const newStatus = newBal > 0 && ord.status === 'collected' ? 'delivered' : ord.status;
 
-        await safeFirestoreSet('orders', ord.id, {
+        orderUpdates.push({
+          id: ord.id,
           paidAmount: newPaid,
           balanceAmount: newBal,
           status: newStatus,
-          updatedAt: new Date().toISOString()
-        }, { merge: true });
-        setOrdersOptimistic(prev => prev.map(o => o.id === ord.id ? { ...o, paidAmount: newPaid, balanceAmount: newBal, status: newStatus } : o));
+          updatedAt: nowIso,
+        });
 
         amountToRevert -= revertVal;
       }
 
-      // 2. Soft-delete the record & purge local caches
-      await safeFirestoreDelete('collection_entries', entry.id, { softDelete: true, user: profile });
+      if (orderUpdates.length > 0) {
+        const updateMap = new Map(orderUpdates.map((u) => [u.id, u]));
+        setOrdersOptimistic((prev) =>
+          prev.map((o) => {
+            const u = updateMap.get(o.id);
+            return u ? { ...o, ...u } : o;
+          })
+        );
+      }
       setCollectionsOptimistic(prev => prev.filter(e => e.id !== entry.id));
 
-      // 3. Audit Log
-      await logAudit(
+      // 2. Soft-delete the record & revert orders in parallel
+      await Promise.all([
+        safeFirestoreDelete('collection_entries', entry.id, { softDelete: true, user: profile }),
+        ...orderUpdates.map((u) =>
+          safeFirestoreSet(
+            'orders',
+            u.id,
+            {
+              paidAmount: u.paidAmount,
+              balanceAmount: u.balanceAmount,
+              status: u.status,
+              updatedAt: u.updatedAt,
+            },
+            { merge: true }
+          ).catch(() => {})
+        ),
+      ]);
+
+      // 3. Non-blocking Audit Log
+      void logAudit(
         'DELETE',
         'collection_entries',
         entry.id,
         `Payment receipt deleted: ₹${entry.amount} from ${entry.dealerName}`,
         profile
-      );
+      ).catch(() => {});
 
-      setSuccessToast(`पावती ₹${(Number(entry.amount) || 0).toLocaleString()} यशस्वीरित्या हटवली आणि बॅलन्स पूर्ववत केला.`);
-      setTimeout(() => setSuccessToast(''), 4000);
+      setSuccessToast('Saved');
+      setTimeout(() => setSuccessToast(''), 3000);
     } catch (err: any) {
       console.error('Delete error:', err);
       setSuccessToast(getFriendlyErrorMessage(err, 'पावती हटवताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'));
@@ -621,10 +664,11 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
 
     setIsSubmitting(true);
     try {
+      const nowIso = new Date().toISOString();
+      const orderUpdates: { id: string; paidAmount: number; balanceAmount: number; status: any; updatedAt: string }[] = [];
+
       if (diff !== 0) {
-        // If amount changed, we need to adjust orders
         if (diff > 0) {
-          // Additional payment - FIFO
           let remaining = diff;
           const dealerOrders = accessibleOrders
             .filter(o => {
@@ -640,17 +684,10 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
             const newPaid = (Number(ord.paidAmount) || 0) + deduction;
             const newBal = Math.max(0, (Number(ord.balanceAmount) || 0) - deduction);
             const newStatus = newBal <= 0 ? 'collected' : ord.status;
-            await safeFirestoreSet('orders', ord.id, {
-              paidAmount: newPaid,
-              balanceAmount: newBal,
-              status: newStatus,
-              updatedAt: new Date().toISOString()
-            }, { merge: true });
-            setOrdersOptimistic(prev => prev.map(o => o.id === ord.id ? { ...o, paidAmount: newPaid, balanceAmount: newBal, status: newStatus } : o));
+            orderUpdates.push({ id: ord.id, paidAmount: newPaid, balanceAmount: newBal, status: newStatus, updatedAt: nowIso });
             remaining -= deduction;
           }
         } else {
-          // Reduced payment - LIFO
           let toRevert = Math.abs(diff);
           const dealerOrders = accessibleOrders
             .filter(o => {
@@ -666,16 +703,20 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
             const newPaid = ord.paidAmount - revertVal;
             const newBal = ord.balanceAmount + revertVal;
             const newStatus = newBal > 0 && ord.status === 'collected' ? 'delivered' : ord.status;
-            await safeFirestoreSet('orders', ord.id, {
-              paidAmount: newPaid,
-              balanceAmount: newBal,
-              status: newStatus,
-              updatedAt: new Date().toISOString()
-            }, { merge: true });
-            setOrdersOptimistic(prev => prev.map(o => o.id === ord.id ? { ...o, paidAmount: newPaid, balanceAmount: newBal, status: newStatus } : o));
+            orderUpdates.push({ id: ord.id, paidAmount: newPaid, balanceAmount: newBal, status: newStatus, updatedAt: nowIso });
             toRevert -= revertVal;
           }
         }
+      }
+
+      if (orderUpdates.length > 0) {
+        const updateMap = new Map(orderUpdates.map((u) => [u.id, u]));
+        setOrdersOptimistic((prev) =>
+          prev.map((o) => {
+            const u = updateMap.get(o.id);
+            return u ? { ...o, ...u } : o;
+          })
+        );
       }
 
       // Update the receipt record
@@ -687,22 +728,38 @@ export const CollectionView: React.FC<Props> = ({ profile, lang }) => {
         bankName: editBankName.trim(),
         date: editDate,
         notes: editRemarks.trim(),
-        updatedAt: new Date().toISOString()
+        updatedAt: nowIso
       };
-      await safeFirestoreSet('collection_entries', editingReceipt.id, updatedReceiptPayload, { merge: true });
       setCollectionsOptimistic(prev => prev.map(e => e.id === editingReceipt.id ? { ...e, ...updatedReceiptPayload } : e));
 
-      await logAudit(
+      await Promise.all([
+        safeFirestoreSet('collection_entries', editingReceipt.id, updatedReceiptPayload, { merge: true }),
+        ...orderUpdates.map((u) =>
+          safeFirestoreSet(
+            'orders',
+            u.id,
+            {
+              paidAmount: u.paidAmount,
+              balanceAmount: u.balanceAmount,
+              status: u.status,
+              updatedAt: u.updatedAt,
+            },
+            { merge: true }
+          ).catch(() => {})
+        ),
+      ]);
+
+      void logAudit(
         'UPDATE',
         'collection_entries',
         editingReceipt.id,
         `Payment receipt updated for ${editingReceipt.dealerName}. Amount: ₹${oldVal} -> ₹${newVal}`,
         profile
-      );
+      ).catch(() => {});
 
       setShowEditReceiptModal(false);
-      setSuccessToast(`Receipt for ${editingReceipt.dealerName} updated successfully.`);
-      setTimeout(() => setSuccessToast(''), 4000);
+      setSuccessToast('Saved');
+      setTimeout(() => setSuccessToast(''), 3000);
     } catch (err: any) {
       console.error('Update error:', err);
       setSuccessToast(getFriendlyErrorMessage(err, 'पावती अपडेट करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'));

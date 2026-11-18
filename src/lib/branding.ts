@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { doc, onSnapshot } from 'firebase/firestore';
 import { db } from '../firebase';
-import { safeFirestoreSet, isQuotaBlocked, setQuotaBlocked, trackFirestoreUsage } from './dataService';
+import { safeFirestoreSet, isQuotaBlocked, setQuotaBlocked, trackFirestoreUsage, toTimestampMs } from './dataService';
 import { subscribeSecondaryCollection, fetchSecondaryCollection, pushToSecondary } from './secondaryDb';
 
 export interface BrandingConfig {
@@ -42,11 +42,20 @@ export function setCachedBranding(config: BrandingConfig) {
 
 let sharedUnsub: (() => void) | null = null;
 let sharedSecUnsub: (() => void) | null = null;
+let brandingResyncAttached = false;
+let brandingSecPulledOnce = false;
+let brandingDocTs = 0;
 const brandingSubscribers = new Set<(config: BrandingConfig) => void>();
 let currentBrandingState: BrandingConfig = getCachedBranding();
 
-function applyBrandingUpdate(data: any) {
+function applyBrandingUpdate(data: any, authoritativeServer = false) {
   if (!data) return;
+  const incomingTs = Math.max(Number(data._syncUpdatedAtMs) || 0, toTimestampMs(data.updatedAt || data.createdAt));
+  if (!authoritativeServer && brandingDocTs > 0 && incomingTs > 0 && brandingDocTs > incomingTs + 500) {
+    return;
+  }
+  if (incomingTs > 0) brandingDocTs = incomingTs;
+
   const fresh: BrandingConfig = {
     logoUrl: data.logoUrl || '',
     logoSize: Number(data.logoSize) || 80,
@@ -64,15 +73,33 @@ function pullBrandingFromSecondary() {
   });
 }
 
+function ensureBrandingResyncHooks() {
+  if (typeof window === 'undefined' || brandingResyncAttached) return;
+  brandingResyncAttached = true;
+  window.addEventListener('blackworm_data_refresh', pullBrandingFromSecondary);
+  window.addEventListener('blackworm_secondary_resync', pullBrandingFromSecondary);
+  window.addEventListener('blackworm_quota_blocked', pullBrandingFromSecondary);
+  window.addEventListener('blackworm_quota_cleared', () => {
+    if (brandingSubscribers.size > 0) startSharedBrandingListener();
+  });
+}
+
 function startSharedBrandingListener() {
+  ensureBrandingResyncHooks();
+
   if (!sharedSecUnsub) {
     sharedSecUnsub = subscribeSecondaryCollection('config', (events) => {
       events.forEach((evt) => {
         if (evt.id === 'branding' && evt.doc && !evt.deleted) {
-          applyBrandingUpdate(evt.doc);
+          applyBrandingUpdate({ ...evt.doc, ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}) });
         }
       });
     });
+  }
+
+  if (!brandingSecPulledOnce) {
+    brandingSecPulledOnce = true;
+    pullBrandingFromSecondary();
   }
 
   if (sharedUnsub) return;
@@ -89,12 +116,18 @@ function startSharedBrandingListener() {
         trackFirestoreUsage('read', 1);
         if (snap.exists()) {
           const data = snap.data();
-          applyBrandingUpdate(data);
-          void pushToSecondary({ collection: 'config', id: 'branding', doc: { ...data, id: 'branding' }, merge: true });
+          applyBrandingUpdate(data, !snap.metadata?.fromCache);
+          if (!snap.metadata?.fromCache) {
+            void pushToSecondary({ collection: 'config', id: 'branding', doc: { ...data, id: 'branding' }, merge: true });
+          }
         }
       },
       (err) => {
         console.warn('Shared branding sync notice:', err);
+        if (sharedUnsub) {
+          try { sharedUnsub(); } catch {}
+          sharedUnsub = null;
+        }
         const msg = String(err?.message || '').toLowerCase();
         if (msg.includes('quota') || msg.includes('resource_exhausted')) {
           setQuotaBlocked(15 * 60 * 1000);
@@ -104,6 +137,7 @@ function startSharedBrandingListener() {
     );
   } catch (e) {
     console.warn('Failed to start shared branding listener:', e);
+    sharedUnsub = null;
     pullBrandingFromSecondary();
   }
 }
@@ -124,10 +158,6 @@ export function useBranding() {
         if (sharedUnsub) {
           sharedUnsub();
           sharedUnsub = null;
-        }
-        if (sharedSecUnsub) {
-          sharedSecUnsub();
-          sharedSecUnsub = null;
         }
       }
     };

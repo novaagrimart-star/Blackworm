@@ -24,20 +24,17 @@ import {
   LGD_STATES,
   canonicalizeDistrictName,
   canonicalizeTalukaName,
-  getDistrictDisplayLabel,
   getDistrictMeta,
   getDistrictsForState,
   getStateMeta,
   getTalukaMeta,
   getTalukaMetasForDistrict,
-  getTalukasForDistrict,
   inferTalukaFromLocation,
   normalizeLocationKey,
   normalizeStateName,
 } from '../../lib/maharashtraLocations';
 import {
   loadLgdStateVillages,
-  getOfficialVillagesByTalukaSync,
   findOfficialLgdVillageSync,
 } from '../../lib/lgdCache';
 import { toTitleCase } from '../../lib/utils';
@@ -70,7 +67,6 @@ import {
   LayoutList,
   Table as TableIcon,
   User as UserIcon,
-  ChevronDown,
   UserCheck
 } from 'lucide-react';
 
@@ -172,7 +168,6 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
   const { locationTalukas } = useSharedLocationTalukas();
   const { officers, usersMap } = useSharedUsers();
   const [searchQuery, setSearchQuery] = useState('');
-  const [lgdRevision, setLgdRevision] = useState(0);
   
   const [viewMode, setViewMode] = useState<'list' | 'form'>('list');
   const [isEditing, setIsEditing] = useState(true);
@@ -206,8 +201,6 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
   const [dateOfBirth, setDateOfBirth] = useState('');
   const [gstNo, setGstNo] = useState('');
   const [pinCode, setPinCode] = useState('');
-  const [showVillagePicker, setShowVillagePicker] = useState(false);
-  const [villagePickerQuery, setVillagePickerQuery] = useState('');
 
   const [bankName, setBankName] = useState('');
   const [bankAddress, setBankAddress] = useState('');
@@ -246,7 +239,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
   const dealerFormHistoryPushedRef = useRef(false);
   useEffect(() => {
     if (viewMode === 'form') {
-      if (!dealerFormHistoryPushedRef.current) {
+      if (!dealerFormHistoryPushedRef.current && !window.history.state?.dealerFormOpen) {
         window.history.pushState({ tab: 'dealer', dealerFormOpen: true }, '');
         dealerFormHistoryPushedRef.current = true;
       }
@@ -342,26 +335,48 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
       });
     });
 
+    void pullSeqFromSecondary();
+
     let unsubSeq: (() => void) | null = null;
-    if (isQuotaBlocked()) {
-      void pullSeqFromSecondary();
-    } else {
-      unsubSeq = onSnapshot(doc(db, 'config', 'dealer_sequence'), (snap) => {
-        if (snap.exists()) {
-          const val = Number(snap.data()?.currentSequence) || 0;
-          setGlobalSequence(val);
-        }
-      }, (err) => {
-        if (isQuotaExceededError(err)) {
-          setQuotaBlocked(15 * 60 * 1000);
-        }
-        console.warn('Dealer sequence sync notice:', err);
-        void pullSeqFromSecondary();
-      });
-    }
+    const attachSeqListener = () => {
+      if (unsubSeq || isQuotaBlocked()) return;
+      try {
+        unsubSeq = onSnapshot(doc(db, 'config', 'dealer_sequence'), (snap) => {
+          if (snap.exists() && !snap.metadata?.fromCache) {
+            const val = Number(snap.data()?.currentSequence) || 0;
+            setGlobalSequence((prev) => Math.max(prev, val));
+          }
+        }, (err) => {
+          if (unsubSeq) {
+            try { unsubSeq(); } catch {}
+            unsubSeq = null;
+          }
+          if (isQuotaExceededError(err)) {
+            setQuotaBlocked(15 * 60 * 1000);
+          }
+          console.warn('Dealer sequence sync notice:', err);
+          void pullSeqFromSecondary();
+        });
+      } catch {
+        unsubSeq = null;
+      }
+    };
+
+    const handleResync = () => { void pullSeqFromSecondary(); attachSeqListener(); };
+    const handleQuotaCleared = () => { attachSeqListener(); };
+    window.addEventListener('blackworm_data_refresh', handleResync);
+    window.addEventListener('blackworm_secondary_resync', handleResync);
+    window.addEventListener('blackworm_quota_blocked', pullSeqFromSecondary);
+    window.addEventListener('blackworm_quota_cleared', handleQuotaCleared);
+
+    attachSeqListener();
     return () => {
       unsubSecSeq();
       if (unsubSeq) unsubSeq();
+      window.removeEventListener('blackworm_data_refresh', handleResync);
+      window.removeEventListener('blackworm_secondary_resync', handleResync);
+      window.removeEventListener('blackworm_quota_blocked', pullSeqFromSecondary);
+      window.removeEventListener('blackworm_quota_cleared', handleQuotaCleared);
     };
   }, []);
 
@@ -461,13 +476,12 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
       }
 
       if (showModalAlert) {
-        const nextPreview = String(totalDealers + 1).padStart(3, '0');
         setDialogConfig({
           isOpen: true,
           type: 'success',
-          title: 'सिरीयल नंबर सिंक झाले!',
-          message: `एकूण ${totalDealers} डीलर ॲप्लिकेशन्सना सलग सिरीयल नंबर (001 ते ${String(totalDealers).padStart(3, '0')}) मिळाले आहेत. पुढील नवीन डीलरला ऑटोमॅटिक #${nextPreview} नंबर मिळेल.`,
-          confirmText: 'ठीक आहे',
+          title: 'Saved',
+          message: 'Saved',
+          confirmText: 'OK',
           onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
         });
       }
@@ -536,7 +550,8 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
         setDeclarationDate(item.declarationDate || getLocalDateStr());
         setRemarks(item.remarks || '');
         // Preserve strictly the officer name of the user who filled the form
-        const origOfficer = item.officerName || item.created_by_name || (item.userId && usersMap[item.userId]) || (item.created_by_user_id && usersMap[item.created_by_user_id]) || (item.loginId && usersMap[item.loginId.toLowerCase()]) || '';
+        const loginKey = String(item.loginId || '').trim().toLowerCase();
+        const origOfficer = item.officerName || item.created_by_name || (item.userId && usersMap[item.userId]) || (item.created_by_user_id && usersMap[item.created_by_user_id]) || (loginKey && usersMap[loginKey]) || '';
         const displayOfficer = (origOfficer || profile.fullName || 'OFFICER').toUpperCase();
         setOfficerName(displayOfficer);
         setCreatedByUserId(item.created_by_user_id || item.createdByUid || item.userId || '');
@@ -585,9 +600,10 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
     let nextNum: number;
 
     if (!isQuotaBlocked() && (typeof navigator === 'undefined' || navigator.onLine)) {
+      let timerId: ReturnType<typeof setTimeout> | null = null;
       try {
-        // Execute atomic Firestore transaction to guarantee concurrent officer submissions NEVER collide
-        nextNum = await runTransaction(db, async (transaction) => {
+        // Race atomic Firestore transaction against a tight 1200ms budget so saving is always instant
+        const txPromise = runTransaction(db, async (transaction) => {
           const seqSnap = await transaction.get(seqRef);
           let cur = 0;
           if (seqSnap.exists()) {
@@ -606,6 +622,11 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
           );
           return allocated;
         });
+        const timeoutPromise = new Promise<number>((_, reject) => {
+          timerId = setTimeout(() => reject(new Error('sequence_tx_budget_exceeded')), 1200);
+        });
+        nextNum = await Promise.race([txPromise, timeoutPromise]);
+        if (timerId) clearTimeout(timerId);
         void safeFirestoreSet(
           'config',
           'dealer_sequence',
@@ -617,6 +638,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
           { merge: true }
         ).catch(() => {});
       } catch (txErr: any) {
+        if (timerId) clearTimeout(timerId);
         if (isQuotaExceededError(txErr)) {
           setQuotaBlocked(15 * 60 * 1000);
         }
@@ -673,8 +695,6 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
     setVillage('');
     setVillageLgdCode('');
     setTaluka('');
-    setShowVillagePicker(false);
-    setVillagePickerQuery('');
     setSecurityDeposit('NA');
     setDealershipAddressPhoto('');
     setFirmName('');
@@ -730,8 +750,6 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
     setDealerCode(item.dealerCode || '');
     setVillage(item.village || '');
     setVillageLgdCode(item.villageLgdCode || '');
-    setShowVillagePicker(false);
-    setVillagePickerQuery('');
     const resolvedState = normalizeStateName(item.state || DEFAULT_STATE);
     const resolvedDistrict = canonicalizeDistrictName(item.district || '', resolvedState) || item.district || '';
     const savedLocMatch = !item.taluka && resolvedDistrict && item.village
@@ -771,7 +789,8 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
     setDeclarationDate(item.declarationDate || getLocalDateStr());
     setRemarks(item.remarks || '');
     // Strictly display the officer name of the user who filled the form!
-    const originalOfficer = item.officerName || item.created_by_name || (item.userId && usersMap[item.userId]) || (item.created_by_user_id && usersMap[item.created_by_user_id]) || (item.loginId && usersMap[item.loginId.toLowerCase()]) || '';
+    const origLoginKey = String(item.loginId || '').trim().toLowerCase();
+    const originalOfficer = item.officerName || item.created_by_name || (item.userId && usersMap[item.userId]) || (item.created_by_user_id && usersMap[item.created_by_user_id]) || (origLoginKey && usersMap[origLoginKey]) || '';
     const displayOfficer = (originalOfficer || profile.fullName || 'OFFICER').toUpperCase();
     setOfficerName(displayOfficer);
     setCreatedByUserId(item.created_by_user_id || item.createdByUid || item.userId || '');
@@ -792,7 +811,9 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
     if (!initialDealerId || dealers.length === 0) return;
     const match = dealers.find((d) => d.id === initialDealerId);
     if (match) {
-      loadDealerToForm(match, true);
+      if (isAdmin(profile) || isCreatedByOfficer(match, profile.uid) || isUserRecord(match, profile)) {
+        loadDealerToForm(match, true);
+      }
       onConsumeInitialDealerId?.();
     }
   }, [initialDealerId, dealers]);
@@ -951,7 +972,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
         payload.createdAt = new Date().toISOString();
       }
 
-      const saveRes = await safeFirestoreSet('dealers_application', id, payload, { merge: true });
+      await safeFirestoreSet('dealers_application', id, payload, { merge: true });
       // Auto-link Dealer Village/Location to Location Mapping (zero duplicate writes if in official LGD Master or cached)
       if (payload.village && payload.district) {
         void ensureLocationVillageLinked({
@@ -967,13 +988,13 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
           user: profile,
         }).catch(() => {});
       }
-      await logAudit(
+      void logAudit(
         isNewRecord ? 'CREATE' : 'UPDATE',
         'dealers_application',
         id,
         `${isNewRecord ? 'Created' : 'Updated'} Dealership Form for ${payload.firmName} (${payload.dealerCode}) by ${payload.officerName}`,
         profile
-      );
+      ).catch(() => {});
 
       // Immediately update shared in-memory state
       setDealersOptimistic((prev) => {
@@ -994,36 +1015,6 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
       setIsEditing(false);
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
-
-      if (isNewRecord) {
-        setDialogConfig({
-          isOpen: true,
-          type: 'success',
-          title: `डीलर फॉर्म सेव्ह झाला: #${finalCode}`,
-          message: saveRes.isCachedLocally
-            ? `डीलर फॉर्म स्थानिक सुरक्षित मेमरीमध्ये सेव्ह झाला आहे (#${finalCode}).\nफर्म: ${payload.firmName}`
-            : `डीलर फॉर्म अधिकृत सिरीयल नंबर #${finalCode} सह यशस्वीरित्या सेव्ह झाला आहे.\nफर्म: ${payload.firmName}`,
-          confirmText: 'डीलर यादी पहा (View List)',
-          onConfirm: () => {
-            setDialogConfig((p) => ({ ...p, isOpen: false }));
-            setViewMode('list');
-          },
-        });
-      } else {
-        setDialogConfig({
-          isOpen: true,
-          type: 'success',
-          title: `डीलर माहिती अपडेट झाली`,
-          message: saveRes.isCachedLocally
-            ? `${payload.firmName} यांची माहिती सुरक्षित सेव्ह झाली आहे.`
-            : `${payload.firmName} यांची माहिती यशस्वीरित्या अपडेट करण्यात आली आहे.`,
-          confirmText: 'डीलर यादी पहा (View List)',
-          onConfirm: () => {
-            setDialogConfig((p) => ({ ...p, isOpen: false }));
-            setViewMode('list');
-          },
-        });
-      }
     } catch (err: any) {
       setDialogConfig({
         isOpen: true,
@@ -1040,7 +1031,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
 
   const handleDelete = async (id: string, name: string) => {
     const itemToDelete = dealers.find(d => d.id === id);
-    if (!isAdmin(profile) && itemToDelete && !isCreatedByOfficer(itemToDelete, profile.uid)) {
+    if (!isAdmin(profile) && itemToDelete && !isCreatedByOfficer(itemToDelete, profile.uid) && !isUserRecord(itemToDelete, profile)) {
       setDialogConfig({
         isOpen: true,
         type: 'alert',
@@ -1104,34 +1095,32 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
       return true;
     }
     const targetOfficer = officers.find(o => o.uid === officerUid);
-    const targetName = (targetOfficer?.fullName || (officerUid === profile.uid ? profile.fullName : '') || '').trim().toUpperCase();
+    const targetName = (targetOfficer?.fullName || (officerUid === profile.uid ? profile.fullName : '') || '').replace(/\s+/g, ' ').trim().toUpperCase();
     const targetLogin = (targetOfficer?.loginId || (officerUid === profile.uid ? profile.loginId : '') || '').trim().toLowerCase();
     const targetCode = (targetOfficer?.userCode || (officerUid === profile.uid ? profile.userCode : '') || '').trim().toLowerCase();
 
     // 1. Direct creator UID match or assigned officer UID match
     const creatorId = (d.created_by_user_id || d.createdByUid || d.userId || d.ownerId || (d as any).assignedOfficerUid || '').toString().trim().toLowerCase();
     const targetUidLower = (officerUid || '').trim().toLowerCase();
-    if (targetUidLower && creatorId && (creatorId === targetUidLower || creatorId.includes(targetUidLower))) {
+    if (targetUidLower && creatorId && creatorId === targetUidLower) {
       return true;
     }
 
-    // 2. Full name match or substring match
-    const dOfficerName = (d.officerName || d.created_by_name || '').toString().trim().toUpperCase();
-    if (targetName && dOfficerName) {
-      if (dOfficerName === targetName || dOfficerName.includes(targetName) || targetName.includes(dOfficerName)) {
-        return true;
-      }
+    // 2. Full name exact normalized match
+    const dOfficerName = (d.officerName || d.created_by_name || '').toString().replace(/\s+/g, ' ').trim().toUpperCase();
+    if (targetName && dOfficerName && dOfficerName === targetName) {
+      return true;
     }
 
     // 3. Officer Login ID match (only if not generic 'admin')
     const dLogin = (d.loginId || '').toString().trim().toLowerCase();
-    if (targetLogin && dLogin && dLogin !== 'admin' && (dLogin === targetLogin || dLogin.includes(targetLogin))) {
+    if (targetLogin && dLogin && dLogin !== 'admin' && dLogin === targetLogin) {
       return true;
     }
 
     // 4. Officer User Code match
     const dCode = (d.userCode || '').toString().trim().toLowerCase();
-    if (targetCode && dCode && (dCode === targetCode || dCode.includes(targetCode))) {
+    if (targetCode && dCode && (dCode === targetCode || dCode.replace(/^emp-/, '') === targetCode.replace(/^emp-/, ''))) {
       return true;
     }
 
@@ -1143,7 +1132,8 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
     if (uid && usersMap[uid]) return usersMap[uid];
     if (d.created_by_name) return d.created_by_name;
     if (d.officerName) return d.officerName;
-    if (d.loginId && usersMap[d.loginId.toLowerCase()]) return usersMap[d.loginId.toLowerCase()];
+    const loginKey = String(d.loginId || '').trim().toLowerCase();
+    if (loginKey && usersMap[loginKey]) return usersMap[loginKey];
     return 'अधिकारी (Officer)';
   };
 
@@ -1170,11 +1160,14 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
   const selectedOfficerObj = officers.find((o) => o.uid === selectedOfficerFilter);
 
   const officerScopedDealers = useMemo(() => {
+    if (!isAdmin(profile)) {
+      return dealers.filter((d) => isCreatedByOfficer(d, profile.uid) || isUserRecord(d, profile));
+    }
     if (selectedOfficerFilter !== 'all') {
       return dealers.filter((d) => isCreatedByOfficer(d, selectedOfficerFilter));
     }
     return dealers;
-  }, [dealers, selectedOfficerFilter, officers]);
+  }, [dealers, selectedOfficerFilter, officers, profile]);
 
   const officerDealersCount = officerScopedDealers.length;
 
@@ -1187,25 +1180,13 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
   useEffect(() => {
     const code = activeFormStateMeta?.code;
     if (viewMode === 'form' && (code === '27' || code === '29')) {
-      void loadLgdStateVillages(code).then((res) => {
-        if (res) setLgdRevision((r) => r + 1);
-      });
+      void loadLgdStateVillages(code);
     }
   }, [viewMode, activeFormStateMeta?.code]);
-
-  const districtsForFormState = useMemo(
-    () => getDistrictsForState(activeFormStateMeta?.code || stateName || DEFAULT_STATE),
-    [activeFormStateMeta?.code, stateName]
-  );
 
   const canonicalFormDistrict = useMemo(
     () => canonicalizeDistrictName(district || '', stateName),
     [district, stateName]
-  );
-
-  const formDistrictMeta = useMemo(
-    () => getDistrictMeta(canonicalFormDistrict || district, activeFormStateMeta?.code),
-    [canonicalFormDistrict, district, activeFormStateMeta?.code]
   );
 
   const availableTalukaOptions = useMemo(() => {
@@ -1241,80 +1222,6 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
 
     return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
   }, [canonicalFormDistrict, district, activeFormStateMeta?.code, locationTalukas, locationVillages]);
-
-  const formTalukaMeta = useMemo(
-    () => getTalukaMeta(formDistrictMeta?.code || canonicalFormDistrict || district, taluka, activeFormStateMeta?.code),
-    [formDistrictMeta?.code, canonicalFormDistrict, district, taluka, activeFormStateMeta?.code]
-  );
-
-  const suggestedVillagesForForm = useMemo(() => {
-    const seen = new Map<string, { village: string; pinCode?: string; taluka?: string; villageCode?: string }>();
-    const sCode = activeFormStateMeta?.code || '';
-    const dKey = normalizeLocationKey(canonicalFormDistrict || district);
-    const tKey = normalizeLocationKey(formTalukaMeta?.name || taluka);
-
-    // 1. Official LGD villages for selected Taluka (from IndexedDB cache)
-    if (sCode && formTalukaMeta?.code) {
-      const officialList = getOfficialVillagesByTalukaSync(sCode, formTalukaMeta.code);
-      officialList.forEach((ov) => {
-        const vKey = normalizeLocationKey(ov.villageName);
-        if (vKey && !seen.has(vKey)) {
-          seen.set(vKey, {
-            village: ov.villageName,
-            pinCode: ov.pinCode || undefined,
-            taluka: ov.talukaName,
-            villageCode: ov.villageCode,
-          });
-        }
-      });
-    }
-
-    // 2. Admin-added custom saved villages
-    locationVillages.forEach((lv) => {
-      if (dKey && normalizeLocationKey(lv.district) !== dKey) return;
-      if (tKey && normalizeLocationKey(lv.taluka) !== tKey) return;
-      const vKey = normalizeLocationKey(lv.village);
-      if (vKey && !seen.has(vKey)) {
-        seen.set(vKey, {
-          village: lv.village,
-          pinCode: lv.pinCode,
-          taluka: lv.taluka,
-          villageCode: lv.villageCode,
-        });
-      }
-    });
-
-    // 3. Existing dealer villages
-    dealers.forEach((d) => {
-      if (!d || d.isArchived || !d.village) return;
-      if (dKey && normalizeLocationKey(canonicalizeDistrictName(d.district || '', d.state)) !== dKey) return;
-      if (tKey && d.taluka && normalizeLocationKey(d.taluka) !== tKey) return;
-      const vKey = normalizeLocationKey(d.village);
-      if (vKey && !seen.has(vKey)) {
-        seen.set(vKey, {
-          village: d.village,
-          pinCode: d.pinCode,
-          taluka: d.taluka,
-          villageCode: d.villageLgdCode,
-        });
-      }
-    });
-
-    return Array.from(seen.values()).sort((a, b) => a.village.localeCompare(b.village));
-  }, [activeFormStateMeta?.code, formTalukaMeta?.code, formTalukaMeta?.name, canonicalFormDistrict, district, taluka, locationVillages, dealers, lgdRevision]);
-
-  const filteredPickerVillages = useMemo(() => {
-    const pq = villagePickerQuery.toLowerCase().trim();
-    const list = pq
-      ? suggestedVillagesForForm.filter(
-          (sv) =>
-            sv.village.toLowerCase().includes(pq) ||
-            (sv.villageCode || '').includes(pq) ||
-            (sv.pinCode || '').includes(pq)
-        )
-      : suggestedVillagesForForm;
-    return list.slice(0, 80);
-  }, [suggestedVillagesForForm, villagePickerQuery]);
 
   const filteredDealers = useMemo(() => {
     let list = officerScopedDealers.filter((d) => {
@@ -1421,7 +1328,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
         <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl flex items-center justify-between no-print animate-fade-in">
           <div className="flex items-center gap-2">
             <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-            <span className="font-semibold">Dealership Form saved successfully!</span>
+            <span className="font-semibold">Saved</span>
           </div>
           <button onClick={() => setSaveSuccess(false)} className="text-emerald-700">
             <X className="w-4 h-4" />
@@ -1438,52 +1345,53 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
             <span
               className="px-3 py-1 rounded-lg text-xs font-black shrink-0 bg-slate-900 text-white shadow-md"
             >
-              {`All (${officerDealersCount})`}
+              {userIsAdmin ? `All (${officerDealersCount})` : `My Dealers (${officerDealersCount})`}
             </span>
 
-            {/* Officer Select - Available across authorized employees & admin */}
-            <select
-              value={selectedOfficerFilter}
-              onChange={(e) => setSelectedOfficerFilter(e.target.value)}
-              className="bg-slate-900 text-white hover:bg-slate-800 border-2 border-slate-900 rounded-lg px-2.5 py-1 text-xs font-black focus:outline-none focus:ring-2 focus:ring-slate-900 cursor-pointer shadow-xs tracking-tight shrink-0"
-              title="Officer Select"
-            >
-              <option value="all" className="bg-white text-slate-900 font-black py-1">
-                Officer Select
-              </option>
-              {officers.map((off) => {
-                const count = dealers.filter((d) => isCreatedByOfficer(d, off.uid)).length;
-                return (
-                  <option key={off.uid} value={off.uid} className="bg-white text-slate-900 font-bold text-xs py-1">
-                    {toTitleCase(off.fullName || 'Officer')} ({count})
+            {/* Officer Select - Admin Only */}
+            {userIsAdmin && (
+              <>
+                <select
+                  value={selectedOfficerFilter}
+                  onChange={(e) => setSelectedOfficerFilter(e.target.value)}
+                  className="bg-slate-900 text-white hover:bg-slate-800 border-2 border-slate-900 rounded-lg px-2.5 py-1 text-xs font-black focus:outline-none focus:ring-2 focus:ring-slate-900 cursor-pointer shadow-xs tracking-tight shrink-0"
+                  title="Officer Select"
+                >
+                  <option value="all" className="bg-white text-slate-900 font-black py-1">
+                    Officer Select
                   </option>
-                );
-              })}
-            </select>
+                  {officers.map((off) => {
+                    const count = dealers.filter((d) => isCreatedByOfficer(d, off.uid)).length;
+                    return (
+                      <option key={off.uid} value={off.uid} className="bg-white text-slate-900 font-bold text-xs py-1">
+                        {toTitleCase(off.fullName || 'Officer')} ({count})
+                      </option>
+                    );
+                  })}
+                </select>
 
-            {selectedOfficerFilter !== 'all' && (
-              <button
-                type="button"
-                onClick={() => setSelectedOfficerFilter('all')}
-                className="bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 px-2 py-0.5 rounded-lg text-[10px] font-black flex items-center gap-1 cursor-pointer transition shrink-0"
-                title="Clear filter"
-              >
-                <span>{selectedOfficerObj?.fullName}</span>
-                <X className="w-3 h-3" />
-              </button>
-            )}
+                {selectedOfficerFilter !== 'all' && (
+                  <button
+                    type="button"
+                    onClick={() => setSelectedOfficerFilter('all')}
+                    className="bg-red-50 border border-red-200 text-red-700 hover:bg-red-100 px-2 py-0.5 rounded-lg text-[10px] font-black flex items-center gap-1 cursor-pointer transition shrink-0"
+                    title="Clear filter"
+                  >
+                    <span>{selectedOfficerObj?.fullName}</span>
+                    <X className="w-3 h-3" />
+                  </button>
+                )}
 
-            {/* Re-index Serial Numbers for Admin */}
-            {isAdmin(profile) && (
-              <button
-                type="button"
-                onClick={() => reindexAllDealersSequence(true)}
-                className="bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 px-2 py-1 rounded-lg text-xs font-bold flex items-center gap-1 cursor-pointer transition shadow-2xs shrink-0"
-                title="सर्व डीलर सिरीयल नंबर सिंक करा (001 ते 070)"
-              >
-                <RefreshCw className="w-3 h-3 text-red-600" />
-                <span className="hidden sm:inline text-[11px]">सिंक सिरीयल</span>
-              </button>
+                <button
+                  type="button"
+                  onClick={() => reindexAllDealersSequence(true)}
+                  className="bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 px-2 py-1 rounded-lg text-xs font-bold flex items-center gap-1 cursor-pointer transition shadow-2xs shrink-0"
+                  title="सर्व डीलर सिरीयल नंबर सिंक करा (001 ते 070)"
+                >
+                  <RefreshCw className="w-3 h-3 text-red-600" />
+                  <span className="hidden sm:inline text-[11px]">सिंक सिरीयल</span>
+                </button>
+              </>
             )}
           </div>
 
@@ -1534,7 +1442,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
                         {toTitleCase(d.proprietorName) || '-'}
                       </td>
                       <td className="p-3 font-bold text-slate-800">
-                        {toTitleCase((d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'Officer')}
+                        {toTitleCase((d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[String(d.loginId).toLowerCase()]) || d.officerName || d.created_by_name || 'Officer')}
                       </td>
                       <td className="p-3 text-slate-600">
                         {toTitleCase(
@@ -1600,7 +1508,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
                       <span className="text-[10px] text-slate-500 font-semibold block truncate">
                         {locationSubtitle}
                         <span className="text-slate-700 font-bold ml-1">
-                          ({toTitleCase((d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[d.loginId.toLowerCase()]) || d.officerName || d.created_by_name || 'Officer')})
+                          ({toTitleCase((d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[String(d.loginId).toLowerCase()]) || d.officerName || d.created_by_name || 'Officer')})
                         </span>
                       </span>
                     </div>
@@ -1842,105 +1750,20 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
                             />
                           </div>
                         </div>
-                        <div className="flex items-center p-0 min-h-[38px] py-0.5 relative">
+                        <div className="flex items-center p-0 min-h-[38px] py-0.5">
                           <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter">Village</span>
-                          <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center gap-1 px-3 relative">
+                          <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
                             <input
                               type="text"
-                              list="dealer-village-options"
                               disabled={!isEditing}
                               value={village}
                               onChange={(e) => {
-                                const nextVal = e.target.value;
-                                setVillage(nextVal);
-                                const matched = suggestedVillagesForForm.find(
-                                  (sv) => normalizeLocationKey(sv.village) === normalizeLocationKey(nextVal)
-                                );
-                                if (matched) {
-                                  if (matched.villageCode) {
-                                    setVillageLgdCode(matched.villageCode);
-                                  }
-                                  if (matched.pinCode && !pinCode.trim()) {
-                                    setPinCode(matched.pinCode);
-                                  }
-                                  if (matched.taluka && !taluka.trim()) {
-                                    setTaluka(matched.taluka);
-                                  }
-                                } else {
-                                  setVillageLgdCode('');
-                                }
+                                setVillage(e.target.value);
+                                setVillageLgdCode('');
                               }}
-                              placeholder={isEditing ? 'Enter or Select Village' : ''}
+                              placeholder={isEditing ? 'Enter Village' : ''}
                               className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
                             />
-                            {isEditing && suggestedVillagesForForm.length > 0 && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setVillagePickerQuery('');
-                                  setShowVillagePicker((prev) => !prev);
-                                }}
-                                className="no-print shrink-0 px-1.5 py-0.5 text-[9px] font-black bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded text-slate-700 flex items-center gap-0.5 cursor-pointer"
-                                title="Select from official LGD village list"
-                              >
-                                <span>{suggestedVillagesForForm.length}</span>
-                                <ChevronDown className="w-3 h-3" />
-                              </button>
-                            )}
-                            <datalist id="dealer-village-options">
-                              {suggestedVillagesForForm.map((sv) => (
-                                <option key={`${sv.villageCode || sv.village}`} value={sv.village.toUpperCase()} />
-                              ))}
-                            </datalist>
-                            {isEditing && showVillagePicker && (
-                              <div className="no-print absolute left-0 right-0 top-full mt-1 z-40 bg-white border border-slate-300 rounded-xl shadow-xl p-2 space-y-1.5 max-h-60 flex flex-col">
-                                <div className="flex items-center gap-1.5 border-b border-slate-100 pb-1.5">
-                                  <Search className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-                                  <input
-                                    type="text"
-                                    value={villagePickerQuery}
-                                    onChange={(e) => setVillagePickerQuery(e.target.value)}
-                                    placeholder="गाव / LGD Code शोधा..."
-                                    className="w-full text-[11px] font-bold text-slate-800 focus:outline-none"
-                                    autoFocus
-                                  />
-                                  <button
-                                    type="button"
-                                    onClick={() => setShowVillagePicker(false)}
-                                    className="text-slate-400 hover:text-slate-700 p-0.5 cursor-pointer"
-                                  >
-                                    <X className="w-3.5 h-3.5" />
-                                  </button>
-                                </div>
-                                <div className="overflow-y-auto divide-y divide-slate-100 max-h-44">
-                                  {filteredPickerVillages.map((sv) => (
-                                    <button
-                                      key={`${sv.villageCode || sv.village}`}
-                                      type="button"
-                                      onClick={() => {
-                                        setVillage(sv.village.toUpperCase());
-                                        setVillageLgdCode(sv.villageCode || '');
-                                        if (sv.pinCode && !pinCode.trim()) setPinCode(sv.pinCode);
-                                        if (sv.taluka && !taluka.trim()) setTaluka(sv.taluka);
-                                        setShowVillagePicker(false);
-                                      }}
-                                      className="w-full text-left px-2 py-1.5 hover:bg-red-50 flex items-center justify-between gap-2 text-[11px] font-bold text-slate-800 cursor-pointer"
-                                    >
-                                      <span className="truncate">{sv.village.toUpperCase()}</span>
-                                      <span className="text-[9px] font-mono text-slate-500 shrink-0">
-                                        {sv.villageCode ? `LGD:${sv.villageCode}` : ''}
-                                        {sv.pinCode ? ` • ${sv.pinCode}` : ''}
-                                      </span>
-                                    </button>
-                                  ))}
-                                  {filteredPickerVillages.length === 0 && (
-                                    <div className="p-2 text-[11px] text-slate-400 text-center font-semibold">
-                                      कोणतेही जुळणारे गाव सापडले नाही
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            )}
                           </div>
                         </div>
                         <div className="flex items-center p-0 min-h-[38px] py-0.5">
@@ -2146,38 +1969,14 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
                     <div className="flex items-center p-0 min-h-[38px] py-0.5">
                       <span className="font-black text-black w-44 shrink-0 px-2 uppercase tracking-tighter text-[10px]">District</span>
                       <div className="flex-1 border-l-2 border-black min-h-[36px] flex items-center px-3">
-                        {isEditing ? (
-                          <select
-                            value={canonicalFormDistrict || district}
-                            onChange={(e) => {
-                              const nextDist = e.target.value;
-                              setDistrict(nextDist.toUpperCase());
-                              const nextTalukas = getTalukasForDistrict(nextDist, stateName);
-                              if (
-                                taluka &&
-                                nextTalukas.length > 0 &&
-                                !nextTalukas.some((t) => normalizeLocationKey(t) === normalizeLocationKey(taluka))
-                              ) {
-                                setTaluka('');
-                                setVillageLgdCode('');
-                              }
-                            }}
-                            className="w-full bg-transparent font-black text-black focus:outline-none uppercase cursor-pointer"
-                          >
-                            <option value="">-- SELECT DISTRICT --</option>
-                            {districtsForFormState.map((dMeta) => (
-                              <option key={dMeta.code} value={dMeta.name}>
-                                {getDistrictDisplayLabel(dMeta.name).toUpperCase()}
-                              </option>
-                            ))}
-                            {district &&
-                              !districtsForFormState.some(
-                                (dMeta) => normalizeLocationKey(dMeta.name) === normalizeLocationKey(canonicalFormDistrict)
-                              ) && <option value={district}>{district.toUpperCase()}</option>}
-                          </select>
-                        ) : (
-                          <span className="w-full font-black text-black uppercase">{district || ''}</span>
-                        )}
+                        <input
+                          type="text"
+                          disabled={!isEditing}
+                          value={district}
+                          onChange={(e) => setDistrict(e.target.value)}
+                          placeholder={isEditing ? 'Enter District' : ''}
+                          className="w-full bg-transparent font-black text-black focus:outline-none uppercase"
+                        />
                       </div>
                     </div>
                   </div>

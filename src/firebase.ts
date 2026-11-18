@@ -3,8 +3,7 @@ import { getAuth } from 'firebase/auth';
 import { 
   initializeFirestore, 
   getFirestore, 
-  persistentLocalCache, 
-  persistentMultipleTabManager,
+  memoryLocalCache,
   doc, 
   getDocFromServer,
   setLogLevel
@@ -19,14 +18,12 @@ const app = initializeApp(firebaseConfig);
 
 let firestoreDb;
 try {
-  // Robust persistence with multi-tab support for seamless data sync across devices
+  // Always load fresh server data into memory on session start so stale IndexedDB cache never masks live updates
   firestoreDb = initializeFirestore(app, {
-    localCache: persistentLocalCache({
-      tabManager: persistentMultipleTabManager()
-    })
+    localCache: memoryLocalCache()
   }, firebaseConfig.firestoreDatabaseId);
 } catch (e) {
-  console.warn('Firestore persistence init failed, falling back to basic init:', e);
+  console.warn('Firestore memory cache init fallback:', e);
   firestoreDb = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 }
 

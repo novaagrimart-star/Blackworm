@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { getFriendlyErrorMessage } from '../../firebase';
-import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
+import { UserProfile, isAdmin, isUserRecord, isGodownOrOfficeStaff } from '../../lib/auth';
 import { softDeleteRecord, logAudit, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, formatDisplayDate, triggerBlobDownload, deduplicateProducts } from '../../lib/dataService';
 import { useSharedOrders, useSharedDealers, useSharedUsers, useSharedMasterPricelist } from '../../lib/realtimeStore';
 import { Language } from '../../lib/i18n';
@@ -476,6 +476,168 @@ export interface OrderItem {
   isArchived?: boolean;
 }
 
+export const isOrderApprovedForGodown = (o?: Partial<OrderItem> | null): boolean => {
+  if (!o) return false;
+  return (
+    o.status === 'complete' ||
+    o.status === 'approved' ||
+    o.status === 'dispatched' ||
+    o.status === 'delivered' ||
+    o.status === 'collected' ||
+    o.status === 'confirmed'
+  );
+};
+
+export interface GodownOrderSlipCardProps {
+  order: OrderItem;
+  resolvedItems: OrderProductLine[];
+  isDownloading?: boolean;
+  isSharing?: boolean;
+  isCopied?: boolean;
+  onDownloadImage?: (order: OrderItem) => void;
+  onSharePhoto?: (order: OrderItem) => void;
+  onCopyText?: (order: OrderItem) => void;
+}
+
+export const GodownOrderSlipCard: React.FC<GodownOrderSlipCardProps> = ({
+  order,
+  resolvedItems,
+  isDownloading = false,
+  isSharing = false,
+  isCopied = false,
+  onDownloadImage,
+  onSharePhoto,
+  onCopyText,
+}) => {
+  return (
+    <div className="bg-white p-4 border-2 border-slate-900 rounded-2xl font-sans text-slate-900 space-y-2.5 shadow-xs">
+      {/* Header Bar: Company, Order No & Date — Identical to Downloaded Image */}
+      <div className="flex items-center justify-between border-b-2 border-slate-900 pb-2 gap-2">
+        <div className="min-w-0">
+          <p className="text-[11px] font-black text-rose-600 uppercase tracking-tight truncate">
+            BLACKWORM AGRITECH PVT LTD
+          </p>
+          <div className="flex items-center gap-1.5 mt-0.5">
+            <p className="text-xs font-black text-purple-800 font-mono">{order.orderNumber}</p>
+            <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[9px] font-black uppercase">
+              <CheckCircle2 className="w-2.5 h-2.5" />
+              Approved
+            </span>
+          </div>
+        </div>
+        <div className="text-right shrink-0">
+          <p className="text-[10px] font-bold text-slate-500">Order Date</p>
+          <p className="text-[11px] font-black text-slate-900 font-mono">
+            {new Date(order.createdAt).toLocaleDateString('en-GB')}
+          </p>
+        </div>
+      </div>
+
+      {/* Dealer & Location Information */}
+      <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs space-y-1">
+        <p className="text-slate-800">
+          <span className="font-bold text-slate-500">Dealer:</span>{' '}
+          <strong className="text-sm font-black text-slate-900">{toTitleCase(order.dealerName)}</strong>
+        </p>
+        <p className="text-slate-800">
+          <span className="font-bold text-slate-500">Proprietor Name:</span>{' '}
+          <strong className="text-slate-900">{toTitleCase(order.farmerName || '-')}</strong>
+        </p>
+        <p className="text-slate-800">
+          <span className="font-bold text-slate-500">Contact Number:</span>{' '}
+          <strong className="font-mono text-slate-900">{order.dealerContact || '-'}</strong>
+        </p>
+        <p className="text-slate-800">
+          <span className="font-bold text-slate-500">Location:</span>{' '}
+          <strong className="text-slate-900">
+            {[toTitleCase(order.dealerVillage), toTitleCase(order.dealerDistrict)].filter(Boolean).join(', ') || '-'}
+          </strong>
+        </p>
+      </div>
+
+      {/* Order Quantity Section — Strictly ONLY Product Name, Packing & Quantity (Box / Nos) */}
+      <div>
+        <p className="text-xs font-black text-slate-800 uppercase tracking-wide mb-1.5">Order Quantity:</p>
+        <table className="w-full text-left border-collapse text-[11px]">
+          <thead>
+            <tr className="bg-slate-900 text-white font-black text-[10px] uppercase">
+              <th className="p-1.5 pl-2"># Product</th>
+              <th className="p-1.5 text-center w-24">Packing</th>
+              <th className="p-1.5 text-center w-24">Quantity</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-200 border-b border-slate-200 font-semibold">
+            {resolvedItems.map((it, idx) => (
+              <tr key={idx} className={idx % 2 === 1 ? 'bg-slate-50/70' : ''}>
+                <td className="p-1.5 pl-2 font-bold text-sky-700 text-[11px]">
+                  {idx + 1}. {it.gradeName || it.productName}
+                </td>
+                <td className="p-1.5 text-center text-slate-600 text-[10px] font-bold">{it.packingSize}</td>
+                <td className="p-1.5 text-center font-mono font-black text-slate-900 text-xs">
+                  {it.quantity} {getOrderLineUnit(it)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot className="bg-emerald-50 font-black text-emerald-950 text-[11px]">
+            <tr>
+              <td colSpan={2} className="p-2 pl-2 text-right uppercase">
+                Total Quantity:
+              </td>
+              <td className="p-2 text-center font-mono font-black text-sm text-emerald-900">
+                {formatOrderTotalQuantity(resolvedItems, order.totalQuantity)}
+              </td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+
+      <div className="flex justify-between items-center pt-1 border-t border-slate-200 text-[10px] text-slate-500 font-bold">
+        <span>Booked by: {toTitleCase(order.createdByName || 'Officer')}</span>
+        <span>{order.cropName ? `Crop: ${order.cropName}` : ''}</span>
+      </div>
+
+      {(onDownloadImage || onSharePhoto || onCopyText) && (
+        <div className="pt-1 flex items-center gap-1.5 border-t border-slate-100">
+          {onDownloadImage && (
+            <button
+              type="button"
+              onClick={() => onDownloadImage(order)}
+              disabled={isDownloading}
+              className="flex-1 py-1.5 px-2.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-lg text-[11px] font-bold flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer"
+              title="Download Order Image"
+            >
+              {isDownloading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+              <span>Download Order Image</span>
+            </button>
+          )}
+          {onSharePhoto && (
+            <button
+              type="button"
+              onClick={() => onSharePhoto(order)}
+              disabled={isSharing}
+              className="p-1.5 px-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-[11px] font-bold flex items-center justify-center gap-1 transition active:scale-95 cursor-pointer"
+              title="Share Order Photo"
+            >
+              {isSharing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Camera className="w-3.5 h-3.5" />}
+            </button>
+          )}
+          {onCopyText && (
+            <button
+              type="button"
+              onClick={() => onCopyText(order)}
+              className="p-1.5 px-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-bold flex items-center justify-center gap-1 transition active:scale-95 cursor-pointer"
+              title="Copy Order Slip Text"
+            >
+              {isCopied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 export interface SavedDealer {
   id: string;
   firmName: string;
@@ -501,25 +663,25 @@ export const isDealerRegisteredByOfficer = (
 ): boolean => {
   if (!d || !officer) return false;
   const offUid = (officer.uid || '').toLowerCase().trim();
-  const offName = (officer.fullName || '').toUpperCase().trim();
+  const offName = (officer.fullName || '').replace(/\s+/g, ' ').toUpperCase().trim();
   const offLogin = (officer.loginId || '').toLowerCase().trim();
   const offCode = (officer.userCode || '').toLowerCase().trim();
 
   // 1. Direct creator / user UID match or assigned officer UID
   const creatorId = (d.created_by_user_id || d.createdByUid || d.userId || d.ownerId || d.assignedOfficerUid || '').toString().toLowerCase().trim();
-  if (offUid && creatorId && (creatorId === offUid || creatorId.includes(offUid))) return true;
+  if (offUid && creatorId && creatorId === offUid) return true;
 
-  // 2. Full name match
-  const dOfficer = (d.officerName || d.created_by_name || '').toString().toUpperCase().trim();
-  if (offName && dOfficer && (dOfficer === offName || dOfficer.includes(offName) || offName.includes(dOfficer))) return true;
+  // 2. Full name exact normalized match
+  const dOfficer = (d.officerName || d.created_by_name || '').toString().replace(/\s+/g, ' ').toUpperCase().trim();
+  if (offName && dOfficer && dOfficer === offName) return true;
 
   // 3. Login ID match
   const dLogin = (d.loginId || '').toString().toLowerCase().trim();
-  if (offLogin && dLogin && dLogin !== 'admin' && (dLogin === offLogin || dLogin.includes(offLogin))) return true;
+  if (offLogin && dLogin && dLogin !== 'admin' && dLogin === offLogin) return true;
 
   // 4. User Code match
   const dCode = (d.userCode || '').toString().toLowerCase().trim();
-  if (offCode && dCode && (dCode === offCode || dCode.includes(offCode))) return true;
+  if (offCode && dCode && (dCode === offCode || dCode.replace(/^emp-/, '') === offCode.replace(/^emp-/, ''))) return true;
 
   return false;
 };
@@ -530,6 +692,7 @@ interface Props {
 }
 
 export const OrderView: React.FC<Props> = ({ profile }) => {
+  const isGodownView = isGodownOrOfficeStaff(profile);
   const { orders: rawSharedOrders, setOrdersOptimistic } = useSharedOrders();
   const { dealers: rawSharedDealers } = useSharedDealers();
   const { fieldOfficers: sharedOfficers } = useSharedUsers();
@@ -661,6 +824,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   const [itemQtyDrafts, setItemQtyDrafts] = useState<Record<number, string>>({});
   const [copiedOrderId, setCopiedOrderId] = useState<string | null>(null);
   const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
+  const [saveToast, setSaveToast] = useState(false);
   const [productCategoryFilter, setProductCategoryFilter] = useState('all');
   const [formError, setFormError] = useState<string | null>(null);
 
@@ -758,7 +922,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   const anyOrderModalOpen = Boolean(showNewOrderModal || selectedOrderDetails || successOrder);
   useEffect(() => {
     if (anyOrderModalOpen) {
-      if (!modalHistoryPushedRef.current) {
+      if (!modalHistoryPushedRef.current && !window.history.state?.orderModalOpen) {
         window.history.pushState({ tab: 'order', orderModalOpen: true }, '');
         modalHistoryPushedRef.current = true;
       }
@@ -782,10 +946,12 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
 
   // Orders, dealers, officers, and master pricelist are subscribed once globally via realtimeStore.ts (Dual-DB synced)
 
-  // All authorized employees and admins can place orders for any registered company dealer;
-  // when an Admin filters by a specific officer, scope to that officer's dealers.
+  // Non-admin users strictly see ONLY dealers they registered; Admins see all (or filtered by selectedOfficerFilter).
   const scopedDealers = useMemo(() => {
-    if (isAdmin(profile) && selectedOfficerFilter !== 'all') {
+    if (!isAdmin(profile)) {
+      return dealers.filter((d) => isDealerRegisteredByOfficer(d, profile) || isUserRecord(d, profile));
+    }
+    if (selectedOfficerFilter !== 'all') {
       const targetOff = officers.find((o) => o.uid === selectedOfficerFilter);
       if (targetOff) {
         return dealers.filter((d) => isDealerRegisteredByOfficer(d, targetOff));
@@ -1183,30 +1349,18 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           return prev;
         });
 
-        try {
-          await logAudit(
-            'UPDATE',
-            'orders',
-            editingOrderId,
-            `Updated order ${existingOrder?.orderNumber || editingOrderId} for ${dealerToUse.firmName}`,
-            profile
-          );
-        } catch (e) {
-          console.warn('Audit log failed (non-fatal):', e);
-        }
+        void logAudit(
+          'UPDATE',
+          'orders',
+          editingOrderId,
+          `Updated order ${existingOrder?.orderNumber || editingOrderId} for ${dealerToUse.firmName}`,
+          profile
+        ).catch(() => {});
 
         setShowNewOrderModal(false);
         resetNewOrderForm();
-        setDialogConfig({
-          isOpen: true,
-          type: 'success',
-          title: 'ऑर्डर अपडेट झाली!',
-          message: saveRes.isCachedLocally
-            ? `ऑर्डर ${existingOrder?.orderNumber || ''} स्थानिक मेमरीमध्ये सुरक्षित सेव्ह झाली आहे.`
-            : `ऑर्डर ${existingOrder?.orderNumber || ''} मधील बदल यशस्वीरित्या सेव्ह झाले आहेत.`,
-          confirmText: 'ठीक आहे',
-          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
-        });
+        setSaveToast(true);
+        setTimeout(() => setSaveToast(false), 3000);
         return;
       }
 
@@ -1243,22 +1397,18 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         isArchived: false,
       };
 
-      const saveRes = await safeFirestoreSet('orders', orderId, newOrder);
+      await safeFirestoreSet('orders', orderId, newOrder);
 
       // Immediately add to shared in-memory orders
       setOrdersOptimistic((prev) => [newOrder, ...prev]);
 
-      try {
-        await logAudit(
-          'CREATE',
-          'orders',
-          orderId,
-          `Generated new order ${orderNumber} for ${dealerToUse.firmName} (Total Quantity: ${totalBags} Units)`,
-          profile
-        );
-      } catch (e) {
-        console.warn('Audit log failed (non-fatal):', e);
-      }
+      void logAudit(
+        'CREATE',
+        'orders',
+        orderId,
+        `Generated new order ${orderNumber} for ${dealerToUse.firmName} (Total Quantity: ${totalBags} Units)`,
+        profile
+      ).catch(() => {});
 
       // Reset modal form
       setShowNewOrderModal(false);
@@ -1573,9 +1723,13 @@ ${itemsListText}
     });
   };
 
-  // Filter Orders List (Strictly Officer-wise for non-admin, and officer filter for admin)
+  // Filter Orders List (Godown/Office Staff see ALL Admin-approved orders strictly; other non-admins see own records)
   const filteredOrders = orders.filter((o) => {
-    if (!isAdmin(profile)) {
+    if (isGodownView) {
+      if (!isOrderApprovedForGodown(o)) {
+        return false;
+      }
+    } else if (!isAdmin(profile)) {
       if (!isUserRecord(o, profile)) {
         return false;
       }
@@ -1585,17 +1739,17 @@ ${itemsListText}
         if (targetOfficer) {
           const anyOrder = o as any;
           const recUid = (anyOrder.userId || anyOrder.ownerId || anyOrder.created_by_user_id || anyOrder.createdByUid || '').toString().toLowerCase().trim();
-          const targetUid = (targetOfficer.uid || '').toLowerCase().trim();
-          const targetName = (targetOfficer.fullName || '').toLowerCase().trim();
-          const targetLogin = (targetOfficer.loginId || '').toLowerCase().trim();
-          const targetCode = (targetOfficer.userCode || '').toLowerCase().trim();
-          const recName = (anyOrder.createdByName || anyOrder.created_by_name || '').toString().toLowerCase().trim();
-          const recLogin = (anyOrder.loginId || '').toString().toLowerCase().trim();
-          const recCode = (anyOrder.userCode || '').toString().toLowerCase().trim();
+          const targetUid = String(targetOfficer.uid || '').toLowerCase().trim();
+          const targetName = String(targetOfficer.fullName || '').replace(/\s+/g, ' ').toLowerCase().trim();
+          const targetLogin = String(targetOfficer.loginId || '').toLowerCase().trim();
+          const targetCode = String(targetOfficer.userCode || '').toLowerCase().trim();
+          const recName = String(anyOrder.createdByName || anyOrder.created_by_name || '').replace(/\s+/g, ' ').toLowerCase().trim();
+          const recLogin = String(anyOrder.loginId || '').toLowerCase().trim();
+          const recCode = String(anyOrder.userCode || '').toLowerCase().trim();
 
           const match =
             (targetUid && recUid === targetUid) ||
-            (targetName && recName && (recName === targetName || recName.includes(targetName) || targetName.includes(recName))) ||
+            (targetName && recName && recName === targetName) ||
             (targetLogin && recLogin && recLogin === targetLogin) ||
             (targetCode && recCode && recCode === targetCode);
 
@@ -1610,9 +1764,13 @@ ${itemsListText}
       String(o.orderNumber || '').toLowerCase().includes(queryStr) ||
       String(o.dealerContact || '').includes(queryStr) ||
       String(o.farmerName || '').toLowerCase().includes(queryStr) ||
+      String(o.dealerVillage || '').toLowerCase().includes(queryStr) ||
+      String(o.dealerDistrict || '').toLowerCase().includes(queryStr) ||
       (Array.isArray(o.items) && o.items.some((it) => String(it?.productName || '').toLowerCase().includes(queryStr)));
 
     if (!matchSearch) return false;
+
+    if (isGodownView) return true;
 
     if (statusFilter === 'all') return true;
     if (statusFilter === 'pending') return o.status === 'pending_approval' || o.status === 'pending';
@@ -1625,22 +1783,37 @@ ${itemsListText}
 
   return (
     <div className="space-y-3 sm:space-y-4 max-w-5xl mx-auto pb-16">
+      {/* Save Toast Banner */}
+      {saveToast && (
+        <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs rounded-xl flex items-center justify-between animate-in fade-in">
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span className="font-bold">Saved</span>
+          </div>
+          <button type="button" onClick={() => setSaveToast(false)} className="text-emerald-700">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
       {/* Header Banner - Compact without subtitle */}
       <div className="flex justify-between items-center bg-white px-3.5 py-2.5 rounded-2xl border border-slate-200 shadow-xs">
         <h2 className="text-base sm:text-lg font-black text-slate-900 flex items-center gap-2">
           <ShoppingBag className="w-5 h-5 text-purple-600" />
-          <span>Order Management</span>
+          <span>{isGodownView ? 'मंजूर ऑर्डर्स (Godown Dispatch Slips)' : 'Order Management'}</span>
         </h2>
-        <button
-          onClick={() => {
-            resetNewOrderForm();
-            setShowNewOrderModal(true);
-          }}
-          className="flex items-center justify-center gap-1.5 bg-purple-600 hover:bg-purple-700 text-white px-3 py-1.5 rounded-xl text-xs font-bold transition shadow-xs cursor-pointer active:scale-95"
-        >
-          <Plus className="w-3.5 h-3.5 stroke-[3]" />
-          <span>New Order</span>
-        </button>
+        {!isGodownView && (
+          <button
+            onClick={() => {
+              resetNewOrderForm();
+              setShowNewOrderModal(true);
+            }}
+            className="flex items-center justify-center gap-1.5 bg-purple-600 hover:bg-purple-700 text-white px-3 py-1.5 rounded-xl text-xs font-bold transition shadow-xs cursor-pointer active:scale-95"
+          >
+            <Plus className="w-3.5 h-3.5 stroke-[3]" />
+            <span>New Order</span>
+          </button>
+        )}
       </div>
 
       {/* Search & Filter Bar - Ultra Compact Small Buttons */}
@@ -1657,7 +1830,7 @@ ${itemsListText}
         </div>
 
         {/* Admin Officer Filter Dropdown */}
-        {isAdmin(profile) && officers.length > 0 && (
+        {!isGodownView && isAdmin(profile) && officers.length > 0 && (
           <div className="shrink-0 flex items-center">
             <select
               value={selectedOfficerFilter}
@@ -1678,55 +1851,88 @@ ${itemsListText}
           </div>
         )}
 
-        {/* Status filter buttons: Pending (default), Complete, All */}
-        <div className="flex gap-1 overflow-x-auto pb-0.5 no-scrollbar items-center">
-          {[
-            { id: 'pending', label: 'Pending' },
-            { id: 'complete', label: 'Complete' },
-            { id: 'all', label: 'All' },
-          ].map((st) => {
-            const count = orders.filter((o) => {
-              if (!isAdmin(profile)) {
-                if (!isUserRecord(o, profile)) return false;
-              } else if (selectedOfficerFilter !== 'all') {
-                const targetOfficer = officers.find((off) => off.uid === selectedOfficerFilter);
-                if (targetOfficer && !isUserRecord(o, targetOfficer as any)) return false;
-              }
-              if (st.id === 'pending') return o.status === 'pending_approval' || o.status === 'pending';
-              if (st.id === 'complete') return o.status === 'complete' || o.status === 'approved' || o.status === 'delivered';
-              return true;
-            }).length;
+        {/* Status filter buttons: Pending (default), Complete, All (Hidden for Godown Incharge / Office Staff) */}
+        {isGodownView ? (
+          <div className="flex items-center px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-black shrink-0">
+            <span>मंजूर ऑर्डर्स: {filteredOrders.length}</span>
+          </div>
+        ) : (
+          <div className="flex gap-1 overflow-x-auto pb-0.5 no-scrollbar items-center">
+            {[
+              { id: 'pending', label: 'Pending' },
+              { id: 'complete', label: 'Complete' },
+              { id: 'all', label: 'All' },
+            ].map((st) => {
+              const count = orders.filter((o) => {
+                if (!isAdmin(profile)) {
+                  if (!isUserRecord(o, profile)) return false;
+                } else if (selectedOfficerFilter !== 'all') {
+                  const targetOfficer = officers.find((off) => off.uid === selectedOfficerFilter);
+                  if (targetOfficer && !isUserRecord(o, targetOfficer as any)) return false;
+                }
+                if (st.id === 'pending') return o.status === 'pending_approval' || o.status === 'pending';
+                if (st.id === 'complete') return o.status === 'complete' || o.status === 'approved' || o.status === 'delivered';
+                return true;
+              }).length;
 
-            return (
-              <button
-                key={st.id}
-                onClick={() => setStatusFilter(st.id)}
-                className={cn(
-                  "px-2.5 py-1 rounded text-xs font-bold transition whitespace-nowrap cursor-pointer active:scale-95 flex items-center gap-1",
-                  statusFilter === st.id
-                    ? "bg-purple-600 text-white shadow-2xs"
-                    : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
-                )}
-              >
-                <span>{st.label}</span>
-                <span className={cn(
-                  "px-1.5 py-0.2 rounded-full text-[10px] font-mono",
-                  statusFilter === st.id ? "bg-white/25 text-white" : "bg-slate-100 text-slate-700"
-                )}>
-                  {count}
-                </span>
-              </button>
-            );
-          })}
-        </div>
+              return (
+                <button
+                  key={st.id}
+                  onClick={() => setStatusFilter(st.id)}
+                  className={cn(
+                    "px-2.5 py-1 rounded text-xs font-bold transition whitespace-nowrap cursor-pointer active:scale-95 flex items-center gap-1",
+                    statusFilter === st.id
+                      ? "bg-purple-600 text-white shadow-2xs"
+                      : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
+                  )}
+                >
+                  <span>{st.label}</span>
+                  <span className={cn(
+                    "px-1.5 py-0.2 rounded-full text-[10px] font-mono",
+                    statusFilter === st.id ? "bg-white/25 text-white" : "bg-slate-100 text-slate-700"
+                  )}>
+                    {count}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Orders List */}
       {filteredOrders.length === 0 ? (
         <div className="bg-white rounded-2xl border border-dashed border-slate-300 p-8 text-center space-y-2">
           <ShoppingBag className="w-10 h-10 text-slate-300 mx-auto" />
-          <p className="text-xs font-bold text-slate-700">No orders found</p>
-          <p className="text-[11px] text-slate-400">Click on 'New Order' button above to create a new order.</p>
+          <p className="text-xs font-bold text-slate-700">
+            {isGodownView ? 'सध्या कोणतीही मंजूर (Approved) ऑर्डर नाही' : 'No orders found'}
+          </p>
+          <p className="text-[11px] text-slate-400">
+            {isGodownView
+              ? 'Admin ने ऑर्डर Approve केल्यानंतर ती येथे तात्काळ (Product, Packing व Quantity स्वरूपात) दिसेल.'
+              : "Click on 'New Order' button above to create a new order."}
+          </p>
+        </div>
+      ) : isGodownView ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+          {filteredOrders.map((o) => {
+            const resolvedCardItems = (o.items || []).map((it) =>
+              resolveOrderLineForBox(it, findProductForOrderItem(it))
+            );
+            return (
+              <GodownOrderSlipCard
+                key={o.id}
+                order={o}
+                resolvedItems={resolvedCardItems}
+                isDownloading={downloadingOrderId === o.id}
+                isSharing={isGeneratingImage && capturingOrder?.id === o.id}
+                isCopied={copiedOrderId === o.id}
+                onDownloadImage={handleDownloadOrderImage}
+                onSharePhoto={handleShareOnWhatsApp}
+                onCopyText={handleCopyOrderText}
+              />
+            );
+          })}
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -2857,7 +3063,7 @@ ${itemsListText}
                 ) : (
                   <>
                     <CheckCircle2 className="w-3.5 h-3.5" />
-                    <span>{editingOrderId ? 'Update Order (बदल सेव्ह करा)' : 'Generate Order'}</span>
+                    <span>{editingOrderId ? 'Update Order' : 'Generate Order'}</span>
                   </>
                 )}
               </button>
@@ -2876,7 +3082,7 @@ ${itemsListText}
             </div>
 
             <div>
-              <h3 className="text-base font-black text-slate-900">Order Generated Successfully!</h3>
+              <h3 className="text-base font-black text-slate-900">Saved</h3>
               <p className="text-[11px] text-slate-500 mt-0.5">Order No: {successOrder.orderNumber}</p>
             </div>
 
@@ -2893,7 +3099,7 @@ ${itemsListText}
                 className="w-full py-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 shadow-xs transition active:scale-95 cursor-pointer"
               >
                 {downloadingOrderId === successOrder.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
-                <span>Download Order Image (गॅलरीमध्ये सेव्ह करा)</span>
+                <span>Download Order Image</span>
               </button>
 
               <button
@@ -2979,9 +3185,10 @@ ${itemsListText}
                   <thead className="bg-slate-100 font-black text-slate-700 text-[10.5px]">
                     <tr>
                       <th className="p-1.5 pl-2">Product</th>
+                      <th className="p-1.5 text-center">Packing</th>
                       <th className="p-1.5 text-center">Qty</th>
-                      <th className="p-1.5 text-right">Rate (₹)</th>
-                      <th className="p-1.5 text-right">Total (₹)</th>
+                      {!isGodownView && <th className="p-1.5 text-right">Rate (₹)</th>}
+                      {!isGodownView && <th className="p-1.5 text-right">Total (₹)</th>}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 text-[11px]">
@@ -2991,33 +3198,47 @@ ${itemsListText}
                         <tr key={idx} className="font-semibold text-slate-800">
                           <td className="p-1.5 pl-2">
                             <p className="font-bold text-sky-700">{it.gradeName || it.productName}</p>
-                            <span className="text-[9.5px] text-slate-400">{it.packingSize}</span>
                           </td>
+                          <td className="p-1.5 text-center text-slate-500 text-[10.5px]">{it.packingSize}</td>
                           <td className="p-1.5 text-center font-mono whitespace-nowrap">{it.quantity} {getOrderLineUnit(it)}</td>
-                          <td className="p-1.5 text-right font-mono">₹{Number(it.rate) || 0}</td>
-                          <td className="p-1.5 text-right font-mono font-bold">₹{(Number(it.subtotal) || 0).toLocaleString()}</td>
+                          {!isGodownView && <td className="p-1.5 text-right font-mono">₹{Number(it.rate) || 0}</td>}
+                          {!isGodownView && <td className="p-1.5 text-right font-mono font-bold">₹{(Number(it.subtotal) || 0).toLocaleString()}</td>}
                         </tr>
                       );
                     })}
                   </tbody>
-                  <tfoot className="bg-purple-50 font-black text-purple-900 border-t border-purple-200 text-xs">
-                    {selectedOrderDetails.discountAmount && selectedOrderDetails.discountAmount > 0 ? (
-                      <>
-                        <tr>
-                          <td colSpan={3} className="p-1.5 text-right text-slate-600 font-bold">Gross Amount:</td>
-                          <td className="p-1.5 text-right font-mono">₹{(Number(selectedOrderDetails.grossAmount || ((Number(selectedOrderDetails.totalAmount) || 0) + (Number(selectedOrderDetails.discountAmount) || 0))) || 0).toLocaleString()}</td>
-                        </tr>
-                        <tr>
-                          <td colSpan={3} className="p-1.5 text-right text-rose-700 font-bold">Discount Applied:</td>
-                          <td className="p-1.5 text-right font-mono text-rose-700 font-bold">-₹{(Number(selectedOrderDetails.discountAmount) || 0).toLocaleString()}</td>
-                        </tr>
-                      </>
-                    ) : null}
-                    <tr className="border-t border-purple-200">
-                      <td colSpan={3} className="p-1.5 text-right uppercase">Net Bill Amount:</td>
-                      <td className="p-1.5 text-right font-mono text-sm font-bold text-purple-950">₹{(Number(selectedOrderDetails.totalAmount) || 0).toLocaleString()}</td>
-                    </tr>
-                  </tfoot>
+                  {isGodownView ? (
+                    <tfoot className="bg-emerald-50 font-black text-emerald-950 border-t border-emerald-200 text-xs">
+                      <tr>
+                        <td colSpan={2} className="p-1.5 text-right uppercase">Total Quantity:</td>
+                        <td className="p-1.5 text-center font-mono font-black text-emerald-900">
+                          {formatOrderTotalQuantity(
+                            (selectedOrderDetails.items || []).map((it) => resolveOrderLineForBox(it, findProductForOrderItem(it))),
+                            selectedOrderDetails.totalQuantity
+                          )}
+                        </td>
+                      </tr>
+                    </tfoot>
+                  ) : (
+                    <tfoot className="bg-purple-50 font-black text-purple-900 border-t border-purple-200 text-xs">
+                      {selectedOrderDetails.discountAmount && selectedOrderDetails.discountAmount > 0 ? (
+                        <>
+                          <tr>
+                            <td colSpan={4} className="p-1.5 text-right text-slate-600 font-bold">Gross Amount:</td>
+                            <td className="p-1.5 text-right font-mono">₹{(Number(selectedOrderDetails.grossAmount || ((Number(selectedOrderDetails.totalAmount) || 0) + (Number(selectedOrderDetails.discountAmount) || 0))) || 0).toLocaleString()}</td>
+                          </tr>
+                          <tr>
+                            <td colSpan={4} className="p-1.5 text-right text-rose-700 font-bold">Discount Applied:</td>
+                            <td className="p-1.5 text-right font-mono text-rose-700 font-bold">-₹{(Number(selectedOrderDetails.discountAmount) || 0).toLocaleString()}</td>
+                          </tr>
+                        </>
+                      ) : null}
+                      <tr className="border-t border-purple-200">
+                        <td colSpan={4} className="p-1.5 text-right uppercase">Net Bill Amount:</td>
+                        <td className="p-1.5 text-right font-mono text-sm font-bold text-purple-950">₹{(Number(selectedOrderDetails.totalAmount) || 0).toLocaleString()}</td>
+                      </tr>
+                    </tfoot>
+                  )}
                 </table>
               </div>
             </div>
@@ -3036,6 +3257,15 @@ ${itemsListText}
 
             {/* Actions Inside Modal */}
             <div className="pt-1 flex flex-wrap gap-2">
+              <button
+                onClick={() => handleDownloadOrderImage(selectedOrderDetails)}
+                disabled={downloadingOrderId !== null}
+                className="flex-1 py-1.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
+              >
+                {downloadingOrderId === selectedOrderDetails.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                <span>Download Image</span>
+              </button>
+
               {/* Direct Photo Share on WhatsApp */}
               <button
                 onClick={() => handleShareOnWhatsApp(selectedOrderDetails)}
@@ -3043,7 +3273,7 @@ ${itemsListText}
                 className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
               >
                 {isGeneratingImage ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Camera className="w-3.5 h-3.5" />}
-                <span>Share Order Photo</span>
+                <span>Share Photo</span>
               </button>
 
               {/* Copy Order Text */}
@@ -3060,7 +3290,7 @@ ${itemsListText}
                 <span>{copiedOrderId === selectedOrderDetails.id ? "Copied!" : "Copy"}</span>
               </button>
 
-              {(selectedOrderDetails.status === 'pending_approval' || selectedOrderDetails.status === 'pending') && isAdmin(profile) && (
+              {!isGodownView && (selectedOrderDetails.status === 'pending_approval' || selectedOrderDetails.status === 'pending') && isAdmin(profile) && (
                 <button
                   onClick={() => handleApproveOrder(selectedOrderDetails)}
                   className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer active:scale-95"
@@ -3070,7 +3300,7 @@ ${itemsListText}
                 </button>
               )}
 
-              {(selectedOrderDetails.status === 'dispatched' || selectedOrderDetails.status === 'confirmed') && (
+              {!isGodownView && (selectedOrderDetails.status === 'dispatched' || selectedOrderDetails.status === 'confirmed') && (
                 <button
                   onClick={() => handleMarkDelivered(selectedOrderDetails)}
                   className="flex-1 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer active:scale-95"
@@ -3080,7 +3310,7 @@ ${itemsListText}
                 </button>
               )}
 
-              {canUserEditOrder(selectedOrderDetails) && (
+              {!isGodownView && canUserEditOrder(selectedOrderDetails) && (
                 <button
                   onClick={() => handleOpenEditOrder(selectedOrderDetails)}
                   className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer active:scale-95 shrink-0"
@@ -3092,14 +3322,16 @@ ${itemsListText}
               )}
 
               {/* Delete Order Button */}
-              <button
-                onClick={() => handleDelete(selectedOrderDetails)}
-                className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer active:scale-95 shrink-0"
-                title="Delete Order"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                <span>Delete</span>
-              </button>
+              {!isGodownView && (
+                <button
+                  onClick={() => handleDelete(selectedOrderDetails)}
+                  className="px-3 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer active:scale-95 shrink-0"
+                  title="Delete Order"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Delete</span>
+                </button>
+              )}
             </div>
           </div>
         </div>

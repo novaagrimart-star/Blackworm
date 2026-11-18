@@ -5,7 +5,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
-import { secondarySyncDb } from './server/secondaryDb';
+import { secondarySyncDb, isValidSyncCollection, isValidSyncDocId } from './server/secondaryDb';
 
 dotenv.config();
 
@@ -18,6 +18,19 @@ const ai = new GoogleGenAI({
   }
 });
 
+const ALLOWED_PRICELIST_MIMES = new Set<string>([
+  'application/pdf',
+  'image/jpeg',
+  'image/jpg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+  'text/csv',
+  'application/csv',
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+]);
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024 },
@@ -25,7 +38,17 @@ const upload = multer({
 
 async function createServer() {
   const app = express();
+  app.disable('x-powered-by');
   const port = 3000;
+
+  // Safe HTTP Security Headers (preserving AI Studio iframe compatibility — NO X-Frame-Options)
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('X-DNS-Prefetch-Control', 'off');
+    res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=(self)');
+    next();
+  });
 
   app.use(express.json({ limit: '10mb' }));
 
@@ -37,6 +60,37 @@ async function createServer() {
     }
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     next();
+  });
+
+  // Server-side credential verification endpoint (timing-safe comparison, zero raw password in response)
+  app.post('/api/auth/login', (req, res) => {
+    try {
+      const loginId = String(req.body?.loginId || '').trim();
+      const password = String(req.body?.password || '').trim();
+      if (!loginId || !password) {
+        return res.status(400).json({ ok: false, status: 'bad_request', error: 'Login ID and password are required.' });
+      }
+      if (loginId.length > 160 || password.length > 160) {
+        return res.status(400).json({ ok: false, status: 'bad_request', error: 'Invalid input length.' });
+      }
+      const result = secondarySyncDb.verifyUserCredentials(loginId, password);
+      if (result.status === 'verified') {
+        return res.json({ ok: true, status: 'verified', profile: result.profile });
+      }
+      if (result.status === 'inactive') {
+        return res.status(403).json({ ok: false, status: 'inactive', error: 'Account is Inactive. Please contact administrator.' });
+      }
+      if (result.status === 'invalid_password') {
+        return res.status(401).json({ ok: false, status: 'invalid_password', error: 'Incorrect Password. Please check and try again.' });
+      }
+      return res.status(result.status === 'empty' ? 404 : 401).json({
+        ok: false,
+        status: result.status,
+        error: 'Invalid Login ID. Please enter the correct Login ID.',
+      });
+    } catch {
+      return res.status(500).json({ ok: false, status: 'error', error: 'Authentication service unavailable.' });
+    }
   });
 
   // API Route for parsing price list with Exponential Backoff & Multi-Model Fallback
@@ -60,9 +114,12 @@ async function createServer() {
       if (!req.file) {
         return res.status(400).json({ error: 'कोणतीही फाईल निवडलेली नाही. कृपया फाईल निवडा.' });
       }
+      const mimeType = String(req.file.mimetype || '').toLowerCase().trim();
+      if (!ALLOWED_PRICELIST_MIMES.has(mimeType)) {
+        return res.status(400).json({ error: 'कृपया फक्त PDF, Image किंवा Excel/CSV फाईल अपलोड करा.' });
+      }
 
       const fileData = req.file.buffer.toString('base64');
-      const mimeType = req.file.mimetype;
 
       const systemInstruction = `You are a specialist in extracting product data from agricultural price lists (PDF, Images, Excel).
       Your goal is to extract every product and every grade listed in the file with 100% accuracy, strictly matching the company's table format.
@@ -319,12 +376,19 @@ async function createServer() {
     }
 
     const sinceRev = Number(req.query.sinceRevision) || 0;
+    const clientEpoch = String(req.query.epoch || '').trim();
     const stats = secondarySyncDb.getStats();
-    res.write(`event: connected\ndata: ${JSON.stringify({ latestRevision: stats.latestRevision, engine: stats.engine })}\n\n`);
+    res.write(
+      `event: connected\ndata: ${JSON.stringify({
+        latestRevision: stats.latestRevision,
+        serverEpoch: stats.serverEpoch,
+        engine: stats.engine,
+      })}\n\n`
+    );
 
     if (sinceRev > 0) {
       try {
-        const catchup = secondarySyncDb.getChangesSince(sinceRev, 500);
+        const catchup = secondarySyncDb.getChangesSince(sinceRev, 1000, clientEpoch);
         catchup.events.forEach((evt) => {
           res.write(`event: delta\ndata: ${JSON.stringify(evt)}\n\n`);
         });
@@ -349,21 +413,25 @@ async function createServer() {
     });
   });
 
-  app.get('/api/sync/collection/:name', (req, res) => {
+  app.get('/api/sync/collection/:name', async (req, res) => {
     try {
       const colName = String(req.params.name || '').trim();
-      if (!colName) {
-        return res.status(400).json({ ok: false, error: 'Collection name is required' });
+      if (!isValidSyncCollection(colName)) {
+        return res.status(400).json({ ok: false, error: 'Invalid collection name' });
       }
       const sinceMs = Number(req.query.since) || 0;
       const limit = Number(req.query.limit) || 1000;
       const offset = Number(req.query.offset) || 0;
       const includeDeleted = req.query.includeDeleted === 'true' || req.query.includeDeleted === '1';
 
-      const result = secondarySyncDb.getCollection(colName, { sinceMs, limit, offset, includeDeleted });
+      let result = secondarySyncDb.getCollection(colName, { sinceMs, limit, offset, includeDeleted });
+      if (result.total === 0 && sinceMs === 0 && secondarySyncDb.isAnyFallbackConfigured()) {
+        await secondarySyncDb.restoreFromCloudMirror(false).catch(() => {});
+        result = secondarySyncDb.getCollection(colName, { sinceMs, limit, offset, includeDeleted });
+      }
       res.json({ ok: true, ...result });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || 'Failed to query secondary collection' });
+    } catch {
+      res.status(500).json({ ok: false, error: 'Failed to query secondary collection' });
     }
   });
 
@@ -371,355 +439,127 @@ async function createServer() {
     try {
       const sinceRev = Number(req.query.since) || 0;
       const limit = Number(req.query.limit) || 500;
-      const result = secondarySyncDb.getChangesSince(sinceRev, limit);
+      const clientEpoch = String(req.query.epoch || '').trim();
+      const result = secondarySyncDb.getChangesSince(sinceRev, limit, clientEpoch);
       res.json({ ok: true, ...result });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || 'Failed to read secondary changes' });
+    } catch {
+      res.status(500).json({ ok: false, error: 'Failed to read secondary changes' });
+    }
+  });
+
+  app.get('/api/sync/export-all', (req, res) => {
+    try {
+      const sinceMs = Number(req.query.sinceMs) || 0;
+      const payload = secondarySyncDb.exportAllRows(sinceMs);
+      res.json({ ok: true, ...payload });
+    } catch {
+      res.status(500).json({ ok: false, error: 'Export failed' });
     }
   });
 
   app.post('/api/sync/upsert', (req, res) => {
     try {
       const { collection, id, doc: docData, updatedAtMs, deleted, merge } = req.body || {};
-      if (!collection || !id) {
-        return res.status(400).json({ ok: false, error: 'collection and id are required' });
+      const colStr = String(collection || '').trim();
+      const idStr = String(id || '').trim();
+      if (!isValidSyncCollection(colStr) || !isValidSyncDocId(idStr)) {
+        return res.status(400).json({ ok: false, error: 'Invalid collection or document id' });
       }
       const result = secondarySyncDb.upsert({
-        collection: String(collection),
-        id: String(id),
+        collection: colStr,
+        id: idStr,
         doc: docData && typeof docData === 'object' ? docData : {},
         updatedAtMs: updatedAtMs ? Number(updatedAtMs) : undefined,
         deleted: Boolean(deleted),
         merge: merge !== false,
       });
-      res.json({ ok: true, applied: result.applied, stored: result.stored });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || 'Secondary upsert failed' });
+      res.json({
+        ok: true,
+        applied: result.applied,
+        stored: result.stored,
+        serverEpoch: secondarySyncDb.getStats().serverEpoch,
+      });
+    } catch {
+      res.status(500).json({ ok: false, error: 'Secondary upsert failed' });
     }
   });
 
   app.post('/api/sync/batch', (req, res) => {
     try {
-      const items = Array.isArray(req.body?.items) ? req.body.items : [];
-      if (items.length === 0) {
-        return res.json({ ok: true, count: 0, latestRevision: secondarySyncDb.getStats().latestRevision });
+      const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+      if (rawItems.length === 0) {
+        const stats = secondarySyncDb.getStats();
+        return res.json({ ok: true, count: 0, latestRevision: stats.latestRevision, serverEpoch: stats.serverEpoch });
       }
-      const result = secondarySyncDb.upsertBatch(items);
-      res.json({ ok: true, count: result.count, latestRevision: result.latestRevision });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || 'Secondary batch upsert failed' });
+      if (rawItems.length > 500) {
+        return res.status(400).json({ ok: false, error: 'Batch limit exceeded (max 500 items per request)' });
+      }
+      const validItems = rawItems.filter(
+        (it: any) => it && isValidSyncCollection(String(it.collection || '')) && isValidSyncDocId(String(it.id || ''))
+      );
+      if (validItems.length === 0) {
+        return res.status(400).json({ ok: false, error: 'No valid sync items provided' });
+      }
+      const result = secondarySyncDb.upsertBatch(validItems);
+      res.json({ ok: true, count: result.count, latestRevision: result.latestRevision, serverEpoch: result.serverEpoch });
+    } catch {
+      res.status(500).json({ ok: false, error: 'Secondary batch upsert failed' });
     }
   });
 
-  // Silent Employee Location Check-In (24h IP-geo & reverse-geo cached, zero client alerts/notifications)
-  const ipGeoCache = new Map<
-    string,
-    {
-      city: string;
-      region: string;
-      country: string;
-      latitude: number | null;
-      longitude: number | null;
-      expiresAt: number;
-    }
-  >();
-
-  const reverseGeoCache = new Map<
-    string,
-    {
-      city: string;
-      region: string;
-      country: string;
-      addressLabel: string;
-      expiresAt: number;
-    }
-  >();
-
-  const isExcludedLocationSubject = (body: any): boolean => {
-    const norm = (v: any) =>
-      String(v || '')
-        .toLowerCase()
-        .replace(/[^a-z0-9\s]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-    const fullName = norm(body?.fullName);
-    const loginId = norm(body?.loginId);
-    const userCode = norm(body?.userCode);
-    const combined = `${fullName} ${loginId} ${userCode}`;
-
-    if (
-      combined.includes('blackworm') ||
-      combined.includes('black worm') ||
-      combined.includes('agritech') ||
-      loginId === 'admin'
-    ) {
-      return true;
-    }
-    if ((fullName.includes('pravin') || fullName.includes('praveen')) && fullName.includes('waghmare')) {
-      return true;
-    }
-    if ((loginId.includes('pravin') || loginId.includes('praveen')) && loginId.includes('waghmare')) {
-      return true;
-    }
-    if (
-      (fullName.includes('shridhar') || fullName.includes('shidhar') || fullName.includes('sridhar')) &&
-      fullName.includes('shinde')
-    ) {
-      return true;
-    }
-    if (
-      (loginId.includes('shridhar') || loginId.includes('shidhar') || loginId.includes('sridhar')) &&
-      loginId.includes('shinde')
-    ) {
-      return true;
-    }
-    return false;
-  };
-
-  app.post('/api/location/silent-checkin', async (req, res) => {
+  app.get('/api/sync/summary', (_req, res) => {
     try {
-      const body = req.body || {};
-      const uid = String(body.uid || '').trim();
-      if (!uid) {
-        return res.status(400).json({ ok: false, error: 'uid is required' });
-      }
-
-      if (isExcludedLocationSubject(body)) {
-        // Ensure excluded subjects do not linger in user_locations
-        secondarySyncDb.upsert({
-          collection: 'user_locations',
-          id: `loc_${uid}`,
-          doc: {},
-          updatedAtMs: Date.now(),
-          deleted: true,
-          merge: false,
-        });
-        return res.json({ ok: true, excluded: true });
-      }
-
-      let latitude: number | null =
-        typeof body.latitude === 'number' && Number.isFinite(body.latitude) ? body.latitude : null;
-      let longitude: number | null =
-        typeof body.longitude === 'number' && Number.isFinite(body.longitude) ? body.longitude : null;
-      const accuracy: number | null =
-        typeof body.accuracy === 'number' && Number.isFinite(body.accuracy) ? body.accuracy : null;
-
-      let source: 'gps' | 'network' | 'profile' =
-        latitude !== null && longitude !== null ? 'gps' : 'profile';
-      let city = '';
-      let region = '';
-      let country = 'India';
-      let gpsResolvedAddress = '';
-
-      if (source === 'gps' && latitude !== null && longitude !== null) {
-        const gridKey = `${latitude.toFixed(2)},${longitude.toFixed(2)}`;
-        const cachedRev = reverseGeoCache.get(gridKey);
-        if (cachedRev && cachedRev.expiresAt > Date.now()) {
-          city = cachedRev.city;
-          region = cachedRev.region;
-          country = cachedRev.country;
-          gpsResolvedAddress = cachedRev.addressLabel;
-        } else {
-          try {
-            const ctrl = new AbortController();
-            const timer = setTimeout(() => ctrl.abort(), 2500);
-            const revResp = await fetch(
-              `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${encodeURIComponent(
-                String(latitude)
-              )}&longitude=${encodeURIComponent(String(longitude))}&localityLanguage=en`,
-              { signal: ctrl.signal }
-            );
-            clearTimeout(timer);
-            if (revResp.ok) {
-              const rev = (await revResp.json()) as any;
-              const locality = String(rev?.locality || rev?.city || '').trim();
-              const subDiv = String(rev?.principalSubdivision || '').trim();
-              const cntry = String(rev?.countryName || 'India').trim();
-              const parts = Array.from(new Set([locality, subDiv, cntry].filter(Boolean)));
-              gpsResolvedAddress = parts.join(', ');
-              city = locality;
-              region = subDiv;
-              country = cntry;
-              if (gpsResolvedAddress) {
-                reverseGeoCache.set(gridKey, {
-                  city,
-                  region,
-                  country,
-                  addressLabel: gpsResolvedAddress,
-                  expiresAt: Date.now() + 24 * 60 * 60 * 1000,
-                });
-              }
-            }
-          } catch {
-            // Silent fallback to GPS coordinates string
-          }
-        }
-      } else {
-        const xff = String(
-          req.headers['x-forwarded-for'] ||
-            req.headers['cf-connecting-ip'] ||
-            req.headers['x-real-ip'] ||
-            ''
-        )
-          .split(',')[0]
-          .trim();
-        const rawIp = xff || String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
-        const isPrivate =
-          !rawIp ||
-          rawIp === '127.0.0.1' ||
-          rawIp === '::1' ||
-          rawIp.startsWith('10.') ||
-          rawIp.startsWith('192.168.') ||
-          /^172\.(1[6-9]|2\d|3[01])\./.test(rawIp);
-
-        if (!isPrivate) {
-          const cached = ipGeoCache.get(rawIp);
-          if (cached && cached.expiresAt > Date.now()) {
-            if (cached.latitude !== null && cached.longitude !== null) {
-              latitude = cached.latitude;
-              longitude = cached.longitude;
-              source = 'network';
-            }
-            if (cached.city) city = cached.city;
-            if (cached.region) region = cached.region;
-            if (cached.country) country = cached.country;
-          } else {
-            // Provider 1: ipwho.is (free, no key)
-            let resolvedFromIp = false;
-            try {
-              const ctrl = new AbortController();
-              const timer = setTimeout(() => ctrl.abort(), 2500);
-              const geoResp = await fetch(`https://ipwho.is/${encodeURIComponent(rawIp)}`, {
-                signal: ctrl.signal,
-              });
-              clearTimeout(timer);
-              if (geoResp.ok) {
-                const geo = (await geoResp.json()) as any;
-                if (geo && geo.success !== false && (geo.city || geo.latitude)) {
-                  const latNum = typeof geo.latitude === 'number' ? Number(geo.latitude.toFixed(5)) : null;
-                  const lngNum = typeof geo.longitude === 'number' ? Number(geo.longitude.toFixed(5)) : null;
-                  const geoCity = String(geo.city || '').trim();
-                  const geoRegion = String(geo.region || '').trim();
-                  const geoCountry = String(geo.country || 'India').trim();
-                  ipGeoCache.set(rawIp, {
-                    city: geoCity,
-                    region: geoRegion,
-                    country: geoCountry,
-                    latitude: latNum,
-                    longitude: lngNum,
-                    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
-                  });
-                  if (latNum !== null && lngNum !== null) {
-                    latitude = latNum;
-                    longitude = lngNum;
-                    source = 'network';
-                  }
-                  if (geoCity) city = geoCity;
-                  if (geoRegion) region = geoRegion;
-                  if (geoCountry) country = geoCountry;
-                  resolvedFromIp = true;
-                }
-              }
-            } catch {}
-
-            // Provider 2 fallback: get.geojs.io (free, no key)
-            if (!resolvedFromIp) {
-              try {
-                const ctrl2 = new AbortController();
-                const timer2 = setTimeout(() => ctrl2.abort(), 2500);
-                const geoResp2 = await fetch(`https://get.geojs.io/v1/ip/geo/${encodeURIComponent(rawIp)}.json`, {
-                  signal: ctrl2.signal,
-                });
-                clearTimeout(timer2);
-                if (geoResp2.ok) {
-                  const geo2 = (await geoResp2.json()) as any;
-                  const latNum = geo2?.latitude ? Number(Number(geo2.latitude).toFixed(5)) : null;
-                  const lngNum = geo2?.longitude ? Number(Number(geo2.longitude).toFixed(5)) : null;
-                  const geoCity = String(geo2?.city || '').trim();
-                  const geoRegion = String(geo2?.region || '').trim();
-                  const geoCountry = String(geo2?.country || 'India').trim();
-                  if (geoCity || (latNum !== null && lngNum !== null)) {
-                    ipGeoCache.set(rawIp, {
-                      city: geoCity,
-                      region: geoRegion,
-                      country: geoCountry,
-                      latitude: latNum,
-                      longitude: lngNum,
-                      expiresAt: Date.now() + 24 * 60 * 60 * 1000,
-                    });
-                    if (latNum !== null && lngNum !== null) {
-                      latitude = latNum;
-                      longitude = lngNum;
-                      source = 'network';
-                    }
-                    if (geoCity) city = geoCity;
-                    if (geoRegion) region = geoRegion;
-                    if (geoCountry) country = geoCountry;
-                  }
-                }
-              } catch {
-                // Silent fallback to profile center
-              }
-            }
-          }
-        }
-      }
-
-      const nowMs = Date.now();
-      const nowIso = new Date(nowMs).toISOString();
-      const profileParts = [body.village, body.taluka, body.center, body.district, body.state]
-        .filter(Boolean)
-        .map((s: any) => String(s).trim());
-      const geoParts =
-        source === 'network' || city || region ? [city, region, country].filter(Boolean) : [];
-      const uniqueParts = Array.from(
-        new Set(
-          source === 'gps'
-            ? gpsResolvedAddress
-              ? [gpsResolvedAddress]
-              : [`GPS (${latitude}, ${longitude})`]
-            : geoParts.length > 0
-              ? geoParts
-              : profileParts
-        )
-      );
-      const addressLabel = uniqueParts.join(', ') || String(body.center || 'Active Session');
-
-      if (!city) city = String(body.village || body.center || '').trim();
-      if (!region) region = String(body.district || body.state || '').trim();
-
-      const record = {
-        id: `loc_${uid}`,
-        uid,
-        userCode: String(body.userCode || ''),
-        fullName: String(body.fullName || ''),
-        designation: String(body.designation || ''),
-        center: String(body.center || ''),
-        mobileNumber: String(body.mobileNumber || ''),
-        latitude,
-        longitude,
-        accuracy,
-        city,
-        region,
-        country,
-        addressLabel,
-        source,
-        updatedAt: nowIso,
-        updatedAtMs: nowMs,
-      };
-
-      secondarySyncDb.upsert({
-        collection: 'user_locations',
-        id: record.id,
-        doc: record,
-        updatedAtMs: nowMs,
-        deleted: false,
-        merge: true,
-      });
-
-      res.json({ ok: true, record });
+      res.json(secondarySyncDb.getCollectionSummary());
     } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || 'Silent checkin failed' });
+      res.status(500).json({ ok: false, error: err?.message || 'Summary failed' });
+    }
+  });
+
+  app.get('/api/sync/cloud-config', (_req, res) => {
+    try {
+      res.json({ ok: true, ...secondarySyncDb.getCloudConfigPublic() });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Failed to read cloud config' });
+    }
+  });
+
+  app.post('/api/sync/cloud-config', async (req, res) => {
+    try {
+      const { type, url, apiKey } = req.body || {};
+      const validType = type === 'supabase' || type === 'relay' || type === 'peer' ? type : 'none';
+      const result = await secondarySyncDb.setCloudConfig({
+        type: validType,
+        url: String(url || ''),
+        apiKey: String(apiKey || ''),
+      });
+      res.status(result.ok ? 200 : 400).json({ ...result, config: secondarySyncDb.getCloudConfigPublic() });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Failed to save cloud config' });
+    }
+  });
+
+  app.post('/api/sync/restore-cloud', async (_req, res) => {
+    try {
+      const result = await secondarySyncDb.restoreFromCloudMirror(false);
+      res.json({ ok: !result.error, ...result, stats: secondarySyncDb.getStats() });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Cloud restore failed' });
+    }
+  });
+
+  app.post('/api/sync/force-cloud-sync', async (_req, res) => {
+    try {
+      const pushed = await secondarySyncDb.pushAllLocalToCloudMirror();
+      const result = await secondarySyncDb.restoreFromCloudMirror(false);
+      res.json({
+        ok: !result.error,
+        pushed,
+        restored: result.restored,
+        ...(result.error ? { error: result.error } : {}),
+        stats: secondarySyncDb.getStats(),
+      });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Cloud sync failed' });
     }
   });
 

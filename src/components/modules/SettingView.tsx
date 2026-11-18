@@ -1,29 +1,19 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { collection, query, onSnapshot, doc, deleteDoc, updateDoc, limit } from 'firebase/firestore';
-import { db, getFriendlyErrorMessage } from '../../firebase';
+import { getFriendlyErrorMessage } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import { 
-  restoreRecord, 
-  DeletedRecordItem, 
-  AuditLogItem, 
-  exportFullDatabaseBackup, 
+import {
+  exportFullDatabaseBackup,
   restoreDatabaseFromJson,
-  getPendingSyncCount,
-  startBackgroundSync,
-  toTimestampMs,
-  isQuotaBlocked
+  forceMultiTierSyncAll,
+  getLocalDateStr,
 } from '../../lib/dataService';
 import { safeClearTransientCaches } from '../../lib/localVault';
 import { Language, translations } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
-import { 
-  Settings, 
-  Trash2, 
-  RotateCcw, 
-  ShieldAlert, 
-  History, 
-  Globe, 
-  HardDrive, 
+import {
+  Settings,
+  Globe,
+  HardDrive,
   RefreshCw,
   Database,
   Download,
@@ -32,7 +22,7 @@ import {
   CheckCircle2,
   AlertCircle,
   Loader2,
-  FileJson
+  FileJson,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
@@ -43,18 +33,17 @@ interface Props {
   onLogout: () => void;
 }
 
-export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
+export const SettingView: React.FC<Props> = ({ profile, lang }) => {
   const t = translations[lang];
   const { logoUrl, logoSize, saveBranding } = useBranding();
-  const [auditLogs, setAuditLogs] = useState<AuditLogItem[]>([]);
   const [activeTab, setActiveTab] = useState<'branding' | 'cache' | 'backup'>(isAdmin(profile) ? 'branding' : 'cache');
   const [isSavingLogo, setIsSavingLogo] = useState<boolean>(false);
+  const [brandingSavedToast, setBrandingSavedToast] = useState<boolean>(false);
   const [isClearingCache, setIsClearingCache] = useState<boolean>(false);
   const [isExportingBackup, setIsExportingBackup] = useState<boolean>(false);
   const [isRestoringBackup, setIsRestoringBackup] = useState<boolean>(false);
   const [backupStatusMessage, setBackupStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [pendingSyncCount, setPendingSyncCount] = useState<number>(0);
-  const [isSyncingNow, setIsSyncingNow] = useState<boolean>(false);
+
   const [localLogoSize, setLocalLogoSize] = useState<number>(logoSize);
   const sizeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -63,42 +52,17 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
   }, [logoSize]);
 
   useEffect(() => {
-    const userIsAdmin = isAdmin(profile);
-    let unsubAudit: (() => void) | null = null;
-    if (!isQuotaBlocked()) {
-      const qAudit = query(collection(db, 'audit_logs'), limit(50));
-      unsubAudit = onSnapshot(qAudit, (snap) => {
-        let list: AuditLogItem[] = [];
-        snap.forEach(d => list.push({ id: d.id, ...d.data() } as AuditLogItem));
-        if (!userIsAdmin) {
-          list = list.filter(item => item.performedByUid === profile.uid || item.performedByName === profile.fullName);
-        }
-        list.sort((a: any, b: any) => toTimestampMs(b.timestamp || b.createdAt) - toTimestampMs(a.timestamp || a.createdAt));
-        setAuditLogs(list);
-      }, (err) => {
-        console.warn('SettingView audit logs sync notice:', err);
-      });
-    }
-
-    const updateCount = () => setPendingSyncCount(getPendingSyncCount());
-    updateCount();
-    window.addEventListener('blackworm_sync_status', updateCount as EventListener);
-    window.addEventListener('storage', updateCount);
-    window.addEventListener('online', updateCount);
-
     return () => {
-      if (unsubAudit) unsubAudit();
-      window.removeEventListener('blackworm_sync_status', updateCount as EventListener);
-      window.removeEventListener('storage', updateCount);
-      window.removeEventListener('online', updateCount);
       if (sizeDebounceRef.current) clearTimeout(sizeDebounceRef.current);
     };
-  }, [profile.uid, profile.role, profile.fullName]);
+  }, []);
 
   const saveLogoConfig = async (newUrl: string, newSize: number) => {
     setIsSavingLogo(true);
     try {
       await saveBranding(newUrl, newSize, profile.uid);
+      setBrandingSavedToast(true);
+      setTimeout(() => setBrandingSavedToast(false), 3000);
     } catch (err) {
       console.error('Logo config save failed:', err);
     } finally {
@@ -153,7 +117,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
           type: 'alert',
           title: 'लोगो त्रुटी',
           message: 'निवडलेली इमेज वाचता आली नाही. कृपया वैध PNG किंवा JPG लोगो निवडा.',
-          onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+          onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
         });
       };
       img.src = base64;
@@ -164,7 +128,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
         type: 'alert',
         title: 'लोगो त्रुटी',
         message: 'लोगो फाईल वाचताना त्रुटी आली.',
-        onConfirm: () => setDialogConfig(p => ({ ...p, isOpen: false })),
+        onConfirm: () => setDialogConfig((p) => ({ ...p, isOpen: false })),
       });
     };
     reader.readAsDataURL(file);
@@ -194,57 +158,17 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
     onConfirm: () => {},
   });
 
-  const handleRestore = async (item: DeletedRecordItem) => {
-    setDialogConfig({
-      isOpen: true,
-      type: 'confirm',
-      title: 'Restore Confirmation',
-      message: 'Are you sure you want to restore this record?',
-      confirmText: 'Restore',
-      cancelText: 'Cancel',
-      onConfirm: async () => {
-        setDialogConfig(prev => ({ ...prev, isOpen: false }));
-        await restoreRecord(item, profile);
-      },
-      onCancel: () => setDialogConfig(prev => ({ ...prev, isOpen: false })),
-    });
-  };
-
   const handleClearCacheAndSync = async () => {
     setIsClearingCache(true);
     try {
-      // 1. Flush any pending offline / dual-DB sync items before clearing HTTP/SW cache
       try {
-        await startBackgroundSync();
+        await forceMultiTierSyncAll(true);
       } catch (_) {}
 
-      // 2. Safely clear only browser Cache API & Service Workers;
-      //    never call localStorage.clear() so unsynced records & local vault remain 100% intact.
       await safeClearTransientCaches();
-
-      // 3. Force reload without stale cache to fetch fresh code/data
       window.location.href = window.location.origin + window.location.pathname + '?fresh=' + Date.now();
     } catch (e) {
       window.location.reload();
-    }
-  };
-
-  const handleManualSync = async () => {
-    if (isSyncingNow) return;
-    setIsSyncingNow(true);
-    try {
-      await startBackgroundSync();
-      setPendingSyncCount(getPendingSyncCount());
-      if (getPendingSyncCount() === 0) {
-        setBackupStatusMessage({ type: 'success', text: 'सर्व डेटाबेस सिंक झाला आहे!' });
-      } else {
-        setBackupStatusMessage({ type: 'error', text: 'काही डेटा सिंक होऊ शकला नाही. इंटरनेट तपासा.' });
-      }
-    } catch (e) {
-      console.error('Manual sync failed:', e);
-    } finally {
-      setIsSyncingNow(false);
-      setTimeout(() => setBackupStatusMessage(null), 3000);
     }
   };
 
@@ -329,9 +253,11 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
         <div>
           <h2 className="text-xl font-bold text-slate-900 flex items-center gap-2">
             <Settings className="w-6 h-6 text-slate-700" />
-            {t.setting} & Data Management
+            {isAdmin(profile) ? `${t.setting} & Data Management` : 'Settings'}
           </h2>
-          <p className="text-xs text-slate-500 mt-0.5">Branding, system update and permanent database backup</p>
+          {isAdmin(profile) && (
+            <p className="text-xs text-slate-500 mt-0.5">Branding, system update and permanent database backup</p>
+          )}
         </div>
       </div>
 
@@ -352,20 +278,30 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
           <RefreshCw className="w-3.5 h-3.5" />
           <span>Refresh Now</span>
         </button>
-        <button
-          onClick={() => setActiveTab('backup')}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'backup' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
-        >
-          <Database className="w-3.5 h-3.5 text-emerald-500" />
-          <span>Permanent Backup</span>
-        </button>
+        {isAdmin(profile) && (
+          <button
+            onClick={() => setActiveTab('backup')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'backup' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
+          >
+            <Database className="w-3.5 h-3.5 text-emerald-500" />
+            <span>Permanent Backup</span>
+          </button>
+        )}
       </div>
 
       {isAdmin(profile) && activeTab === 'branding' && (
         <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-6 text-xs">
-          <div>
-            <h3 className="text-sm font-bold text-slate-900">Company Branding</h3>
-            <p className="text-[11px] text-slate-500">Update your company logo for forms and letterheads</p>
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900">Company Branding</h3>
+              <p className="text-[11px] text-slate-500">Update your company logo for forms and letterheads</p>
+            </div>
+            {brandingSavedToast && (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 font-bold text-xs">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                Saved
+              </span>
+            )}
           </div>
 
           <div className="flex flex-col items-center gap-4 p-8 border-2 border-dashed border-slate-200 rounded-2xl bg-slate-50/50">
@@ -415,41 +351,20 @@ export const SettingView: React.FC<Props> = ({ profile, lang, onLogout }) => {
       )}
 
       {activeTab === 'cache' && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-4 text-xs">
-          <div>
-            <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-              <RefreshCw className="w-4 h-4 text-rose-600" />
-              <span>App Update & Data Sync</span>
-            </h3>
-            <p className="text-[11px] text-slate-500 mt-1">
-              नवीन डेटा किंवा अपडेट्स त्वरित लोड करण्यासाठी खालील 'Refresh Now' बटण दाबा. सर्व डेटा तात्काळ सर्व्हरवरून रीफ्रेश केला जाईल.
-            </p>
-          </div>
-
-          <div className="p-5 bg-slate-50 border border-slate-200 rounded-xl space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <div>
-                <h4 className="font-bold text-slate-800 text-sm">Real-Time Data Refresh</h4>
-                <p className="text-[11px] text-slate-500 mt-0.5">
-                  सर्व्हरवरून थेट डेटा अपडेट आणि ॲप स्टेट तात्काळ रिफ्रेश करा.
-                </p>
-              </div>
-
-              <button
-                type="button"
-                onClick={handleClearCacheAndSync}
-                disabled={isClearingCache}
-                className="px-6 py-2.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-2 shadow-sm active:scale-95 cursor-pointer shrink-0"
-              >
-                <RefreshCw className={`w-4 h-4 ${isClearingCache ? 'animate-spin' : ''}`} />
-                <span>{isClearingCache ? 'Refreshing...' : 'Refresh Now'}</span>
-              </button>
-            </div>
-          </div>
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 flex items-center justify-center">
+          <button
+            type="button"
+            onClick={handleClearCacheAndSync}
+            disabled={isClearingCache}
+            className="px-6 py-3 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-2 shadow-sm active:scale-95 cursor-pointer"
+          >
+            <RefreshCw className={`w-4 h-4 ${isClearingCache ? 'animate-spin' : ''}`} />
+            <span>{isClearingCache ? 'Refreshing...' : 'Refresh Now'}</span>
+          </button>
         </div>
       )}
 
-      {activeTab === 'backup' && (
+      {isAdmin(profile) && activeTab === 'backup' && (
         <div className="space-y-4 text-xs">
           {/* Guaranteed Data Safety Banner */}
           <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl flex items-start gap-2.5 text-xs text-emerald-950">

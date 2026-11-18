@@ -22,7 +22,7 @@
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["uid", "fullName", "role", "loginId", "password"]
+      "required": ["uid", "fullName", "role", "loginId"]
     },
     "dealerApplication": {
       "title": "Dealer Application",
@@ -34,7 +34,9 @@
         "proprietorName": { "type": "string" },
         "dealerCode": { "type": "string" },
         "village": { "type": "string" },
+        "taluka": { "type": "string" },
         "district": { "type": "string" },
+        "state": { "type": "string" },
         "contactNumber": { "type": "string" },
         "officerName": { "type": "string" },
         "status": { "type": "string" },
@@ -81,7 +83,8 @@
         "orderId": { "type": "string" },
         "collectedByUid": { "type": "string" },
         "isArchived": { "type": "boolean" },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "amount", "collectedByUid"]
     },
@@ -101,6 +104,7 @@
         "proprietorName": { "type": "string" },
         "matchedDealerId": { "type": "string" },
         "sourceFile": { "type": "string" },
+        "isArchived": { "type": "boolean" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "firmName", "amount"]
@@ -125,6 +129,24 @@
       },
       "required": ["id", "userId", "month", "year"]
     },
+    "yearlyTarget": {
+      "title": "Yearly Target Sheet",
+      "description": "Annual financial-year officer target sheets with monthly breakdown",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "officerName": { "type": "string" },
+        "financialYear": { "type": "string" },
+        "center": { "type": "string" },
+        "designation": { "type": "string" },
+        "months": { "type": "object" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "financialYear"]
+    },
     "travelSheet": {
       "title": "Travel Sheet",
       "description": "Monthly or daily travel expense summary",
@@ -136,10 +158,70 @@
         "monthYear": { "type": "string" },
         "totalKm": { "type": "number" },
         "totalAmount": { "type": "number" },
+        "entries": { "type": "array" },
         "isArchived": { "type": "boolean" },
-        "createdAt": { "type": "string", "format": "date-time" }
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "userId"]
+    },
+    "productItem": {
+      "title": "Product Price List Item",
+      "description": "Company product pricing and pack size metadata",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "category": { "type": "string" },
+        "packSize": { "type": "string" },
+        "dealerRate": { "type": "number" },
+        "mrp": { "type": "number" },
+        "isArchived": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name"]
+    },
+    "schemeItem": {
+      "title": "Scheme Discount Record",
+      "description": "Promotional discount and scheme rules",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "discountPercent": { "type": "number" },
+        "isArchived": { "type": "boolean" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id"]
+    },
+    "pricelistBackup": {
+      "title": "Price List Backup",
+      "description": "Historical snapshots of master price list before bulk updates",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "products": { "type": "array" },
+        "createdByUid": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id"]
+    },
+    "userApprovalRequest": {
+      "title": "User Profile Approval Request",
+      "description": "Staff profile edit requests pending Admin approval",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "targetUserId": { "type": "string" },
+        "targetUserName": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "proposedData": { "type": "object" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "targetUserId", "status"]
     },
     "auditLog": {
       "title": "Audit Log",
@@ -156,23 +238,6 @@
         "timestamp": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "action", "collection"]
-    },
-    "userLocation": {
-      "title": "User Location",
-      "description": "Cached silent location check-in snapshots per employee",
-      "type": "object",
-      "properties": {
-        "id": { "type": "string" },
-        "uid": { "type": "string" },
-        "userCode": { "type": "string" },
-        "fullName": { "type": "string" },
-        "latitude": { "type": "number" },
-        "longitude": { "type": "number" },
-        "addressLabel": { "type": "string" },
-        "source": { "type": "string" },
-        "updatedAt": { "type": "string", "format": "date-time" }
-      },
-      "required": ["id", "uid"]
     },
     "locationVillage": {
       "title": "Location Village Mapping",
@@ -216,20 +281,81 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "state", "district", "taluka", "talukaCode"]
+    },
+    "officeStaffMember": {
+      "title": "Office / Factory Staff Member",
+      "description": "Office and Factory staff members managed by Godown Incharge & Admin for daily attendance",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "fullName": { "type": "string" },
+        "category": { "type": "string", "enum": ["Office Staff", "Factory Staff"] },
+        "workRole": { "type": "string" },
+        "mobileNumber": { "type": "string" },
+        "joiningDate": { "type": "string" },
+        "status": { "type": "string", "enum": ["Active", "Inactive"] },
+        "linkedUserUid": { "type": "string" },
+        "createdByUid": { "type": "string" },
+        "createdByName": { "type": "string" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "fullName", "category"]
+    },
+    "officeStaffAttendance": {
+      "title": "Office / Factory Staff Attendance",
+      "description": "Daily attendance records for Office Staff & Factory Staff marked by Godown Incharge or Admin",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "date": { "type": "string" },
+        "monthKey": { "type": "string" },
+        "staffId": { "type": "string" },
+        "staffName": { "type": "string" },
+        "category": { "type": "string", "enum": ["Office Staff", "Factory Staff"] },
+        "workRole": { "type": "string" },
+        "status": { "type": "string", "enum": ["present", "half_day", "absent", "leave"] },
+        "note": { "type": "string" },
+        "markedByUid": { "type": "string" },
+        "markedByName": { "type": "string" },
+        "markedAt": { "type": "string", "format": "date-time" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "date", "staffId", "status"]
+    },
+    "configDoc": {
+      "title": "Global Configuration Document",
+      "description": "Shared application configuration (branding, master pricelist, schemes, locks, dealer sequences)",
+      "type": "object",
+      "properties": {
+        "updatedAt": { "type": "string", "format": "date-time" },
+        "isLocked": { "type": "boolean" },
+        "products": { "type": "array" },
+        "nextSequence": { "type": "number" }
+      }
+    },
+    "deletedRecord": {
+      "title": "Recycle Bin Record",
+      "description": "Soft-deleted records retained for audit and recovery",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "originalCollection": { "type": "string" },
+        "originalId": { "type": "string" },
+        "recordData": { "type": "object" },
+        "deletedAt": { "type": "string", "format": "date-time" },
+        "isArchived": { "type": "boolean" }
+      },
+      "required": ["id", "originalCollection", "originalId"]
     }
   },
   "firestore": {
     "users/{userId}": {
       "schema": "user",
       "description": "User profiles"
-    },
-    "user_locations/{docId}": {
-      "schema": "userLocation",
-      "description": "Latest cached user locations viewable on demand by EMP 002"
-    },
-    "location_requests/{docId}": {
-      "schema": "object",
-      "description": "On-demand silent location sync requests"
     },
     "location_villages/{docId}": {
       "schema": "locationVillage",
@@ -239,9 +365,25 @@
       "schema": "locationTaluka",
       "description": "Admin-added State -> District -> Taluka custom subdistrict mapping"
     },
+    "office_staff_members/{docId}": {
+      "schema": "officeStaffMember",
+      "description": "Office Staff & Factory Staff roster managed by Godown Incharge and Admin"
+    },
+    "office_staff_attendance/{docId}": {
+      "schema": "officeStaffAttendance",
+      "description": "Daily attendance records for Office Staff & Factory Staff"
+    },
     "dealers_application/{docId}": {
       "schema": "dealerApplication",
       "description": "Dealership registration forms"
+    },
+    "dealers/{docId}": {
+      "schema": "dealerApplication",
+      "description": "Legacy dealer records"
+    },
+    "outstanding_records/{docId}": {
+      "schema": "outstandingRecord",
+      "description": "Party master & dealer outstanding statement balances"
     },
     "orders/{orderId}": {
       "schema": "order",
@@ -255,21 +397,49 @@
       "schema": "target",
       "description": "Monthly targets"
     },
+    "yearly_targets/{docId}": {
+      "schema": "yearlyTarget",
+      "description": "Annual financial-year officer target sheets"
+    },
     "travel_sheets/{sheetId}": {
       "schema": "travelSheet",
       "description": "Travel expense summaries"
+    },
+    "travel_records/{docId}": {
+      "schema": "travelSheet",
+      "description": "Individual travel expense logs"
+    },
+    "products_pricelist_v2/{docId}": {
+      "schema": "productItem",
+      "description": "Product price list collection items"
+    },
+    "products/{docId}": {
+      "schema": "productItem",
+      "description": "Legacy product catalog"
+    },
+    "schemes/{docId}": {
+      "schema": "schemeItem",
+      "description": "Promotional discount schemes"
+    },
+    "config/{docId}": {
+      "schema": "configDoc",
+      "description": "Global config documents (branding, master_pricelist, pricelist_meta, schemes_extra_discounts, party_master_meta, dealer_sequence)"
     },
     "audit_logs/{logId}": {
       "schema": "auditLog",
       "description": "Immutable audit trails"
     },
-    "config/branding": {
-      "schema": "object",
-      "description": "Global company branding configuration"
-    },
     "deleted_records/{docId}": {
-      "schema": "object",
+      "schema": "deletedRecord",
       "description": "Recycle bin for soft-deleted records"
+    },
+    "user_approval_requests/{docId}": {
+      "schema": "userApprovalRequest",
+      "description": "Pending user profile update approval requests"
+    },
+    "pricelist_backups/{docId}": {
+      "schema": "pricelistBackup",
+      "description": "Historical price list backups"
     }
   }
 }
