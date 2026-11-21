@@ -67,11 +67,13 @@ if (typeof window !== 'undefined') {
       }
     } else if (import.meta.env.PROD) {
       let lastSwCheckAt = 0;
+      const hadControllerAtBoot = Boolean('serviceWorker' in navigator && navigator.serviceWorker.controller);
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.addEventListener('controllerchange', () => {
+          if (!hadControllerAtBoot) return;
           try {
             const lastReload = Number(sessionStorage.getItem('blackworm_sw_reload_at') || '0');
-            if (Date.now() - lastReload > 15000) {
+            if (Date.now() - lastReload > 60000) {
               sessionStorage.setItem('blackworm_sw_reload_at', String(Date.now()));
               window.location.reload();
             }
@@ -85,7 +87,7 @@ if (typeof window !== 'undefined') {
           const checkForUpdate = () => {
             if (document.visibilityState === 'hidden') return;
             const now = Date.now();
-            if (now - lastSwCheckAt < 10 * 1000) return;
+            if (now - lastSwCheckAt < 30 * 1000) return;
             lastSwCheckAt = now;
             registration.update().catch(() => {});
           };
@@ -93,12 +95,12 @@ if (typeof window !== 'undefined') {
           window.addEventListener('online', checkForUpdate);
           window.addEventListener('focus', checkForUpdate);
           document.addEventListener('visibilitychange', checkForUpdate);
-          setInterval(checkForUpdate, 25 * 1000);
+          setInterval(checkForUpdate, 60 * 1000);
         },
         onNeedRefresh() {
           try {
             const lastReload = Number(sessionStorage.getItem('blackworm_sw_reload_at') || '0');
-            if (Date.now() - lastReload > 15000) {
+            if (Date.now() - lastReload > 60000) {
               sessionStorage.setItem('blackworm_sw_reload_at', String(Date.now()));
               void updateSW(true);
               setTimeout(() => {

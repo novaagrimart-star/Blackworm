@@ -9,9 +9,6 @@ import {
 import { hydrateAllChannelsFromSecondary } from '../../lib/realtimeStore';
 import { safeClearTransientCaches } from '../../lib/localVault';
 import {
-  APP_VERSION,
-  APP_BUILD_ID,
-  SINGLE_SOURCE_OF_TRUTH,
   applyRemoteAppUpdate,
   checkRemoteAppVersion,
   resolveApiUrl,
@@ -31,6 +28,7 @@ import {
   AlertCircle,
   Loader2,
   FileJson,
+  Image as ImageIcon,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
@@ -43,17 +41,13 @@ interface Props {
 
 export const SettingView: React.FC<Props> = ({ profile, lang }) => {
   const t = translations[lang];
+  const userIsAdmin = isAdmin(profile);
   const { logoUrl, logoSize, saveBranding } = useBranding();
-  const [activeTab, setActiveTab] = useState<'branding' | 'cache' | 'backup'>(isAdmin(profile) ? 'branding' : 'cache');
+  const [activeTab, setActiveTab] = useState<'cache' | 'branding' | 'backup'>('cache');
   const [isSavingLogo, setIsSavingLogo] = useState<boolean>(false);
   const [brandingSavedToast, setBrandingSavedToast] = useState<boolean>(false);
   const [isClearingCache, setIsClearingCache] = useState<boolean>(false);
   const [refreshStatus, setRefreshStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [remoteVersionInfo, setRemoteVersionInfo] = useState<{
-    buildId: string;
-    version: string;
-    hasUpdate: boolean;
-  } | null>(null);
   const [isExportingBackup, setIsExportingBackup] = useState<boolean>(false);
   const [isCreatingServerBackup, setIsCreatingServerBackup] = useState<boolean>(false);
   const [isRestoringBackup, setIsRestoringBackup] = useState<boolean>(false);
@@ -90,22 +84,10 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
   };
 
   useEffect(() => {
-    if (activeTab === 'cache') {
-      void checkRemoteAppVersion({ manual: true, forceReloadOnUpdate: false })
-        .then((res) => {
-          if (res.checked && res.remoteBuildId) {
-            setRemoteVersionInfo({
-              buildId: res.remoteBuildId,
-              version: res.remote?.version || APP_VERSION,
-              hasUpdate: res.hasUpdate,
-            });
-          }
-        })
-        .catch(() => {});
-    } else if (activeTab === 'backup' && isAdmin(profile)) {
+    if (activeTab === 'backup' && userIsAdmin) {
       void loadServerBackups();
     }
-  }, [activeTab, profile]);
+  }, [activeTab, userIsAdmin, profile.uid]);
 
   const saveLogoConfig = async (newUrl: string, newSize: number) => {
     setIsSavingLogo(true);
@@ -240,18 +222,10 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
         forceReloadOnUpdate: false,
       });
 
-      if (verRes.checked && verRes.remoteBuildId) {
-        setRemoteVersionInfo({
-          buildId: verRes.remoteBuildId,
-          version: verRes.remote?.version || APP_VERSION,
-          hasUpdate: verRes.hasUpdate,
-        });
-      }
-
       if (verRes.hasUpdate && verRes.remoteBuildId) {
         setRefreshStatus({
           type: 'success',
-          text: `नवीन अपडेट (v${verRes.remote?.version || APP_VERSION} • ${verRes.remoteBuildId}) आढळले! नवीन आवृत्ती लागू होत आहे...`,
+          text: 'नवीन अपडेट आढळले! नवीन आवृत्ती लागू होत आहे...',
         });
         await applyRemoteAppUpdate(verRes.remoteBuildId, verRes.remote?.version);
         return;
@@ -267,7 +241,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
         setRefreshStatus({
           type: 'error',
           text: syncResult.ok
-            ? 'स्थानिक डेटा रिफ्रेश झाला, परंतु सर्व्हर आवृत्ती तपासताना अडचण आली. कृपया पुन्हा प्रयत्न करा.'
+            ? 'स्थानिक डेटा रिफ्रेश झाला, परंतु सर्व्हर तपासताना अडचण आली. कृपया पुन्हा प्रयत्न करा.'
             : 'सर्व्हरशी संपर्क होऊ शकला नाही. कृपया इंटरनेट तपासून पुन्हा Refresh करा.',
         });
         return;
@@ -279,8 +253,8 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
         type: 'success',
         text:
           pending > 0
-            ? `रिफ्रेश पूर्ण! आवृत्ती v${APP_VERSION} अद्ययावत आहे (${pulled} नोंदी सिंक झाल्या, ${pending} नोंदी रांगेत).`
-            : `रिफ्रेश यशस्वी! सर्व डेटा सिंक झाला असून ॲप अद्ययावत आहे (v${APP_VERSION} • ${APP_BUILD_ID}).`,
+            ? `रिफ्रेश पूर्ण! ${pulled} नोंदी सिंक झाल्या (${pending} नोंदी रांगेत).`
+            : `रिफ्रेश यशस्वी! सर्व डेटा सिंक झाला असून ॲप अद्ययावत आहे.`,
       });
     } catch (err: any) {
       setRefreshStatus({
@@ -418,26 +392,29 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
       </div>
 
       <div className="flex gap-2 border-b border-slate-200 pb-2 overflow-x-auto">
-        {isAdmin(profile) && (
+        <button
+          type="button"
+          onClick={() => setActiveTab('cache')}
+          className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold transition shrink-0 cursor-pointer whitespace-nowrap ${activeTab === 'cache' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
+        >
+          <RefreshCw className="w-3.5 h-3.5" />
+          <span>Refresh Now</span>
+        </button>
+        {userIsAdmin && (
           <button
+            type="button"
             onClick={() => setActiveTab('branding')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'branding' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
+            className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold transition shrink-0 cursor-pointer whitespace-nowrap ${activeTab === 'branding' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
           >
             <Globe className="w-3.5 h-3.5" />
             <span>Branding</span>
           </button>
         )}
-        <button
-          onClick={() => setActiveTab('cache')}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'cache' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
-        >
-          <RefreshCw className="w-3.5 h-3.5" />
-          <span>Refresh Now</span>
-        </button>
-        {isAdmin(profile) && (
+        {userIsAdmin && (
           <button
+            type="button"
             onClick={() => setActiveTab('backup')}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition shrink-0 cursor-pointer ${activeTab === 'backup' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
+            className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold transition shrink-0 cursor-pointer whitespace-nowrap ${activeTab === 'backup' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
           >
             <Database className="w-3.5 h-3.5 text-emerald-500" />
             <span>Permanent Backup</span>
@@ -445,87 +422,8 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
         )}
       </div>
 
-      {isAdmin(profile) && activeTab === 'branding' && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-6 space-y-6 text-xs">
-          <div className="flex items-center justify-between gap-2">
-            <div>
-              <h3 className="text-sm font-bold text-slate-900">Company Branding</h3>
-              <p className="text-[11px] text-slate-500">Update your company logo for forms and letterheads</p>
-            </div>
-            {brandingSavedToast && (
-              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-700 font-bold text-xs">
-                <CheckCircle2 className="w-3.5 h-3.5" />
-                Saved
-              </span>
-            )}
-          </div>
-
-          <div className="flex flex-col items-center gap-4 p-8 border-2 border-dashed border-slate-200 rounded-2xl bg-slate-50/50">
-            <div className="w-48 h-48 bg-white rounded-2xl border border-slate-200 shadow-sm flex items-center justify-center overflow-hidden">
-              {logoUrl ? (
-                <img src={logoUrl} alt="Company Logo" style={{ width: `${localLogoSize}px`, height: `${localLogoSize}px` }} className="object-contain" />
-              ) : (
-                <Settings className="w-12 h-12 text-slate-200" />
-              )}
-            </div>
-            
-            <div className="w-full max-w-xs space-y-4">
-              <div className="space-y-2">
-                <div className="flex justify-between items-center">
-                  <span className="font-bold text-slate-700">Logo Size: {localLogoSize}px</span>
-                </div>
-                <input
-                  type="range"
-                  min="40"
-                  max="200"
-                  value={localLogoSize}
-                  onChange={handleSizeChange}
-                  className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-rose-600"
-                />
-              </div>
-
-              <div className="text-center">
-                <input
-                  type="file"
-                  id="logo-upload"
-                  className="hidden"
-                  accept="image/*"
-                  onChange={handleLogoUpload}
-                  disabled={isSavingLogo}
-                />
-                <label
-                  htmlFor="logo-upload"
-                  className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition shadow-2xs cursor-pointer w-full justify-center active:scale-95 ${isSavingLogo ? 'bg-slate-100 text-slate-400' : 'bg-rose-600 text-white hover:bg-rose-700'}`}
-                >
-                  {isSavingLogo ? 'Uploading...' : logoUrl ? 'Change Company Logo' : 'Upload Company Logo'}
-                </label>
-              </div>
-              <p className="text-[10px] text-slate-400 mt-2 uppercase tracking-widest font-bold text-center">Square aspect ratio recommended</p>
-            </div>
-          </div>
-        </div>
-      )}
-
       {activeTab === 'cache' && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-6 flex flex-col items-center justify-center gap-4 text-center">
-          <div className="space-y-1">
-            <p className="text-xs font-bold text-slate-900">
-              Installed Version: v{APP_VERSION} <span className="font-mono text-slate-500">({APP_BUILD_ID})</span>
-            </p>
-            {remoteVersionInfo && (
-              <p className="text-[11px] font-semibold text-slate-600">
-                Server Version: v{remoteVersionInfo.version}{' '}
-                <span className="font-mono text-slate-500">({remoteVersionInfo.buildId})</span>
-                {remoteVersionInfo.hasUpdate && (
-                  <span className="ml-1.5 text-amber-700 font-bold">• Update Available</span>
-                )}
-              </p>
-            )}
-            <p className="text-[11px] font-medium text-emerald-700">
-              Single Source of Truth: {SINGLE_SOURCE_OF_TRUTH.firebaseProjectId} • Real-Time Sync Active
-            </p>
-          </div>
-
+        <div className="bg-white rounded-2xl border border-slate-200 p-8 sm:p-10 flex flex-col items-center justify-center gap-4 text-center shadow-2xs">
           {refreshStatus && (
             <div
               className={cn(
@@ -548,11 +446,143 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
             type="button"
             onClick={handleClearCacheAndSync}
             disabled={isClearingCache}
-            className="px-6 py-3 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-2 shadow-sm active:scale-95 cursor-pointer"
+            className="px-7 py-3.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-xl text-xs sm:text-sm font-black transition flex items-center justify-center gap-2.5 shadow-sm active:scale-95 cursor-pointer whitespace-nowrap"
           >
-            <RefreshCw className={`w-4 h-4 ${isClearingCache ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`w-4 h-4 shrink-0 ${isClearingCache ? 'animate-spin' : ''}`} />
             <span>{isClearingCache ? 'Syncing & Checking Update...' : 'Check Update & Refresh Now'}</span>
           </button>
+        </div>
+      )}
+
+      {userIsAdmin && activeTab === 'branding' && (
+        <div className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-6 text-xs shadow-2xs">
+          <div className="flex items-center justify-between gap-3 pb-4 border-b border-slate-100">
+            <div>
+              <h3 className="text-sm sm:text-base font-bold text-slate-900 tracking-tight">Company Branding</h3>
+              <p className="text-xs text-slate-500 mt-0.5">Configure your company logo and display scale for headers &amp; official forms</p>
+            </div>
+            {brandingSavedToast && (
+              <span className="inline-flex items-center gap-1.5 text-emerald-700 font-bold text-xs shrink-0">
+                <CheckCircle2 className="w-4 h-4" />
+                <span>Saved</span>
+              </span>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-center">
+            {/* Modern Studio Logo Showcase */}
+            <div className="md:col-span-5 flex flex-col items-center gap-2.5">
+              <div
+                className="w-52 h-52 rounded-2xl border border-slate-200 bg-slate-50 flex items-center justify-center overflow-hidden p-3 relative"
+                style={{
+                  backgroundImage:
+                    'radial-gradient(#cbd5e1 1px, transparent 1px)',
+                  backgroundSize: '14px 14px',
+                }}
+              >
+                {logoUrl ? (
+                  <img
+                    src={logoUrl}
+                    alt="Company Logo"
+                    style={{ width: `${localLogoSize}px`, height: `${localLogoSize}px` }}
+                    className="object-contain transition-transform duration-150 drop-shadow-xs"
+                  />
+                ) : (
+                  <div className="flex flex-col items-center gap-2 text-slate-400">
+                    <ImageIcon className="w-10 h-10 stroke-[1.5]" />
+                    <span className="text-[11px] font-medium">No Logo Uploaded</span>
+                  </div>
+                )}
+              </div>
+              <p className="text-[11px] font-mono tabular-nums font-semibold text-slate-500">
+                Preview: {localLogoSize} × {localLogoSize} px
+              </p>
+            </div>
+
+            {/* Clean Typography & Scale Controls */}
+            <div className="md:col-span-7 space-y-5">
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-xs font-bold text-slate-800">Logo Display Size</label>
+                  <span className="text-xs font-mono tabular-nums font-bold text-slate-900">
+                    {localLogoSize}px
+                  </span>
+                </div>
+
+                <input
+                  type="range"
+                  min="40"
+                  max="200"
+                  value={localLogoSize}
+                  onChange={handleSizeChange}
+                  className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-rose-600"
+                />
+
+                <div className="flex items-center gap-2 pt-0.5">
+                  {([
+                    { label: 'Compact', value: 64 },
+                    { label: 'Standard', value: 96 },
+                    { label: 'Large', value: 140 },
+                  ] as const).map((preset) => {
+                    const isPresetActive = Math.abs(localLogoSize - preset.value) <= 4;
+                    return (
+                      <button
+                        key={preset.value}
+                        type="button"
+                        onClick={() => {
+                          setLocalLogoSize(preset.value);
+                          void saveLogoConfig(logoUrl, preset.value);
+                        }}
+                        className={cn(
+                          'flex-1 py-1.5 px-2.5 rounded-lg text-[11px] font-semibold transition border cursor-pointer whitespace-nowrap',
+                          isPresetActive
+                            ? 'bg-slate-900 text-white border-slate-900'
+                            : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+                        )}
+                      >
+                        {preset.label} · {preset.value}px
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="pt-4 border-t border-slate-100 space-y-2.5">
+                <input
+                  type="file"
+                  id="logo-upload"
+                  className="hidden"
+                  accept="image/*"
+                  onChange={handleLogoUpload}
+                  disabled={isSavingLogo}
+                />
+                <label
+                  htmlFor="logo-upload"
+                  className={cn(
+                    'inline-flex items-center justify-center gap-2 px-5 py-3 rounded-xl text-xs font-bold transition w-full cursor-pointer active:scale-95',
+                    isSavingLogo
+                      ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                      : 'bg-rose-600 hover:bg-rose-700 text-white shadow-xs'
+                  )}
+                >
+                  {isSavingLogo ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Uploading Logo...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Upload className="w-4 h-4 shrink-0" />
+                      <span>{logoUrl ? 'Change Company Logo' : 'Upload Company Logo'}</span>
+                    </>
+                  )}
+                </label>
+                <p className="text-[11px] text-slate-500 text-center">
+                  PNG, JPG or SVG · Recommended 1:1 square aspect ratio
+                </p>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 

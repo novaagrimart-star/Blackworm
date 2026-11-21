@@ -147,7 +147,7 @@ function canAttemptReloadForBuild(targetBuildId: string, manual = false): boolea
   try {
     const prevBuild = sessionStorage.getItem(ATTEMPTED_BUILD_KEY) || '';
     const prevAt = Number(sessionStorage.getItem(ATTEMPTED_TIME_KEY) || '0');
-    if (prevBuild === targetBuildId && Date.now() - prevAt < 30 * 1000) {
+    if (prevBuild === targetBuildId && Date.now() - prevAt < 5 * 60 * 1000) {
       return false;
     }
     sessionStorage.setItem(ATTEMPTED_BUILD_KEY, targetBuildId);

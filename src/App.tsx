@@ -319,7 +319,19 @@ export default function App() {
     );
   }
 
+  const clearStoredActiveTabs = () => {
+    try {
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < sessionStorage.length; i += 1) {
+        const k = sessionStorage.key(i);
+        if (k && k.startsWith('blackworm_active_tab_')) keysToRemove.push(k);
+      }
+      keysToRemove.forEach((k) => sessionStorage.removeItem(k));
+    } catch {}
+  };
+
   const handleLoginSuccess = (userProfile: UserProfile) => {
+    clearStoredActiveTabs();
     const safe = sanitizeSessionProfile(userProfile);
     activeSessionUidRef.current = safe.uid;
     sessionGenerationRef.current += 1;
@@ -335,6 +347,7 @@ export default function App() {
   };
 
   const handleLogout = () => {
+    clearStoredActiveTabs();
     activeSessionUidRef.current = null;
     sessionGenerationRef.current += 1;
     try {

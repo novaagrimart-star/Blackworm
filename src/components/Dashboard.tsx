@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 import { 
   Target, 
@@ -52,11 +52,32 @@ interface DashboardProps {
 
 export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, onProfileUpdate }) => {
   const t = translations[lang];
-  const [activeTab, setActiveTab] = useState<string>('dashboard');
+  const tabStorageKey = `blackworm_active_tab_${profile.uid}`;
+  const [activeTab, setActiveTab] = useState<string>(() => {
+    try {
+      const saved = sessionStorage.getItem(`blackworm_active_tab_${profile.uid}`);
+      if (saved && saved !== 'dashboard' && canAccessModule(profile, saved)) {
+        return saved;
+      }
+    } catch {}
+    return 'dashboard';
+  });
+  const activeTabRef = useRef<string>(activeTab);
   const [pendingOpenDealerId, setPendingOpenDealerId] = useState<string | null>(null);
   const { logoUrl, logoSize } = useBranding();
   const [currentUserData, setCurrentUserData] = useState<any>(profile);
   const [isApplyingRemoteUpdate, setIsApplyingRemoteUpdate] = useState(false);
+
+  useEffect(() => {
+    activeTabRef.current = activeTab;
+    try {
+      if (activeTab && activeTab !== 'dashboard') {
+        sessionStorage.setItem(tabStorageKey, activeTab);
+      } else {
+        sessionStorage.removeItem(tabStorageKey);
+      }
+    } catch {}
+  }, [activeTab, tabStorageKey]);
 
   useEffect(() => {
     setCurrentUserData(profile);
@@ -136,24 +157,51 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     }
   }, [activeTab, currentUserData]);
 
-  // Handle mobile back button / browser history for modules
+  // Handle mobile back button / browser history cleanly without cross-tab popstate races
   useEffect(() => {
-    if (!window.history.state) {
-      window.history.replaceState({ tab: 'dashboard' }, '');
+    try {
+      const url = new URL(window.location.href);
+      if (url.searchParams.has('v') || url.searchParams.has('apk_ota')) {
+        url.searchParams.delete('v');
+        url.searchParams.delete('apk_ota');
+        window.history.replaceState({ tab: activeTabRef.current }, '', url.toString());
+      } else if (!window.history.state?.tab) {
+        window.history.replaceState({ tab: activeTabRef.current }, '');
+      }
+    } catch {
+      if (!window.history.state?.tab) {
+        window.history.replaceState({ tab: activeTabRef.current }, '');
+      }
     }
 
     const handlePopState = (e: PopStateEvent) => {
-      const targetTab = e.state?.tab;
+      const state = e.state;
+      const targetTab = state?.tab;
+      const currentTab = activeTabRef.current;
 
-      // Stay on current tab if back navigation only closed an inner modal/form within this same tab
-      if (targetTab && targetTab === activeTab) {
+      // Ignore sub-view / inner-hub back events inside office_staff when GodownInchargeView is active and handling its own sub-tab
+      if (targetTab && targetTab === currentTab) {
+        return;
+      }
+
+      // Guard against stale async history.back() from a previously left tab
+      if (
+        (state?.warehouseStaffFormOpen ||
+          state?.dealerFormOpen ||
+          state?.userFormOpen ||
+          state?.orderModalOpen ||
+          state?.payModalOpen ||
+          state?.modalOpen) &&
+        targetTab !== currentTab
+      ) {
+        window.history.replaceState({ tab: currentTab }, '');
         return;
       }
 
       if (targetTab && targetTab !== 'dashboard') {
         setActiveTab(targetTab);
       } else {
-        if (activeTab !== 'dashboard') {
+        if (currentTab !== 'dashboard') {
           setActiveTab('dashboard');
         } else {
           // If already on dashboard, keep dashboard on top of history stack
@@ -166,7 +214,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     return () => {
       window.removeEventListener('popstate', handlePopState);
     };
-  }, [activeTab]);
+  }, []);
 
   const handleTabChange = (tab: string) => {
     if (tab !== activeTab) {

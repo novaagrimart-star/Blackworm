@@ -54,30 +54,6 @@ function getServerBuildMetadata() {
 
 const SERVER_BUILD_INFO = getServerBuildMetadata();
 
-if (process.env.NODE_ENV !== 'production') {
-  try {
-    const srcDir = path.join(process.cwd(), 'src');
-    if (fs.existsSync(srcDir)) {
-      let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-      fs.watch(srcDir, { recursive: true }, (_evt, filename) => {
-        if (!filename) return;
-        if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-          const nextBuildId = `dev_${Date.now().toString(36)}`;
-          SERVER_BUILD_INFO.buildId = nextBuildId;
-          SERVER_BUILD_INFO.builtAt = new Date().toISOString();
-          process.env.BLACKWORM_BUILD_ID = nextBuildId;
-          try {
-            secondarySyncDb.broadcastEvent('build_update', {
-              version: SERVER_BUILD_INFO.version,
-              buildId: nextBuildId,
-            });
-          } catch {}
-        }, 600);
-      });
-    }
-  } catch {}
-}
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY || '',
