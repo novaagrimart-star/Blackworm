@@ -6,7 +6,7 @@ import {
 } from 'firebase/firestore';
 import { db, getFriendlyErrorMessage, isQuotaExceededError } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
-import { safeFirestoreSet, safeFirestoreDelete, triggerBlobDownload, getLocalDateStr, trackFirestoreUsage, isQuotaBlocked, setQuotaBlocked, safeLocalStorageSet } from '../../lib/dataService';
+import { safeFirestoreSet, safeFirestoreDelete, triggerBlobDownload, getLocalDateStr, trackFirestoreUsage, isQuotaBlocked, setQuotaBlocked, isWriteQuotaBlocked, setWriteQuotaBlocked, safeLocalStorageSet } from '../../lib/dataService';
 import { subscribeSecondaryCollection, fetchSecondaryCollection, pushBatchToSecondary } from '../../lib/secondaryDb';
 import { useSharedDealers, useSharedOutstandingRecords } from '../../lib/realtimeStore';
 import { Language } from '../../lib/i18n';
@@ -17,7 +17,7 @@ import {
   parseOutstandingPdf, 
   ExtractedRecord, 
   MatchedOutstandingItem, 
-  getFirmNameMatchScore, 
+  matchDealerToOutstandingRecords,
   buildWhatsAppLink, 
   cleanPhoneNumber,
   mergeAndDeduplicateRecords,
@@ -171,6 +171,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       const nowIso = new Date().toISOString();
       const defaultData: ExtractedRecord[] = ALL_PARTY_REPORT_166.map(r => ({
         ...r,
+        statementUpdatedAt: nowIso,
         updatedAt: nowIso,
         updatedBy: profile.fullName || 'System'
       }));
@@ -186,7 +187,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
         }))
       );
 
-      if (!isQuotaBlocked()) {
+      if (!isWriteQuotaBlocked()) {
         for (let i = 0; i < defaultData.length; i += 400) {
           const chunk = defaultData.slice(i, i + 400);
           const batch = writeBatch(db);
@@ -195,9 +196,13 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
             batch.set(docRef, item);
           });
           await batch.commit();
+          trackFirestoreUsage('write', chunk.length);
         }
       }
     } catch (e) {
+      if (isQuotaExceededError(e)) {
+        setWriteQuotaBlocked(2 * 60 * 1000);
+      }
       console.warn('Failed to seed default outstanding records:', e);
     }
   };
@@ -209,11 +214,14 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     }
     if (outstandingLoaded) {
       setLoadingDealers(false);
+      if (typeof navigator !== 'undefined' && !navigator.onLine) return;
       void (async () => {
         try {
           const secCheck = await fetchSecondaryCollection('outstanding_records', { limit: 10 });
-          if (secCheck.ok && secCheck.items.length > 0) return;
-        } catch {}
+          if (!secCheck.ok || secCheck.items.length > 0) return;
+        } catch {
+          return;
+        }
         await seedDefaultOutstandingRecords();
       })();
     }
@@ -267,7 +275,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
             unsubMeta = null;
           }
           if (isQuotaExceededError(err)) {
-            setQuotaBlocked(15 * 60 * 1000);
+            setQuotaBlocked(2 * 60 * 1000);
           }
           console.warn("Party master meta sync notice:", err);
           void pullMetaFromSecondary();
@@ -279,10 +287,17 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
 
     const handleResync = () => { void pullMetaFromSecondary(); attachMetaListener(); };
     const handleQuotaCleared = () => { attachMetaListener(); };
+    const handleLocalMutation = (e: Event) => {
+      const detail = (e as CustomEvent)?.detail;
+      if (detail?.collection === 'config' && detail?.id === 'party_master_meta' && detail?.doc && !detail?.deleted) {
+        applyMeta(detail.doc);
+      }
+    };
     window.addEventListener('blackworm_data_refresh', handleResync);
     window.addEventListener('blackworm_secondary_resync', handleResync);
     window.addEventListener('blackworm_quota_blocked', pullMetaFromSecondary);
     window.addEventListener('blackworm_quota_cleared', handleQuotaCleared);
+    window.addEventListener('blackworm_local_record_mutation', handleLocalMutation as EventListener);
 
     attachMetaListener();
 
@@ -293,6 +308,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       window.removeEventListener('blackworm_secondary_resync', handleResync);
       window.removeEventListener('blackworm_quota_blocked', pullMetaFromSecondary);
       window.removeEventListener('blackworm_quota_cleared', handleQuotaCleared);
+      window.removeEventListener('blackworm_local_record_mutation', handleLocalMutation as EventListener);
     };
   }, []);
 
@@ -441,7 +457,17 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       if (newlyProcessedFiles.length === 0) {
         setParseError('निवडलेल्या PDF फाईल्समधून कोणताही डेटा काढता आला नाही. कृपया वैध पार्टी रिपोर्ट किंवा आउटस्टँडिंग PDF फाईल निवडा.');
       } else {
-        setRawRecords(currentRecords);
+        const nowMs = Date.now();
+        const nowIso = new Date(nowMs).toISOString();
+        const stampedRecords: ExtractedRecord[] = currentRecords.map((rec) => ({
+          ...rec,
+          statementUpdatedAt: nowIso,
+          updatedAt: nowIso,
+          updatedBy: profile.fullName || 'Admin',
+          _syncUpdatedAtMs: nowMs,
+        } as ExtractedRecord & { _syncUpdatedAtMs?: number; updatedBy?: string }));
+
+        setRawRecords(stampedRecords);
         setUploadedFiles(prev => {
           const existingNames = new Set(prev.map(f => f.name));
           const filteredNew = newlyProcessedFiles.filter(f => !existingNames.has(f.name));
@@ -450,38 +476,51 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
         setDuplicatesPreventedCount(prev => prev + totalDuplicatesMerged);
 
         // Persist all extracted records to Secondary DB and Firestore in safe chunks of 400
-        const nowIso = new Date().toISOString();
         await pushBatchToSecondary(
-          currentRecords.map((rec) => ({
+          stampedRecords.map((rec) => ({
             collection: 'outstanding_records',
             id: rec.id,
-            doc: { ...rec, updatedAt: nowIso, updatedBy: profile.fullName || 'User' },
+            doc: rec,
             merge: true,
           }))
         );
-        if (!isQuotaBlocked()) {
+
+        const totalUploadedAmt = stampedRecords.reduce((acc, r) => acc + (Number(r.amount) || 0), 0);
+        void safeFirestoreSet(
+          'config',
+          'party_master_meta',
+          {
+            lastStatementUpdatedAt: nowIso,
+            totalRecords: stampedRecords.length,
+            totalOutstanding: totalUploadedAmt,
+            updatedAt: nowIso,
+          },
+          { merge: true }
+        ).catch(() => {});
+
+        if (!isWriteQuotaBlocked()) {
           void (async () => {
             try {
-              for (let i = 0; i < currentRecords.length; i += 400) {
-                const chunk = currentRecords.slice(i, i + 400);
+              for (let i = 0; i < stampedRecords.length; i += 400) {
+                const chunk = stampedRecords.slice(i, i + 400);
                 const batch = writeBatch(db);
                 chunk.forEach((rec) => {
                   const docRef = doc(db, 'outstanding_records', rec.id);
-                  batch.set(docRef, {
-                    ...rec,
-                    updatedAt: nowIso,
-                    updatedBy: profile.fullName || 'User'
-                  }, { merge: true });
+                  batch.set(docRef, rec, { merge: true });
                 });
                 await batch.commit();
+                trackFirestoreUsage('write', chunk.length);
               }
             } catch (dbErr) {
+              if (isQuotaExceededError(dbErr)) {
+                setWriteQuotaBlocked(2 * 60 * 1000);
+              }
               console.warn('Failed to persist to Primary Firestore:', dbErr);
             }
           })();
         }
 
-        safeLocalStorageSet('blackworm_saved_outstanding_records', JSON.stringify(currentRecords));
+        safeLocalStorageSet('blackworm_saved_outstanding_records', JSON.stringify(stampedRecords));
 
         // Set the full Summary Report for user visibility
         setUploadSummaryReport({
@@ -534,7 +573,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
         setDialogConfig(p => ({ ...p, isOpen: false }));
         try {
           setRawRecords(prev => prev.filter(r => r.id !== recordId));
-          await safeFirestoreDelete('outstanding_records', recordId);
+          await safeFirestoreDelete('outstanding_records', recordId, { softDelete: true, user: profile });
           showToast(`'${firmName}' ची नोंद काढली.`);
         } catch (err) {
           console.error('Failed to delete record:', err);
@@ -568,7 +607,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
         if (sources.includes(fileNameToRemove)) {
           const nextSources = sources.filter(s => s !== fileNameToRemove).join(', ');
           toUpdateRecords.push({ id: record.id, sourceFile: nextSources });
-          remaining.push({ ...record, sourceFile: nextSources });
+          remaining.push({ ...record, sourceFile: nextSources, updatedAt: new Date().toISOString() });
         } else {
           remaining.push(record);
         }
@@ -577,9 +616,10 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       return remaining;
     });
 
+    const removeNowIso = new Date().toISOString();
     Promise.all([
-      ...toDeleteIds.map(id => safeFirestoreDelete('outstanding_records', id).catch(() => {})),
-      ...toUpdateRecords.map(u => safeFirestoreSet('outstanding_records', u.id, { sourceFile: u.sourceFile }, { merge: true }).catch(() => {}))
+      ...toDeleteIds.map(id => safeFirestoreDelete('outstanding_records', id, { softDelete: true, user: profile }).catch(() => {})),
+      ...toUpdateRecords.map(u => safeFirestoreSet('outstanding_records', u.id, { sourceFile: u.sourceFile, updatedAt: removeNowIso }, { merge: true }).catch(() => {}))
     ]).catch(() => {});
 
     showToast(`"${fileNameToRemove}" फाईल आणि तिचा डेटा शीटमधून काढला.`);
@@ -621,26 +661,49 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
         } catch {}
 
         try {
+          const clearMs = Date.now();
+          const clearIso = new Date(clearMs).toISOString();
           await pushBatchToSecondary(
             recordsToDelete.map((r) => ({
               collection: 'outstanding_records',
               id: r.id,
-              doc: { isArchived: true, updatedAt: new Date().toISOString() },
+              doc: {
+                isArchived: true,
+                is_deleted: true,
+                archivedAt: clearIso,
+                updatedAt: clearIso,
+                _syncUpdatedAtMs: clearMs,
+              },
+              updatedAtMs: clearMs,
               deleted: true,
               merge: true,
             }))
           );
-          if (!isQuotaBlocked()) {
+          if (!isWriteQuotaBlocked()) {
             for (let i = 0; i < recordsToDelete.length; i += 400) {
               const chunk = recordsToDelete.slice(i, i + 400);
               const batch = writeBatch(db);
               chunk.forEach((r) => {
-                batch.delete(doc(db, 'outstanding_records', r.id));
+                batch.set(
+                  doc(db, 'outstanding_records', r.id),
+                  {
+                    isArchived: true,
+                    is_deleted: true,
+                    archivedAt: clearIso,
+                    updatedAt: clearIso,
+                    _syncUpdatedAtMs: clearMs,
+                  },
+                  { merge: true }
+                );
               });
               await batch.commit();
+              trackFirestoreUsage('write', chunk.length);
             }
           }
         } catch (e) {
+          if (isQuotaExceededError(e)) {
+            setWriteQuotaBlocked(2 * 60 * 1000);
+          }
           console.warn('Clear outstanding batch notice:', e);
         }
         showToast('सर्व डेटा साफ केला.');
@@ -657,14 +720,14 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     const matchedList: MatchedOutstandingItem[] = [];
 
     rawRecords.forEach((rec) => {
-      // Best fuzzy match against registered dealers
+      // Best canonical+village+contact match against registered dealers
       let bestMatch: DealershipFormItem | null = null;
       let highestScore = 0;
 
       for (const d of accessibleDealers) {
-        const score = getFirmNameMatchScore(rec.cleanedFirmName, d.firmName);
-        if (score > highestScore) {
-          highestScore = score;
+        const matched = matchDealerToOutstandingRecords(d, [rec]);
+        if (matched && matched.score > highestScore) {
+          highestScore = matched.score;
           bestMatch = d;
         }
       }
@@ -672,7 +735,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       // Check if user manually saved an override phone for this record
       const overridePhone = phoneOverrides[rec.id];
 
-      if (bestMatch && highestScore >= 60) {
+      if (bestMatch && highestScore >= 65) {
         matchedList.push({
           ...rec,
           matchedDealerId: bestMatch.id,

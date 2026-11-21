@@ -56,10 +56,17 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
   const [pendingOpenDealerId, setPendingOpenDealerId] = useState<string | null>(null);
   const { logoUrl, logoSize } = useBranding();
   const [currentUserData, setCurrentUserData] = useState<any>(profile);
+  const [isApplyingRemoteUpdate, setIsApplyingRemoteUpdate] = useState(false);
 
   useEffect(() => {
     setCurrentUserData(profile);
   }, [profile]);
+
+  useEffect(() => {
+    const onRemoteUpdating = () => setIsApplyingRemoteUpdate(true);
+    window.addEventListener('blackworm_remote_updating', onRemoteUpdating);
+    return () => window.removeEventListener('blackworm_remote_updating', onRemoteUpdating);
+  }, []);
 
   const [dialogConfig, setDialogConfig] = useState<{
     isOpen: boolean;
@@ -97,7 +104,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
   const modules = [
     { id: 'target', label: t.targetSheet, icon: Target, color: 'text-blue-500', bg: 'bg-blue-50' },
     { id: 'user', label: 'User Form', icon: UserPlus, color: 'text-emerald-500', bg: 'bg-emerald-50' },
-    { id: 'office_staff', label: 'Godown Incharge', icon: Warehouse, color: 'text-indigo-600', bg: 'bg-indigo-50' },
+    { id: 'office_staff', label: 'Warehouse Incharge', icon: Warehouse, color: 'text-indigo-600', bg: 'bg-indigo-50' },
     { id: 'order', label: t.orders, icon: ShoppingBag, color: 'text-purple-500', bg: 'bg-purple-50' },
     { id: 'collection', label: t.collections, icon: IndianRupee, color: 'text-emerald-600', bg: 'bg-emerald-50' },
     { id: 'calculator', label: t.outstanding || 'Outstanding', icon: FileText, color: 'text-teal-600', bg: 'bg-teal-50' },
@@ -173,12 +180,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     if (activeTab !== 'dashboard' && !canAccessModule(currentUserData, activeTab)) {
       return (
         <div className="bg-white rounded-2xl border border-slate-200 p-8 text-center max-w-md mx-auto my-12">
-          <p className="text-sm font-bold text-slate-800">तुम्हाला या पर्यायासाठी परवानगी नाही (Access Denied)</p>
+          <p className="text-sm font-bold text-slate-800">You do not have permission to access this module (Access Denied)</p>
           <button 
             onClick={() => handleTabChange('dashboard')} 
-            className="mt-4 px-4 py-2 bg-rose-600 text-white rounded-xl text-xs font-bold"
+            className="mt-4 px-4 py-2 bg-rose-600 text-white rounded-xl text-xs font-bold cursor-pointer"
           >
-            डॅशबोर्डवर परत जा
+            Back to Dashboard
           </button>
         </div>
       );
@@ -333,21 +340,44 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
         </div>
 
         {/* Current Active Logged-In User Badge in Header */}
-        <div className="hidden sm:flex items-center gap-1.5 px-2 shrink-0">
-          <span className="text-xs font-black text-slate-900 leading-none">
-            {toTitleCase(currentUserData.fullName) || 'User'}
-          </span>
-          <span className="text-[9.5px] font-bold text-slate-600 leading-none bg-slate-100 border border-slate-200 px-1 py-0.5 rounded">
-            {currentUserData.role === 'owner' ? 'Owner (MD)' : toTitleCase(currentUserData.designation || currentUserData.role)}
-          </span>
-        </div>
+        {(() => {
+          const headerName = toTitleCase(currentUserData.fullName) || 'User';
+          const headerRole =
+            currentUserData.role === 'owner'
+              ? 'Owner (MD)'
+              : toTitleCase(currentUserData.designation || currentUserData.role);
+          const showHeaderRole =
+            Boolean(headerRole) &&
+            headerRole.trim().toLowerCase() !== headerName.trim().toLowerCase();
+          return (
+            <div className="hidden sm:flex items-center gap-1.5 px-2 shrink-0">
+              <span className="text-xs font-black text-slate-900 leading-none">
+                {headerName}
+              </span>
+              {showHeaderRole && (
+                <span className="text-[9.5px] font-bold text-slate-600 leading-none bg-slate-100 border border-slate-200 px-1 py-0.5 rounded">
+                  {headerRole}
+                </span>
+              )}
+            </div>
+          );
+        })()}
       </header>
 
-      <main className="px-2 sm:px-4 py-3 sm:py-6 flex-1 max-w-4xl mx-auto w-full">
+      <main className={cn(
+        'px-2 sm:px-4 py-3 sm:py-6 flex-1 mx-auto w-full',
+        activeTab === 'office_staff' || activeTab === 'order' ? 'max-w-6xl' : 'max-w-4xl'
+      )}>
         {renderContent()}
       </main>
 
       <OfflineIndicator />
+      {isApplyingRemoteUpdate && (
+        <div className="fixed bottom-16 left-1/2 -translate-x-1/2 z-50 bg-slate-900 text-white px-4 py-2 rounded-xl shadow-lg text-xs font-bold flex items-center gap-2 border border-slate-700 animate-pulse">
+          <span className="w-2 h-2 rounded-full bg-emerald-400" />
+          <span>नवीन ॲप अपडेट लागू होत आहे...</span>
+        </div>
+      )}
 
       <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 px-4 pt-2 flex justify-around items-center z-20 shadow-lg mobile-safe-nav">
         <NavItem icon={BarChart3} label={t.dashboard} active={activeTab === 'dashboard'} onClick={() => handleTabChange('dashboard')} />
@@ -367,7 +397,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
           <NavItem icon={Bike} label={t.travel} active={activeTab === 'travel'} onClick={() => handleTabChange('travel')} />
         )}
         {!isUserAdmin && canAccessModule(currentUserData, 'office_staff') && (
-          <NavItem icon={Warehouse} label="Godown" active={activeTab === 'office_staff'} onClick={() => handleTabChange('office_staff')} />
+          <NavItem icon={Warehouse} label="Warehouse" active={activeTab === 'office_staff'} onClick={() => handleTabChange('office_staff')} />
         )}
       </nav>
       <CustomDialogModal {...dialogConfig} />

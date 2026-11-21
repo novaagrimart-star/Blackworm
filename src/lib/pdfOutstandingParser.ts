@@ -26,6 +26,7 @@ export interface ExtractedRecord {
   proprietorName?: string;
   updatedAt?: string;
   createdAt?: string;
+  statementUpdatedAt?: string;
 }
 
 export interface MatchedOutstandingItem extends ExtractedRecord {
@@ -125,6 +126,256 @@ export function normalizeFirmName(name: string): string {
 }
 
 /**
+ * Preserves and canonicalizes business category tokens while removing only legal wrappers (M/s, Pvt Ltd).
+ * Prevents "Balaji Fertilizers" and "Balaji Krushi Seva Kendra" or "Shree Krushi Seva Kendra" from collapsing.
+ */
+export function canonicalizeFirmName(name: string): string {
+  if (!name) return '';
+  const cleaned = cleanOnlyPartyName(name) || name;
+  return cleaned
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[.,\/#!$%\^*\*;:{}=\-_`~()'"]/g, ' ')
+    .replace(/\b(?:m\/s|ms|messrs|prop|proprietor|pvt|ltd|private|limited)\b/g, ' ')
+    .replace(/(?:मे\.|मेसर्स|प्रायव्हेट|लिमिटेड)/g, ' ')
+    .replace(/\b(?:shree|shri|sri)\b/g, 'shri')
+    .replace(/\b(?:krishi|krushi)\b/g, 'krushi')
+    .replace(/\b(?:fertilisers|fertiliser|fertilizers|fertilizer)\b/g, 'fertilizers')
+    .replace(/\b(?:agencies|agency)\b/g, 'agency')
+    .replace(/\b(?:services|service)\b/g, 'service')
+    .replace(/\b(?:enterprises|enterprise)\b/g, 'enterprise')
+    .replace(/\b(?:stores|store)\b/g, 'store')
+    .replace(/\b(?:traders|trading|trader)\b/g, 'traders')
+    .replace(/\b(?:seeds|seed)\b/g, 'seeds')
+    .replace(/\b(?:pesticides|pesticide)\b/g, 'pesticides')
+    .replace(/\b(?:kishan|kisan)\b/g, 'kisan')
+    .replace(/\b(?:lakshmi|laxmi)\b/g, 'laxmi')
+    .replace(/\b(?:agrotech|agro\s+tech)\b/g, 'agro')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function levenshteinDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  const al = a.length;
+  const bl = b.length;
+  if (al === 0) return bl;
+  if (bl === 0) return al;
+  const prev = new Array<number>(bl + 1);
+  const curr = new Array<number>(bl + 1);
+  for (let j = 0; j <= bl; j++) prev[j] = j;
+  for (let i = 1; i <= al; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= bl; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    for (let j = 0; j <= bl; j++) prev[j] = curr[j];
+  }
+  return prev[bl];
+}
+
+const BUSINESS_CATEGORY_TOKENS = new Set([
+  'fertilizers',
+  'krushi',
+  'agency',
+  'traders',
+  'enterprise',
+  'seeds',
+  'pesticides',
+  'store',
+  'dairy',
+  'nursery',
+]);
+
+function extractBusinessCategories(tokens: string[]): Set<string> {
+  const out = new Set<string>();
+  for (const t of tokens) {
+    if (BUSINESS_CATEGORY_TOKENS.has(t)) out.add(t);
+  }
+  return out;
+}
+
+function scoreCanonicalTokens(candidateCanon: string, recordCanon: string): number {
+  if (!candidateCanon || !recordCanon) return 0;
+  if (candidateCanon === recordCanon) return 100;
+
+  if (candidateCanon.includes(recordCanon) || recordCanon.includes(candidateCanon)) {
+    const minLen = Math.min(candidateCanon.length, recordCanon.length);
+    const maxLen = Math.max(candidateCanon.length, recordCanon.length);
+    if (minLen >= 6 && minLen / maxLen >= 0.72) {
+      return 92;
+    }
+  }
+
+  const cTokens = candidateCanon.split(' ').filter((t) => t.length >= 1);
+  const rTokens = recordCanon.split(' ').filter((t) => t.length >= 1);
+  if (cTokens.length === 0 || rTokens.length === 0) return 0;
+
+  const rSet = new Set(rTokens);
+  let matchedWeight = 0;
+  let totalCWeight = 0;
+
+  for (const ct of cTokens) {
+    const w = BUSINESS_CATEGORY_TOKENS.has(ct) ? 0.6 : ct.length <= 2 ? 0.7 : 1.25;
+    totalCWeight += w;
+
+    if (rSet.has(ct)) {
+      matchedWeight += w;
+    } else {
+      let bestPartial = 0;
+      for (const rt of rTokens) {
+        if (ct.length >= 4 && rt.length >= 4) {
+          const dist = levenshteinDistance(ct, rt);
+          if (dist <= 1 || (Math.min(ct.length, rt.length) >= 7 && dist <= 2)) {
+            bestPartial = Math.max(bestPartial, 0.85);
+            continue;
+          }
+          if (ct.includes(rt) || rt.includes(ct)) {
+            const ratio = Math.min(ct.length, rt.length) / Math.max(ct.length, rt.length);
+            if (ratio >= 0.65) {
+              bestPartial = Math.max(bestPartial, 0.75);
+            }
+          }
+        }
+      }
+      matchedWeight += w * bestPartial;
+    }
+  }
+
+  let matchedRWeight = 0;
+  let totalRWeight = 0;
+  const cSet = new Set(cTokens);
+  for (const rt of rTokens) {
+    const w = BUSINESS_CATEGORY_TOKENS.has(rt) ? 0.6 : rt.length <= 2 ? 0.7 : 1.25;
+    totalRWeight += w;
+    if (cSet.has(rt)) {
+      matchedRWeight += w;
+    } else {
+      let bestPartial = 0;
+      for (const ct of cTokens) {
+        if (ct.length >= 4 && rt.length >= 4) {
+          const dist = levenshteinDistance(ct, rt);
+          if (dist <= 1 || (Math.min(ct.length, rt.length) >= 7 && dist <= 2)) {
+            bestPartial = Math.max(bestPartial, 0.85);
+            continue;
+          }
+          if (ct.includes(rt) || rt.includes(ct)) {
+            const ratio = Math.min(ct.length, rt.length) / Math.max(ct.length, rt.length);
+            if (ratio >= 0.65) {
+              bestPartial = Math.max(bestPartial, 0.75);
+            }
+          }
+        }
+      }
+      matchedRWeight += w * bestPartial;
+    }
+  }
+
+  const coverageC = totalCWeight > 0 ? matchedWeight / totalCWeight : 0;
+  const coverageR = totalRWeight > 0 ? matchedRWeight / totalRWeight : 0;
+  let score = Math.round(((coverageC + coverageR) / 2) * 100);
+
+  // Penalize clear business-category mismatch when both have explicit distinct categories (e.g. Fertilizers vs Krushi Seva Kendra)
+  const cCats = extractBusinessCategories(cTokens);
+  const rCats = extractBusinessCategories(rTokens);
+  if (cCats.size > 0 && rCats.size > 0) {
+    let overlap = false;
+    cCats.forEach((cat) => {
+      if (rCats.has(cat)) overlap = true;
+    });
+    if (!overlap) {
+      score = Math.max(0, score - 35);
+    }
+  }
+
+  return Math.min(100, Math.max(0, score));
+}
+
+export interface DealerMatchCandidate {
+  id?: string;
+  firmName?: string;
+  village?: string;
+  contactNumber?: string;
+  responsibleContact?: string;
+}
+
+/**
+ * Matches a saved dealer accurately against uploaded Outstanding Statement records,
+ * combining firmName + village, business category canonicalization, and contact number verification.
+ */
+export function matchDealerToOutstandingRecords(
+  dealer: DealerMatchCandidate,
+  records: ExtractedRecord[]
+): { record: ExtractedRecord; score: number } | null {
+  if (!dealer || !Array.isArray(records) || records.length === 0) return null;
+
+  const firmOnlyCanon = canonicalizeFirmName(dealer.firmName || '');
+  const villageCanon = canonicalizeFirmName(dealer.village || '');
+  const firmWithVillageCanon = canonicalizeFirmName(
+    [dealer.firmName || '', dealer.village || ''].filter(Boolean).join(' ')
+  );
+
+  const dealerPhones = [
+    cleanPhoneNumber(dealer.contactNumber),
+    cleanPhoneNumber(dealer.responsibleContact),
+  ].filter((p) => p.length === 10);
+
+  let bestRecord: ExtractedRecord | null = null;
+  let bestScore = 0;
+
+  for (const rec of records) {
+    const recName = rec.cleanedFirmName || rec.rawFirmName || '';
+    const recCanon = canonicalizeFirmName(recName);
+    const recWithVillageCanon = canonicalizeFirmName(
+      [recName, rec.village || ''].filter(Boolean).join(' ')
+    );
+    const recPhone = cleanPhoneNumber(rec.contactNumber);
+
+    const s1 = scoreCanonicalTokens(firmOnlyCanon, recCanon);
+    const s2 = firmWithVillageCanon ? scoreCanonicalTokens(firmWithVillageCanon, recCanon) : 0;
+    const s3 = firmWithVillageCanon && recWithVillageCanon !== recCanon
+      ? scoreCanonicalTokens(firmWithVillageCanon, recWithVillageCanon)
+      : 0;
+    const s4 = firmOnlyCanon && recWithVillageCanon !== recCanon
+      ? scoreCanonicalTokens(firmOnlyCanon, recWithVillageCanon)
+      : 0;
+
+    let score = Math.max(s1, s2, s3, s4);
+
+    // Village boost or penalty
+    if (villageCanon && villageCanon.length >= 3) {
+      const recVillageCanon = canonicalizeFirmName(rec.village || '');
+      if (recCanon.includes(villageCanon) || (recVillageCanon && recVillageCanon === villageCanon)) {
+        score = Math.min(100, score + (score >= 45 ? 18 : 8));
+      } else if (recVillageCanon && recVillageCanon.length >= 3 && recVillageCanon !== villageCanon) {
+        score = Math.max(0, score - 20);
+      }
+    }
+
+    // Phone verification
+    if (recPhone.length === 10 && dealerPhones.length > 0) {
+      if (dealerPhones.includes(recPhone)) {
+        // Phone match confirms identity if name isn't completely unrelated
+        score = score >= 35 ? Math.min(100, score + 35) : Math.max(score, 66);
+      } else if (score < 95) {
+        score = Math.max(0, score - 20);
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestRecord = rec;
+    }
+  }
+
+  if (bestRecord && bestScore >= 65) {
+    return { record: bestRecord, score: bestScore };
+  }
+  return null;
+}
+
+/**
  * Calculates string similarity score between 0 and 100.
  */
 export function getFirmNameMatchScore(pdfName: string, dbName: string): number {
@@ -136,54 +387,43 @@ export function getFirmNameMatchScore(pdfName: string, dbName: string): number {
   // Exact match
   if (pRaw === dRaw) return 100;
 
+  const pCanon = canonicalizeFirmName(pdfName);
+  const dCanon = canonicalizeFirmName(dbName);
+  if (pCanon && dCanon && pCanon === dCanon) return 98;
+
+  const canonicalScore = scoreCanonicalTokens(pCanon, dCanon);
+  if (canonicalScore >= 65) return canonicalScore;
+
   const pNorm = normalizeFirmName(pdfName);
   const dNorm = normalizeFirmName(dbName);
 
-  // Normalized exact match
-  if (pNorm && dNorm && pNorm === dNorm) return 96;
+  // Normalized exact match (only if non-empty and > 3 chars so generic words don't falsely match)
+  if (pNorm && dNorm && pNorm.length >= 4 && pNorm === dNorm) {
+    // Check category conflict via canonicalScore
+    const pCats = extractBusinessCategories(pCanon.split(' '));
+    const dCats = extractBusinessCategories(dCanon.split(' '));
+    if (pCats.size > 0 && dCats.size > 0) {
+      let overlap = false;
+      pCats.forEach((cat) => {
+        if (dCats.has(cat)) overlap = true;
+      });
+      if (!overlap) return Math.min(canonicalScore, 55);
+    }
+    return 94;
+  }
 
   // Substring containment
   if (pNorm && dNorm) {
     if (pNorm.includes(dNorm) || dNorm.includes(pNorm)) {
       const minLen = Math.min(pNorm.length, dNorm.length);
       const maxLen = Math.max(pNorm.length, dNorm.length);
-      if (minLen >= 4 && minLen / maxLen > 0.45) {
-        return 88;
+      if (minLen >= 4 && minLen / maxLen > 0.55) {
+        return Math.max(canonicalScore, 82);
       }
     }
   }
 
-  // Token Jaccard similarity
-  const pTokens = new Set(pNorm.split(' ').filter(t => t.length > 2));
-  const dTokens = new Set(dNorm.split(' ').filter(t => t.length > 2));
-
-  if (pTokens.size > 0 && dTokens.size > 0) {
-    let intersection = 0;
-    pTokens.forEach(token => {
-      if (dTokens.has(token)) {
-        intersection++;
-      } else {
-        // partial token match
-        for (const dt of dTokens) {
-          if (dt.includes(token) || token.includes(dt)) {
-            intersection += 0.7;
-            break;
-          }
-        }
-      }
-    });
-
-    const union = pTokens.size + dTokens.size - intersection;
-    const score = Math.min(100, Math.round((intersection / union) * 100));
-    if (score >= 45) return score;
-  }
-
-  // Raw substring check
-  if (pRaw.includes(dRaw) || dRaw.includes(pRaw)) {
-    return 75;
-  }
-
-  return 0;
+  return canonicalScore;
 }
 
 /**
@@ -540,6 +780,8 @@ export function mergeAndDeduplicateRecords(
   const newParties: UploadSummaryReport['newParties'] = [];
   const updatedParties: UploadSummaryReport['updatedParties'] = [];
 
+  const nowIso = new Date().toISOString();
+
   // Clone existing array to avoid direct mutation
   const list: ExtractedRecord[] = existingRecords.map(item => ({ ...item }));
   const matchedIndices = new Set<number>();
@@ -553,7 +795,7 @@ export function mergeAndDeduplicateRecords(
       sourceFile: incoming.sourceFile || sourceFileName || 'PDF Document',
     };
 
-    const normIncoming = normalizeFirmName(item.cleanedFirmName);
+    const canonIncoming = canonicalizeFirmName(item.cleanedFirmName);
     const cleanIncomingPhone = cleanPhoneNumber(item.contactNumber);
 
     // Look for duplicate / match in existing list:
@@ -562,7 +804,7 @@ export function mergeAndDeduplicateRecords(
       if (matchedIndices.has(i)) continue;
 
       const existing = list[i];
-      const normExisting = normalizeFirmName(existing.cleanedFirmName);
+      const canonExisting = canonicalizeFirmName(existing.cleanedFirmName);
       const cleanExistingPhone = cleanPhoneNumber(existing.contactNumber);
 
       // 1. Direct ID match
@@ -585,25 +827,25 @@ export function mergeAndDeduplicateRecords(
       }
 
       const nameScore = getFirmNameMatchScore(item.cleanedFirmName, existing.cleanedFirmName);
-      const exactNorm = Boolean(normIncoming && normExisting && normIncoming === normExisting);
+      const exactCanon = Boolean(canonIncoming && canonExisting && canonIncoming === canonExisting);
 
-      // CRITICAL: If same contact number, ONLY merge if name matches or has good similarity (>= 50).
+      // CRITICAL: If same contact number, ONLY merge if name matches or has good similarity (>= 55).
       // Different party names with the same phone must NEVER be merged!
       if (hasBothPhones && cleanIncomingPhone === cleanExistingPhone) {
-        if (exactNorm || nameScore >= 50) {
+        if (exactCanon || nameScore >= 55) {
           matchIndex = i;
           break;
         }
         continue;
       }
 
-      // If one or both do not have phone numbers, match strictly by Party Name:
-      if (exactNorm) {
+      // If one or both do not have phone numbers, match strictly by Canonical Party Name:
+      if (exactCanon) {
         matchIndex = i;
         break;
       }
 
-      if (nameScore >= 80) {
+      if (nameScore >= 82) {
         matchIndex = i;
         break;
       }
@@ -656,7 +898,8 @@ export function mergeAndDeduplicateRecords(
         formattedAmount: newAmount.toLocaleString('en-IN'),
         contactNumber: finalContact,
         sourceFile: existingSources.join(', ') || existing.sourceFile,
-        updatedAt: new Date().toISOString(),
+        statementUpdatedAt: nowIso,
+        updatedAt: nowIso,
       };
     } else {
       // NEW UNIQUE PARTY RECORD
@@ -668,7 +911,9 @@ export function mergeAndDeduplicateRecords(
         cleanedFirmName: cleanFreshName,
         contactNumber: cleanIncomingPhone.length === 10 ? cleanIncomingPhone : '',
         id: item.id || `rec_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        updatedAt: new Date().toISOString(),
+        createdAt: item.createdAt || nowIso,
+        statementUpdatedAt: nowIso,
+        updatedAt: nowIso,
       };
       list.push(freshRecord);
       newParties.push({

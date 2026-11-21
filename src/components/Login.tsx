@@ -13,6 +13,7 @@ import {
   toTimestampMs,
 } from '../lib/dataService';
 import { fetchSecondaryCollection, bootstrapCollectionToSecondary } from '../lib/secondaryDb';
+import { resolveApiUrl } from '../lib/appVersion';
 import { useBranding } from '../lib/branding';
 
 interface LoginProps {
@@ -30,6 +31,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (loading) return;
     setError('');
     setLoading(true);
 
@@ -55,7 +57,7 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
         try {
           const authController = new AbortController();
           const authTimer = setTimeout(() => authController.abort(), 3000);
-          const authResp = await fetch('/api/auth/login', {
+          const authResp = await fetch(resolveApiUrl('/api/auth/login'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ loginId: trimmedId, password: trimmedPass }),
@@ -122,12 +124,12 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
                     }
                   })
                   .catch((err) => {
-                    if (isQuotaExceededError(err)) setQuotaBlocked(15 * 60 * 1000);
+                    if (isQuotaExceededError(err)) setQuotaBlocked(2 * 60 * 1000);
                   });
               }
             } catch (networkErr: any) {
               if (isQuotaExceededError(networkErr)) {
-                setQuotaBlocked(15 * 60 * 1000);
+                setQuotaBlocked(2 * 60 * 1000);
               }
               console.warn('Primary login lookup fallback:', networkErr);
             }
@@ -215,40 +217,53 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
         }
       }
 
-      // Flexible, accurate login identification: Login ID, User Code, Mobile Number, or Email
-      let foundUser = allUsers.find((u: any) => {
+      // Prioritized matching: exact loginId > userCode > emailId > mobileNumber > owner-alias
+      const getMatchRank = (u: any): number => {
+        if (!u || u.isArchived || u.is_deleted) return 99;
         const storedLoginId = (u.loginId || '').toString().trim().toLowerCase();
-        if (storedLoginId && storedLoginId === lowerId) return true;
-        if (u.userCode && u.userCode.toString().trim().toLowerCase() === lowerId) return true;
-        const storedMobile = (u.mobileNumber || '').toString().replace(/\D/g, '').slice(-10);
-        if (last10Digits && storedMobile && storedMobile === last10Digits) return true;
+        if (storedLoginId && storedLoginId === lowerId) return 1;
+        if (u.userCode && u.userCode.toString().trim().toLowerCase() === lowerId) return 2;
         const storedEmail = (u.emailId || '').toString().trim().toLowerCase();
-        if (storedEmail && storedEmail === lowerId) return true;
+        if (storedEmail && storedEmail === lowerId) return 3;
+        const storedMobile = (u.mobileNumber || '').toString().replace(/\D/g, '').slice(-10);
+        if (last10Digits && storedMobile && storedMobile === last10Digits) return 4;
         const storedName = (u.fullName || '').toString().trim().toLowerCase();
         if (storedName && (lowerId === 'shridhar' || lowerId === 'shridhar shinde' || lowerId === 'shinde')) {
-          if (u.role === 'owner') return true;
+          if (u.role === 'owner') return 5;
         }
-        return false;
-      });
+        return 99;
+      };
 
-      // If user not found, reject login
-      if (!foundUser) {
+      const candidates = allUsers
+        .map((u: any) => ({ user: u, rank: getMatchRank(u) }))
+        .filter((entry) => entry.rank < 99)
+        .sort((a, b) => a.rank - b.rank);
+
+      if (candidates.length === 0) {
         setError('Invalid Login ID. Please enter the correct Login ID.');
         return;
       }
 
-      // Check Account Status
-      if (foundUser.status === 'Inactive') {
+      // First try active candidates matching password (handles shared mobile numbers accurately)
+      const activeCandidates = candidates.filter((c) => c.user.status !== 'Inactive');
+      if (activeCandidates.length === 0) {
         setError('Account is Inactive. Please contact administrator.');
         return;
       }
 
-      // Only allow login if password matches saved record
-      const userStoredPass = (foundUser.password !== undefined && foundUser.password !== null && String(foundUser.password).trim() !== '' ? String(foundUser.password) : 'bw@123').trim();
-      const isPasswordCorrect = (trimmedPass === userStoredPass);
+      const passwordMatched = activeCandidates.find((c) => {
+        const storedPass = (
+          c.user.password !== undefined &&
+          c.user.password !== null &&
+          String(c.user.password).trim() !== ''
+            ? String(c.user.password)
+            : 'bw@123'
+        ).trim();
+        return trimmedPass === storedPass;
+      });
 
-      if (isPasswordCorrect) {
-        const { password: _omittedPass, ...safeUser } = foundUser;
+      if (passwordMatched) {
+        const { password: _omittedPass, ...safeUser } = passwordMatched.user;
         onLoginSuccess(safeUser as UserProfile);
       } else {
         setError('Incorrect Password. Please check and try again.');

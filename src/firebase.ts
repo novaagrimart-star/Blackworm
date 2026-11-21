@@ -3,6 +3,8 @@ import { getAuth } from 'firebase/auth';
 import { 
   initializeFirestore, 
   getFirestore, 
+  persistentLocalCache,
+  persistentMultipleTabManager,
   memoryLocalCache,
   doc, 
   getDocFromServer,
@@ -18,13 +20,21 @@ const app = initializeApp(firebaseConfig);
 
 let firestoreDb;
 try {
-  // Always load fresh server data into memory on session start so stale IndexedDB cache never masks live updates
+  // Persist Firestore local cache in IndexedDB so reloads & APK launches use delta-sync instead of re-reading every collection
   firestoreDb = initializeFirestore(app, {
-    localCache: memoryLocalCache()
+    localCache: persistentLocalCache({
+      tabManager: persistentMultipleTabManager(),
+    }),
   }, firebaseConfig.firestoreDatabaseId);
 } catch (e) {
-  console.warn('Firestore memory cache init fallback:', e);
-  firestoreDb = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  try {
+    firestoreDb = initializeFirestore(app, {
+      localCache: memoryLocalCache(),
+    }, firebaseConfig.firestoreDatabaseId);
+  } catch (memErr) {
+    console.warn('Firestore cache init fallback:', memErr);
+    firestoreDb = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+  }
 }
 
 export const db = firestoreDb;

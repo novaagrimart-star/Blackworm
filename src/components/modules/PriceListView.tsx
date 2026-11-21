@@ -34,10 +34,12 @@ import {
   setQuotaBlocked,
   formatDisplayDate,
   safeLocalStorageSet,
-  toTimestampMs
+  toTimestampMs,
+  trackFirestoreUsage
 } from '../../lib/dataService';
 import { useBranding } from '../../lib/branding';
 import { pushBatchToSecondary, fetchSecondaryCollection, subscribeSecondaryCollection } from '../../lib/secondaryDb';
+import { useSharedMasterPricelist, setMasterPricelistStateOptimistic } from '../../lib/realtimeStore';
 import * as XLSX from 'xlsx';
 
 export interface PackingOption {
@@ -680,11 +682,13 @@ export async function savePriceListPermanently(
     throw new Error('प्रॉडक्ट्स लिस्ट रिकामी आहे. कोणतीही माहिती सेव्ह केली गेली नाही.');
   }
 
-  // 1. Instant local caching for 0ms refresh / offline / mobile sync
+  // 1. Instant local caching + immediate global store propagation across Order, Scheme & Godown views
+  const resolvedValidity = validityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026';
+  setMasterPricelistStateOptimistic(cleanProducts, resolvedValidity);
   safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(cleanProducts));
   safeLocalStorageSet('blackworm_master_pricelist', JSON.stringify({
     products: cleanProducts,
-    validityDate: validityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026',
+    validityDate: resolvedValidity,
     updatedAt: new Date().toISOString(),
     updatedByUid: profile.uid,
     updatedByName: profile.fullName || 'Admin',
@@ -753,10 +757,11 @@ export async function savePriceListPermanently(
             }, { merge: true });
           });
           await batch.commit();
+          trackFirestoreUsage('write', chunk.length);
         }
       } catch (upsertErr: any) {
         const msg = String(upsertErr?.message || '').toLowerCase();
-        if (msg.includes('quota') || msg.includes('resource_exhausted')) setQuotaBlocked(15 * 60 * 1000);
+        if (msg.includes('quota') || msg.includes('resource_exhausted')) setQuotaBlocked(2 * 60 * 1000);
         console.warn('Batch upsert products notice:', upsertErr);
       }
     }
@@ -801,9 +806,10 @@ export async function savePriceListPermanently(
             archiveBatch.update(ref, { isArchived: true, archivedAt: nowIso });
           });
           await archiveBatch.commit();
+          trackFirestoreUsage('write', chunk.length);
         }
       } catch (archErr: any) {
-        if (isQuotaExceededError(archErr)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaExceededError(archErr)) setQuotaBlocked(2 * 60 * 1000);
         console.warn('Soft-archive notice:', archErr);
       }
     }
@@ -825,9 +831,31 @@ export async function savePriceListPermanently(
 }
 
 export const PriceListView: React.FC<Props> = ({ profile }) => {
-  // Pre-load from instant cache for 0ms initial render
-  const [products, setProducts] = useState<DynamicPriceProduct[]>(getInitialCachedProducts);
-  const [validityDate, setValidityDate] = useState('Pricelist w.e.f 01/10/2026 to 31/10/2026');
+  // Use shared master pricelist singleton across PriceList, Order, Scheme & Godown views (zero duplicate listeners!)
+  const {
+    products: sharedProducts,
+    validityDate: sharedValidityDate,
+    loaded: sharedPricelistLoaded,
+    setMasterPricelistOptimistic,
+  } = useSharedMasterPricelist();
+  const [fallbackProducts, setFallbackProducts] = useState<DynamicPriceProduct[]>(getInitialCachedProducts);
+  const products: DynamicPriceProduct[] =
+    sharedProducts.length > 0 ? (sharedProducts as DynamicPriceProduct[]) : fallbackProducts;
+  const setProducts = (
+    next: DynamicPriceProduct[] | ((prev: DynamicPriceProduct[]) => DynamicPriceProduct[])
+  ) => {
+    const resolved = typeof next === 'function' ? next(products) : next;
+    setFallbackProducts(resolved);
+    setMasterPricelistOptimistic(resolved, validityDate);
+  };
+  const [validityDate, setValidityDate] = useState(
+    () => sharedValidityDate || 'Pricelist w.e.f 01/10/2026 to 31/10/2026'
+  );
+  useEffect(() => {
+    if (sharedValidityDate) {
+      setValidityDate(sharedValidityDate);
+    }
+  }, [sharedValidityDate]);
   const { logoUrl, logoSize } = useBranding();
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [uploadStatusMessage, setUploadStatusMessage] = useState<string>('');
@@ -859,7 +887,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
               fbMaster = masterSnap.data();
             }
           } catch (fbErr: any) {
-            if (isQuotaExceededError(fbErr)) setQuotaBlocked(15 * 60 * 1000);
+            if (isQuotaExceededError(fbErr)) setQuotaBlocked(2 * 60 * 1000);
           }
         })(),
         (async () => {
@@ -906,7 +934,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         }
       }
     } catch (e: any) {
-      if (isQuotaExceededError(e)) setQuotaBlocked(15 * 60 * 1000);
+      if (isQuotaExceededError(e)) setQuotaBlocked(2 * 60 * 1000);
       console.warn('Manual refresh notice:', e);
     } finally {
       setTimeout(() => setIsRefreshing(false), 400);
@@ -994,7 +1022,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
           }
           const msg = String(err?.message || '').toLowerCase();
           if (msg.includes('quota') || msg.includes('resource_exhausted')) {
-            setQuotaBlocked(15 * 60 * 1000);
+            setQuotaBlocked(2 * 60 * 1000);
           }
           pullMetaFromSecondary();
           console.warn('PriceList meta live sync notice:', err);
@@ -1006,10 +1034,17 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
 
     const handleMetaRefresh = () => { pullMetaFromSecondary(); attachMetaListener(); };
     const handleMetaQuotaCleared = () => { attachMetaListener(); };
+    const handleMetaLocalMutation = (e: Event) => {
+      const detail = (e as CustomEvent)?.detail;
+      if (detail?.collection === 'config' && detail?.id === 'pricelist_meta' && detail?.doc && !detail?.deleted) {
+        applyMeta({ ...detail.doc, ...(detail.updatedAtMs ? { _syncUpdatedAtMs: detail.updatedAtMs } : {}) }, false);
+      }
+    };
     window.addEventListener('blackworm_data_refresh', handleMetaRefresh);
     window.addEventListener('blackworm_secondary_resync', handleMetaRefresh);
     window.addEventListener('blackworm_quota_blocked', pullMetaFromSecondary);
     window.addEventListener('blackworm_quota_cleared', handleMetaQuotaCleared);
+    window.addEventListener('blackworm_local_record_mutation', handleMetaLocalMutation as EventListener);
 
     attachMetaListener();
 
@@ -1020,165 +1055,50 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
       window.removeEventListener('blackworm_secondary_resync', handleMetaRefresh);
       window.removeEventListener('blackworm_quota_blocked', pullMetaFromSecondary);
       window.removeEventListener('blackworm_quota_cleared', handleMetaQuotaCleared);
+      window.removeEventListener('blackworm_local_record_mutation', handleMetaLocalMutation as EventListener);
     };
   }, []);
 
-  // 2. Real-time Listener with Dual Master-Doc, Secondary DB SSE & Collection Redundancy
+  // 2. Fallback to legacy products_pricelist_v2 / Official Reference ONLY if shared master_pricelist is empty after load
   useEffect(() => {
-    let appliedMasterTs = 0;
-    let hasMasterData = false;
+    if (sharedProducts.length > 0) {
+      setFallbackProducts(sharedProducts as DynamicPriceProduct[]);
+      return;
+    }
+    if (!sharedPricelistLoaded) return;
 
-    const applyMasterData = (data: any, authoritativeServer = false) => {
-      if (data && Array.isArray(data.products) && data.products.length > 0) {
-        const incomingTs = Math.max(Number(data._syncUpdatedAtMs) || 0, toTimestampMs(data.updatedAt));
-        if (!authoritativeServer && appliedMasterTs > 0 && incomingTs > 0 && appliedMasterTs > incomingTs + 500) {
-          return;
-        }
-        if (incomingTs > 0) appliedMasterTs = incomingTs;
-        hasMasterData = true;
-        const clean = deduplicateProducts(data.products);
-        safeLocalStorageSet('blackworm_master_pricelist', JSON.stringify({ ...data, products: clean }));
-        safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(clean));
-        setProducts(clean);
-        if (data.validityDate) setValidityDate(data.validityDate);
-        if (clean.length < data.products.length && isAdmin(profile)) {
-          savePriceListPermanently(clean, 'Auto Deduplication Self-Healing', profile, data.validityDate, data.products).catch(() => {});
-        }
-      }
-    };
-
-    const pullMasterFromSecondary = () => {
-      void fetchSecondaryCollection('config', { limit: 50 }).then((res) => {
-        if (!res.ok) return;
-        const found = res.items.find((it) => it?.id === 'master_pricelist');
-        if (found) applyMasterData(found, false);
-      });
-    };
-
-    const unsubSecMaster = subscribeSecondaryCollection('config', (events) => {
-      events.forEach((evt) => {
-        if (evt.id === 'master_pricelist' && evt.doc && !evt.deleted) {
-          applyMasterData({ ...evt.doc, ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}) }, false);
-        }
-      });
-    });
-
-    // Always pull from Secondary even if Firebase isn't quota-blocked on THIS device yet
-    pullMasterFromSecondary();
-
-    let unsubMaster: (() => void) | null = null;
-    let unsub: (() => void) | null = null;
-
-    const attachMasterListeners = () => {
-      if (isQuotaBlocked()) return;
-      if (!unsubMaster) {
+    let cancelled = false;
+    const hydrateLegacyIfEmpty = async () => {
+      if (!isQuotaBlocked()) {
         try {
-          unsubMaster = onSnapshot(doc(db, 'config', 'master_pricelist'), (docSnap) => {
-            if (docSnap.exists() && !docSnap.metadata?.fromCache) {
-              applyMasterData(docSnap.data(), true);
-            }
-          }, (err) => {
-            if (unsubMaster) {
-              try { unsubMaster(); } catch {}
-              unsubMaster = null;
-            }
-            const msg = String(err?.message || '').toLowerCase();
-            if (msg.includes('quota') || msg.includes('resource_exhausted')) setQuotaBlocked(15 * 60 * 1000);
-            pullMasterFromSecondary();
-            console.warn('Master price list sync notice:', err);
+          const snap = await getDocs(query(collection(db, 'products_pricelist_v2')));
+          trackFirestoreUsage('read', Math.max(1, snap.docs.length));
+          const list: DynamicPriceProduct[] = [];
+          snap.forEach((docSnap) => {
+            const data = docSnap.data() as DynamicPriceProduct;
+            if (!data.isArchived) list.push({ ...data, id: docSnap.id });
           });
-        } catch {
-          unsubMaster = null;
+          if (!cancelled && list.length > 0) {
+            const cleanList = deduplicateProducts(list);
+            setFallbackProducts(cleanList);
+            setMasterPricelistOptimistic(cleanList, validityDate);
+            return;
+          }
+        } catch (err) {
+          if (isQuotaExceededError(err)) setQuotaBlocked(2 * 60 * 1000);
         }
       }
 
-      if (!unsub) {
-        try {
-          const q = query(collection(db, 'products_pricelist_v2'));
-          unsub = onSnapshot(q, async (snap) => {
-            // Never let legacy products_pricelist_v2 overwrite master_pricelist once master_pricelist is active
-            if (hasMasterData) return;
-
-            const list: DynamicPriceProduct[] = [];
-            let maxSnapTs = 0;
-            snap.forEach((docSnap) => {
-              const data = docSnap.data() as DynamicPriceProduct;
-              const ts = Math.max(Number((data as any)._syncUpdatedAtMs) || 0, toTimestampMs((data as any).updatedAt));
-              if (ts > maxSnapTs) maxSnapTs = ts;
-              if (!data.isArchived) {
-                list.push({ ...data, id: docSnap.id });
-              }
-            });
-
-            if (list.length > 0) {
-              if (snap.metadata?.fromCache || (appliedMasterTs > 0 && (maxSnapTs === 0 || appliedMasterTs > maxSnapTs + 5000))) {
-                return;
-              }
-              const cleanList = deduplicateProducts(list);
-              cleanList.sort((a, b) => {
-                if (a.groupName !== b.groupName) {
-                  if (a.groupName.includes('Group A')) return -1;
-                  if (b.groupName.includes('Group A')) return 1;
-                  if (a.groupName.includes('Specialty')) return -1;
-                  if (b.groupName.includes('Specialty')) return 1;
-                  return a.groupName.localeCompare(b.groupName);
-                }
-                return (a.orderIndex || 0) - (b.orderIndex || 0);
-              });
-              setProducts(cleanList);
-              safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(cleanList));
-            } else if (!snap.metadata?.fromCache) {
-              const cached = getInitialCachedProducts();
-              if (cached.length > 0) {
-                setProducts(cached);
-              } else {
-                await seedReferenceDataSafe();
-              }
-            }
-          }, (err) => {
-            if (unsub) {
-              try { unsub(); } catch {}
-              unsub = null;
-            }
-            if (isQuotaExceededError(err)) setQuotaBlocked(15 * 60 * 1000);
-            pullMasterFromSecondary();
-            console.warn('PriceList products live sync notice:', err);
-            const cached = getInitialCachedProducts();
-            if (cached.length > 0) {
-              setProducts(cached);
-            } else {
-              const fallback: DynamicPriceProduct[] = OFFICIAL_REFERENCE_DATA.map((item, idx) => ({
-                ...item,
-                id: `ref_${idx + 1}`,
-              }));
-              setProducts(fallback);
-            }
-          });
-        } catch {
-          unsub = null;
-        }
+      if (!cancelled && getInitialCachedProducts().length === 0) {
+        await seedReferenceDataSafe();
       }
     };
 
-    const handleMasterRefresh = () => { pullMasterFromSecondary(); attachMasterListeners(); };
-    const handleMasterQuotaCleared = () => { attachMasterListeners(); };
-    window.addEventListener('blackworm_data_refresh', handleMasterRefresh);
-    window.addEventListener('blackworm_secondary_resync', handleMasterRefresh);
-    window.addEventListener('blackworm_quota_blocked', pullMasterFromSecondary);
-    window.addEventListener('blackworm_quota_cleared', handleMasterQuotaCleared);
-
-    attachMasterListeners();
-
+    void hydrateLegacyIfEmpty();
     return () => {
-      unsubSecMaster();
-      if (unsubMaster) unsubMaster();
-      if (unsub) unsub();
-      window.removeEventListener('blackworm_data_refresh', handleMasterRefresh);
-      window.removeEventListener('blackworm_secondary_resync', handleMasterRefresh);
-      window.removeEventListener('blackworm_quota_blocked', pullMasterFromSecondary);
-      window.removeEventListener('blackworm_quota_cleared', handleMasterQuotaCleared);
+      cancelled = true;
     };
-  }, []);
+  }, [sharedPricelistLoaded, sharedProducts.length]);
 
   // Safe Seeding: Only runs if database is completely empty; NEVER wipes or overwrites
   const seedReferenceDataSafe = async () => {
@@ -1223,14 +1143,14 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
             await safeFirestoreSet('products_pricelist_v2', item.id, item, { merge: true });
           }
         } catch (seedErr: any) {
-          if (isQuotaExceededError(seedErr)) setQuotaBlocked(15 * 60 * 1000);
+          if (isQuotaExceededError(seedErr)) setQuotaBlocked(2 * 60 * 1000);
           console.warn('Initial pricelist seed notice:', seedErr);
         }
       }
       setProducts(initialProducts);
       safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(initialProducts));
     } catch (err: any) {
-      if (isQuotaExceededError(err)) setQuotaBlocked(15 * 60 * 1000);
+      if (isQuotaExceededError(err)) setQuotaBlocked(2 * 60 * 1000);
       console.warn('Safe seed notice:', err);
     }
   };
@@ -1250,7 +1170,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
             return;
           }
         } catch (fbErr: any) {
-          if (isQuotaExceededError(fbErr)) setQuotaBlocked(15 * 60 * 1000);
+          if (isQuotaExceededError(fbErr)) setQuotaBlocked(2 * 60 * 1000);
           console.warn('Primary backups fetch notice:', fbErr);
         }
       }
@@ -1259,7 +1179,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         setBackupList(sec.items);
       }
     } catch (e: any) {
-      if (isQuotaExceededError(e)) setQuotaBlocked(15 * 60 * 1000);
+      if (isQuotaExceededError(e)) setQuotaBlocked(2 * 60 * 1000);
       console.warn('Fetch backups notice:', e);
     } finally {
       setIsLoadingBackups(false);

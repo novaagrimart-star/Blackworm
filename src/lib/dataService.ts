@@ -3,7 +3,6 @@ import {
   doc, 
   setDoc, 
   getDocs, 
-  deleteDoc, 
   updateDoc
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../firebase';
@@ -14,6 +13,9 @@ import {
   savePendingQueueToVault,
   loadPendingQueueFromVault,
 } from './localVault';
+import { isRecordDeleted, mergeTravelSheetDocs } from './travelMerge';
+export { isRecordDeleted, mergeTravelSheetDocs };
+import { resolveApiUrl } from './appVersion';
 import {
   pushToSecondary,
   pushBatchToSecondary,
@@ -25,6 +27,7 @@ import {
   getSecondarySyncStatus,
   exportAllRowsFromSecondary,
   forceResetSecondaryCursor,
+  broadcastLocalMutation,
   SecondarySyncStatus,
 } from './secondaryDb';
 
@@ -39,29 +42,43 @@ export interface AuditLogItem {
   timestamp: string;
 }
 
-let quotaExceededUntil = (() => {
-  try {
-    if (typeof window !== 'undefined') {
-      const stored = localStorage.getItem('blackworm_quota_blocked_until');
-      if (stored) {
-        const val = Number(stored);
-        if (!isNaN(val) && val > Date.now()) return val;
-      }
-    }
-  } catch {}
-  return 0;
-})();
+let quotaExceededUntil = 0;
+let consecutiveReadQuotaBlocks = 0;
+let writeQuotaExceededUntil = 0;
 
 export function isQuotaBlocked(): boolean {
   if (quotaExceededUntil <= 0) return false;
   if (Date.now() >= quotaExceededUntil) {
-    setQuotaBlocked(0);
+    quotaExceededUntil = 0;
+    try {
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('blackworm_quota_cleared', { detail: { timestamp: Date.now() } }));
+      }
+    } catch {}
     return false;
   }
   return true;
 }
 
-const CACHE_SCHEMA_VERSION = 'v2026_11_18_realtime_1';
+export function isWriteQuotaBlocked(): boolean {
+  if (writeQuotaExceededUntil <= 0) return false;
+  if (Date.now() >= writeQuotaExceededUntil) {
+    writeQuotaExceededUntil = 0;
+    return false;
+  }
+  return true;
+}
+
+export function setWriteQuotaBlocked(durationMs: number = 2 * 60 * 1000) {
+  if (durationMs <= 0) {
+    writeQuotaExceededUntil = 0;
+    return;
+  }
+  const safeDuration = Math.min(Math.max(15000, durationMs), 10 * 60 * 1000);
+  writeQuotaExceededUntil = Date.now() + safeDuration;
+}
+
+const CACHE_SCHEMA_VERSION = 'v2026_11_19_sync_v2';
 let staleCachePurgedOnce = false;
 
 export function purgeStaleReadCachesOnBoot(): void {
@@ -97,14 +114,25 @@ export function purgeStaleReadCachesOnBoot(): void {
         k === 'blackworm_secondary_epoch' ||
         k === 'blackworm_secondary_sync_rev' ||
         k === 'blackworm_secondary_server_epoch' ||
-        k.startsWith('blackworm_report_daily_v4_') ||
-        k.startsWith('blackworm_cached_')
+        k.startsWith('blackworm_report_daily_v4_')
       ) {
+        keysToRemove.push(k);
+      } else if (k.startsWith('blackworm_cached_') && k !== 'blackworm_cached_travel_sheets') {
         keysToRemove.push(k);
       } else if (k.startsWith('travel_sheet_')) {
         const sheetId = k.replace(/^travel_sheet_/, 'travel_');
         if (!pendingSet.has(`travel_sheets:::${sheetId}`)) {
-          keysToRemove.push(k);
+          // Only keep unsynced drafts; leave other travel_sheet_ drafts intact if they have populated rows
+          try {
+            const rawDraft = localStorage.getItem(k);
+            const parsedDraft = rawDraft ? JSON.parse(rawDraft) : null;
+            const hasRows = Array.isArray(parsedDraft?.rows) && parsedDraft.rows.some((r: any) =>
+              Boolean(String(r?.route || '').trim()) || Number(r?.km) > 0 || Number(r?.amount) > 0 || Number(r?.otherExpenses) > 0
+            );
+            if (!hasRows) keysToRemove.push(k);
+          } catch {
+            keysToRemove.push(k);
+          }
         }
       } else if (k.startsWith('yearly_target_sheet_')) {
         const uid = k.replace(/^yearly_target_sheet_/, '');
@@ -152,24 +180,33 @@ export function purgeStaleReadCachesOnBoot(): void {
 
 purgeStaleReadCachesOnBoot();
 
-export function setQuotaBlocked(durationMs: number = 10 * 60 * 1000) {
+export function setQuotaBlocked(durationMs: number = 2 * 60 * 1000) {
   const wasBlocked = quotaExceededUntil > Date.now();
+  try {
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('blackworm_quota_blocked_until');
+    }
+  } catch {}
   if (durationMs <= 0) {
     quotaExceededUntil = 0;
+    consecutiveReadQuotaBlocks = 0;
+    writeQuotaExceededUntil = 0;
     try {
-      if (typeof window !== 'undefined') {
-        localStorage.removeItem('blackworm_quota_blocked_until');
-        if (wasBlocked) {
-          window.dispatchEvent(new CustomEvent('blackworm_quota_cleared', { detail: { timestamp: Date.now() } }));
-        }
+      if (typeof window !== 'undefined' && wasBlocked) {
+        window.dispatchEvent(new CustomEvent('blackworm_quota_cleared', { detail: { timestamp: Date.now() } }));
       }
     } catch {}
     return;
   }
-  quotaExceededUntil = Date.now() + durationMs;
+  // If already blocked right now, keep the existing timer instead of resetting on sibling listener errors
+  if (wasBlocked) return;
+  consecutiveReadQuotaBlocks = Math.min(consecutiveReadQuotaBlocks + 1, 4);
+  const multiplier = consecutiveReadQuotaBlocks <= 1 ? 1 : consecutiveReadQuotaBlocks === 2 ? 2.5 : consecutiveReadQuotaBlocks === 3 ? 5 : 7.5;
+  const escalatedMs = Math.round(durationMs * multiplier);
+  const safeDuration = Math.min(Math.max(15000, escalatedMs), 15 * 60 * 1000);
+  quotaExceededUntil = Date.now() + safeDuration;
   try {
     if (typeof window !== 'undefined') {
-      localStorage.setItem('blackworm_quota_blocked_until', String(quotaExceededUntil));
       window.dispatchEvent(
         new CustomEvent('blackworm_quota_blocked', {
           detail: { blockedUntil: quotaExceededUntil, timestamp: Date.now() },
@@ -177,6 +214,11 @@ export function setQuotaBlocked(durationMs: number = 10 * 60 * 1000) {
       );
     }
   } catch {}
+}
+
+export function resetReadQuotaBackoff() {
+  consecutiveReadQuotaBlocks = 0;
+  quotaExceededUntil = 0;
 }
 
 export function trackFirestoreUsage(type: 'read' | 'write', count = 1): void {
@@ -271,7 +313,7 @@ export function getPendingSyncMap(colName: string): Map<string, PendingSyncMeta>
             ts: Number(q.timestamp) || toTimestampMs(q.data?.updatedAt || q.data?._localSavedAt) || 0,
             needsFirebase: q.needsFirebase !== false,
             needsSecondary: q.needsSecondary !== false,
-            deleted: Boolean(q.deleted || q.data?.isArchived),
+            deleted: Boolean(q.deleted || isRecordDeleted(q.data)),
           });
         }
       });
@@ -316,7 +358,6 @@ export function safeLocalStorageSet(key: string, value: string): boolean {
         'BLACKWORM_LOCAL_DATA_MIRROR',
         'blackworm_report_static_cache_v4',
         'blackworm_all_dealers',
-        'blackworm_cached_travel_sheets',
         'blackworm_cached_pricelist',
         'blackworm_master_pricelist',
       ];
@@ -443,7 +484,7 @@ export function updateCollectionCache<T extends { id: string }>(colName: string,
     items.forEach((it: any) => {
       if (!it || !it.id) return;
       const pendingMeta = pendingMap.get(it.id);
-      if (it.isArchived) {
+      if (isRecordDeleted(it)) {
         if (!pendingMeta || !pendingMeta.needsSecondary) {
           delete existing[it.id];
         }
@@ -456,21 +497,32 @@ export function updateCollectionCache<T extends { id: string }>(colName: string,
         return;
       }
 
-      // If this document still hasn't reached Secondary DB, only let server win if server is newer
-      if (pendingMeta && pendingMeta.needsSecondary) {
-        const prevTime = Math.max(
-          pendingMeta.ts || 0,
-          toTimestampMs(prev._syncUpdatedAtMs || prev._localSavedAt || prev.updatedAt || prev.createdAt)
-        );
-        const nextTime = toTimestampMs(it._syncUpdatedAtMs || it.updatedAt || it.createdAt);
-        if (nextTime < prevTime) {
-          return;
-        }
+      if (colName === 'travel_sheets' && Array.isArray(prev.rows) && Array.isArray(it.rows)) {
+        const mergedTravel = mergeTravelSheetDocs(prev, it);
+        delete mergedTravel._localSavedAt;
+        existing[it.id] = mergedTravel;
+        return;
       }
 
-      const merged = { ...prev, ...it };
-      delete merged._localSavedAt;
-      existing[it.id] = merged;
+      const prevTime = Math.max(
+        pendingMeta?.needsSecondary ? pendingMeta.ts || 0 : 0,
+        toTimestampMs(prev._syncUpdatedAtMs || prev._localSavedAt || prev.updatedAt || prev.createdAt)
+      );
+      const nextTime = toTimestampMs(it._syncUpdatedAtMs || it.updatedAt || it.createdAt);
+
+      if (pendingMeta && pendingMeta.needsSecondary && nextTime < prevTime) {
+        return;
+      }
+      if (prevTime > 0 && nextTime > 0 && prevTime > nextTime) {
+        return;
+      }
+
+      const nextDoc = {
+        ...(prev.createdAt && !it.createdAt ? { createdAt: prev.createdAt } : {}),
+        ...it,
+      };
+      delete nextDoc._localSavedAt;
+      existing[it.id] = nextDoc;
     });
 
     safeLocalStorageSet(storageKey, JSON.stringify(existing));
@@ -545,6 +597,19 @@ function writeLocalCollectionRecord(colName: string, docId: string, data: Record
     map[docId] = nextDoc;
     safeLocalStorageSet(storageKey, JSON.stringify(map));
     void saveCollectionToVault(colName, map);
+    const updatedAtMs = toTimestampMs(nextDoc._syncUpdatedAtMs || nextDoc.updatedAt) || Date.now();
+    const mutationDetail = {
+      collection: colName,
+      id: docId,
+      doc: nextDoc,
+      merge,
+      deleted: Boolean(nextDoc.isArchived),
+      updatedAtMs,
+    };
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('blackworm_local_record_mutation', { detail: mutationDetail }));
+      broadcastLocalMutation(mutationDetail);
+    }
   } catch (e) {
     console.warn(`Local caching notice for ${colName}/${docId}:`, e);
   }
@@ -605,8 +670,8 @@ function markFirebaseCompletedInQueue(colName: string, docId: string) {
 }
 
 /**
- * Safely deletes or soft-deletes a record across Primary (Firestore), Secondary DB, Local Vault,
- * and pending sync queue so deleted items never resurrect across refreshes or quota limits.
+ * Soft-deletes a record safely across Primary (Firestore), Secondary DB, Local Vault,
+ * and pending sync queue (hard deletes are disabled globally for 100% data safety).
  */
 export async function safeFirestoreDelete(
   colName: string,
@@ -616,13 +681,28 @@ export async function safeFirestoreDelete(
   removeFromCollectionCache(colName, docId);
   removeFromPendingSync(colName, docId);
 
-  const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
   const archivePayload = {
     isArchived: true,
+    is_deleted: true,
     archivedAt: nowIso,
     updatedAt: nowIso,
+    _syncUpdatedAtMs: nowMs,
     ...(options.user?.uid ? { archivedBy: options.user.uid } : {}),
   };
+  const delDetail = {
+    collection: colName,
+    id: docId,
+    doc: { ...archivePayload, id: docId },
+    merge: true,
+    deleted: true,
+    updatedAtMs: nowMs,
+  };
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('blackworm_local_record_mutation', { detail: delDetail }));
+    broadcastLocalMutation(delDetail);
+  }
 
   const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
   if (isCurrentlyOffline) {
@@ -640,22 +720,10 @@ export async function safeFirestoreDelete(
   let timedOut = false;
 
   const firebaseTask = async () => {
-    if (isQuotaBlocked()) return;
+    if (isWriteQuotaBlocked()) return;
     try {
-      if (options.softDelete) {
-        await setDoc(doc(db, colName, docId), archivePayload, { merge: true });
-      } else {
-        try {
-          await deleteDoc(doc(db, colName, docId));
-        } catch (hardDelErr: any) {
-          const msg = String(hardDelErr?.message || '').toLowerCase();
-          if (msg.includes('permission') || msg.includes('denied')) {
-            await setDoc(doc(db, colName, docId), archivePayload, { merge: true });
-          } else {
-            throw hardDelErr;
-          }
-        }
-      }
+      // Strictly enforce Soft Delete (Add & Update Only) — hard deleteDoc() disabled for data safety
+      await setDoc(doc(db, colName, docId), archivePayload, { merge: true });
       trackFirestoreUsage('write', 1);
       needsFirebase = false;
       if (timedOut) {
@@ -664,16 +732,17 @@ export async function safeFirestoreDelete(
     } catch (err: any) {
       const msg = err instanceof Error ? err.message : String(err);
       lastErrMsg = msg;
-      if (isQuotaErrorMsg(msg)) setQuotaBlocked(15 * 60 * 1000);
+      if (isQuotaErrorMsg(msg)) setWriteQuotaBlocked(2 * 60 * 1000);
     }
   };
 
   const secondaryTask = async () => {
+    const secDoc = (isQuotaBlocked() || isWriteQuotaBlocked()) ? { ...archivePayload, _syncSource: 'secondary_failover' } : archivePayload;
     const secRes = await pushToSecondary({
       collection: colName,
       id: docId,
-      doc: archivePayload,
-      updatedAtMs: Date.now(),
+      doc: secDoc,
+      updatedAtMs: nowMs,
       deleted: true,
       merge: true,
     });
@@ -690,6 +759,17 @@ export async function safeFirestoreDelete(
     secondaryTask(),
   ]);
 
+  if (needsFirebase && !needsSecondary && !isWriteQuotaBlocked()) {
+    void pushToSecondary({
+      collection: colName,
+      id: docId,
+      doc: { ...archivePayload, _syncSource: 'secondary_failover' },
+      updatedAtMs: nowMs,
+      deleted: true,
+      merge: true,
+    });
+  }
+
   if (needsFirebase || needsSecondary) {
     setPendingSyncItem(colName, docId, archivePayload, { merge: true }, {
       needsFirebase,
@@ -698,9 +778,8 @@ export async function safeFirestoreDelete(
     });
   }
 
-  // Success if at least one remote tier or softDelete-queue absorbed it safely
   return {
-    success: !needsFirebase || !needsSecondary || Boolean(options.softDelete),
+    success: true,
     ...(lastErrMsg && needsFirebase && needsSecondary ? { error: lastErrMsg } : {}),
   };
 }
@@ -756,7 +835,7 @@ export async function safeFirestoreSet<T extends Record<string, any>>(
   let timedOut = false;
 
   const writePrimary = async (_attempt = retryCount): Promise<void> => {
-    if (isQuotaBlocked()) return;
+    if (isWriteQuotaBlocked()) return;
     try {
       await setDoc(doc(db, colName, docId), cleanData, { merge: options.merge !== false });
       trackFirestoreUsage('write', 1);
@@ -768,17 +847,19 @@ export async function safeFirestoreSet<T extends Record<string, any>>(
       const rawMsg = err instanceof Error ? err.message : String(err);
       firebaseError = rawMsg;
       if (isQuotaErrorMsg(rawMsg)) {
-        setQuotaBlocked(15 * 60 * 1000);
+        setWriteQuotaBlocked(2 * 60 * 1000);
         return;
       }
+      console.warn(`Primary write notice (${colName}/${docId}):`, rawMsg);
     }
   };
 
   const writeSecondary = async (): Promise<void> => {
+    const secDoc = isQuotaBlocked() || isWriteQuotaBlocked() ? { ...cleanData, _syncSource: 'secondary_failover' } : cleanData;
     const secRes = await pushToSecondary({
       collection: colName,
       id: docId,
-      doc: cleanData,
+      doc: secDoc,
       updatedAtMs: resolvedSyncMs,
       deleted: Boolean(cleanData.isArchived),
       merge: options.merge !== false,
@@ -795,6 +876,17 @@ export async function safeFirestoreSet<T extends Record<string, any>>(
     }),
     writeSecondary(),
   ]);
+
+  if (needsFirebase && !needsSecondary && !isWriteQuotaBlocked()) {
+    void pushToSecondary({
+      collection: colName,
+      id: docId,
+      doc: { ...cleanData, _syncSource: 'secondary_failover' },
+      updatedAtMs: resolvedSyncMs,
+      deleted: Boolean(cleanData.isArchived),
+      merge: options.merge !== false,
+    });
+  }
 
   if (needsFirebase || needsSecondary) {
     setPendingSyncItem(colName, docId, cleanData, { merge: options.merge !== false }, {
@@ -873,7 +965,7 @@ function setPendingSyncItem(
       timestamp: Date.now(),
       needsFirebase,
       needsSecondary,
-      deleted: Boolean(flags.deleted || data?.isArchived),
+      deleted: Boolean(flags.deleted || isRecordDeleted(data)),
     };
 
     if (idx >= 0) queue[idx] = item;
@@ -939,7 +1031,7 @@ export async function startBackgroundSync() {
 
     if (!Array.isArray(queue) || queue.length === 0) return;
 
-    const firebaseUp = !isQuotaBlocked();
+    const firebaseUp = !isWriteQuotaBlocked();
     const secondaryUp = !isSecondaryBlocked();
     if (!firebaseUp && !secondaryUp) return;
 
@@ -955,9 +1047,10 @@ export async function startBackgroundSync() {
         let dropItem = false;
 
         // 1. Primary (Firebase) replay
-        if (needsFb && !isQuotaBlocked()) {
+        if (needsFb && !isWriteQuotaBlocked()) {
           try {
-            const payload = stripUndefined(item.data || {});
+            const payload = stripUndefined({ ...(item.data || {}) });
+            delete (payload as any)._syncSource;
             await setDoc(doc(db, item.collection, item.id), payload, item.options || { merge: true });
             trackFirestoreUsage('write', 1);
             needsFb = false;
@@ -965,7 +1058,7 @@ export async function startBackgroundSync() {
             const rawMsg = err instanceof Error ? err.message : String(err);
             const lower = rawMsg.toLowerCase();
             if (isQuotaErrorMsg(rawMsg)) {
-              setQuotaBlocked(30 * 60 * 1000);
+              setWriteQuotaBlocked(2 * 60 * 1000);
             } else if (
               lower.includes('invalid-argument') ||
               lower.includes('unsupported field value') ||
@@ -984,7 +1077,7 @@ export async function startBackgroundSync() {
             id: item.id,
             doc: stripUndefined(item.data || {}),
             updatedAtMs: item.data?._syncUpdatedAtMs || item.timestamp || Date.now(),
-            deleted: Boolean(item.deleted || item.data?.isArchived),
+            deleted: Boolean(item.deleted || isRecordDeleted(item.data)),
             merge: item.options?.merge !== false,
           });
           if (secRes.ok) {
@@ -1073,7 +1166,7 @@ export async function safeFirestoreUpdate(
   let timedOut = false;
 
   const updatePrimary = async (_attempt = retryCount): Promise<void> => {
-    if (isQuotaBlocked()) return;
+    if (isWriteQuotaBlocked()) return;
     try {
       await updateDoc(doc(db, colName, docId), cleanData);
       trackFirestoreUsage('write', 1);
@@ -1085,7 +1178,7 @@ export async function safeFirestoreUpdate(
       const rawMsg = err instanceof Error ? err.message : String(err);
       firebaseError = rawMsg;
       if (isQuotaErrorMsg(rawMsg)) {
-        setQuotaBlocked(15 * 60 * 1000);
+        setWriteQuotaBlocked(2 * 60 * 1000);
         return;
       }
       const lower = rawMsg.toLowerCase();
@@ -1100,14 +1193,16 @@ export async function safeFirestoreUpdate(
           return;
         } catch {}
       }
+      console.warn(`Primary update notice (${colName}/${docId}):`, rawMsg);
     }
   };
 
   const updateSecondary = async (): Promise<void> => {
+    const secDoc = isQuotaBlocked() || isWriteQuotaBlocked() ? { ...cleanData, _syncSource: 'secondary_failover' } : cleanData;
     const secRes = await pushToSecondary({
       collection: colName,
       id: docId,
-      doc: cleanData,
+      doc: secDoc,
       updatedAtMs: nowMs,
       merge: true,
     });
@@ -1123,6 +1218,16 @@ export async function safeFirestoreUpdate(
     }),
     updateSecondary(),
   ]);
+
+  if (needsFirebase && !needsSecondary && !isWriteQuotaBlocked()) {
+    void pushToSecondary({
+      collection: colName,
+      id: docId,
+      doc: { ...cleanData, _syncSource: 'secondary_failover' },
+      updatedAtMs: nowMs,
+      merge: true,
+    });
+  }
 
   if (needsFirebase || needsSecondary) {
     setPendingSyncItem(colName, docId, cleanData, { merge: true }, {
@@ -1831,13 +1936,13 @@ export function mergeWithLocalData<T extends { id: string }>(
 ): T[] {
   try {
     if (typeof window === 'undefined') {
-      return (serverItems || []).filter((it: any) => it && !it.isArchived);
+      return (serverItems || []).filter((it: any) => it && !isRecordDeleted(it));
     }
     const storageKey = `blackworm_local_${colName}`;
     const pendingMap = getPendingSyncMap(colName);
     const archivedSet = new Set<string>(options?.archivedIds ? Array.from(options.archivedIds) : []);
     (serverItems || []).forEach((it: any) => {
-      if (it && it.id && it.isArchived) {
+      if (it && it.id && isRecordDeleted(it)) {
         archivedSet.add(it.id);
       }
     });
@@ -1847,7 +1952,7 @@ export function mergeWithLocalData<T extends { id: string }>(
       updateCollectionCache(colName, serverItems);
     }
 
-    const activeServerItems = (serverItems || []).filter((it: any) => it && !it.isArchived);
+    const activeServerItems = (serverItems || []).filter((it: any) => it && !isRecordDeleted(it));
     const raw = localStorage.getItem(storageKey);
     if (!raw) {
       if (colName === 'dealers_application' || colName === 'dealers') return deduplicateDealers(activeServerItems as any) as unknown as T[];
@@ -1905,9 +2010,9 @@ export function mergeWithLocalData<T extends { id: string }>(
       safeLocalStorageSet(storageKey, JSON.stringify(map));
     }
 
-    // Overlay locally saved items when pending, respecting server LWW if another device updated later
+    // Overlay locally saved items when pending or non-archived, respecting server LWW & non-destructive travel merge
     Object.entries(map).forEach(([id, localDoc]) => {
-      if (!localDoc || localDoc.isArchived || archivedSet.has(id)) {
+      if (!localDoc || isRecordDeleted(localDoc) || archivedSet.has(id)) {
         mergedMap.delete(id);
         return;
       }
@@ -1915,8 +2020,12 @@ export function mergeWithLocalData<T extends { id: string }>(
       const isPending = Boolean(pendingMeta) || id.startsWith('temp_');
       if (mergedMap.has(id)) {
         const serverItem = mergedMap.get(id);
-        if (serverItem?.isArchived) {
+        if (isRecordDeleted(serverItem)) {
           mergedMap.delete(id);
+          return;
+        }
+        if (colName === 'travel_sheets' && Array.isArray(localDoc.rows) && Array.isArray(serverItem.rows)) {
+          mergedMap.set(id, mergeTravelSheetDocs(serverItem, localDoc));
           return;
         }
         if (isPending && pendingMeta) {
@@ -1929,12 +2038,18 @@ export function mergeWithLocalData<T extends { id: string }>(
             mergedMap.set(id, { ...serverItem, ...localDoc });
           }
         }
-      } else if (isPending || activeServerItems.length === 0) {
+      } else if (
+        isPending ||
+        activeServerItems.length === 0 ||
+        !options?.authoritativeServer ||
+        localDoc._syncSource === 'secondary_failover' ||
+        colName === 'travel_sheets'
+      ) {
         mergedMap.set(id, localDoc);
       }
     });
 
-    let mergedList = Array.from(mergedMap.values()).filter((it) => it && !it.isArchived);
+    let mergedList = Array.from(mergedMap.values()).filter((it) => it && !isRecordDeleted(it));
 
     // Apply collection-specific intelligent deduplication
     if (colName === 'dealers_application' || colName === 'dealers') {
@@ -1987,11 +2102,20 @@ export async function forceMultiTierSyncAll(clearQuotaCooldown = false): Promise
 }> {
   if (clearQuotaCooldown) {
     setQuotaBlocked(0);
+    setWriteQuotaBlocked(0);
     forceResetSecondaryCursor();
   }
-  await startBackgroundSync();
-  const hydratedCount = await autoHydrateServerFromLocalCache(true);
-  const deltasPulled = await pullSecondaryChanges(true);
+
+  const withBudget = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> =>
+    Promise.race([
+      p.catch(() => fallback),
+      new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
+    ]);
+
+  await withBudget(startBackgroundSync(), 5000, undefined);
+  const hydratedCount = await withBudget(autoHydrateServerFromLocalCache(true), 4500, 0);
+  const deltasPulled = await withBudget(pullSecondaryChanges(true), 6000, 0);
+
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('blackworm_secondary_resync', { detail: { reason: 'force_sync' } }));
     window.dispatchEvent(new CustomEvent('blackworm_data_refresh', { detail: { timestamp: Date.now() } }));
@@ -2167,7 +2291,7 @@ export async function importSmartSyncPacket(rawInput: string): Promise<{
           await setDoc(doc(db, item.collection, item.id), stripUndefined(item.doc), { merge: true });
         } catch (err: any) {
           if (isQuotaErrorMsg(err?.message || '')) {
-            setQuotaBlocked(15 * 60 * 1000);
+            setQuotaBlocked(2 * 60 * 1000);
             break;
           }
         }
@@ -2276,6 +2400,7 @@ export async function restoreRecord(
         ...(trashRecord.data || {}),
         id: trashRecord.originalRecordId,
         isArchived: false,
+        is_deleted: false,
         updatedAt: new Date().toISOString(),
         restoredBy: user.uid,
       },
@@ -2391,75 +2516,60 @@ export async function syncOfficerDetailsEverywhere(
   const extraOldName = (extraIdentifiers?.oldName || '').trim().toUpperCase();
   const extraCode = (extraIdentifiers?.userCode || '').trim().toLowerCase();
 
-  // Helper to update matching cached collection documents without full-collection remote scans
+  // Helper to collect ALL matching docs across Local Cache, Secondary DB, and Firestore without skipping remote docs
   const updateTargets = async (
     colName: string,
     matcher: (data: any, id: string) => Record<string, any> | null
   ) => {
     try {
+      const candidateMap = new Map<string, any>();
+
       const storageKey = `blackworm_local_${colName}`;
       const raw = typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null;
       if (raw) {
-        const map = JSON.parse(raw);
-        if (map && typeof map === 'object' && !Array.isArray(map)) {
-          const updates: Promise<any>[] = [];
-          Object.entries(map).forEach(([id, data]) => {
-            const patch = matcher(data, id);
-            if (patch) {
-              updates.push(
-                safeFirestoreUpdate(colName, id, patch).catch((e) =>
-                  console.warn(`Sync notice for ${colName}/${id}:`, e)
-                )
-              );
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          Object.entries(parsed).forEach(([id, data]) => {
+            if (id && data && typeof data === 'object') {
+              candidateMap.set(id, data);
             }
           });
-          if (updates.length > 0) {
-            await Promise.all(updates);
-            return;
-          }
-        }
-      }
-
-      if (!isQuotaBlocked()) {
-        try {
-          const snap = await getDocs(collection(db, colName));
-          trackFirestoreUsage('read', Math.max(1, snap.docs.length));
-          const updates: Promise<any>[] = [];
-          snap.forEach((d) => {
-            const patch = matcher(d.data(), d.id);
-            if (patch) {
-              updates.push(
-                safeFirestoreUpdate(colName, d.id, patch).catch((e) =>
-                  console.warn(`Sync notice for ${colName}/${d.id}:`, e)
-                )
-              );
-            }
-          });
-          if (updates.length > 0) {
-            await Promise.all(updates);
-          }
-          return;
-        } catch (fbErr: any) {
-          if (isQuotaErrorMsg(fbErr?.message || '')) setQuotaBlocked(15 * 60 * 1000);
         }
       }
 
       const sec = await fetchSecondaryCollection(colName, { limit: 2000 });
       if (sec.ok && sec.items.length > 0) {
-        const updates: Promise<any>[] = [];
         sec.items.forEach((d) => {
-          const patch = matcher(d, d.id);
-          if (patch) {
-            updates.push(
-              safeFirestoreUpdate(colName, d.id, patch).catch((e) =>
-                console.warn(`Secondary sync notice for ${colName}/${d.id}:`, e)
-              )
-            );
-          }
+          if (d?.id) candidateMap.set(String(d.id), d);
         });
-        if (updates.length > 0) {
-          await Promise.all(updates);
+      }
+
+      if (candidateMap.size === 0 && !isQuotaBlocked()) {
+        try {
+          const snap = await getDocs(collection(db, colName));
+          trackFirestoreUsage('read', Math.max(1, snap.docs.length));
+          snap.forEach((d) => {
+            candidateMap.set(d.id, d.data());
+          });
+        } catch (fbErr: any) {
+          if (isQuotaErrorMsg(fbErr?.message || '')) setQuotaBlocked(2 * 60 * 1000);
         }
+      }
+
+      const updates: Promise<any>[] = [];
+      candidateMap.forEach((data, id) => {
+        const patch = matcher(data, id);
+        if (patch) {
+          updates.push(
+            safeFirestoreUpdate(colName, id, patch).catch((e) =>
+              console.warn(`Sync notice for ${colName}/${id}:`, e)
+            )
+          );
+        }
+      });
+
+      if (updates.length > 0) {
+        await Promise.all(updates);
       }
     } catch (err) {
       console.warn(`Sync notice in ${colName}:`, err);
@@ -2563,7 +2673,12 @@ export async function syncOfficerDetailsEverywhere(
  * Creates a comprehensive full backup of the entire application database across all collections.
  * Generates and downloads a complete JSON file that any developer can run or restore anywhere.
  */
-export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{ success: boolean; filename: string; stats: Record<string, number> }> {
+export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{
+  success: boolean;
+  filename: string;
+  stats: Record<string, number>;
+  serverBackupFile?: string;
+}> {
   const collectionsToBackup = [
     'users',
     'office_staff_members',
@@ -2577,6 +2692,8 @@ export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{ 
     'yearly_targets',
     'targets',
     'travel_records',
+    'outstanding_records',
+    'user_approval_requests',
     'products_pricelist_v2',
     'pricelist_backups',
     'config',
@@ -2584,41 +2701,111 @@ export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{ 
     'audit_logs',
   ];
 
+  // Trigger a permanent WAL-checkpointed snapshot on the backend server in parallel
+  let serverBackupFile = '';
+  const serverBackupPromise = fetch(resolveApiUrl('/api/sync/backup'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason: 'manual_settings_export' }),
+  })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((j) => {
+      if (j?.ok && j?.jsonFile) serverBackupFile = String(j.jsonFile);
+    })
+    .catch(() => {});
+
+  // 1. Fetch unified snapshot from Secondary DB in one fast call (includes all collections + failover + soft-deleted)
+  const secondaryByCol = new Map<string, Map<string, any>>();
+  try {
+    const secAll = await Promise.race([
+      exportAllRowsFromSecondary(0),
+      new Promise<{ ok: false; rows: any[] }>((r) => setTimeout(() => r({ ok: false, rows: [] }), 8000)),
+    ]);
+    if (secAll.ok && Array.isArray(secAll.rows)) {
+      secAll.rows.forEach((r) => {
+        if (!r?.collection || !r?.id || !r?.doc) return;
+        let colMap = secondaryByCol.get(r.collection);
+        if (!colMap) {
+          colMap = new Map<string, any>();
+          secondaryByCol.set(r.collection, colMap);
+        }
+        colMap.set(String(r.id), {
+          ...r.doc,
+          _id: String(r.id),
+          id: String(r.id),
+          ...(r.deleted ? { isArchived: true, is_deleted: true } : {}),
+        });
+      });
+    }
+  } catch {}
+
   const backupData: Record<string, any[]> = {};
   const stats: Record<string, number> = {};
 
   for (const colName of collectionsToBackup) {
-    let docsList: any[] = [];
-    if (!isQuotaBlocked()) {
+    const mergedMap = new Map<string, any>();
+
+    // Layer A: Secondary SQLite authoritative records
+    const secMap = secondaryByCol.get(colName);
+    if (secMap) {
+      secMap.forEach((docObj, docId) => {
+        mergedMap.set(docId, docObj);
+      });
+    }
+
+    // Layer B: LocalStorage offline/pending records (merged non-destructively)
+    try {
+      const rawLocal = typeof window !== 'undefined' ? localStorage.getItem(`blackworm_local_${colName}`) : null;
+      if (rawLocal) {
+        const parsedLocal = JSON.parse(rawLocal);
+        if (parsedLocal && typeof parsedLocal === 'object' && !Array.isArray(parsedLocal)) {
+          Object.entries(parsedLocal).forEach(([docId, docVal]: [string, any]) => {
+            if (!docId || !docVal || typeof docVal !== 'object') return;
+            const prev = mergedMap.get(docId);
+            if (!prev) {
+              mergedMap.set(docId, { ...docVal, _id: docId, id: docId });
+            } else if (colName === 'travel_sheets' && Array.isArray(prev.rows) && Array.isArray(docVal.rows)) {
+              mergedMap.set(docId, { ...mergeTravelSheetDocs(prev, { ...docVal, id: docId }), _id: docId });
+            } else {
+              const prevTs = toTimestampMs(prev._syncUpdatedAtMs || prev.updatedAt || prev.createdAt);
+              const localTs = toTimestampMs(docVal._syncUpdatedAtMs || docVal._localSavedAt || docVal.updatedAt || docVal.createdAt);
+              if (localTs > prevTs) {
+                mergedMap.set(docId, { ...docVal, _id: docId, id: docId });
+              }
+            }
+          });
+        }
+      }
+    } catch {}
+
+    // Layer C: Fallback Firestore read only if still empty on both Secondary & Local and quota allows
+    if (mergedMap.size === 0 && !isQuotaBlocked()) {
       try {
-        const snap = await getDocs(collection(db, colName));
-        trackFirestoreUsage('read', Math.max(1, snap.docs.length));
-        snap.forEach((d) => {
-          docsList.push({ _id: d.id, ...d.data() });
-        });
+        const snap = await Promise.race([
+          getDocs(collection(db, colName)),
+          new Promise<null>((r) => setTimeout(() => r(null), 4000)),
+        ]);
+        if (snap) {
+          trackFirestoreUsage('read', Math.max(1, snap.docs.length));
+          snap.forEach((d) => {
+            mergedMap.set(d.id, { _id: d.id, id: d.id, ...d.data() });
+          });
+        }
       } catch (e: any) {
-        if (isQuotaErrorMsg(e?.message || '')) setQuotaBlocked(15 * 60 * 1000);
-        console.warn(`Could not export primary collection ${colName}:`, e);
+        if (isQuotaErrorMsg(e?.message || '')) setQuotaBlocked(2 * 60 * 1000);
       }
     }
-    if (docsList.length === 0) {
-      try {
-        const sec = await fetchSecondaryCollection(colName, { limit: 5000, includeDeleted: true });
-        if (sec.ok && sec.items.length > 0) {
-          docsList = sec.items.map((it) => ({ _id: it.id, ...it }));
-        }
-      } catch {}
-    }
-    if (docsList.length === 0) {
-      docsList = mergeWithLocalData<any>(colName, []).map((it) => ({ _id: it.id, ...it }));
-    }
+
+    const docsList = Array.from(mergedMap.values());
     backupData[colName] = docsList;
     stats[colName] = docsList.length;
   }
 
+  await Promise.race([serverBackupPromise, new Promise((r) => setTimeout(r, 2500))]);
+
   const exportPayload = {
     appName: 'Blackworm Agritech Pvt Ltd - Core Business Data',
-    exportVersion: '2.0',
+    exportVersion: '2.1',
     exportedAt: new Date().toISOString(),
     exportedByUid: profile.uid,
     exportedByName: profile.fullName || profile.loginId || 'Admin',
@@ -2626,11 +2813,12 @@ export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{ 
     collections: backupData,
   };
 
-  // Local mirror backup in browser storage as additional offline safety net
+  // Local mirror backup metadata in browser storage
   try {
     localStorage.setItem('BLACKWORM_LOCAL_DATA_MIRROR', JSON.stringify({
       savedAt: new Date().toISOString(),
       statistics: stats,
+      serverBackupFile,
     }));
   } catch (e) {
     console.warn('Local mirror storage failed:', e);
@@ -2655,49 +2843,93 @@ export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{ 
     console.warn('Audit failed on backup export:', e);
   }
 
-  return { success: true, filename, stats };
+  return { success: true, filename, stats, ...(serverBackupFile ? { serverBackupFile } : {}) };
 }
 
 /**
- * Restores all collections from a JSON backup file.
+ * Restores all collections from a JSON backup file safely without overwriting newer live records.
  */
-export async function restoreDatabaseFromJson(jsonData: string, profile: UserProfile): Promise<{ success: boolean; restoredCount: number; message: string }> {
+export async function restoreDatabaseFromJson(jsonData: string, profile: UserProfile): Promise<{
+  success: boolean;
+  restoredCount: number;
+  preservedNewerCount?: number;
+  message: string;
+}> {
   const parsed = JSON.parse(jsonData);
-  if (!parsed || typeof parsed !== 'object' || !parsed.collections || typeof parsed.collections !== 'object' || Array.isArray(parsed.collections)) {
+  const rawCollections =
+    parsed?.collections && typeof parsed.collections === 'object' && !Array.isArray(parsed.collections)
+      ? parsed.collections
+      : null;
+
+  if (!parsed || typeof parsed !== 'object' || !rawCollections) {
     throw new Error('अवैध बॅकअप फाईल स्वरूप (Invalid backup file structure).');
   }
 
   let totalRestored = 0;
-  for (const [colName, docsList] of Object.entries(parsed.collections)) {
+  let preservedNewerCount = 0;
+  const firebaseWrites: Array<{ colName: string; docId: string; docData: any }> = [];
+
+  for (const [colName, docsList] of Object.entries(rawCollections)) {
     if (!colName || colName.startsWith('_') || !Array.isArray(docsList)) continue;
+
+    // Read current local collection map so we NEVER overwrite newer live records with stale backup items
+    const existingLocalMap: Record<string, any> = {};
+    try {
+      const raw = typeof window !== 'undefined' ? localStorage.getItem(`blackworm_local_${colName}`) : null;
+      if (raw) {
+        const parsedMap = JSON.parse(raw);
+        if (parsedMap && typeof parsedMap === 'object' && !Array.isArray(parsedMap)) {
+          Object.assign(existingLocalMap, parsedMap);
+        }
+      }
+    } catch {}
+
     const restoredForCache: any[] = [];
     const secondaryBatch: any[] = [];
+
     for (const item of docsList) {
       if (!item || typeof item !== 'object') continue;
       const docId = String(item._id || item.id || '').trim();
       if (!docId || docId.includes('/')) continue;
-      const cleanItem = { ...item, id: docId };
+
+      const cleanItem: Record<string, any> = { ...item, id: docId };
       delete cleanItem._id;
-      if (!isQuotaBlocked()) {
-        try {
-          await setDoc(doc(db, colName, docId), cleanItem, { merge: true });
-        } catch (err: any) {
-          if (isQuotaErrorMsg(err?.message || '')) setQuotaBlocked(15 * 60 * 1000);
-          setPendingSyncItem(colName, docId, cleanItem, { merge: true }, { needsFirebase: true, needsSecondary: false });
+
+      const existing = existingLocalMap[docId];
+      let finalItem = cleanItem;
+
+      if (existing && typeof existing === 'object') {
+        if (colName === 'travel_sheets' && Array.isArray(existing.rows) && Array.isArray(cleanItem.rows)) {
+          // Non-destructive per-day row merge for Traveling Sheets
+          finalItem = mergeTravelSheetDocs(existing, cleanItem);
+        } else {
+          const existingTs = toTimestampMs(existing._syncUpdatedAtMs || existing._localSavedAt || existing.updatedAt || existing.createdAt);
+          const incomingTs = toTimestampMs(cleanItem._syncUpdatedAtMs || cleanItem.updatedAt || cleanItem.createdAt);
+          if (existingTs > 0 && incomingTs > 0 && existingTs > incomingTs) {
+            // Live database record is strictly newer than backup item — preserve newer data
+            preservedNewerCount++;
+            continue;
+          }
         }
-      } else {
-        setPendingSyncItem(colName, docId, cleanItem, { merge: true }, { needsFirebase: true, needsSecondary: false });
       }
+
+      const deleted = isRecordDeleted(finalItem);
+      const syncTs = toTimestampMs(finalItem._syncUpdatedAtMs || finalItem.updatedAt || finalItem.createdAt) || Date.now();
+      finalItem._syncUpdatedAtMs = syncTs;
+
       secondaryBatch.push({
         collection: colName,
         id: docId,
-        doc: cleanItem,
-        deleted: Boolean(cleanItem.isArchived),
+        doc: finalItem,
+        updatedAtMs: syncTs,
+        deleted,
         merge: true,
       });
-      restoredForCache.push(cleanItem);
+      restoredForCache.push(finalItem);
+      firebaseWrites.push({ colName, docId, docData: finalItem });
       totalRestored++;
     }
+
     if (secondaryBatch.length > 0) {
       await pushBatchToSecondary(secondaryBatch);
     }
@@ -2706,17 +2938,53 @@ export async function restoreDatabaseFromJson(jsonData: string, profile: UserPro
     }
   }
 
+  // Mirror restored records to Firebase in bounded concurrent chunks with pending-queue fallback
+  const CHUNK_SIZE = 10;
+  for (let i = 0; i < firebaseWrites.length; i += CHUNK_SIZE) {
+    const slice = firebaseWrites.slice(i, i + CHUNK_SIZE);
+    if (isWriteQuotaBlocked()) {
+      slice.forEach(({ colName, docId, docData }) => {
+        setPendingSyncItem(colName, docId, docData, { merge: true }, { needsFirebase: true, needsSecondary: false });
+      });
+      continue;
+    }
+    await Promise.all(
+      slice.map(async ({ colName, docId, docData }) => {
+        try {
+          await Promise.race([
+            setDoc(doc(db, colName, docId), stripUndefined(docData), { merge: true }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3500)),
+          ]);
+          trackFirestoreUsage('write', 1);
+        } catch (err: any) {
+          if (isQuotaErrorMsg(err?.message || '')) setWriteQuotaBlocked(2 * 60 * 1000);
+          setPendingSyncItem(colName, docId, docData, { merge: true }, { needsFirebase: true, needsSecondary: false });
+        }
+      })
+    );
+  }
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('blackworm_secondary_resync', { detail: { reason: 'packet_import' } }));
+    window.dispatchEvent(new CustomEvent('blackworm_data_refresh', { detail: { timestamp: Date.now() } }));
+  }
+
   try {
     await logAudit(
       'BACKUP_IMPORT',
       'system',
       'full_import',
-      `Restored database from JSON backup (${totalRestored} records restored) by ${profile.fullName || profile.loginId}`,
+      `Restored database from JSON backup (${totalRestored} restored, ${preservedNewerCount} newer live records preserved) by ${profile.fullName || profile.loginId}`,
       profile
     );
   } catch (e) {
     console.warn('Audit failed on backup import:', e);
   }
 
-  return { success: true, restoredCount: totalRestored, message: `${totalRestored} रेकॉर्ड यशस्वीरित्या रिस्टोर झाले.` };
+  const msg =
+    preservedNewerCount > 0
+      ? `${totalRestored} रेकॉर्ड सुरक्षित रिस्टोर झाले आणि ${preservedNewerCount} नवीन लाइव्ह नोंदी जतन ठेवल्या.`
+      : `${totalRestored} रेकॉर्ड यशस्वीरित्या रिस्टोर झाले.`;
+
+  return { success: true, restoredCount: totalRestored, preservedNewerCount, message: msg };
 }

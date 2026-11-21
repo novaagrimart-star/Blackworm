@@ -56,7 +56,9 @@ export function isGodownIncharge(user?: Partial<UserProfile> | null): boolean {
   const designation = (user.designation || '').toLowerCase().trim();
   return (
     role === 'godown_incharge' ||
+    role === 'warehouse_incharge' ||
     designation.includes('godown') ||
+    designation.includes('warehouse') ||
     designation.includes('store incharge') ||
     designation.includes('store in-charge')
   );

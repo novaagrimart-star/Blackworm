@@ -1,12 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import {
-  doc,
-  onSnapshot,
-} from 'firebase/firestore';
-import { db, isQuotaExceededError } from '../../firebase';
 import { UserProfile, isAdmin } from '../../lib/auth';
-import { logAudit, safeFirestoreSet, getLocalDateStr, getPendingSyncMap, toTimestampMs, trackFirestoreUsage, isQuotaBlocked, setQuotaBlocked, safeLocalStorageSet } from '../../lib/dataService';
-import { subscribeSecondaryCollection, fetchSecondaryCollection } from '../../lib/secondaryDb';
+import { logAudit, safeFirestoreSet, getLocalDateStr, getPendingSyncMap, toTimestampMs, safeLocalStorageSet } from '../../lib/dataService';
+import { loadCollectionFromVault } from '../../lib/localVault';
+import { isRecordDeleted, isTravelRowPopulated, mergeTravelSheetDocs } from '../../lib/travelMerge';
 import { useSharedUsers, useSharedTravelSheets } from '../../lib/realtimeStore';
 import { Language, translations } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
@@ -40,6 +36,8 @@ export interface TravelRow {
   amount: number;
   otherExpenses: number;
   subtotal: number;
+  rowUpdatedAtMs?: number;
+  rowClearedAtMs?: number;
 }
 
 export interface TravelSheetData {
@@ -105,7 +103,13 @@ export const generateMonthRows = (
         km,
         amount,
         otherExpenses,
-        subtotal
+        subtotal,
+        ...(typeof ext.rowUpdatedAtMs === 'number' && Number.isFinite(ext.rowUpdatedAtMs)
+          ? { rowUpdatedAtMs: ext.rowUpdatedAtMs }
+          : {}),
+        ...(typeof ext.rowClearedAtMs === 'number' && Number.isFinite(ext.rowClearedAtMs)
+          ? { rowClearedAtMs: ext.rowClearedAtMs }
+          : {}),
       });
     } else {
       rows.push({
@@ -159,12 +163,12 @@ const normalizeTravelSheet = (
     yearNumber: Number(raw?.yearNumber) || yearNumber,
     ratePerKm: rate,
     rows: fullRows,
-    totalKm: Number(raw?.totalKm ?? totalKm) || totalKm,
-    totalAmount: Number(raw?.totalAmount ?? totalAmount) || totalAmount,
-    totalOtherExpenses: Number(raw?.totalOtherExpenses ?? totalOtherExpenses) || totalOtherExpenses,
-    subtotalAmount: Number(raw?.subtotalAmount ?? subtotalAmount) || subtotalAmount,
-    averageCostPerKm: Number(raw?.averageCostPerKm ?? averageCostPerKm) || averageCostPerKm,
-    totalExpensesAmount: Number(raw?.totalExpensesAmount ?? totalExpensesAmount) || totalExpensesAmount,
+    totalKm,
+    totalAmount,
+    totalOtherExpenses,
+    subtotalAmount,
+    averageCostPerKm,
+    totalExpensesAmount,
   };
 };
 
@@ -172,7 +176,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const t = translations[lang];
   const userIsAdmin = isAdmin(profile);
   const { fieldOfficers: users } = useSharedUsers();
-  const { setTravelSheetsOptimistic } = useSharedTravelSheets();
+  const { travelSheets: sharedTravelSheets, loaded: sharedTravelLoaded, setTravelSheetsOptimistic } = useSharedTravelSheets();
   const usersRef = useRef<UserProfile[]>(users);
   usersRef.current = users;
   const [selectedUserId, setSelectedUserId] = useState<string>(() => {
@@ -263,7 +267,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       const raw = localStorage.getItem(cacheKey);
       if (raw) {
         const parsed = JSON.parse(raw);
-        if (parsed && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
+        if (parsed && !isRecordDeleted(parsed) && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
           return normalizeTravelSheet(
             parsed,
             selectedYearNumber,
@@ -304,6 +308,181 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const suppressedCommaMap = useRef<Record<number, boolean>>({});
   const hasUnsavedEditsRef = useRef(false);
   const lastLocalEditAtRef = useRef(0);
+  const latestSheetRef = useRef<TravelSheetData | null>(sheet);
+  const dirtyDaysRef = useRef<Set<number>>(new Set());
+  const autoSaveTimerRef = useRef<number | null>(null);
+  latestSheetRef.current = sheet;
+
+  const getMonthKeyForSheet = (targetSheet: TravelSheetData) => {
+    const idParts = String(targetSheet.id || '').split('_');
+    if (idParts.length >= 2) {
+      const maybeYear = idParts[idParts.length - 2];
+      const maybeMonth = idParts[idParts.length - 1];
+      if (/^\d{4}$/.test(maybeYear) && /^\d{2}$/.test(maybeMonth)) {
+        return `${maybeYear}_${maybeMonth}`;
+      }
+    }
+    const monthIdxFromName = monthNames.findIndex(
+      (m) => m.toLowerCase() === String(targetSheet.monthName || '').toLowerCase()
+    );
+    const mIdx = monthIdxFromName >= 0 ? monthIdxFromName : selectedMonthIndex;
+    return `${targetSheet.yearNumber || selectedYearNumber}_${String(mIdx + 1).padStart(2, '0')}`;
+  };
+
+  const writeSheetToLocalCaches = (sheetObj: TravelSheetData) => {
+    try {
+      const sheetMonthKey = getMonthKeyForSheet(sheetObj);
+      const cacheKey = `travel_sheet_${sheetObj.userId}_${sheetMonthKey}`;
+      safeLocalStorageSet(cacheKey, JSON.stringify(sheetObj));
+      safeLocalStorageSet(`travel_sheet_${sheetObj.userId}`, JSON.stringify(sheetObj));
+      const cachedAllRaw = localStorage.getItem('blackworm_cached_travel_sheets');
+      let cachedAll: any[] = cachedAllRaw ? JSON.parse(cachedAllRaw) : [];
+      if (!Array.isArray(cachedAll)) cachedAll = [];
+      const idx = cachedAll.findIndex((s: any) => s && (s.id === sheetObj.id || s._id === sheetObj.id));
+      if (idx >= 0) {
+        cachedAll[idx] = mergeTravelSheetDocs(cachedAll[idx], sheetObj);
+      } else {
+        cachedAll.push(sheetObj);
+      }
+      safeLocalStorageSet('blackworm_cached_travel_sheets', JSON.stringify(cachedAll));
+    } catch {}
+  };
+
+  const persistTravelSheet = async (
+    targetSheet: TravelSheetData,
+    options: { showToast?: boolean; logAuditEntry?: boolean; isAutoSave?: boolean } = {}
+  ) => {
+    if (!targetSheet || !targetSheet.id) return;
+    if (autoSaveTimerRef.current !== null) {
+      window.clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+
+    const rawTargetTs = Number((targetSheet as any)._syncUpdatedAtMs) || 0;
+    const nowMs = Date.now();
+    const saveTs = Math.max(nowMs, rawTargetTs);
+    const saveIso = new Date(saveTs).toISOString();
+    const sheetToSave: TravelSheetData = {
+      ...targetSheet,
+      isArchived: false,
+      is_deleted: false,
+      updatedAt: saveIso,
+      _syncUpdatedAtMs: saveTs,
+    } as any;
+
+    writeSheetToLocalCaches(sheetToSave);
+
+    setTravelSheetsOptimistic((prev) => {
+      const idx = prev.findIndex((s: any) => s && (s.id === sheetToSave.id || s._id === sheetToSave.id));
+      if (idx >= 0) {
+        const next = [...prev];
+        next[idx] = mergeTravelSheetDocs(prev[idx], sheetToSave);
+        return next;
+      }
+      return [sheetToSave, ...prev];
+    });
+
+    try {
+      await safeFirestoreSet('travel_sheets', sheetToSave.id, sheetToSave, { merge: true });
+
+      if (options.logAuditEntry) {
+        void logAudit(
+          'UPDATE',
+          'travel_sheets',
+          sheetToSave.id,
+          `Saved Travelling Sheet for ${sheetToSave.officerName} (${sheetToSave.monthName} ${sheetToSave.yearNumber})`,
+          profile
+        ).catch(() => {});
+      }
+
+      // Clear dirty markers only for days not subsequently modified while this save ran
+      const currentSheet = latestSheetRef.current;
+      if (!currentSheet || currentSheet.id !== sheetToSave.id) {
+        hasUnsavedEditsRef.current = false;
+        dirtyDaysRef.current.clear();
+      } else {
+        const currentRows = Array.isArray(currentSheet.rows) ? currentSheet.rows : [];
+        dirtyDaysRef.current.forEach((dayNum) => {
+          const matchingRow = currentRows.find((r) => Number(r.dayNumber) === dayNum);
+          if (!matchingRow || (Number(matchingRow.rowUpdatedAtMs) || 0) <= rawTargetTs) {
+            dirtyDaysRef.current.delete(dayNum);
+          }
+        });
+        const currentTs = Number((currentSheet as any)._syncUpdatedAtMs) || 0;
+        if (dirtyDaysRef.current.size === 0 && currentTs <= rawTargetTs) {
+          hasUnsavedEditsRef.current = false;
+          lastLocalEditAtRef.current = 0;
+        }
+      }
+
+      if (options.showToast) {
+        setShowSuccess(true);
+        setTimeout(() => setShowSuccess(false), 3000);
+      }
+    } catch (err) {
+      console.warn('Travel sheet save notice:', err);
+      if (options.showToast) {
+        setShowSuccess(true);
+        setTimeout(() => setShowSuccess(false), 3000);
+      }
+    }
+  };
+
+  const persistTravelSheetRef = useRef(persistTravelSheet);
+  persistTravelSheetRef.current = persistTravelSheet;
+
+  const scheduleAutoSave = (targetSheet: TravelSheetData) => {
+    if (autoSaveTimerRef.current !== null) {
+      window.clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    autoSaveTimerRef.current = window.setTimeout(() => {
+      autoSaveTimerRef.current = null;
+      const toFlush = latestSheetRef.current && latestSheetRef.current.id === targetSheet.id
+        ? latestSheetRef.current
+        : targetSheet;
+      void persistTravelSheetRef.current(toFlush, {
+        showToast: false,
+        logAuditEntry: false,
+        isAutoSave: true,
+      });
+    }, 900);
+  };
+
+  // Lifecycle flush: guarantee edits survive tab hide, APK minimize, browser close, or component unmount
+  useEffect(() => {
+    const flushDirtySheet = () => {
+      if (autoSaveTimerRef.current !== null) {
+        window.clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
+      if (hasUnsavedEditsRef.current && latestSheetRef.current) {
+        const snapshot = latestSheetRef.current;
+        writeSheetToLocalCaches(snapshot);
+        void persistTravelSheetRef.current(snapshot, {
+          showToast: false,
+          logAuditEntry: false,
+          isAutoSave: true,
+        });
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushDirtySheet();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', flushDirtySheet);
+    window.addEventListener('beforeunload', flushDirtySheet);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', flushDirtySheet);
+      window.removeEventListener('beforeunload', flushDirtySheet);
+      flushDirtySheet();
+    };
+  }, []);
 
   // Village name formatter: First letter Capital, rest lowercase (Title Case)
   const formatRouteVillages = (str: string): string => {
@@ -381,269 +560,296 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     }
   }, [users, profile.role, profile.uid, selectedUserId]);
 
-  const { travelSheets: sharedTravelSheets } = useSharedTravelSheets();
   const sharedTravelSheetsRef = useRef<any[]>(sharedTravelSheets);
   sharedTravelSheetsRef.current = sharedTravelSheets;
 
-  // Fetch or initialize sheet with instant cache-first and live sync (stable deps: no listener churn)
+  const hasPopulatedRows = (s?: Partial<TravelSheetData> | null) =>
+    Boolean(
+      s &&
+        Array.isArray(s.rows) &&
+        s.rows.some((r) => isTravelRowPopulated(r))
+    );
+
+  // Hydrate and reactively sync sheet from shared real-time store + localStorage + IndexedDB Vault
   useEffect(() => {
+    let cancelled = false;
     const currentUsers = usersRef.current;
     // Strictly prevent creating or loading travel sheets for Owner
     const isOwnerTarget = (profile.role === 'owner' && (!selectedUserId || selectedUserId === profile.uid)) ||
                           currentUsers.some(u => u.uid === selectedUserId && u.role === 'owner');
     if (isOwnerTarget || !selectedUserId) {
       setSheet(null);
+      latestSheetRef.current = null;
       setLoading(false);
       return;
     }
 
     hasUnsavedEditsRef.current = false;
     lastLocalEditAtRef.current = 0;
+    dirtyDaysRef.current.clear();
 
     const targetUid = selectedUserId;
     const sheetMonthKey = `${selectedYearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
     const sheetId = `travel_${targetUid}_${sheetMonthKey}`;
     const cacheKey = `travel_sheet_${targetUid}_${sheetMonthKey}`;
+    const selectedUser = currentUsers.find(u => u.uid === targetUid) || profile;
 
-    const hasPopulatedRows = (s?: Partial<TravelSheetData> | null) =>
-      Boolean(
-        s &&
-          Array.isArray(s.rows) &&
-          s.rows.some(
-            (r) =>
-              (Number(r?.openingKm) || 0) > 0 ||
-              (Number(r?.closingKm) || 0) > 0 ||
-              (Number(r?.km) || 0) > 0 ||
-              (Number(r?.otherExpenses) || 0) > 0 ||
-              Boolean(String(r?.route || '').trim())
-          )
-      );
-
-    // 1. Immediately hydrate from localStorage OR shared travelSheetsChannel so remount shows 0ms live data
-    let initialPopulated = false;
+    let cachedSheetObj: TravelSheetData | null = null;
     try {
       const cached = localStorage.getItem(cacheKey);
       if (cached) {
         const parsed = JSON.parse(cached);
-        if (parsed && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
-          const normalizedCached = normalizeTravelSheet(
+        if (parsed && !isRecordDeleted(parsed) && Array.isArray(parsed.rows) && parsed.rows.length > 0) {
+          cachedSheetObj = normalizeTravelSheet(
             parsed,
             selectedYearNumber,
             selectedMonthIndex,
             selectedMonthName,
             targetUid,
-            profile.fullName || targetUid,
-            profile.designation || 'FIELD OFFICER'
+            parsed.officerName || selectedUser.fullName || targetUid,
+            parsed.designation || selectedUser.designation || 'FIELD OFFICER'
           );
-          setSheet(normalizedCached);
-          setRatePerKm(normalizedCached.ratePerKm || 3.5);
-          initialPopulated = hasPopulatedRows(normalizedCached);
         }
       }
     } catch {}
 
-    const sharedMatch = sharedTravelSheetsRef.current.find((s) => s && (s.id === sheetId || s._id === sheetId));
-    if (sharedMatch && Array.isArray(sharedMatch.rows) && (!initialPopulated || hasPopulatedRows(sharedMatch))) {
-      const normalizedShared = normalizeTravelSheet(
-        sharedMatch,
-        selectedYearNumber,
-        selectedMonthIndex,
-        selectedMonthName,
-        targetUid,
-        sharedMatch.officerName || profile.fullName || targetUid,
-        sharedMatch.designation || profile.designation || 'FIELD OFFICER'
-      );
-      setSheet(normalizedShared);
-      setRatePerKm(normalizedShared.ratePerKm || 3.5);
+    // Also inspect bulk local travel cache if per-month key was missing
+    if (!cachedSheetObj) {
+      try {
+        const bulkRaw = localStorage.getItem('blackworm_cached_travel_sheets');
+        if (bulkRaw) {
+          const bulkArr = JSON.parse(bulkRaw);
+          if (Array.isArray(bulkArr)) {
+            const bulkMatch = bulkArr.find((s: any) => s && !isRecordDeleted(s) && (s.id === sheetId || s._id === sheetId));
+            if (bulkMatch && Array.isArray(bulkMatch.rows) && bulkMatch.rows.length > 0) {
+              cachedSheetObj = normalizeTravelSheet(
+                bulkMatch,
+                selectedYearNumber,
+                selectedMonthIndex,
+                selectedMonthName,
+                targetUid,
+                bulkMatch.officerName || selectedUser.fullName || targetUid,
+                bulkMatch.designation || selectedUser.designation || 'FIELD OFFICER'
+              );
+            }
+          }
+        }
+      } catch {}
     }
 
-    const currentRate = 3.5;
-
-    let appliedSheetTs = 0;
-
-    const applyTravelSheetPayload = (data: TravelSheetData & { _syncUpdatedAtMs?: number }, authoritativeServer = false) => {
-      if (hasUnsavedEditsRef.current && Date.now() - lastLocalEditAtRef.current < 120000) {
-        setLoading(false);
-        return;
-      }
-      const selectedUser = usersRef.current.find(u => u.uid === targetUid) || profile;
-      const incomingTs = Math.max(Number(data?._syncUpdatedAtMs) || 0, toTimestampMs((data as any)?.updatedAt));
-      const pendingMeta = getPendingSyncMap('travel_sheets').get(sheetId);
-      if (pendingMeta && pendingMeta.ts > incomingTs) {
-        setLoading(false);
-        return;
-      }
-      if (!authoritativeServer && appliedSheetTs > 0 && incomingTs > 0 && appliedSheetTs > incomingTs + 500) {
-        setLoading(false);
-        return;
-      }
-      if (incomingTs > 0) appliedSheetTs = incomingTs;
-      const rRate = data.ratePerKm || currentRate;
-      setRatePerKm(rRate);
-      const fullRows = generateMonthRows(
-        selectedYearNumber,
-        selectedMonthIndex,
-        rRate,
-        data.rows || []
-      );
-
-      const totalKm = fullRows.reduce((acc, r) => acc + (r.km || 0), 0);
-      const totalAmount = fullRows.reduce((acc, r) => acc + (r.amount || 0), 0);
-      const totalOtherExpenses = fullRows.reduce((acc, r) => acc + (r.otherExpenses || 0), 0);
-      const subtotalAmount = Math.round((totalAmount + totalOtherExpenses) * 100) / 100;
-      const totalExpensesAmount = subtotalAmount;
-      const averageCostPerKm = totalKm > 0 ? Math.round((totalExpensesAmount / totalKm) * 100) / 100 : 0;
-
-      const updatedSheet: TravelSheetData = {
-        ...data,
-        id: sheetId,
-        userId: targetUid,
-        officerName: selectedUser.fullName || data.officerName || targetUid,
-        designation: selectedUser.designation || data.designation || 'FIELD OFFICER',
-        date: selectedDate,
-        monthName: selectedMonthName,
-        yearNumber: selectedYearNumber,
-        ratePerKm: rRate,
-        rows: fullRows,
-        totalKm,
-        totalAmount,
-        totalOtherExpenses,
-        subtotalAmount,
-        averageCostPerKm,
-        totalExpensesAmount
-      };
-
-      setSheet(updatedSheet);
-      safeLocalStorageSet(cacheKey, JSON.stringify(updatedSheet));
-    };
-
-    const ensureBlankSheetIfEmpty = () => {
-      const selectedUser = usersRef.current.find(u => u.uid === targetUid) || profile;
-      setSheet((prevSheet) => {
-        if (prevSheet && prevSheet.id === sheetId && (hasPopulatedRows(prevSheet) || prevSheet.rows.length > 0)) {
-          return prevSheet;
-        }
-        const sharedExisting = sharedTravelSheetsRef.current.find((s) => s && (s.id === sheetId || s._id === sheetId));
-        if (sharedExisting && hasPopulatedRows(sharedExisting)) {
-          return normalizeTravelSheet(
-            sharedExisting,
+    const sharedMatchRaw = sharedTravelSheetsRef.current.find(
+      (s) => s && !isRecordDeleted(s) && (s.id === sheetId || s._id === sheetId)
+    );
+    const sharedSheetObj =
+      sharedMatchRaw && Array.isArray(sharedMatchRaw.rows)
+        ? normalizeTravelSheet(
+            sharedMatchRaw,
             selectedYearNumber,
             selectedMonthIndex,
             selectedMonthName,
             targetUid,
-            selectedUser.fullName || targetUid,
-            selectedUser.designation || 'FIELD OFFICER'
-          );
-        }
-        const fullRows = generateMonthRows(
+            sharedMatchRaw.officerName || selectedUser.fullName || targetUid,
+            sharedMatchRaw.designation || selectedUser.designation || 'FIELD OFFICER'
+          )
+        : null;
+
+    if (cachedSheetObj && sharedSheetObj) {
+      const merged = normalizeTravelSheet(
+        mergeTravelSheetDocs(cachedSheetObj, sharedSheetObj),
+        selectedYearNumber,
+        selectedMonthIndex,
+        selectedMonthName,
+        targetUid,
+        sharedSheetObj.officerName || cachedSheetObj.officerName || selectedUser.fullName || targetUid,
+        sharedSheetObj.designation || cachedSheetObj.designation || selectedUser.designation || 'FIELD OFFICER'
+      );
+      latestSheetRef.current = merged;
+      setSheet(merged);
+      setRatePerKm(merged.ratePerKm || 3.5);
+      writeSheetToLocalCaches(merged);
+
+      // Recover unsynced local rows to backend automatically if merged differs from server snapshot
+      const cachedHadDataNotInServer = cachedSheetObj.rows.some((cr) => {
+        if (!isTravelRowPopulated(cr)) return false;
+        const sr = sharedSheetObj.rows.find((r) => r.dayNumber === cr.dayNumber);
+        return !sr || !isTravelRowPopulated(sr) || (Number(cr.rowUpdatedAtMs) || 0) > (Number(sr.rowUpdatedAtMs) || 0);
+      });
+      if (cachedHadDataNotInServer) {
+        void persistTravelSheetRef.current(merged, { showToast: false, logAuditEntry: false, isAutoSave: true });
+      }
+      setLoading(false);
+    } else if (sharedSheetObj) {
+      latestSheetRef.current = sharedSheetObj;
+      setSheet(sharedSheetObj);
+      setRatePerKm(sharedSheetObj.ratePerKm || 3.5);
+      writeSheetToLocalCaches(sharedSheetObj);
+      setLoading(false);
+    } else if (cachedSheetObj) {
+      latestSheetRef.current = cachedSheetObj;
+      setSheet(cachedSheetObj);
+      setRatePerKm(cachedSheetObj.ratePerKm || 3.5);
+      if (hasPopulatedRows(cachedSheetObj)) {
+        void persistTravelSheetRef.current(cachedSheetObj, { showToast: false, logAuditEntry: false, isAutoSave: true });
+      }
+      setLoading(false);
+    } else {
+      const fullRows = generateMonthRows(selectedYearNumber, selectedMonthIndex, 3.5);
+      const emptySheet: TravelSheetData = {
+        id: sheetId,
+        userId: targetUid,
+        officerName: selectedUser.fullName || targetUid,
+        designation: selectedUser.designation || 'FIELD OFFICER',
+        date: selectedDate,
+        monthName: selectedMonthName,
+        yearNumber: selectedYearNumber,
+        ratePerKm: 3.5,
+        rows: fullRows,
+        totalKm: 0,
+        totalAmount: 0,
+        totalOtherExpenses: 0,
+        subtotalAmount: 0,
+        averageCostPerKm: 0,
+        totalExpensesAmount: 0,
+      };
+      latestSheetRef.current = emptySheet;
+      setSheet(emptySheet);
+      setLoading(false);
+
+      // Asynchronously check IndexedDB Vault for offline fallback data if neither localStorage nor memory store had it yet
+      void loadCollectionFromVault('travel_sheets').then((vaultMap) => {
+        if (cancelled || !vaultMap) return;
+        const vaultDoc = vaultMap[sheetId];
+        if (!vaultDoc || isRecordDeleted(vaultDoc) || !Array.isArray(vaultDoc.rows)) return;
+        const normalizedVault = normalizeTravelSheet(
+          vaultDoc,
           selectedYearNumber,
           selectedMonthIndex,
-          currentRate
+          selectedMonthName,
+          targetUid,
+          vaultDoc.officerName || selectedUser.fullName || targetUid,
+          vaultDoc.designation || selectedUser.designation || 'FIELD OFFICER'
         );
-        const newSheet: TravelSheetData = {
-          id: sheetId,
-          userId: targetUid,
-          officerName: selectedUser.fullName || targetUid,
-          designation: selectedUser.designation || 'FIELD OFFICER',
-          date: selectedDate,
-          monthName: selectedMonthName,
-          yearNumber: selectedYearNumber,
-          ratePerKm: currentRate,
-          rows: fullRows,
-          totalKm: 0,
-          totalAmount: 0,
-          totalOtherExpenses: 0,
-          subtotalAmount: 0,
-          averageCostPerKm: 0,
-          totalExpensesAmount: 0
-        };
-        return newSheet;
+        if (!hasPopulatedRows(normalizedVault)) return;
+        const currentBase = latestSheetRef.current && latestSheetRef.current.id === sheetId
+          ? latestSheetRef.current
+          : emptySheet;
+        const mergedVault = normalizeTravelSheet(
+          mergeTravelSheetDocs(currentBase, normalizedVault, { dirtyDays: dirtyDaysRef.current }),
+          selectedYearNumber,
+          selectedMonthIndex,
+          selectedMonthName,
+          targetUid,
+          normalizedVault.officerName || selectedUser.fullName || targetUid,
+          normalizedVault.designation || selectedUser.designation || 'FIELD OFFICER'
+        );
+        latestSheetRef.current = mergedVault;
+        setSheet(mergedVault);
+        setRatePerKm(mergedVault.ratePerKm || 3.5);
+        writeSheetToLocalCaches(mergedVault);
       });
-    };
-
-    const pullTravelFromSecondary = async () => {
-      try {
-        const res = await fetchSecondaryCollection('travel_sheets', { limit: 500 });
-        if (res.ok) {
-          const found = res.items.find((it) => it?.id === sheetId);
-          if (found) {
-            applyTravelSheetPayload(found as TravelSheetData);
-            setLoading(false);
-            return;
-          }
-        }
-      } catch {}
-      ensureBlankSheetIfEmpty();
-      setLoading(false);
-    };
-
-    const unsubSec = subscribeSecondaryCollection('travel_sheets', (events) => {
-      events.forEach((evt) => {
-        if (evt.id === sheetId && evt.doc && !evt.deleted) {
-          applyTravelSheetPayload({ ...evt.doc, ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}) } as TravelSheetData);
-          setLoading(false);
-        }
-      });
-    });
-
-    // Always pull latest sheet from Secondary even if Firebase isn't quota-blocked on THIS device yet
-    void pullTravelFromSecondary();
-
-    let unsubFb: (() => void) | null = null;
-    const attachTravelListener = () => {
-      if (unsubFb || isQuotaBlocked()) return;
-      try {
-        unsubFb = onSnapshot(doc(db, 'travel_sheets', sheetId), (docSnap) => {
-          trackFirestoreUsage('read', 1);
-          if (docSnap.exists() && !docSnap.metadata?.fromCache) {
-            applyTravelSheetPayload(docSnap.data() as TravelSheetData, true);
-          } else if (!docSnap.exists()) {
-            void pullTravelFromSecondary();
-            return;
-          }
-          setLoading(false);
-        }, (err) => {
-          if (unsubFb) {
-            try { unsubFb(); } catch {}
-            unsubFb = null;
-          }
-          if (isQuotaExceededError(err)) {
-            setQuotaBlocked(15 * 60 * 1000);
-          }
-          console.warn('Travel sheet snapshot notice:', err);
-          void pullTravelFromSecondary();
-        });
-      } catch {
-        unsubFb = null;
-      }
-    };
-
-    const handleResync = () => { void pullTravelFromSecondary(); attachTravelListener(); };
-    const handleQuotaCleared = () => { attachTravelListener(); };
-    window.addEventListener('blackworm_data_refresh', handleResync);
-    window.addEventListener('blackworm_secondary_resync', handleResync);
-    window.addEventListener('blackworm_quota_blocked', handleResync);
-    window.addEventListener('blackworm_quota_cleared', handleQuotaCleared);
-
-    attachTravelListener();
+    }
 
     return () => {
-      unsubSec();
-      if (unsubFb) unsubFb();
-      window.removeEventListener('blackworm_data_refresh', handleResync);
-      window.removeEventListener('blackworm_secondary_resync', handleResync);
-      window.removeEventListener('blackworm_quota_blocked', handleResync);
-      window.removeEventListener('blackworm_quota_cleared', handleQuotaCleared);
+      cancelled = true;
+      if (autoSaveTimerRef.current !== null) {
+        window.clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
+      // Flush dirty edits for the officer/month before switching to another officer/month
+      if (hasUnsavedEditsRef.current && latestSheetRef.current && latestSheetRef.current.id === sheetId) {
+        const snapshot = latestSheetRef.current;
+        writeSheetToLocalCaches(snapshot);
+        void persistTravelSheetRef.current(snapshot, {
+          showToast: false,
+          logAuditEntry: false,
+          isAutoSave: true,
+        });
+      }
     };
   }, [selectedUserId, selectedYearNumber, selectedMonthIndex, profile.role, profile.uid]);
 
+  // Apply live updates from sharedTravelSheets cleanly with non-destructive per-day row merging
+  useEffect(() => {
+    const isOwnerTarget = (profile.role === 'owner' && (!selectedUserId || selectedUserId === profile.uid)) ||
+                          usersRef.current.some(u => u.uid === selectedUserId && u.role === 'owner');
+    if (isOwnerTarget || !selectedUserId) return;
+    const targetUid = selectedUserId;
+    const sheetMonthKey = `${selectedYearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
+    const sheetId = `travel_${targetUid}_${sheetMonthKey}`;
+    const cacheKey = `travel_sheet_${targetUid}_${sheetMonthKey}`;
+
+    const sharedMatch = sharedTravelSheets.find(
+      (s) => s && !isRecordDeleted(s) && (s.id === sheetId || s._id === sheetId)
+    );
+    if (!sharedMatch || !Array.isArray(sharedMatch.rows)) return;
+
+    const incomingTs = Math.max(Number(sharedMatch._syncUpdatedAtMs) || 0, toTimestampMs(sharedMatch.updatedAt));
+    const pendingMeta = getPendingSyncMap('travel_sheets').get(sheetId);
+    const pendingNewer = Boolean(pendingMeta && pendingMeta.ts > incomingTs);
+
+    const selectedUser = usersRef.current.find(u => u.uid === targetUid) || profile;
+    const normalizedIncoming = normalizeTravelSheet(
+      sharedMatch,
+      selectedYearNumber,
+      selectedMonthIndex,
+      selectedMonthName,
+      targetUid,
+      selectedUser.fullName || sharedMatch.officerName || targetUid,
+      selectedUser.designation || sharedMatch.designation || 'FIELD OFFICER'
+    );
+
+    const currentBase =
+      latestSheetRef.current && latestSheetRef.current.id === sheetId
+        ? latestSheetRef.current
+        : null;
+
+    let nextSheet: TravelSheetData;
+    if (currentBase) {
+      const prevTs = Math.max(Number((currentBase as any)._syncUpdatedAtMs) || 0, toTimestampMs(currentBase.updatedAt));
+      const merged = mergeTravelSheetDocs(currentBase, normalizedIncoming, {
+        dirtyDays: dirtyDaysRef.current,
+        preferIncomingMeta: !hasUnsavedEditsRef.current && !pendingNewer && incomingTs >= prevTs,
+      });
+      nextSheet = normalizeTravelSheet(
+        merged,
+        selectedYearNumber,
+        selectedMonthIndex,
+        selectedMonthName,
+        targetUid,
+        merged.officerName || selectedUser.fullName || targetUid,
+        merged.designation || selectedUser.designation || 'FIELD OFFICER'
+      );
+
+      // Skip state churn if rows, rate, and timestamp are identical
+      const nextTs = Number((nextSheet as any)._syncUpdatedAtMs) || 0;
+      if (
+        prevTs === nextTs &&
+        Number(currentBase.ratePerKm) === Number(nextSheet.ratePerKm) &&
+        JSON.stringify(currentBase.rows) === JSON.stringify(nextSheet.rows)
+      ) {
+        return;
+      }
+    } else {
+      nextSheet = normalizedIncoming;
+    }
+
+    latestSheetRef.current = nextSheet;
+    setRatePerKm(nextSheet.ratePerKm || 3.5);
+    setSheet(nextSheet);
+    safeLocalStorageSet(cacheKey, JSON.stringify(nextSheet));
+    setLoading(false);
+  }, [sharedTravelSheets, sharedTravelLoaded, selectedUserId, selectedYearNumber, selectedMonthIndex, profile.role, profile.uid]);
+
   const updateRow = (index: number, updates: Partial<TravelRow>) => {
-    if (!sheet) return;
+    const baseSheet = latestSheetRef.current || sheet;
+    if (!baseSheet) return;
+    const nowEditMs = Date.now();
     hasUnsavedEditsRef.current = true;
-    lastLocalEditAtRef.current = Date.now();
-    const newRows = [...sheet.rows];
+    lastLocalEditAtRef.current = nowEditMs;
+    const newRows = [...baseSheet.rows];
     const currentRow = newRows[index];
-    const updated = { ...currentRow, ...updates };
+    const wasPopulated = isTravelRowPopulated(currentRow);
+    const updated: TravelRow = { ...currentRow, ...updates };
 
     // Auto-calculate KM (Closing KM - Opening KM)
     if ('openingKm' in updates || 'closingKm' in updates) {
@@ -658,7 +864,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
 
     // Manual Amount: strictly set by user input, not auto-calculated from KM
     if ('amount' in updates) {
-      updated.amount = updates.amount !== undefined && updates.amount !== null ? Math.max(0, Number(updates.amount) || 0) : 0;
+      updated.amount = updates.amount !== undefined && updates.amount !== null ? Math.max(0, Number(updated.amount) || 0) : 0;
     }
 
     if ('otherExpenses' in updates) {
@@ -669,6 +875,18 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     const amount = Math.max(0, Number(updated.amount) || 0);
     const other = Math.max(0, Number(updated.otherExpenses) || 0);
     updated.subtotal = Math.round((amount + other) * 100) / 100;
+
+    // Stamp row-level edit / clear timestamp so per-day merging never clobbers or loses entries
+    updated.rowUpdatedAtMs = nowEditMs;
+    if (isTravelRowPopulated(updated)) {
+      delete updated.rowClearedAtMs;
+    } else if (wasPopulated) {
+      updated.rowClearedAtMs = nowEditMs;
+    }
+
+    if (updated.dayNumber) {
+      dirtyDaysRef.current.add(updated.dayNumber);
+    }
 
     newRows[index] = updated;
 
@@ -681,102 +899,53 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     const averageCostPerKm = totalKm > 0 ? Math.round((totalExpensesAmount / totalKm) * 100) / 100 : 0;
 
     const updatedSheet: TravelSheetData = {
-      ...sheet,
+      ...baseSheet,
       rows: newRows,
       totalKm,
       totalAmount,
       totalOtherExpenses,
       subtotalAmount,
       averageCostPerKm,
-      totalExpensesAmount
-    };
+      totalExpensesAmount,
+      updatedAt: new Date(nowEditMs).toISOString(),
+      _syncUpdatedAtMs: nowEditMs,
+    } as any;
 
+    latestSheetRef.current = updatedSheet;
     setSheet(updatedSheet);
-
-    // Instant local caching so Report view and tab switching see this row immediately
-    try {
-      const sheetMonthKey = `${sheet.yearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
-      const cacheKey = `travel_sheet_${sheet.userId}_${sheetMonthKey}`;
-      safeLocalStorageSet(cacheKey, JSON.stringify(updatedSheet));
-      safeLocalStorageSet(`travel_sheet_${sheet.userId}`, JSON.stringify(updatedSheet));
-      const cachedAllRaw = localStorage.getItem('blackworm_cached_travel_sheets');
-      let cachedAll: any[] = cachedAllRaw ? JSON.parse(cachedAllRaw) : [];
-      if (!Array.isArray(cachedAll)) cachedAll = [];
-      const idx = cachedAll.findIndex((s: any) => s.id === sheet.id || s._id === sheet.id);
-      if (idx >= 0) cachedAll[idx] = updatedSheet;
-      else cachedAll.push(updatedSheet);
-      safeLocalStorageSet('blackworm_cached_travel_sheets', JSON.stringify(cachedAll));
-    } catch {}
+    writeSheetToLocalCaches(updatedSheet);
+    scheduleAutoSave(updatedSheet);
   };
 
   const handleRateChange = (newRate: number) => {
-    if (!sheet) return;
+    const baseSheet = latestSheetRef.current || sheet;
+    if (!baseSheet) return;
+    const nowEditMs = Date.now();
     hasUnsavedEditsRef.current = true;
-    lastLocalEditAtRef.current = Date.now();
+    lastLocalEditAtRef.current = nowEditMs;
     setRatePerKm(newRate);
     const updatedSheet: TravelSheetData = {
-      ...sheet,
+      ...baseSheet,
       ratePerKm: newRate,
-    };
+      updatedAt: new Date(nowEditMs).toISOString(),
+      _syncUpdatedAtMs: nowEditMs,
+    } as any;
+    latestSheetRef.current = updatedSheet;
     setSheet(updatedSheet);
-    try {
-      const sheetMonthKey = `${sheet.yearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
-      safeLocalStorageSet(`travel_sheet_${sheet.userId}_${sheetMonthKey}`, JSON.stringify(updatedSheet));
-      safeLocalStorageSet(`travel_sheet_${sheet.userId}`, JSON.stringify(updatedSheet));
-    } catch {}
+    writeSheetToLocalCaches(updatedSheet);
+    scheduleAutoSave(updatedSheet);
   };
 
   const handleSave = async () => {
-    if (!sheet || saving) return;
-    hasUnsavedEditsRef.current = false;
-    lastLocalEditAtRef.current = 0;
+    const currentSheet = latestSheetRef.current || sheet;
+    if (!currentSheet || saving) return;
     setSaving(true);
-    const nowIso = new Date().toISOString();
-    const sheetToSave: TravelSheetData = { ...sheet, updatedAt: nowIso };
-    // Instant local caching + shared store optimistic update so Report view & refreshes never lose rows
-    const sheetMonthKey = `${sheetToSave.yearNumber}_${(selectedMonthIndex + 1).toString().padStart(2, '0')}`;
-    const cacheKey = `travel_sheet_${sheetToSave.userId}_${sheetMonthKey}`;
     try {
-      safeLocalStorageSet(cacheKey, JSON.stringify(sheetToSave));
-      safeLocalStorageSet(`travel_sheet_${sheetToSave.userId}`, JSON.stringify(sheetToSave));
-      const cachedAllRaw = localStorage.getItem('blackworm_cached_travel_sheets');
-      let cachedAll: any[] = cachedAllRaw ? JSON.parse(cachedAllRaw) : [];
-      if (!Array.isArray(cachedAll)) cachedAll = [];
-      const idx = cachedAll.findIndex((s: any) => s.id === sheetToSave.id || s._id === sheetToSave.id);
-      if (idx >= 0) {
-        cachedAll[idx] = sheetToSave;
-      } else {
-        cachedAll.push(sheetToSave);
-      }
-      safeLocalStorageSet('blackworm_cached_travel_sheets', JSON.stringify(cachedAll));
-    } catch {}
-
-    setTravelSheetsOptimistic((prev) => {
-      const idx = prev.findIndex((s: any) => s.id === sheetToSave.id || s._id === sheetToSave.id);
-      if (idx >= 0) {
-        const next = [...prev];
-        next[idx] = sheetToSave;
-        return next;
-      }
-      return [sheetToSave, ...prev];
-    });
-
-    try {
-      await safeFirestoreSet('travel_sheets', sheetToSave.id, sheetToSave, { merge: true });
-
-      void logAudit(
-        'UPDATE',
-        'travel_sheets',
-        sheetToSave.id,
-        `Saved Travelling Sheet for ${sheetToSave.officerName} (${sheetToSave.monthName} ${sheetToSave.yearNumber})`,
-        profile
-      ).catch(() => {});
-      setShowSuccess(true);
-      setTimeout(() => setShowSuccess(false), 3000);
-    } catch (err) {
-      console.warn('Firestore save notice:', err);
-      setShowSuccess(true);
-      setTimeout(() => setShowSuccess(false), 3000);
+      await persistTravelSheet(currentSheet, {
+        showToast: true,
+        logAuditEntry: true,
+        isAutoSave: false,
+      });
     } finally {
       setSaving(false);
     }

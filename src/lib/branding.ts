@@ -76,6 +76,12 @@ function pullBrandingFromSecondary() {
 function ensureBrandingResyncHooks() {
   if (typeof window === 'undefined' || brandingResyncAttached) return;
   brandingResyncAttached = true;
+  window.addEventListener('blackworm_local_record_mutation', (e: any) => {
+    const d = e?.detail;
+    if (d?.collection === 'config' && d?.id === 'branding' && d?.doc && !d?.deleted) {
+      applyBrandingUpdate({ ...d.doc, ...(d.updatedAtMs ? { _syncUpdatedAtMs: d.updatedAtMs } : {}) }, false);
+    }
+  });
   window.addEventListener('blackworm_data_refresh', pullBrandingFromSecondary);
   window.addEventListener('blackworm_secondary_resync', pullBrandingFromSecondary);
   window.addEventListener('blackworm_quota_blocked', pullBrandingFromSecondary);
@@ -130,7 +136,7 @@ function startSharedBrandingListener() {
         }
         const msg = String(err?.message || '').toLowerCase();
         if (msg.includes('quota') || msg.includes('resource_exhausted')) {
-          setQuotaBlocked(15 * 60 * 1000);
+          setQuotaBlocked(2 * 60 * 1000);
         }
         pullBrandingFromSecondary();
       }

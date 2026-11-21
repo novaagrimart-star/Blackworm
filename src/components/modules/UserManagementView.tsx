@@ -396,7 +396,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
             try { unsub(); } catch {}
             unsub = null;
           }
-          if (isQuotaExceededError(err)) setQuotaBlocked(15 * 60 * 1000);
+          if (isQuotaExceededError(err)) setQuotaBlocked(2 * 60 * 1000);
           pullRequestsFromSecondary();
           console.warn('UserManagement approval requests sync notice:', err);
         });
@@ -407,10 +407,23 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
 
     const handleRefresh = () => { pullRequestsFromSecondary(); attachReqListener(); };
     const handleQuotaCleared = () => { attachReqListener(); };
+    const handleLocalMutation = (e: Event) => {
+      const detail = (e as CustomEvent)?.detail;
+      if (detail?.collection === 'user_approval_requests' && detail?.id) {
+        if (detail.deleted || detail.doc?.isArchived) {
+          reqMap.delete(detail.id);
+        } else if (detail.doc) {
+          const prev = reqMap.get(detail.id) || {};
+          reqMap.set(detail.id, { ...prev, ...detail.doc, id: detail.id });
+        }
+        syncList();
+      }
+    };
     window.addEventListener('blackworm_data_refresh', handleRefresh);
     window.addEventListener('blackworm_secondary_resync', handleRefresh);
     window.addEventListener('blackworm_quota_blocked', pullRequestsFromSecondary);
     window.addEventListener('blackworm_quota_cleared', handleQuotaCleared);
+    window.addEventListener('blackworm_local_record_mutation', handleLocalMutation as EventListener);
 
     attachReqListener();
     return () => {
@@ -420,33 +433,28 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
       window.removeEventListener('blackworm_secondary_resync', handleRefresh);
       window.removeEventListener('blackworm_quota_blocked', pullRequestsFromSecondary);
       window.removeEventListener('blackworm_quota_cleared', handleQuotaCleared);
+      window.removeEventListener('blackworm_local_record_mutation', handleLocalMutation as EventListener);
     };
   }, []);
 
   const handleApproveRequest = async (req: any) => {
     setActionLoading(req.id);
     try {
+      const updatedAtIso = new Date().toISOString();
+      // Immediately update shared users state & clear pending card optimistically
+      setUsersOptimistic((prev) =>
+        prev.map((u) =>
+          u.uid === req.targetUserId
+            ? { ...u, ...req.proposedData, updatedAt: updatedAtIso }
+            : u
+        )
+      );
+      setPendingRequests((prev) => prev.filter((r) => r.id !== req.id));
+
       await safeFirestoreSet('users', req.targetUserId, {
         ...req.proposedData,
-        updatedAt: new Date().toISOString(),
+        updatedAt: updatedAtIso,
       }, { merge: true });
-
-      // Synchronize updated user details everywhere across all linked records
-      try {
-        await syncOfficerDetailsEverywhere(
-          req.targetUserId,
-          req.proposedData.fullName,
-          req.proposedData.designation,
-          req.proposedData.center,
-          {
-            loginId: req.proposedData.loginId,
-            oldName: req.targetUserName,
-            userCode: req.targetUserCode,
-          }
-        );
-      } catch (syncErr) {
-        console.warn('Sync error on approval:', syncErr);
-      }
 
       await safeFirestoreSet('user_approval_requests', req.id, {
         status: 'approved',
@@ -454,6 +462,21 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
         approvedByUid: profile.uid,
         approvedByName: profile.fullName || 'Admin',
       }, { merge: true });
+
+      // Synchronize updated user details everywhere across all linked records in background
+      void syncOfficerDetailsEverywhere(
+        req.targetUserId,
+        req.proposedData.fullName,
+        req.proposedData.designation,
+        req.proposedData.center,
+        {
+          loginId: req.proposedData.loginId,
+          oldName: req.targetUserName,
+          userCode: req.targetUserCode,
+        }
+      ).catch((syncErr) => {
+        console.warn('Sync error on approval:', syncErr);
+      });
 
       void logAudit(
         'UPDATE',
@@ -487,6 +510,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const handleRejectRequest = async (req: any) => {
     setActionLoading(req.id);
     try {
+      setPendingRequests((prev) => prev.filter((r) => r.id !== req.id));
       await safeFirestoreSet('user_approval_requests', req.id, {
         status: 'rejected',
         rejectedAt: new Date().toISOString(),
@@ -742,10 +766,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
       const existingUser = users.find(u => u.uid === uid);
       const wasNewUser = !currentUid;
 
-      // 1. Direct safe save with local backup (guarantees zero data loss & fast response)
-      await safeFirestoreSet('users', uid, payload, { merge: true });
-
-      // 2. Immediately update shared in-memory state across app
+      // 1. Immediately update shared in-memory state across app before awaiting network write
       setUsersOptimistic((prev) => {
         const idx = prev.findIndex((u) => u.uid === uid);
         if (idx >= 0) {
@@ -759,12 +780,11 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
       setDesignation(payload.designation || '');
       setCenter(payload.center || '');
 
-      // 3. If updating current logged in user, immediately update local storage & notify parent Dashboard/App
-      if (
-        uid === profile.uid ||
-        (profile.loginId && payload.loginId && String(profile.loginId).toLowerCase() === String(payload.loginId).toLowerCase()) ||
-        (profile.mobileNumber && payload.mobileNumber && String(profile.mobileNumber) === String(payload.mobileNumber))
-      ) {
+      // 2. Direct safe save with local backup (guarantees zero data loss & fast response)
+      await safeFirestoreSet('users', uid, payload, { merge: true });
+
+      // 3. Strictly update current session ONLY if editing the exact same UID (never overwrite session via shared mobile/loginId)
+      if (uid === profile.uid) {
         const { password: _omittedPass, ...safeSession } = payload;
         safeLocalStorageSet('blackworm_user_profile', JSON.stringify(safeSession));
         onProfileUpdate?.(safeSession as DetailedUserProfile);

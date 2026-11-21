@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, type SetStateAction } from 'react';
 import {
   collection,
   doc,
@@ -22,9 +22,12 @@ import {
   toTimestampMs,
   isQuotaBlocked,
   setQuotaBlocked,
+  resetReadQuotaBackoff,
   safeLocalStorageSet,
   safeFirestoreSet,
   getPendingSyncMap,
+  isRecordDeleted,
+  mergeTravelSheetDocs,
 } from './dataService';
 import {
   DEFAULT_STATE,
@@ -74,7 +77,7 @@ function createChannel<T>(initial: T): StoreChannel<T> {
   if (Array.isArray(initial)) {
     initial.forEach((it: any) => {
       const id = it?.id || it?.uid;
-      if (id && !it?.isArchived) {
+      if (id && !isRecordDeleted(it)) {
         docMap.set(String(id), { ...it, id: String(id) });
       }
     });
@@ -101,6 +104,44 @@ function getDocSyncTs(docObj: any): number {
     Number(docObj._syncUpdatedAtMs) || 0,
     toTimestampMs(docObj.updatedAt || docObj.markedAt || docObj.createdAt)
   );
+}
+
+function getContentTs(docObj: any): number {
+  if (!docObj) return 0;
+  return toTimestampMs(docObj.updatedAt || docObj.markedAt || docObj.createdAt);
+}
+
+function shouldSecondaryDocWin(
+  existing: any,
+  incoming: any,
+  ch: StoreChannel<any[]>,
+  id: string,
+  pendingMap: Map<string, { ts: number; needsFirebase: boolean; needsSecondary: boolean; deleted: boolean }>
+): boolean {
+  const incomingTs = getDocSyncTs(incoming);
+  const pendingMeta = pendingMap.get(id);
+  if (pendingMeta && pendingMeta.needsSecondary && pendingMeta.ts > incomingTs) {
+    return false;
+  }
+  if (!existing) return true;
+  const existingTs = getDocSyncTs(existing);
+  // Protect live Firestore docs against synthetic SQLite timestamps unless failover or strictly newer content timestamp
+  if (
+    ch.hasServerSnapshot &&
+    !isQuotaBlocked() &&
+    !ch.secIds.has(id) &&
+    incoming?._syncSource !== 'secondary_failover'
+  ) {
+    const existingContentTs = getContentTs(existing);
+    const incomingContentTs = getContentTs(incoming);
+    if (existingContentTs > 0 && incomingContentTs > 0) {
+      return incomingContentTs > existingContentTs;
+    }
+    if (existingContentTs > 0 && incomingContentTs === 0) {
+      return false;
+    }
+  }
+  return incomingTs > existingTs;
 }
 
 function notifyChannel<T>(ch: StoreChannel<T>, next: T, loaded = true) {
@@ -141,17 +182,21 @@ function applyIncrementalSnapshot(
   colName: string,
   snap: any,
   queryLimit = 0
-): { items: any[]; changedCount: number } {
+): { items: any[]; changedCount: number; skipNotify?: boolean } {
   const changes = typeof snap.docChanges === 'function' ? snap.docChanges() : [];
   let changedCount = changes.length;
   const fromCache = Boolean(snap?.metadata?.fromCache);
+  if (fromCache && (!snap?.docs || snap.docs.length === 0) && !ch.hasServerSnapshot) {
+    // Do not wipe cache or flip loaded=true from an empty Firestore IndexedDB cache snapshot
+    return { items: Array.from(ch.docMap.values()), changedCount: 0, skipNotify: true };
+  }
   const pendingMap = getPendingSyncMap(colName);
 
   const upsertWithLww = (id: string, data: any) => {
     const pendingMeta = pendingMap.get(id);
-    if (data?.isArchived) {
-      if (pendingMeta && !pendingMeta.deleted) {
-        const archTs = toTimestampMs(data.archivedAt || data.updatedAt || data._syncUpdatedAtMs);
+    if (isRecordDeleted(data)) {
+      const archTs = toTimestampMs(data.archivedAt || data.updatedAt || data._syncUpdatedAtMs);
+      if (pendingMeta && pendingMeta.needsFirebase && !pendingMeta.deleted) {
         if (pendingMeta.ts > archTs) return;
       }
       ch.archivedIds.add(id);
@@ -164,31 +209,52 @@ function applyIncrementalSnapshot(
     ch.archivedIds.delete(id);
     const incoming = { ...data, id };
     const existing = ch.docMap.get(id);
+    if (colName === 'travel_sheets' && existing && Array.isArray(existing.rows) && Array.isArray(incoming.rows)) {
+      const mergedTravel = mergeTravelSheetDocs(existing, incoming);
+      ch.secIds.delete(id);
+      ch.docMap.set(id, mergedTravel);
+      return;
+    }
     if (existing) {
       const incomingTs = getDocSyncTs(incoming);
       const existingTs = getDocSyncTs(existing);
-      if (pendingMeta) {
-        // Protect locally queued edits that haven't completed syncing yet
+      if (pendingMeta && pendingMeta.needsFirebase) {
+        // Protect locally queued edits on THIS device that haven't finished syncing to Firebase yet
         if (pendingMeta.ts > incomingTs) return;
       } else if (fromCache) {
         if (existingTs >= incomingTs) return;
-      } else if (ch.secIds.has(id) && existingTs > incomingTs + 500) {
-        // Secondary DB has a strictly newer write (e.g. saved while Firebase quota was blocked on another device)
+      } else if (
+        ch.secIds.has(id) &&
+        existing?._syncSource === 'secondary_failover' &&
+        existingTs > incomingTs + 1500
+      ) {
+        // Only defer to Secondary DB when that write explicitly happened under Firebase failover and is strictly newer
         return;
       }
     }
+    ch.secIds.delete(id);
     ch.docMap.set(id, incoming);
   };
 
   if (!fromCache && !ch.hasServerSnapshot && Array.isArray(snap.docs)) {
-    // First authoritative server snapshot: only prune stale pre-seeded cache items that are NOT live in Secondary DB
+    // First authoritative server snapshot: only prune truly archived or temp items; NEVER drop active Secondary/offline docs
     ch.hasServerSnapshot = true;
     const isFullServerView = !queryLimit || snap.docs.length < queryLimit;
     if (isFullServerView) {
       const serverIds = new Set<string>(snap.docs.map((d: any) => String(d.id)));
       Array.from(ch.docMap.keys()).forEach((existingId) => {
-        if (!serverIds.has(existingId) && !pendingMap.has(existingId) && !ch.secIds.has(existingId)) {
+        if (serverIds.has(existingId)) return;
+        const pendingMeta = pendingMap.get(existingId);
+        const existing = ch.docMap.get(existingId);
+        const isProtectedSecondaryOrPending =
+          (pendingMeta && pendingMeta.needsFirebase) ||
+          ch.secIds.has(existingId) ||
+          Boolean(existing?._localSavedAt) ||
+          existing?._syncSource === 'secondary_failover' ||
+          colName === 'travel_sheets';
+        if (!isProtectedSecondaryOrPending || isRecordDeleted(existing) || ch.archivedIds.has(existingId)) {
           ch.docMap.delete(existingId);
+          ch.secIds.delete(existingId);
           removeFromCollectionCache(colName, existingId);
         }
       });
@@ -202,8 +268,10 @@ function applyIncrementalSnapshot(
     changes.forEach((change: any) => {
       const id = change.doc.id;
       if (change.type === 'removed') {
-        if (!pendingMap.has(id) && !ch.secIds.has(id)) {
+        const pendingMeta = pendingMap.get(id);
+        if (!pendingMeta?.needsFirebase && !ch.secIds.has(id) && colName !== 'travel_sheets') {
           ch.docMap.delete(id);
+          ch.secIds.delete(id);
           ch.archivedIds.add(id);
           removeFromCollectionCache(colName, id);
         }
@@ -223,9 +291,16 @@ function applySecondaryDeltas(
   events: SecondaryDeltaEvent[]
 ): any[] | null {
   let mutated = false;
+  const pendingMap = getPendingSyncMap(colName);
   events.forEach((evt) => {
     if (!evt || evt.collection !== colName || !evt.id) return;
-    if (evt.deleted || evt.doc?.isArchived) {
+    const evtTs = Number(evt.updatedAtMs) || 0;
+    const pendingMeta = pendingMap.get(evt.id);
+    if (pendingMeta && pendingMeta.needsSecondary && pendingMeta.ts > evtTs) {
+      return;
+    }
+
+    if (evt.deleted || isRecordDeleted(evt.doc)) {
       ch.secIds.delete(evt.id);
       if (ch.docMap.has(evt.id) || !ch.archivedIds.has(evt.id)) {
         ch.docMap.delete(evt.id);
@@ -237,19 +312,29 @@ function applySecondaryDeltas(
     }
 
     if (evt.doc) {
-      ch.secIds.add(evt.id);
       const incoming: Record<string, any> = {
         ...evt.doc,
         id: evt.id,
         ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}),
       };
       const existing = ch.docMap.get(evt.id);
-      const existingTs = getDocSyncTs(existing);
-      const incomingTs = Math.max(evt.updatedAtMs || 0, getDocSyncTs(incoming));
-
-      if (!existing || incomingTs >= existingTs) {
+      if (colName === 'travel_sheets' && existing && Array.isArray(existing.rows) && Array.isArray(incoming.rows)) {
+        const mergedTravel = mergeTravelSheetDocs(existing, incoming);
+        if (JSON.stringify(existing) !== JSON.stringify(mergedTravel)) {
+          ch.secIds.add(evt.id);
+          ch.archivedIds.delete(evt.id);
+          ch.docMap.set(evt.id, mergedTravel);
+          mutated = true;
+        }
+      } else if (shouldSecondaryDocWin(existing, incoming, ch, evt.id, pendingMap)) {
+        ch.secIds.add(evt.id);
         ch.archivedIds.delete(evt.id);
-        ch.docMap.set(evt.id, existing ? { ...existing, ...incoming } : incoming);
+        ch.docMap.set(
+          evt.id,
+          existing && existing.createdAt && !incoming.createdAt
+            ? { createdAt: existing.createdAt, ...incoming }
+            : incoming
+        );
         mutated = true;
       }
     }
@@ -265,10 +350,13 @@ async function pullSecondaryIntoChannel(
   transform: (items: any[], archivedIds: Set<string>, authoritative: boolean) => any[]
 ) {
   ch.lastSecPullAtMs = Date.now();
+  const pendingMap = getPendingSyncMap(colName);
   try {
-    const sec = await fetchSecondaryCollection(colName, { limit: 2000 });
+    const sec = await fetchSecondaryCollection(colName, { limit: 5000 });
     if (sec.ok) {
       sec.archivedIds.forEach((id) => {
+        const pendingMeta = pendingMap.get(id);
+        if (pendingMeta && pendingMeta.needsSecondary && !pendingMeta.deleted) return;
         ch.archivedIds.add(id);
         ch.secIds.delete(id);
         ch.docMap.delete(id);
@@ -276,13 +364,22 @@ async function pullSecondaryIntoChannel(
       });
       sec.items.forEach((it) => {
         if (!it || !it.id) return;
-        ch.secIds.add(it.id);
         const existing = ch.docMap.get(it.id);
-        const existingTs = getDocSyncTs(existing);
-        const incomingTs = getDocSyncTs(it);
-        if (!existing || incomingTs >= existingTs) {
+        if (colName === 'travel_sheets' && existing && Array.isArray(existing.rows) && Array.isArray(it.rows)) {
+          ch.secIds.add(it.id);
           ch.archivedIds.delete(it.id);
-          ch.docMap.set(it.id, existing ? { ...existing, ...it } : it);
+          ch.docMap.set(it.id, mergeTravelSheetDocs(existing, it));
+          return;
+        }
+        if (shouldSecondaryDocWin(existing, it, ch, it.id, pendingMap)) {
+          ch.secIds.add(it.id);
+          ch.archivedIds.delete(it.id);
+          ch.docMap.set(
+            it.id,
+            existing && existing.createdAt && !it.createdAt
+              ? { createdAt: existing.createdAt, ...it }
+              : it
+          );
         }
       });
       if (sec.items.length > 0 || sec.archivedIds.length > 0 || ch.docMap.size > 0 || isQuotaBlocked()) {
@@ -293,20 +390,27 @@ async function pullSecondaryIntoChannel(
     }
   } catch {}
 
-  // Fallback to IndexedDB vault — always merge into ch.docMap rather than overwriting live server records
+  // Fallback to IndexedDB vault — always respect strict LWW & live server docs
   try {
     const vaultMap = await loadCollectionFromVault(colName);
     if (vaultMap) {
-      const vaultItems = Object.values(vaultMap).filter((it: any) => it && !it.isArchived);
+      const vaultItems = Object.values(vaultMap).filter((it: any) => it && !isRecordDeleted(it));
       if (vaultItems.length > 0) {
         vaultItems.forEach((it: any) => {
           const id = String(it?.id || it?.uid || '').trim();
           if (!id || ch.archivedIds.has(id)) return;
           const existing = ch.docMap.get(id);
-          const existingTs = getDocSyncTs(existing);
-          const incomingTs = getDocSyncTs(it);
-          if (!existing || incomingTs >= existingTs) {
-            ch.docMap.set(id, existing ? { ...existing, ...it, id } : { ...it, id });
+          if (colName === 'travel_sheets' && existing && Array.isArray(existing.rows) && Array.isArray(it.rows)) {
+            ch.docMap.set(id, mergeTravelSheetDocs(existing, { ...it, id }));
+            return;
+          }
+          if (shouldSecondaryDocWin(existing, { ...it, id }, ch, id, pendingMap)) {
+            ch.docMap.set(
+              id,
+              existing && existing.createdAt && !it.createdAt
+                ? { createdAt: existing.createdAt, ...it, id }
+                : { ...it, id }
+            );
           }
         });
         const finalList = transform(Array.from(ch.docMap.values()), ch.archivedIds, false);
@@ -327,7 +431,7 @@ function loadInitialUsers(): UserProfile[] {
     const cached = localStorage.getItem('blackworm_cached_users');
     if (cached) {
       const parsed = JSON.parse(cached);
-      if (Array.isArray(parsed)) return parsed.filter((u: any) => u && !u.isArchived);
+      if (Array.isArray(parsed)) return parsed.filter((u: any) => u && !isRecordDeleted(u));
     }
   } catch {}
   return [];
@@ -385,7 +489,8 @@ function startUsersListener() {
     usersChannel.unsub = onSnapshot(
       collection(db, 'users'),
       (snap) => {
-        const { items } = applyIncrementalSnapshot(usersChannel, 'users', snap);
+        const { items, skipNotify } = applyIncrementalSnapshot(usersChannel, 'users', snap);
+        if (skipNotify) return;
         const sorted = finalizeUsersList(items, usersChannel.archivedIds, !snap.metadata?.fromCache);
         notifyChannel(usersChannel, sorted, true);
         if (!snap.metadata?.fromCache) {
@@ -398,7 +503,7 @@ function startUsersListener() {
           try { usersChannel.unsub(); } catch {}
           usersChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         void pullSecondaryIntoChannel(usersChannel, 'users', finalizeUsersList);
       }
     );
@@ -432,14 +537,24 @@ export function useSharedUsers() {
     }
   });
 
-  const setUsersOptimistic = (updater: (prev: UserProfile[]) => UserProfile[]) => {
+  const setUsersOptimistic = (updater: SetStateAction<UserProfile[]>) => {
     const nowMs = Date.now();
-    const next = sortUsers(updater(usersChannel.data));
+    const rawNext = typeof updater === 'function' ? updater(usersChannel.data) : updater;
+    const next = sortUsers(rawNext);
+    const nextIds = new Set<string>();
     next.forEach((u: any) => {
       const id = u?.uid || u?.id;
       if (id) {
+        nextIds.add(String(id));
         usersChannel.archivedIds.delete(id);
         usersChannel.docMap.set(id, { ...u, id, uid: id, _syncUpdatedAtMs: Math.max(Number(u._syncUpdatedAtMs) || 0, nowMs) });
+      }
+    });
+    Array.from(usersChannel.docMap.keys()).forEach((k) => {
+      if (!nextIds.has(k)) {
+        usersChannel.docMap.delete(k);
+        usersChannel.secIds.delete(k);
+        usersChannel.archivedIds.add(k);
       }
     });
     safeLocalStorageSet('blackworm_cached_users', JSON.stringify(next));
@@ -514,7 +629,8 @@ function startDealersListener() {
     dealersChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(dealersChannel, 'dealers_application', snap, 1000);
+        const { items, skipNotify } = applyIncrementalSnapshot(dealersChannel, 'dealers_application', snap, 1000);
+        if (skipNotify) return;
         const sorted = finalizeDealersList(items, dealersChannel.archivedIds, !snap.metadata?.fromCache);
         notifyChannel(dealersChannel, sorted, true);
         if (!snap.metadata?.fromCache) {
@@ -527,7 +643,7 @@ function startDealersListener() {
           try { dealersChannel.unsub(); } catch {}
           dealersChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         void pullSecondaryIntoChannel(dealersChannel, 'dealers_application', finalizeDealersList);
       }
     );
@@ -549,9 +665,10 @@ export function useSharedDealers() {
     });
   }, []);
 
-  const updateLocalDealersOptimistic = (updater: (prev: any[]) => any[]) => {
+  const updateLocalDealersOptimistic = (updater: SetStateAction<any[]>) => {
     const nowMs = Date.now();
-    const next = sortDealers(deduplicateDealers(updater(dealersChannel.data)));
+    const rawNext = typeof updater === 'function' ? updater(dealersChannel.data) : updater;
+    const next = sortDealers(deduplicateDealers(rawNext));
     const nextIds = new Set<string>();
     next.forEach((d: any) => {
       if (d?.id) {
@@ -619,7 +736,8 @@ function startOrdersListener() {
     ordersChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(ordersChannel, 'orders', snap, 1000);
+        const { items, skipNotify } = applyIncrementalSnapshot(ordersChannel, 'orders', snap, 1000);
+        if (skipNotify) return;
         const sorted = finalizeOrdersList(items, ordersChannel.archivedIds, !snap.metadata?.fromCache);
         notifyChannel(ordersChannel, sorted, true);
         if (!snap.metadata?.fromCache) {
@@ -632,7 +750,7 @@ function startOrdersListener() {
           try { ordersChannel.unsub(); } catch {}
           ordersChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         void pullSecondaryIntoChannel(ordersChannel, 'orders', finalizeOrdersList);
       }
     );
@@ -654,9 +772,10 @@ export function useSharedOrders() {
     });
   }, []);
 
-  const setOrdersOptimistic = (updater: (prev: any[]) => any[]) => {
+  const setOrdersOptimistic = (updater: SetStateAction<any[]>) => {
     const nowMs = Date.now();
-    const next = deduplicateOrders(updater(ordersChannel.data)).sort(
+    const rawNext = typeof updater === 'function' ? updater(ordersChannel.data) : updater;
+    const next = deduplicateOrders(rawNext).sort(
       (a, b) => toTimestampMs(b.createdAt) - toTimestampMs(a.createdAt)
     );
     const nextIds = new Set<string>();
@@ -729,7 +848,8 @@ function startCollectionsListener() {
     collectionsChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(collectionsChannel, 'collection_entries', snap, 1000);
+        const { items, skipNotify } = applyIncrementalSnapshot(collectionsChannel, 'collection_entries', snap, 1000);
+        if (skipNotify) return;
         const sorted = finalizeCollectionsList(items, collectionsChannel.archivedIds, !snap.metadata?.fromCache);
         notifyChannel(collectionsChannel, sorted, true);
         if (!snap.metadata?.fromCache) {
@@ -742,7 +862,7 @@ function startCollectionsListener() {
           try { collectionsChannel.unsub(); } catch {}
           collectionsChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         void pullSecondaryIntoChannel(collectionsChannel, 'collection_entries', finalizeCollectionsList);
       }
     );
@@ -764,9 +884,10 @@ export function useSharedCollectionEntries() {
     });
   }, []);
 
-  const setCollectionsOptimistic = (updater: (prev: any[]) => any[]) => {
+  const setCollectionsOptimistic = (updater: SetStateAction<any[]>) => {
     const nowMs = Date.now();
-    const next = deduplicateCollections(updater(collectionsChannel.data)).sort(
+    const rawNext = typeof updater === 'function' ? updater(collectionsChannel.data) : updater;
+    const next = deduplicateCollections(rawNext).sort(
       (a, b) => toTimestampMs(b.createdAt || b.date) - toTimestampMs(a.createdAt || a.date)
     );
     const nextIds = new Set<string>();
@@ -832,7 +953,8 @@ function startYearlyTargetsListener() {
     yearlyTargetsChannel.unsub = onSnapshot(
       collection(db, 'yearly_targets'),
       (snap) => {
-        const { items } = applyIncrementalSnapshot(yearlyTargetsChannel, 'yearly_targets', snap);
+        const { items, skipNotify } = applyIncrementalSnapshot(yearlyTargetsChannel, 'yearly_targets', snap);
+        if (skipNotify) return;
         const merged = finalizeYearlyTargetsList(items, yearlyTargetsChannel.archivedIds, !snap.metadata?.fromCache);
         notifyChannel(yearlyTargetsChannel, merged, true);
         if (!snap.metadata?.fromCache) {
@@ -845,7 +967,7 @@ function startYearlyTargetsListener() {
           try { yearlyTargetsChannel.unsub(); } catch {}
           yearlyTargetsChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         void pullSecondaryIntoChannel(yearlyTargetsChannel, 'yearly_targets', finalizeYearlyTargetsList);
       }
     );
@@ -881,7 +1003,7 @@ export function useSharedYearlyTargets() {
             fbData = { ...docSnap.data(), id: docSnap.id, _id: docSnap.id };
           }
         } catch (err) {
-          if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+          if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
           console.warn('Refresh target doc notice:', err);
         }
       })(),
@@ -922,19 +1044,16 @@ export function useSharedYearlyTargets() {
   const refreshAllYearlyTargetsFromServer = async () => {
     await Promise.all([
       (async () => {
-        if (isQuotaBlocked()) return;
+        if (isQuotaBlocked() || yearlyTargetsChannel.unsub) return;
         try {
           const snap = await getDocsFromServer(collection(db, 'yearly_targets'));
           trackFirestoreUsage('read', Math.max(1, snap.docs.length));
           snap.docs.forEach((d) => {
             const incoming = { ...d.data(), id: d.id, _id: d.id };
-            const existing = yearlyTargetsChannel.docMap.get(d.id);
-            if (!existing || getDocSyncTs(incoming) >= getDocSyncTs(existing)) {
-              yearlyTargetsChannel.docMap.set(d.id, existing ? { ...existing, ...incoming } : incoming);
-            }
+            yearlyTargetsChannel.docMap.set(d.id, incoming);
           });
         } catch (err) {
-          if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+          if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
           console.warn('Refresh all targets notice:', err);
         }
       })(),
@@ -949,9 +1068,10 @@ export function useSharedYearlyTargets() {
     notifyChannel(yearlyTargetsChannel, merged, true);
   };
 
-  const setYearlyTargetsOptimistic = (updater: (prev: any[]) => any[]) => {
+  const setYearlyTargetsOptimistic = (updater: SetStateAction<any[]>) => {
     const nowMs = Date.now();
-    const next = updater(yearlyTargetsChannel.data).map((t: any) => ({
+    const rawNext = typeof updater === 'function' ? updater(yearlyTargetsChannel.data) : updater;
+    const next = rawNext.map((t: any) => ({
       ...t,
       _id: t._id || t.id,
       _syncUpdatedAtMs: Math.max(Number(t._syncUpdatedAtMs) || 0, nowMs),
@@ -1022,7 +1142,7 @@ function loadInitialTravelSheets(): any[] {
     const raw = localStorage.getItem('blackworm_cached_travel_sheets');
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed;
+      if (Array.isArray(parsed)) return parsed.filter((s: any) => s && !isRecordDeleted(s));
     }
   } catch {}
   return [];
@@ -1035,8 +1155,17 @@ function finalizeTravelSheetsList(rawItems: any[], archivedIds: Set<string>, aut
     archivedIds,
     authoritativeServer: authoritative,
   }).map((s: any) => ({ ...s, _id: s._id || s.id }));
-  safeLocalStorageSet('blackworm_cached_travel_sheets', JSON.stringify(merged));
-  return merged;
+  // Reconcile any matching sheet IDs non-destructively so rows are never dropped
+  const byId = new Map<string, any>();
+  merged.forEach((s: any) => {
+    const id = String(s?.id || s?._id || '').trim();
+    if (!id || isRecordDeleted(s)) return;
+    const existing = byId.get(id);
+    byId.set(id, existing ? mergeTravelSheetDocs(existing, s) : s);
+  });
+  const finalList = Array.from(byId.values());
+  safeLocalStorageSet('blackworm_cached_travel_sheets', JSON.stringify(finalList));
+  return finalList;
 }
 
 function startTravelSheetsListener() {
@@ -1065,7 +1194,8 @@ function startTravelSheetsListener() {
     travelSheetsChannel.unsub = onSnapshot(
       collection(db, 'travel_sheets'),
       (snap) => {
-        const { items } = applyIncrementalSnapshot(travelSheetsChannel, 'travel_sheets', snap);
+        const { items, skipNotify } = applyIncrementalSnapshot(travelSheetsChannel, 'travel_sheets', snap);
+        if (skipNotify) return;
         const merged = finalizeTravelSheetsList(items, travelSheetsChannel.archivedIds, !snap.metadata?.fromCache);
         notifyChannel(travelSheetsChannel, merged, true);
         if (!snap.metadata?.fromCache) {
@@ -1078,7 +1208,7 @@ function startTravelSheetsListener() {
           try { travelSheetsChannel.unsub(); } catch {}
           travelSheetsChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         void pullSecondaryIntoChannel(travelSheetsChannel, 'travel_sheets', finalizeTravelSheetsList);
       }
     );
@@ -1100,9 +1230,10 @@ export function useSharedTravelSheets() {
     });
   }, []);
 
-  const setTravelSheetsOptimistic = (updater: (prev: any[]) => any[]) => {
+  const setTravelSheetsOptimistic = (updater: SetStateAction<any[]>) => {
     const nowMs = Date.now();
-    const next = updater(travelSheetsChannel.data).map((s: any) => ({
+    const rawNext = typeof updater === 'function' ? updater(travelSheetsChannel.data) : updater;
+    const next = rawNext.map((s: any) => ({
       ...s,
       _id: s._id || s.id,
       _syncUpdatedAtMs: Math.max(Number(s._syncUpdatedAtMs) || 0, nowMs),
@@ -1164,7 +1295,7 @@ function applyMasterPricelistDoc(data: any, authoritativeServer = false) {
     return;
   }
   if (incomingTs > 0) masterPricelistDocTs = incomingTs;
-  const clean = deduplicateProducts(data.products.filter((p: any) => !p.isArchived));
+  const clean = deduplicateProducts(data.products.filter((p: any) => !isRecordDeleted(p)));
   const nextState: MasterPricelistState = {
     products: clean,
     validityDate: data.validityDate || '',
@@ -1233,7 +1364,7 @@ function startMasterPricelistListener() {
           try { masterPricelistChannel.unsub(); } catch {}
           masterPricelistChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         pullMasterPricelistFromSecondary();
       }
     );
@@ -1242,6 +1373,27 @@ function startMasterPricelistListener() {
     masterPricelistChannel.unsub = null;
     pullMasterPricelistFromSecondary();
   }
+}
+
+export function setMasterPricelistStateOptimistic(products: any[], validityDate?: string) {
+  const clean = deduplicateProducts((products || []).filter((p: any) => !isRecordDeleted(p)));
+  const resolvedValidity = validityDate !== undefined ? validityDate : masterPricelistChannel.data.validityDate;
+  masterPricelistDocTs = Date.now();
+  const nextState: MasterPricelistState = {
+    products: clean,
+    validityDate: resolvedValidity,
+  };
+  safeLocalStorageSet(
+    'blackworm_master_pricelist',
+    JSON.stringify({
+      products: clean,
+      validityDate: resolvedValidity,
+      updatedAt: new Date(masterPricelistDocTs).toISOString(),
+      _syncUpdatedAtMs: masterPricelistDocTs,
+    })
+  );
+  safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(clean));
+  notifyChannel(masterPricelistChannel, nextState, true);
 }
 
 export function useSharedMasterPricelist() {
@@ -1255,7 +1407,12 @@ export function useSharedMasterPricelist() {
     });
   }, []);
 
-  return { products: state.products, validityDate: state.validityDate, loaded };
+  return {
+    products: state.products,
+    validityDate: state.validityDate,
+    loaded,
+    setMasterPricelistOptimistic: setMasterPricelistStateOptimistic,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,7 +1426,7 @@ function loadInitialOutstanding(): any[] {
     const raw = localStorage.getItem('blackworm_saved_outstanding_records');
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed.filter((r: any) => r && !r.isArchived);
+      if (Array.isArray(parsed)) return parsed.filter((r: any) => r && !isRecordDeleted(r));
     }
   } catch {}
   return [];
@@ -1313,7 +1470,8 @@ function startOutstandingListener() {
     outstandingChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(outstandingChannel, 'outstanding_records', snap, 1000);
+        const { items, skipNotify } = applyIncrementalSnapshot(outstandingChannel, 'outstanding_records', snap, 1000);
+        if (skipNotify) return;
         const merged = finalizeOutstandingList(items, outstandingChannel.archivedIds, !snap.metadata?.fromCache);
         notifyChannel(outstandingChannel, merged, true);
         if (!snap.metadata?.fromCache && merged.length > 0) {
@@ -1326,7 +1484,7 @@ function startOutstandingListener() {
           try { outstandingChannel.unsub(); } catch {}
           outstandingChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         void pullSecondaryIntoChannel(outstandingChannel, 'outstanding_records', finalizeOutstandingList);
       }
     );
@@ -1348,9 +1506,10 @@ export function useSharedOutstandingRecords() {
     });
   }, []);
 
-  const setOutstandingOptimistic = (updater: (prev: any[]) => any[]) => {
+  const setOutstandingOptimistic = (updater: SetStateAction<any[]>) => {
     const nowMs = Date.now();
-    const next = updater(outstandingChannel.data);
+    const rawNext = typeof updater === 'function' ? updater(outstandingChannel.data) : updater;
+    const next = Array.isArray(rawNext) ? rawNext : [];
     const nextIds = new Set<string>();
     next.forEach((r: any) => {
       if (r?.id) {
@@ -1457,7 +1616,7 @@ function startSchemeDiscountsListener() {
           try { schemeDiscountsChannel.unsub(); } catch {}
           schemeDiscountsChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         pullSchemeDiscountsFromSecondary();
       }
     );
@@ -1480,6 +1639,7 @@ export function useSharedSchemeDiscounts() {
   }, []);
 
   const setDiscountsOptimistic = (updater: (prev: Record<string, number>) => Record<string, number>) => {
+    schemeDiscountsDocTs = Date.now();
     const next = updater(schemeDiscountsChannel.data);
     safeLocalStorageSet(SCHEME_DISCOUNTS_KEY, JSON.stringify(next));
     notifyChannel(schemeDiscountsChannel, next, schemeDiscountsChannel.loaded);
@@ -1554,7 +1714,8 @@ function startLocationVillagesListener() {
     locationVillagesChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(locationVillagesChannel, 'location_villages', snap, 2000);
+        const { items, skipNotify } = applyIncrementalSnapshot(locationVillagesChannel, 'location_villages', snap, 2000);
+        if (skipNotify) return;
         const sorted = finalizeLocationVillagesList(
           items,
           locationVillagesChannel.archivedIds,
@@ -1571,7 +1732,7 @@ function startLocationVillagesListener() {
           try { locationVillagesChannel.unsub(); } catch {}
           locationVillagesChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         void pullSecondaryIntoChannel(locationVillagesChannel, 'location_villages', finalizeLocationVillagesList);
       }
     );
@@ -1594,10 +1755,11 @@ export function useSharedLocationVillages() {
   }, []);
 
   const setLocationVillagesOptimistic = (
-    updater: (prev: LocationVillageItem[]) => LocationVillageItem[]
+    updater: SetStateAction<LocationVillageItem[]>
   ) => {
     const nowMs = Date.now();
-    const next = deduplicateLocationVillages(updater(locationVillagesChannel.data));
+    const rawNext = typeof updater === 'function' ? updater(locationVillagesChannel.data) : updater;
+    const next = deduplicateLocationVillages(rawNext);
     const nextIds = new Set<string>();
     next.forEach((v: any) => {
       if (v?.id) {
@@ -1781,7 +1943,8 @@ function startLocationTalukasListener() {
     locationTalukasChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(locationTalukasChannel, 'location_talukas', snap, 1000);
+        const { items, skipNotify } = applyIncrementalSnapshot(locationTalukasChannel, 'location_talukas', snap, 1000);
+        if (skipNotify) return;
         const sorted = finalizeLocationTalukasList(
           items,
           locationTalukasChannel.archivedIds,
@@ -1798,7 +1961,7 @@ function startLocationTalukasListener() {
           try { locationTalukasChannel.unsub(); } catch {}
           locationTalukasChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         void pullSecondaryIntoChannel(locationTalukasChannel, 'location_talukas', finalizeLocationTalukasList);
       }
     );
@@ -1823,10 +1986,11 @@ export function useSharedLocationTalukas() {
   }, []);
 
   const setLocationTalukasOptimistic = (
-    updater: (prev: LocationTalukaItem[]) => LocationTalukaItem[]
+    updater: SetStateAction<LocationTalukaItem[]>
   ) => {
     const nowMs = Date.now();
-    const next = deduplicateLocationTalukas(updater(locationTalukasChannel.data));
+    const rawNext = typeof updater === 'function' ? updater(locationTalukasChannel.data) : updater;
+    const next = deduplicateLocationTalukas(rawNext);
     const nextIds = new Set<string>();
     next.forEach((t: any) => {
       if (t?.id) {
@@ -1871,7 +2035,7 @@ const OFFICE_STAFF_CACHE_KEY = 'blackworm_cached_office_staff';
 function normalizeOfficeStaffList(rawItems: any[]): OfficeStaffMember[] {
   const map = new Map<string, OfficeStaffMember>();
   rawItems.forEach((it) => {
-    if (!it || !it.id || it.isArchived) return;
+    if (!it || !it.id || isRecordDeleted(it)) return;
     const prev = map.get(it.id);
     if (!prev || toTimestampMs(it.updatedAt || it.createdAt) >= toTimestampMs(prev.updatedAt || prev.createdAt)) {
       map.set(it.id, {
@@ -1884,22 +2048,50 @@ function normalizeOfficeStaffList(rawItems: any[]): OfficeStaffMember[] {
     }
   });
 
-  // Deduplicate by linkedUserUid or normalized (fullName + category), preferring non-staff_user manual entries or newest timestamp
-  const deduped = new Map<string, OfficeStaffMember>();
+  // Pass 1: Deduplicate by linkedUserUid (when linked to same user account)
+  const dedupedByUid = new Map<string, OfficeStaffMember>();
   Array.from(map.values()).forEach((item) => {
     const normName = item.fullName.toLowerCase().replace(/\s+/g, ' ').trim();
-    const dedupKey = item.linkedUserUid
+    const uidKey = item.linkedUserUid
       ? `uid:${item.linkedUserUid}`
-      : `name:${normName}|${item.category}`;
-    const existing = deduped.get(dedupKey);
+      : `id:${item.id}`;
+    const existing = dedupedByUid.get(uidKey);
     if (!existing) {
-      deduped.set(dedupKey, item);
+      dedupedByUid.set(uidKey, item);
       return;
     }
     const existingTs = toTimestampMs(existing.updatedAt || existing.createdAt);
     const incomingTs = toTimestampMs(item.updatedAt || item.createdAt);
     if (incomingTs >= existingTs) {
-      deduped.set(dedupKey, item);
+      dedupedByUid.set(uidKey, item);
+    } else if (!normName) {
+      dedupedByUid.set(uidKey, existing);
+    }
+  });
+
+  // Pass 2: Person-level deduplication by normalized (fullName + category), preventing duplicate Warehouse/Godown Incharge rows
+  const deduped = new Map<string, OfficeStaffMember>();
+  Array.from(dedupedByUid.values()).forEach((item) => {
+    const normName = item.fullName.toLowerCase().replace(/\s+/g, ' ').trim();
+    const personKey = `name:${normName}|${item.category}`;
+    const existing = deduped.get(personKey);
+    if (!existing) {
+      deduped.set(personKey, item);
+      return;
+    }
+    const existingManual = !existing.id.startsWith('staff_user_');
+    const incomingManual = !item.id.startsWith('staff_user_');
+    if (incomingManual && !existingManual) {
+      deduped.set(personKey, item);
+      return;
+    }
+    if (existingManual && !incomingManual) {
+      return;
+    }
+    const existingTs = toTimestampMs(existing.updatedAt || existing.createdAt);
+    const incomingTs = toTimestampMs(item.updatedAt || item.createdAt);
+    if (incomingTs >= existingTs) {
+      deduped.set(personKey, item);
     }
   });
 
@@ -1967,7 +2159,8 @@ function startOfficeStaffListener() {
     officeStaffChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(officeStaffChannel, 'office_staff_members', snap, 500);
+        const { items, skipNotify } = applyIncrementalSnapshot(officeStaffChannel, 'office_staff_members', snap, 500);
+        if (skipNotify) return;
         const finalList = finalizeOfficeStaffList(
           items,
           officeStaffChannel.archivedIds,
@@ -1984,7 +2177,7 @@ function startOfficeStaffListener() {
           try { officeStaffChannel.unsub(); } catch {}
           officeStaffChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         void pullSecondaryIntoChannel(officeStaffChannel, 'office_staff_members', finalizeOfficeStaffList);
       }
     );
@@ -2007,10 +2200,11 @@ export function useSharedOfficeStaff() {
   }, []);
 
   const setOfficeStaffOptimistic = (
-    updater: (prev: OfficeStaffMember[]) => OfficeStaffMember[]
+    updater: SetStateAction<OfficeStaffMember[]>
   ) => {
     const nowMs = Date.now();
-    const next = normalizeOfficeStaffList(updater(officeStaffChannel.data));
+    const rawNext = typeof updater === 'function' ? updater(officeStaffChannel.data) : updater;
+    const next = normalizeOfficeStaffList(rawNext);
     const nextIds = new Set<string>();
     next.forEach((m: any) => {
       if (m?.id) {
@@ -2055,7 +2249,7 @@ const OFFICE_ATTENDANCE_CACHE_KEY = 'blackworm_cached_office_attendance';
 function normalizeOfficeAttendanceList(rawItems: any[]): OfficeStaffAttendanceRecord[] {
   const map = new Map<string, OfficeStaffAttendanceRecord>();
   rawItems.forEach((it) => {
-    if (!it || !it.id || it.isArchived) return;
+    if (!it || !it.id || isRecordDeleted(it)) return;
     const prev = map.get(it.id);
     if (!prev || toTimestampMs(it.updatedAt || it.markedAt || it.createdAt) >= toTimestampMs(prev.updatedAt || prev.markedAt || prev.createdAt)) {
       const dateStr = String(it.date || '').slice(0, 10);
@@ -2140,7 +2334,8 @@ function startOfficeAttendanceListener() {
     officeAttendanceChannel.unsub = onSnapshot(
       q,
       (snap) => {
-        const { items } = applyIncrementalSnapshot(officeAttendanceChannel, 'office_staff_attendance', snap, 2000);
+        const { items, skipNotify } = applyIncrementalSnapshot(officeAttendanceChannel, 'office_staff_attendance', snap, 2000);
+        if (skipNotify) return;
         const finalList = finalizeOfficeAttendanceList(
           items,
           officeAttendanceChannel.archivedIds,
@@ -2157,7 +2352,7 @@ function startOfficeAttendanceListener() {
           try { officeAttendanceChannel.unsub(); } catch {}
           officeAttendanceChannel.unsub = null;
         }
-        if (isQuotaError(err)) setQuotaBlocked(15 * 60 * 1000);
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
         void pullSecondaryIntoChannel(officeAttendanceChannel, 'office_staff_attendance', finalizeOfficeAttendanceList);
       }
     );
@@ -2182,10 +2377,11 @@ export function useSharedOfficeAttendance() {
   }, []);
 
   const setOfficeAttendanceOptimistic = (
-    updater: (prev: OfficeStaffAttendanceRecord[]) => OfficeStaffAttendanceRecord[]
+    updater: SetStateAction<OfficeStaffAttendanceRecord[]>
   ) => {
     const nowMs = Date.now();
-    const next = normalizeOfficeAttendanceList(updater(officeAttendanceChannel.data));
+    const rawNext = typeof updater === 'function' ? updater(officeAttendanceChannel.data) : updater;
+    const next = normalizeOfficeAttendanceList(rawNext);
     const nextIds = new Set<string>();
     next.forEach((a: any) => {
       if (a?.id) {
@@ -2205,10 +2401,211 @@ export function useSharedOfficeAttendance() {
 }
 
 // ---------------------------------------------------------------------------
-// 14. GLOBAL MULTI-TIER FAILOVER RESYNC COORDINATOR
+// 14. SHARED MONTHLY TARGETS STORE (targets collection - Primary + Secondary)
 // ---------------------------------------------------------------------------
+function loadInitialTargets(): any[] {
+  try {
+    if (typeof window === 'undefined') return [];
+    const local = mergeWithLocalData<any>('targets', []);
+    if (local.length > 0) return local;
+    const cached = localStorage.getItem('blackworm_cached_targets');
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed)) return parsed.filter((t: any) => t && !isRecordDeleted(t));
+    }
+  } catch {}
+  return [];
+}
+
+const targetsChannel = createChannel<any[]>(loadInitialTargets());
+
+function finalizeTargetsList(rawItems: any[], archivedIds: Set<string>, authoritative: boolean): any[] {
+  const merged = mergeWithLocalData<any>('targets', rawItems, {
+    archivedIds,
+    authoritativeServer: authoritative,
+  });
+  safeLocalStorageSet('blackworm_cached_targets', JSON.stringify(merged));
+  return merged;
+}
+
+function startTargetsListener() {
+  ensureGlobalResyncListeners();
+  if (!targetsChannel.secUnsub) {
+    targetsChannel.secUnsub = subscribeSecondaryCollection('targets', (events) => {
+      const updated = applySecondaryDeltas(targetsChannel, 'targets', events);
+      if (updated) {
+        notifyChannel(targetsChannel, finalizeTargetsList(updated, targetsChannel.archivedIds, false), true);
+      }
+    });
+  }
+
+  if (!targetsChannel.secPulledOnce) {
+    targetsChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(targetsChannel, 'targets', finalizeTargetsList);
+  }
+
+  if (targetsChannel.unsub) return;
+  if (isQuotaBlocked()) {
+    void pullSecondaryIntoChannel(targetsChannel, 'targets', finalizeTargetsList);
+    return;
+  }
+
+  try {
+    targetsChannel.unsub = onSnapshot(
+      collection(db, 'targets'),
+      (snap) => {
+        const { items, skipNotify } = applyIncrementalSnapshot(targetsChannel, 'targets', snap);
+        if (skipNotify) return;
+        const merged = finalizeTargetsList(items, targetsChannel.archivedIds, !snap.metadata?.fromCache);
+        notifyChannel(targetsChannel, merged, true);
+        if (!snap.metadata?.fromCache && merged.length > 0) {
+          bootstrapCollectionToSecondary('targets', merged);
+        }
+      },
+      (err) => {
+        console.warn('Shared targets sync notice:', err);
+        if (targetsChannel.unsub) {
+          try { targetsChannel.unsub(); } catch {}
+          targetsChannel.unsub = null;
+        }
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
+        void pullSecondaryIntoChannel(targetsChannel, 'targets', finalizeTargetsList);
+      }
+    );
+  } catch (e) {
+    console.warn('Failed to start shared targets listener:', e);
+    targetsChannel.unsub = null;
+    void pullSecondaryIntoChannel(targetsChannel, 'targets', finalizeTargetsList);
+  }
+}
+
+export function useSharedTargets() {
+  const [targets, setTargets] = useState<any[]>(() => targetsChannel.data);
+  const [loaded, setLoaded] = useState<boolean>(() => targetsChannel.loaded);
+
+  useEffect(() => {
+    return subscribeChannel(targetsChannel, startTargetsListener, (val, isLoaded) => {
+      setTargets(val);
+      setLoaded(isLoaded);
+    });
+  }, []);
+
+  return { targets, loaded };
+}
+
+// ---------------------------------------------------------------------------
+// 15. IN-TAB INSTANT MUTATION PROPAGATION + GLOBAL MULTI-TIER FAILOVER COORDINATOR
+// ---------------------------------------------------------------------------
+const channelRegistry: Record<
+  string,
+  {
+    channel: StoreChannel<any[]>;
+    finalize: (items: any[], archivedIds: Set<string>, authoritative: boolean) => any[];
+  }
+> = {
+  users: { channel: usersChannel, finalize: finalizeUsersList },
+  dealers_application: { channel: dealersChannel, finalize: finalizeDealersList },
+  orders: { channel: ordersChannel, finalize: finalizeOrdersList },
+  collection_entries: { channel: collectionsChannel, finalize: finalizeCollectionsList },
+  yearly_targets: { channel: yearlyTargetsChannel, finalize: finalizeYearlyTargetsList },
+  travel_sheets: { channel: travelSheetsChannel, finalize: finalizeTravelSheetsList },
+  outstanding_records: { channel: outstandingChannel, finalize: finalizeOutstandingList },
+  location_villages: { channel: locationVillagesChannel, finalize: finalizeLocationVillagesList },
+  location_talukas: { channel: locationTalukasChannel, finalize: finalizeLocationTalukasList },
+  office_staff_members: { channel: officeStaffChannel, finalize: finalizeOfficeStaffList },
+  office_staff_attendance: { channel: officeAttendanceChannel, finalize: finalizeOfficeAttendanceList },
+  targets: { channel: targetsChannel, finalize: finalizeTargetsList },
+};
+
+function handleLocalRecordMutation(detail: {
+  collection?: string;
+  id?: string;
+  doc?: any;
+  merge?: boolean;
+  deleted?: boolean;
+  updatedAtMs?: number;
+}) {
+  const col = String(detail?.collection || '').trim();
+  const id = String(detail?.id || '').trim();
+  if (!col || !id) return;
+
+  if (col === 'config' && id === 'master_pricelist' && detail.doc && !detail.deleted) {
+    applyMasterPricelistDoc(
+      { ...detail.doc, ...(detail.updatedAtMs ? { _syncUpdatedAtMs: detail.updatedAtMs } : {}) },
+      false
+    );
+    return;
+  }
+  if (col === 'config' && id === 'schemes_extra_discounts' && detail.doc && !detail.deleted) {
+    applySchemeDiscountsDoc(
+      { ...detail.doc, ...(detail.updatedAtMs ? { _syncUpdatedAtMs: detail.updatedAtMs } : {}) },
+      false
+    );
+    return;
+  }
+
+  const entry = channelRegistry[col];
+  if (!entry) return;
+  const { channel, finalize } = entry;
+
+  if (detail.deleted || isRecordDeleted(detail.doc)) {
+    channel.secIds.delete(id);
+    channel.archivedIds.add(id);
+    channel.docMap.delete(id);
+  } else if (detail.doc && typeof detail.doc === 'object') {
+    const existing = channel.docMap.get(id);
+    const mergedDoc =
+      col === 'travel_sheets' && existing && Array.isArray(existing.rows) && Array.isArray(detail.doc.rows)
+        ? mergeTravelSheetDocs(existing, { ...detail.doc, id })
+        : detail.merge !== false && existing
+          ? { ...existing, ...detail.doc, id }
+          : { ...detail.doc, id };
+    if (detail.updatedAtMs && !mergedDoc._syncUpdatedAtMs) {
+      mergedDoc._syncUpdatedAtMs = detail.updatedAtMs;
+    }
+    channel.archivedIds.delete(id);
+    channel.docMap.set(id, mergedDoc);
+  }
+
+  const next = finalize(Array.from(channel.docMap.values()), channel.archivedIds, false);
+  notifyChannel(channel, next, channel.loaded || next.length > 0);
+}
+
 let globalResyncAttached = false;
 let lastGlobalPullAt = 0;
+let needsReadRecoveryProbe = false;
+let isProbingReadRecovery = false;
+let lastReadProbeAtMs = 0;
+
+async function probeAndReattachListeners(forceProbe = false) {
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+  if (isQuotaBlocked()) return;
+
+  if (needsReadRecoveryProbe) {
+    const now = Date.now();
+    if (isProbingReadRecovery) return;
+    if (!forceProbe && now - lastReadProbeAtMs < 30000) return;
+    isProbingReadRecovery = true;
+    lastReadProbeAtMs = now;
+    try {
+      await getDocFromServer(doc(db, 'test', 'connection'));
+      trackFirestoreUsage('read', 1);
+      needsReadRecoveryProbe = false;
+      resetReadQuotaBackoff();
+    } catch (err: any) {
+      if (isQuotaError(err)) {
+        setQuotaBlocked(2 * 60 * 1000);
+        return;
+      }
+      // Non-quota error (e.g. offline/network): wait before retrying full reattach
+      return;
+    } finally {
+      isProbingReadRecovery = false;
+    }
+  }
+
+  reattachAllActiveListeners();
+}
 
 export async function hydrateAllChannelsFromSecondary(force = false): Promise<void> {
   const now = Date.now();
@@ -2233,6 +2630,9 @@ export async function hydrateAllChannelsFromSecondary(force = false): Promise<vo
   }
   if (shouldPull(yearlyTargetsChannel)) {
     jobs.push(pullSecondaryIntoChannel(yearlyTargetsChannel, 'yearly_targets', finalizeYearlyTargetsList));
+  }
+  if (shouldPull(targetsChannel)) {
+    jobs.push(pullSecondaryIntoChannel(targetsChannel, 'targets', finalizeTargetsList));
   }
   if (shouldPull(travelSheetsChannel)) {
     jobs.push(pullSecondaryIntoChannel(travelSheetsChannel, 'travel_sheets', finalizeTravelSheetsList));
@@ -2269,6 +2669,7 @@ function reattachAllActiveListeners() {
   if (ordersChannel.subscribers.size > 0 && !ordersChannel.unsub) startOrdersListener();
   if (collectionsChannel.subscribers.size > 0 && !collectionsChannel.unsub) startCollectionsListener();
   if (yearlyTargetsChannel.subscribers.size > 0 && !yearlyTargetsChannel.unsub) startYearlyTargetsListener();
+  if (targetsChannel.subscribers.size > 0 && !targetsChannel.unsub) startTargetsListener();
   if (travelSheetsChannel.subscribers.size > 0 && !travelSheetsChannel.unsub) startTravelSheetsListener();
   if (masterPricelistChannel.subscribers.size > 0 && !masterPricelistChannel.unsub) startMasterPricelistListener();
   if (outstandingChannel.subscribers.size > 0 && !outstandingChannel.unsub) startOutstandingListener();
@@ -2283,11 +2684,15 @@ function ensureGlobalResyncListeners() {
   if (typeof window === 'undefined' || globalResyncAttached) return;
   globalResyncAttached = true;
 
+  window.addEventListener('blackworm_local_record_mutation', (e: any) => {
+    handleLocalRecordMutation(e?.detail || {});
+  });
   window.addEventListener('blackworm_quota_blocked', () => {
+    needsReadRecoveryProbe = true;
     void hydrateAllChannelsFromSecondary(true);
   });
   window.addEventListener('blackworm_data_refresh', () => {
-    reattachAllActiveListeners();
+    void probeAndReattachListeners(true);
     void hydrateAllChannelsFromSecondary(true);
   });
   window.addEventListener('blackworm_secondary_resync', (e: any) => {
@@ -2301,26 +2706,27 @@ function ensureGlobalResyncListeners() {
     void hydrateAllChannelsFromSecondary(isUrgent);
   });
   window.addEventListener('blackworm_quota_cleared', () => {
-    reattachAllActiveListeners();
+    void probeAndReattachListeners(true);
   });
   window.addEventListener('online', () => {
-    reattachAllActiveListeners();
+    void probeAndReattachListeners(false);
   });
   window.addEventListener('focus', () => {
-    reattachAllActiveListeners();
+    void probeAndReattachListeners(false);
   });
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
-        reattachAllActiveListeners();
+        void probeAndReattachListeners(false);
       }
     });
   }
-  // Auto-recovery heartbeat: if any active channel lost its onSnapshot listener, re-attach automatically
+  // Auto-recovery heartbeat: if any active channel lost its onSnapshot listener, re-attach safely
   setInterval(() => {
-    reattachAllActiveListeners();
+    void probeAndReattachListeners(false);
   }, 20000);
 }
 
-
-
+if (typeof window !== 'undefined') {
+  ensureGlobalResyncListeners();
+}

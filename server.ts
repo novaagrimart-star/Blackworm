@@ -9,6 +9,76 @@ import { secondarySyncDb, isValidSyncCollection, isValidSyncDocId } from './serv
 
 dotenv.config();
 
+if (process.env.NODE_ENV !== 'production' && !process.env.BLACKWORM_BUILD_ID) {
+  process.env.BLACKWORM_BUILD_ID = `dev_${Date.now().toString(36)}`;
+}
+
+function getServerBuildMetadata() {
+  const pkgPath = path.join(process.cwd(), 'package.json');
+  const fbPath = path.join(process.cwd(), 'firebase-applet-config.json');
+  const distVersionPath = path.join(process.cwd(), 'dist', 'version.json');
+  let version = '1.0.1';
+  let firebaseProjectId = '';
+  let firestoreDatabaseId = '';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+    if (pkg?.version) version = String(pkg.version);
+  } catch {}
+  try {
+    const fb = JSON.parse(fs.readFileSync(fbPath, 'utf-8'));
+    firebaseProjectId = String(fb?.projectId || '');
+    firestoreDatabaseId = String(fb?.firestoreDatabaseId || '');
+  } catch {}
+
+  if (process.env.NODE_ENV === 'production' && fs.existsSync(distVersionPath)) {
+    try {
+      const distMeta = JSON.parse(fs.readFileSync(distVersionPath, 'utf-8'));
+      return {
+        version: String(distMeta?.version || version),
+        buildId: String(distMeta?.buildId || process.env.BLACKWORM_BUILD_ID || 'prod'),
+        builtAt: String(distMeta?.builtAt || ''),
+        firebaseProjectId: String(distMeta?.firebaseProjectId || firebaseProjectId),
+        firestoreDatabaseId: String(distMeta?.firestoreDatabaseId || firestoreDatabaseId),
+      };
+    } catch {}
+  }
+
+  return {
+    version,
+    buildId: String(process.env.BLACKWORM_BUILD_ID || 'dev'),
+    builtAt: new Date().toISOString(),
+    firebaseProjectId,
+    firestoreDatabaseId,
+  };
+}
+
+const SERVER_BUILD_INFO = getServerBuildMetadata();
+
+if (process.env.NODE_ENV !== 'production') {
+  try {
+    const srcDir = path.join(process.cwd(), 'src');
+    if (fs.existsSync(srcDir)) {
+      let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+      fs.watch(srcDir, { recursive: true }, (_evt, filename) => {
+        if (!filename) return;
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          const nextBuildId = `dev_${Date.now().toString(36)}`;
+          SERVER_BUILD_INFO.buildId = nextBuildId;
+          SERVER_BUILD_INFO.builtAt = new Date().toISOString();
+          process.env.BLACKWORM_BUILD_ID = nextBuildId;
+          try {
+            secondarySyncDb.broadcastEvent('build_update', {
+              version: SERVER_BUILD_INFO.version,
+              buildId: nextBuildId,
+            });
+          } catch {}
+        }, 600);
+      });
+    }
+  } catch {}
+}
+
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY || '',
   httpOptions: {
@@ -50,16 +120,54 @@ async function createServer() {
     next();
   });
 
+  // Enable cross-origin API, root HTML, & version checks so packaged Android APK WebViews / Capacitor shells share exact same backend and OTA updates
+  app.use((req, res, next) => {
+    const reqPath = (req.url || '').split('?')[0];
+    if (
+      reqPath.startsWith('/api') ||
+      reqPath === '/version.json' ||
+      reqPath === '/' ||
+      reqPath === '/index.html'
+    ) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control, Pragma');
+      if (req.method === 'OPTIONS') {
+        res.status(204).end();
+        return;
+      }
+    }
+    next();
+  });
+
   app.use(express.json({ limit: '10mb' }));
 
   // Simple Request Logging for production debugging
   app.use((req, res, next) => {
-    if (req.url.startsWith('/api/') || req.url.startsWith('/assets/')) {
+    if (req.url.startsWith('/api/') || req.url.startsWith('/assets/') || req.url.startsWith('/version.json')) {
       next();
       return;
     }
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     next();
+  });
+
+  // Live App Version & Single-Source-of-Truth check (Zero Firebase reads)
+  app.get(['/api/app-version', '/version.json'], (_req, res) => {
+    res.set({
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      Pragma: 'no-cache',
+      Expires: '0',
+    });
+    let serverEpoch = '';
+    try {
+      serverEpoch = secondarySyncDb.getStats().serverEpoch || '';
+    } catch {}
+    res.json({
+      ok: true,
+      ...SERVER_BUILD_INFO,
+      serverEpoch,
+    });
   });
 
   // Server-side credential verification endpoint (timing-safe comparison, zero raw password in response)
@@ -383,6 +491,8 @@ async function createServer() {
         latestRevision: stats.latestRevision,
         serverEpoch: stats.serverEpoch,
         engine: stats.engine,
+        version: SERVER_BUILD_INFO.version,
+        buildId: SERVER_BUILD_INFO.buildId,
       })}\n\n`
     );
 
@@ -413,7 +523,7 @@ async function createServer() {
     });
   });
 
-  app.get('/api/sync/collection/:name', async (req, res) => {
+  app.get('/api/sync/collection/:name', (req, res) => {
     try {
       const colName = String(req.params.name || '').trim();
       if (!isValidSyncCollection(colName)) {
@@ -424,11 +534,7 @@ async function createServer() {
       const offset = Number(req.query.offset) || 0;
       const includeDeleted = req.query.includeDeleted === 'true' || req.query.includeDeleted === '1';
 
-      let result = secondarySyncDb.getCollection(colName, { sinceMs, limit, offset, includeDeleted });
-      if (result.total === 0 && sinceMs === 0 && secondarySyncDb.isAnyFallbackConfigured()) {
-        await secondarySyncDb.restoreFromCloudMirror(false).catch(() => {});
-        result = secondarySyncDb.getCollection(colName, { sinceMs, limit, offset, includeDeleted });
-      }
+      const result = secondarySyncDb.getCollection(colName, { sinceMs, limit, offset, includeDeleted });
       res.json({ ok: true, ...result });
     } catch {
       res.status(500).json({ ok: false, error: 'Failed to query secondary collection' });
@@ -450,16 +556,35 @@ async function createServer() {
   app.get('/api/sync/export-all', (req, res) => {
     try {
       const sinceMs = Number(req.query.sinceMs) || 0;
-      const payload = secondarySyncDb.exportAllRows(sinceMs);
+      const limit = Number(req.query.limit) || 50000;
+      const payload = secondarySyncDb.exportAllRows(sinceMs, limit);
       res.json({ ok: true, ...payload });
     } catch {
       res.status(500).json({ ok: false, error: 'Export failed' });
     }
   });
 
+  app.post('/api/sync/backup', (req, res) => {
+    try {
+      const reason = String(req.body?.reason || req.query?.reason || 'manual');
+      const snapshot = secondarySyncDb.createBackupSnapshot(reason);
+      res.json(snapshot);
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Backup failed' });
+    }
+  });
+
+  app.get('/api/sync/backups', (_req, res) => {
+    try {
+      res.json({ ok: true, backups: secondarySyncDb.listBackups() });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Failed to list backups' });
+    }
+  });
+
   app.post('/api/sync/upsert', (req, res) => {
     try {
-      const { collection, id, doc: docData, updatedAtMs, deleted, merge } = req.body || {};
+      const { collection, id, doc: docData, updatedAtMs, deleted, merge, isBootstrap } = req.body || {};
       const colStr = String(collection || '').trim();
       const idStr = String(id || '').trim();
       if (!isValidSyncCollection(colStr) || !isValidSyncDocId(idStr)) {
@@ -472,6 +597,7 @@ async function createServer() {
         updatedAtMs: updatedAtMs ? Number(updatedAtMs) : undefined,
         deleted: Boolean(deleted),
         merge: merge !== false,
+        isBootstrap: Boolean(isBootstrap),
       });
       res.json({
         ok: true,
@@ -515,62 +641,21 @@ async function createServer() {
     }
   });
 
-  app.get('/api/sync/cloud-config', (_req, res) => {
-    try {
-      res.json({ ok: true, ...secondarySyncDb.getCloudConfigPublic() });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || 'Failed to read cloud config' });
-    }
-  });
-
-  app.post('/api/sync/cloud-config', async (req, res) => {
-    try {
-      const { type, url, apiKey } = req.body || {};
-      const validType = type === 'supabase' || type === 'relay' || type === 'peer' ? type : 'none';
-      const result = await secondarySyncDb.setCloudConfig({
-        type: validType,
-        url: String(url || ''),
-        apiKey: String(apiKey || ''),
-      });
-      res.status(result.ok ? 200 : 400).json({ ...result, config: secondarySyncDb.getCloudConfigPublic() });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || 'Failed to save cloud config' });
-    }
-  });
-
-  app.post('/api/sync/restore-cloud', async (_req, res) => {
-    try {
-      const result = await secondarySyncDb.restoreFromCloudMirror(false);
-      res.json({ ok: !result.error, ...result, stats: secondarySyncDb.getStats() });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || 'Cloud restore failed' });
-    }
-  });
-
-  app.post('/api/sync/force-cloud-sync', async (_req, res) => {
-    try {
-      const pushed = await secondarySyncDb.pushAllLocalToCloudMirror();
-      const result = await secondarySyncDb.restoreFromCloudMirror(false);
-      res.json({
-        ok: !result.error,
-        pushed,
-        restored: result.restored,
-        ...(result.error ? { error: result.error } : {}),
-        stats: secondarySyncDb.getStats(),
-      });
-    } catch (err: any) {
-      res.status(500).json({ ok: false, error: err?.message || 'Cloud sync failed' });
-    }
-  });
-
   // Return clean JSON 404 for unmatched API routes before SPA middlewares handle them
   app.all('/api/*', (_req, res) => {
     res.status(404).json({ error: 'API route not found' });
   });
 
-  // Never cache Service Worker or manifest
+  // Never cache Service Worker, manifest, or version manifest
   app.use((req, res, next) => {
-    if (req.url === '/sw.js' || req.url.startsWith('/dev-sw.js') || req.url === '/manifest.webmanifest' || req.url === '/registerSW.js') {
+    const reqPath = (req.url || '').split('?')[0];
+    if (
+      reqPath === '/sw.js' ||
+      reqPath.startsWith('/dev-sw.js') ||
+      reqPath === '/manifest.webmanifest' ||
+      reqPath === '/registerSW.js' ||
+      reqPath === '/version.json'
+    ) {
       res.set({
         'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
         'Pragma': 'no-cache',
@@ -600,8 +685,19 @@ async function createServer() {
 
   if (process.env.NODE_ENV === 'production' && fs.existsSync(indexPath)) {
     console.log('Serving production-ready application from dist/');
-    app.use('/assets', express.static(path.join(distPath, 'assets'), { maxAge: '1y' }));
-    app.use(express.static(distPath, { index: false }));
+    app.use('/assets', express.static(path.join(distPath, 'assets'), { maxAge: '1y', immutable: true }));
+    app.use(
+      express.static(distPath, {
+        index: false,
+        setHeaders: (res, filePath) => {
+          if (/\.(html|webmanifest)$/i.test(filePath) || /(?:sw\.js|registerSW\.js|version\.json)$/i.test(filePath)) {
+            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+            res.setHeader('Pragma', 'no-cache');
+            res.setHeader('Expires', '0');
+          }
+        },
+      })
+    );
     
     app.get('*', (req, res) => {
       if (req.url.startsWith('/api/')) {

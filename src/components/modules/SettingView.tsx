@@ -5,9 +5,17 @@ import {
   exportFullDatabaseBackup,
   restoreDatabaseFromJson,
   forceMultiTierSyncAll,
-  getLocalDateStr,
 } from '../../lib/dataService';
+import { hydrateAllChannelsFromSecondary } from '../../lib/realtimeStore';
 import { safeClearTransientCaches } from '../../lib/localVault';
+import {
+  APP_VERSION,
+  APP_BUILD_ID,
+  SINGLE_SOURCE_OF_TRUTH,
+  applyRemoteAppUpdate,
+  checkRemoteAppVersion,
+  resolveApiUrl,
+} from '../../lib/appVersion';
 import { Language, translations } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
 import {
@@ -40,8 +48,18 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
   const [isSavingLogo, setIsSavingLogo] = useState<boolean>(false);
   const [brandingSavedToast, setBrandingSavedToast] = useState<boolean>(false);
   const [isClearingCache, setIsClearingCache] = useState<boolean>(false);
+  const [refreshStatus, setRefreshStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [remoteVersionInfo, setRemoteVersionInfo] = useState<{
+    buildId: string;
+    version: string;
+    hasUpdate: boolean;
+  } | null>(null);
   const [isExportingBackup, setIsExportingBackup] = useState<boolean>(false);
+  const [isCreatingServerBackup, setIsCreatingServerBackup] = useState<boolean>(false);
   const [isRestoringBackup, setIsRestoringBackup] = useState<boolean>(false);
+  const [serverBackups, setServerBackups] = useState<
+    Array<{ filename: string; sizeBytes: number; modifiedAtMs: number }>
+  >([]);
   const [backupStatusMessage, setBackupStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const [localLogoSize, setLocalLogoSize] = useState<number>(logoSize);
@@ -56,6 +74,38 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
       if (sizeDebounceRef.current) clearTimeout(sizeDebounceRef.current);
     };
   }, []);
+
+  const loadServerBackups = async () => {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 4500);
+      const res = await fetch(resolveApiUrl('/api/sync/backups'), { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) return;
+      const json = await res.json();
+      if (json?.ok && Array.isArray(json.backups)) {
+        setServerBackups(json.backups);
+      }
+    } catch {}
+  };
+
+  useEffect(() => {
+    if (activeTab === 'cache') {
+      void checkRemoteAppVersion({ manual: true, forceReloadOnUpdate: false })
+        .then((res) => {
+          if (res.checked && res.remoteBuildId) {
+            setRemoteVersionInfo({
+              buildId: res.remoteBuildId,
+              version: res.remote?.version || APP_VERSION,
+              hasUpdate: res.hasUpdate,
+            });
+          }
+        })
+        .catch(() => {});
+    } else if (activeTab === 'backup' && isAdmin(profile)) {
+      void loadServerBackups();
+    }
+  }, [activeTab, profile]);
 
   const saveLogoConfig = async (newUrl: string, newSize: number) => {
     setIsSavingLogo(true);
@@ -159,16 +209,86 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
   });
 
   const handleClearCacheAndSync = async () => {
+    if (isClearingCache) return;
     setIsClearingCache(true);
-    try {
-      try {
-        await forceMultiTierSyncAll(true);
-      } catch (_) {}
+    setRefreshStatus(null);
 
-      await safeClearTransientCaches();
-      window.location.href = window.location.origin + window.location.pathname + '?fresh=' + Date.now();
-    } catch (e) {
-      window.location.reload();
+    try {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        setRefreshStatus({
+          type: 'error',
+          text: 'इंटरनेट कनेक्शन उपलब्ध नाही. ऑफलाइन डेटा सुरक्षित आहे, इंटरनेट सुरू झाल्यावर पुन्हा प्रयत्न करा.',
+        });
+        return;
+      }
+
+      // 1. Bounded multi-tier sync & channel refresh (never hangs)
+      const syncResult = await Promise.race([
+        (async () => {
+          const summary = await forceMultiTierSyncAll(true);
+          await hydrateAllChannelsFromSecondary(true);
+          return { ok: true as const, summary };
+        })(),
+        new Promise<{ ok: false; summary: null }>((resolve) =>
+          setTimeout(() => resolve({ ok: false, summary: null }), 10000)
+        ),
+      ]).catch(() => ({ ok: false as const, summary: null }));
+
+      // 2. Check remote build version without forcing blind redirect yet
+      const verRes = await checkRemoteAppVersion({
+        manual: true,
+        forceReloadOnUpdate: false,
+      });
+
+      if (verRes.checked && verRes.remoteBuildId) {
+        setRemoteVersionInfo({
+          buildId: verRes.remoteBuildId,
+          version: verRes.remote?.version || APP_VERSION,
+          hasUpdate: verRes.hasUpdate,
+        });
+      }
+
+      if (verRes.hasUpdate && verRes.remoteBuildId) {
+        setRefreshStatus({
+          type: 'success',
+          text: `नवीन अपडेट (v${verRes.remote?.version || APP_VERSION} • ${verRes.remoteBuildId}) आढळले! नवीन आवृत्ती लागू होत आहे...`,
+        });
+        await applyRemoteAppUpdate(verRes.remoteBuildId, verRes.remote?.version);
+        return;
+      }
+
+      // 3. Clear only transient HTTP/SW caches when on current build and report crisp outcome
+      await Promise.race([
+        safeClearTransientCaches(),
+        new Promise((r) => setTimeout(r, 2000)),
+      ]);
+
+      if (!verRes.checked) {
+        setRefreshStatus({
+          type: 'error',
+          text: syncResult.ok
+            ? 'स्थानिक डेटा रिफ्रेश झाला, परंतु सर्व्हर आवृत्ती तपासताना अडचण आली. कृपया पुन्हा प्रयत्न करा.'
+            : 'सर्व्हरशी संपर्क होऊ शकला नाही. कृपया इंटरनेट तपासून पुन्हा Refresh करा.',
+        });
+        return;
+      }
+
+      const pulled = syncResult.ok && syncResult.summary ? syncResult.summary.deltasPulled : 0;
+      const pending = syncResult.ok && syncResult.summary ? syncResult.summary.pendingRemaining : 0;
+      setRefreshStatus({
+        type: 'success',
+        text:
+          pending > 0
+            ? `रिफ्रेश पूर्ण! आवृत्ती v${APP_VERSION} अद्ययावत आहे (${pulled} नोंदी सिंक झाल्या, ${pending} नोंदी रांगेत).`
+            : `रिफ्रेश यशस्वी! सर्व डेटा सिंक झाला असून ॲप अद्ययावत आहे (v${APP_VERSION} • ${APP_BUILD_ID}).`,
+      });
+    } catch (err: any) {
+      setRefreshStatus({
+        type: 'error',
+        text: getFriendlyErrorMessage(err, 'रिफ्रेश करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'),
+      });
+    } finally {
+      setIsClearingCache(false);
     }
   };
 
@@ -179,16 +299,52 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
       const res = await exportFullDatabaseBackup(profile);
       setBackupStatusMessage({
         type: 'success',
-        text: `संपूर्ण डेटाबेस बॅकअप यशस्वीरित्या डाउनलोड झाला: ${res.filename}`
+        text: res.serverBackupFile
+          ? `संपूर्ण डेटाबेस बॅकअप यशस्वीरित्या डाउनलोड झाला (${res.filename}) आणि सर्व्हर स्नॅपशॉट सुरक्षित जतन झाला.`
+          : `संपूर्ण डेटाबेस बॅकअप यशस्वीरित्या डाउनलोड झाला: ${res.filename}`,
       });
+      void loadServerBackups();
     } catch (err: any) {
       console.error('Backup export failed:', err);
       setBackupStatusMessage({
         type: 'error',
-        text: getFriendlyErrorMessage(err, 'बॅकअप डाउनलोड करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.')
+        text: getFriendlyErrorMessage(err, 'बॅकअप डाउनलोड करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'),
       });
     } finally {
       setIsExportingBackup(false);
+    }
+  };
+
+  const handleCreateServerBackup = async () => {
+    if (isCreatingServerBackup) return;
+    setIsCreatingServerBackup(true);
+    setBackupStatusMessage(null);
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 8000);
+      const res = await fetch(resolveApiUrl('/api/sync/backup'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'manual_permanent_snapshot' }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const json = await res.json();
+      if (!res.ok || !json?.ok) {
+        throw new Error(json?.error || 'Server backup failed');
+      }
+      setBackupStatusMessage({
+        type: 'success',
+        text: `सर्व्हरवर कायमस्वरूपी स्नॅपशॉट सुरक्षित जतन झाला (${json.recordCount || 0} नोंदी).`,
+      });
+      await loadServerBackups();
+    } catch (err: any) {
+      setBackupStatusMessage({
+        type: 'error',
+        text: getFriendlyErrorMessage(err, 'सर्व्हर बॅकअप तयार करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'),
+      });
+    } finally {
+      setIsCreatingServerBackup(false);
     }
   };
 
@@ -200,7 +356,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
       isOpen: true,
       type: 'confirm',
       title: 'डेटाबेस रिस्टोर निश्चित करा',
-      message: `तुम्ही "${file.name}" या फाईलमधून डेटाबेस रिस्टोर करू इच्छिता का? फाईलमधील सर्व रेकॉर्ड्स डेटाबेसमध्ये अपडेट/रिस्टोर केले जातील.`,
+      message: `तुम्ही "${file.name}" या फाईलमधून डेटाबेस रिस्टोर करू इच्छिता का? फाईलमधील सर्व रेकॉर्ड्स सुरक्षितपणे जोडले जातील व नवीन लाइव्ह नोंदी Overwrite केल्या जाणार नाहीत.`,
       confirmText: 'होय, रिस्टोर करा',
       cancelText: 'रद्द करा',
       onConfirm: async () => {
@@ -215,12 +371,12 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
               const res = await restoreDatabaseFromJson(content, profile);
               setBackupStatusMessage({
                 type: 'success',
-                text: res.message
+                text: res.message,
               });
             } catch (err: any) {
               setBackupStatusMessage({
                 type: 'error',
-                text: getFriendlyErrorMessage(err, 'रिस्टोर करताना त्रुटी आली. कृपया वैध बॅकअप JSON फाईल निवडा.')
+                text: getFriendlyErrorMessage(err, 'रिस्टोर करताना त्रुटी आली. कृपया वैध बॅकअप JSON फाईल निवडा.'),
               });
             } finally {
               setIsRestoringBackup(false);
@@ -230,7 +386,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
             setIsRestoringBackup(false);
             setBackupStatusMessage({
               type: 'error',
-              text: 'फाईल वाचताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'
+              text: 'फाईल वाचताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.',
             });
           };
           reader.readAsText(file);
@@ -238,7 +394,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
           setIsRestoringBackup(false);
           setBackupStatusMessage({
             type: 'error',
-            text: getFriendlyErrorMessage(err, 'फाईल वाचण्यात त्रुटी आली. कृपया पुन्हा प्रयत्न करा.')
+            text: getFriendlyErrorMessage(err, 'फाईल वाचण्यात त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'),
           });
         }
       },
@@ -351,7 +507,43 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
       )}
 
       {activeTab === 'cache' && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-6 flex items-center justify-center">
+        <div className="bg-white rounded-2xl border border-slate-200 p-6 flex flex-col items-center justify-center gap-4 text-center">
+          <div className="space-y-1">
+            <p className="text-xs font-bold text-slate-900">
+              Installed Version: v{APP_VERSION} <span className="font-mono text-slate-500">({APP_BUILD_ID})</span>
+            </p>
+            {remoteVersionInfo && (
+              <p className="text-[11px] font-semibold text-slate-600">
+                Server Version: v{remoteVersionInfo.version}{' '}
+                <span className="font-mono text-slate-500">({remoteVersionInfo.buildId})</span>
+                {remoteVersionInfo.hasUpdate && (
+                  <span className="ml-1.5 text-amber-700 font-bold">• Update Available</span>
+                )}
+              </p>
+            )}
+            <p className="text-[11px] font-medium text-emerald-700">
+              Single Source of Truth: {SINGLE_SOURCE_OF_TRUTH.firebaseProjectId} • Real-Time Sync Active
+            </p>
+          </div>
+
+          {refreshStatus && (
+            <div
+              className={cn(
+                'w-full max-w-md p-3 rounded-xl border text-xs font-bold flex items-center justify-center gap-2',
+                refreshStatus.type === 'success'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-rose-50 border-rose-200 text-rose-800'
+              )}
+            >
+              {refreshStatus.type === 'success' ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              ) : (
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              )}
+              <span>{refreshStatus.text}</span>
+            </div>
+          )}
+
           <button
             type="button"
             onClick={handleClearCacheAndSync}
@@ -359,7 +551,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
             className="px-6 py-3 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white rounded-xl text-xs font-black transition flex items-center justify-center gap-2 shadow-sm active:scale-95 cursor-pointer"
           >
             <RefreshCw className={`w-4 h-4 ${isClearingCache ? 'animate-spin' : ''}`} />
-            <span>{isClearingCache ? 'Refreshing...' : 'Refresh Now'}</span>
+            <span>{isClearingCache ? 'Syncing & Checking Update...' : 'Check Update & Refresh Now'}</span>
           </button>
         </div>
       )}
@@ -372,7 +564,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
             <div className="space-y-1">
               <h4 className="font-bold text-xs text-emerald-900">डेटा सुरक्षितता व कायमस्वरूपी बॅकअप हमी (Permanent Data Safety)</h4>
               <p className="text-emerald-800 text-[11px] leading-relaxed font-medium">
-                ॲपमधील कोणताही सिंगल डेटा मॅन्युअल डिलीट केल्याशिवाय कधीही आपोआप डिलीट होत नाही. भविष्यात कोणत्याही परिस्थितीत ॲप इतर साइटवर किंवा नवीन सर्व्हरवर रन करण्यासाठी खालील बटनावर क्लिक करून संपूर्ण डेटाबेस फाईल डाउनलोड करा.
+                ॲपमधील कोणताही डेटा आपोआप डिलीट किंवा Overwrite होत नाही. खालील बटनावरून संपूर्ण डेटाबेस फाईल डाउनलोड करा किंवा सर्व्हरवर स्नॅपशॉट जतन करा.
               </p>
             </div>
           </div>
@@ -399,38 +591,61 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
               </div>
               <div>
                 <h3 className="text-xs sm:text-sm font-bold text-slate-900">Download Full Database Backup (.JSON)</h3>
-                <p className="text-[10.5px] text-slate-500 font-medium">Dealers, Orders, Collections, Travel, Targets, Users & Products</p>
+                <p className="text-[10.5px] text-slate-500 font-medium">Dealers, Orders, Collections, Travel, Targets, Outstanding, Users & Products</p>
               </div>
             </div>
 
             <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-0.5 text-slate-700">
               <p className="font-bold flex items-center gap-1.5 text-slate-800 text-[11px]">
                 <HardDrive className="w-3.5 h-3.5 text-slate-600" />
-                <span>Offline Persistence: Active</span>
+                <span>
+                  Offline Persistence: Active • Server Snapshots: {serverBackups.length}
+                </span>
               </p>
               <p className="text-[10.5px] text-slate-500">
-                This JSON backup can be restored on any device or site.
+                This JSON backup merges live, secondary, and offline records safely and can be restored anytime.
               </p>
             </div>
 
-            <button
-              type="button"
-              onClick={handleDownloadBackup}
-              disabled={isExportingBackup}
-              className="w-full py-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold shadow-xs transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer"
-            >
-              {isExportingBackup ? (
-                <>
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  <span>Exporting data...</span>
-                </>
-              ) : (
-                <>
-                  <Download className="w-3.5 h-3.5 stroke-[2.5]" />
-                  <span>Download Full Backup (.JSON)</span>
-                </>
-              )}
-            </button>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={handleDownloadBackup}
+                disabled={isExportingBackup}
+                className="w-full py-2 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold shadow-xs transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer"
+              >
+                {isExportingBackup ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Exporting data...</span>
+                  </>
+                ) : (
+                  <>
+                    <Download className="w-3.5 h-3.5 stroke-[2.5]" />
+                    <span>Download Full Backup (.JSON)</span>
+                  </>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleCreateServerBackup}
+                disabled={isCreatingServerBackup}
+                className="w-full py-2 bg-slate-800 hover:bg-slate-900 disabled:opacity-50 text-white rounded-lg text-xs font-bold shadow-xs transition flex items-center justify-center gap-2 active:scale-95 cursor-pointer"
+              >
+                {isCreatingServerBackup ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    <span>Saving Snapshot...</span>
+                  </>
+                ) : (
+                  <>
+                    <Database className="w-3.5 h-3.5" />
+                    <span>Save Server Snapshot Now</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
 
           {/* 2. Database Restore Card (For Admin/Owner) */}
@@ -442,7 +657,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
                 </div>
                 <div>
                   <h3 className="text-xs sm:text-sm font-bold text-slate-900">Restore / Import Database</h3>
-                  <p className="text-[10.5px] text-slate-500 font-medium">Restore all collections from a previously exported .JSON backup file</p>
+                  <p className="text-[10.5px] text-slate-500 font-medium">Restore safely from a previously exported .JSON backup file (preserves newer live records)</p>
                 </div>
               </div>
 

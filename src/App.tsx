@@ -1,49 +1,144 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { doc, onSnapshot } from 'firebase/firestore';
-import { db, testFirestoreConnection } from './firebase';
+import { db } from './firebase';
 import { UserProfile } from './lib/auth';
 import { Dashboard } from './components/Dashboard';
 import { Login } from './components/Login';
 import { Language } from './lib/i18n';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { startBackgroundSync, isQuotaBlocked, setQuotaBlocked, trackFirestoreUsage, toTimestampMs } from './lib/dataService';
-import { subscribeSecondaryCollection, fetchSecondaryCollection, autoHydrateServerFromLocalCache } from './lib/secondaryDb';
+import { startBackgroundSync, isQuotaBlocked, setQuotaBlocked, trackFirestoreUsage, toTimestampMs, isRecordDeleted } from './lib/dataService';
+import { subscribeSecondaryCollection, fetchSecondaryCollection, autoHydrateServerFromLocalCache, pullSecondaryChanges } from './lib/secondaryDb';
+import { hydrateAllChannelsFromSecondary } from './lib/realtimeStore';
+
+const PROFILE_STORAGE_KEY = 'blackworm_user_profile';
+const SESSION_BC_NAME = 'blackworm_session_channel';
 
 function sanitizeSessionProfile(p: Record<string, any>): UserProfile {
   const { password: _omittedPassword, ...safe } = p;
   return safe as UserProfile;
 }
 
-export default function App() {
-  const [profile, setProfile] = useState<UserProfile | null>(() => {
-    try {
-      const saved = localStorage.getItem('blackworm_user_profile');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (parsed && typeof parsed === 'object' && parsed.uid) {
-          const sanitized = sanitizeSessionProfile(parsed);
-          if ('password' in parsed) {
-            try { localStorage.setItem('blackworm_user_profile', JSON.stringify(sanitized)); } catch {}
-          }
-          return sanitized;
-        }
-        localStorage.removeItem('blackworm_user_profile');
+function readStoredProfile(): UserProfile | null {
+  try {
+    const saved = localStorage.getItem(PROFILE_STORAGE_KEY);
+    if (!saved) return null;
+    const parsed = JSON.parse(saved);
+    if (parsed && typeof parsed === 'object' && parsed.uid) {
+      const sanitized = sanitizeSessionProfile(parsed);
+      if ('password' in parsed) {
+        try { localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(sanitized)); } catch {}
       }
-    } catch (e) {
-      console.error('Failed to parse saved profile:', e);
-      try { localStorage.removeItem('blackworm_user_profile'); } catch {}
+      return sanitized;
     }
-    return null;
-  });
-  const lang: Language = 'en';
-  const [loading, setLoading] = useState(false);
+    localStorage.removeItem(PROFILE_STORAGE_KEY);
+  } catch (e) {
+    console.error('Failed to parse saved profile:', e);
+    try { localStorage.removeItem(PROFILE_STORAGE_KEY); } catch {}
+  }
+  return null;
+}
 
-  // Initialize background sync & check Firestore connectivity once on app load
-  useEffect(() => {
-    startBackgroundSync();
-    if (!isQuotaBlocked()) {
-      void testFirestoreConnection();
+export default function App() {
+  const [profile, setProfile] = useState<UserProfile | null>(() => readStoredProfile());
+  const lang: Language = 'en';
+  const [loading] = useState(false);
+
+  // Authoritative session refs prevent any stale async fetch / listener / tab callback
+  // from resurrecting a logged-out session or overwriting a newly logged-in user.
+  const activeSessionUidRef = useRef<string | null>(profile?.uid || null);
+  const sessionGenerationRef = useRef<number>(1);
+  const sessionChannelRef = useRef<BroadcastChannel | null>(null);
+
+  const broadcastSessionEvent = useCallback((type: 'logout' | 'login', uid?: string | null) => {
+    try {
+      if (!sessionChannelRef.current && typeof BroadcastChannel !== 'undefined') {
+        sessionChannelRef.current = new BroadcastChannel(SESSION_BC_NAME);
+      }
+      sessionChannelRef.current?.postMessage({ type, uid: uid || null, at: Date.now() });
+    } catch {}
+  }, []);
+
+  // Reconcile React session state with authoritative localStorage across tabs, reloads, and Android WebView bfcache
+  const reconcileSessionFromStorage = useCallback(() => {
+    const stored = readStoredProfile();
+    const currentActiveUid = activeSessionUidRef.current;
+
+    if (!stored) {
+      if (currentActiveUid !== null) {
+        activeSessionUidRef.current = null;
+        sessionGenerationRef.current += 1;
+        setProfile(null);
+      }
+      return;
     }
+
+    if (stored.uid !== currentActiveUid) {
+      activeSessionUidRef.current = stored.uid;
+      sessionGenerationRef.current += 1;
+      setProfile(stored);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    let channel: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        channel = new BroadcastChannel(SESSION_BC_NAME);
+        sessionChannelRef.current = channel;
+        channel.onmessage = (evt) => {
+          const msg = evt?.data;
+          if (!msg || typeof msg !== 'object') return;
+          if (msg.type === 'logout') {
+            if (activeSessionUidRef.current !== null) {
+              activeSessionUidRef.current = null;
+              sessionGenerationRef.current += 1;
+              setProfile(null);
+            }
+          } else if (msg.type === 'login') {
+            reconcileSessionFromStorage();
+          }
+        };
+      }
+    } catch {}
+
+    const handleStorage = (e: StorageEvent) => {
+      if (e.key === null || e.key === PROFILE_STORAGE_KEY) {
+        reconcileSessionFromStorage();
+      }
+    };
+    const handlePageShow = (e: PageTransitionEvent) => {
+      if (e.persisted) {
+        reconcileSessionFromStorage();
+      }
+    };
+    const handleFocusReconcile = () => {
+      reconcileSessionFromStorage();
+    };
+
+    window.addEventListener('storage', handleStorage);
+    window.addEventListener('pageshow', handlePageShow);
+    window.addEventListener('focus', handleFocusReconcile);
+
+    return () => {
+      window.removeEventListener('storage', handleStorage);
+      window.removeEventListener('pageshow', handlePageShow);
+      window.removeEventListener('focus', handleFocusReconcile);
+      try {
+        channel?.close();
+      } catch {}
+      if (sessionChannelRef.current === channel) {
+        sessionChannelRef.current = null;
+      }
+    };
+  }, [reconcileSessionFromStorage]);
+
+  // Initialize background sync + Sync on Start once on app load
+  useEffect(() => {
+    void startBackgroundSync();
+    void pullSecondaryChanges(true);
+    void hydrateAllChannelsFromSecondary(true);
   }, []);
 
   // Live real-time listener for current logged-in user profile changes (Primary + Secondary DB)
@@ -51,12 +146,39 @@ export default function App() {
     const currentUid = profile?.uid;
     if (!currentUid) return;
 
+    let cancelled = false;
+    const effectGen = sessionGenerationRef.current;
+
+    const isSessionStillValid = () =>
+      !cancelled &&
+      activeSessionUidRef.current === currentUid &&
+      sessionGenerationRef.current === effectGen;
+
     const getProfileTs = (obj: any) =>
       Math.max(Number(obj?._syncUpdatedAtMs) || 0, toTimestampMs(obj?.updatedAt || obj?.createdAt));
 
     const applyFreshProfile = (freshData: Record<string, any>, authoritativeServer = false) => {
+      if (!isSessionStillValid()) return;
+      const incomingUid = String(freshData?.uid || freshData?.id || currentUid).trim();
+      if (incomingUid && incomingUid !== currentUid) return;
+
       setProfile((prev) => {
-        if (prev && !authoritativeServer) {
+        if (!isSessionStillValid() || !prev || prev.uid !== currentUid) {
+          return prev;
+        }
+        try {
+          const currentStored = localStorage.getItem(PROFILE_STORAGE_KEY);
+          if (!currentStored) {
+            // Explicit logout already cleared storage
+            return prev;
+          }
+          const parsedStored = JSON.parse(currentStored);
+          if (!parsedStored?.uid || parsedStored.uid !== currentUid) {
+            return prev;
+          }
+        } catch {}
+
+        if (!authoritativeServer) {
           const prevTs = getProfileTs(prev);
           const nextTs = getProfileTs(freshData);
           if (prevTs > 0 && nextTs > 0 && prevTs > nextTs + 500) {
@@ -64,12 +186,14 @@ export default function App() {
           }
         }
         const merged = sanitizeSessionProfile({
-          ...(prev || {}),
+          ...prev,
           ...freshData,
           uid: currentUid,
         });
         try {
-          localStorage.setItem('blackworm_user_profile', JSON.stringify(merged));
+          if (isSessionStillValid()) {
+            localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(merged));
+          }
         } catch (e) {
           console.warn('Failed to update localStorage profile:', e);
         }
@@ -78,24 +202,28 @@ export default function App() {
     };
 
     const pullProfileFromSecondary = () => {
-      void fetchSecondaryCollection('users', { limit: 1000 }).then((res) => {
-        if (!res.ok) return;
-        const found = res.items.find((it) => it && (it.id === currentUid || it.uid === currentUid) && !it.isArchived);
+      if (!isSessionStillValid()) return;
+      void fetchSecondaryCollection('users', { limit: 2000 }).then((res) => {
+        if (!isSessionStillValid() || !res.ok) return;
+        const found = res.items.find((it) => it && (it.id === currentUid || it.uid === currentUid) && !isRecordDeleted(it));
         if (found) applyFreshProfile(found, false);
       });
     };
 
-    // Always pull latest user profile from Secondary on mount and hydrate server if cold
+    // Always pull latest user profile & server deltas on start / login without blocking UI
     pullProfileFromSecondary();
     void autoHydrateServerFromLocalCache(false);
+    void pullSecondaryChanges(false);
+    void hydrateAllChannelsFromSecondary(true);
 
     let unsubFb: (() => void) | null = null;
     const attachProfileListener = () => {
-      if (unsubFb || isQuotaBlocked()) return;
+      if (!isSessionStillValid() || unsubFb || isQuotaBlocked()) return;
       try {
         unsubFb = onSnapshot(
           doc(db, 'users', currentUid),
           (snap) => {
+            if (!isSessionStillValid()) return;
             trackFirestoreUsage('read', 1);
             if (snap.exists() && !snap.metadata?.fromCache) {
               applyFreshProfile(snap.data(), true);
@@ -106,9 +234,10 @@ export default function App() {
               try { unsubFb(); } catch {}
               unsubFb = null;
             }
+            if (!isSessionStillValid()) return;
             const msg = String(err?.message || '').toLowerCase();
             if (msg.includes('quota') || msg.includes('resource_exhausted')) {
-              setQuotaBlocked(15 * 60 * 1000);
+              setQuotaBlocked(2 * 60 * 1000);
             }
             pullProfileFromSecondary();
             console.warn('Real-time profile listener error:', err);
@@ -120,14 +249,22 @@ export default function App() {
     };
 
     const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && isSessionStillValid()) {
         pullProfileFromSecondary();
         attachProfileListener();
       }
     };
     const handleQuotaCleared = () => {
-      attachProfileListener();
+      if (isSessionStillValid()) attachProfileListener();
     };
+    const handleLocalMutation = (e: any) => {
+      if (!isSessionStillValid()) return;
+      const d = e?.detail;
+      if (d?.collection === 'users' && d?.id === currentUid && d?.doc && !d?.deleted) {
+        applyFreshProfile({ ...d.doc, ...(d.updatedAtMs ? { _syncUpdatedAtMs: d.updatedAtMs } : {}) }, false);
+      }
+    };
+    window.addEventListener('blackworm_local_record_mutation', handleLocalMutation);
     window.addEventListener('focus', pullProfileFromSecondary);
     window.addEventListener('blackworm_data_refresh', pullProfileFromSecondary);
     window.addEventListener('blackworm_secondary_resync', pullProfileFromSecondary);
@@ -136,6 +273,7 @@ export default function App() {
     document.addEventListener('visibilitychange', handleVisibility);
 
     const unsubSec = subscribeSecondaryCollection('users', (events) => {
+      if (!isSessionStillValid()) return;
       events.forEach((evt) => {
         if (evt.id === currentUid && evt.doc && !evt.deleted) {
           applyFreshProfile({ ...evt.doc, ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}) }, false);
@@ -146,8 +284,13 @@ export default function App() {
     attachProfileListener();
 
     return () => {
+      cancelled = true;
       unsubSec();
-      if (unsubFb) unsubFb();
+      if (unsubFb) {
+        try { unsubFb(); } catch {}
+        unsubFb = null;
+      }
+      window.removeEventListener('blackworm_local_record_mutation', handleLocalMutation);
       window.removeEventListener('focus', pullProfileFromSecondary);
       window.removeEventListener('blackworm_data_refresh', pullProfileFromSecondary);
       window.removeEventListener('blackworm_secondary_resync', pullProfileFromSecondary);
@@ -158,11 +301,14 @@ export default function App() {
   }, [profile?.uid]);
 
   const handleUpdateProfile = (updatedProfile: UserProfile) => {
+    if (!updatedProfile?.uid || activeSessionUidRef.current !== updatedProfile.uid) {
+      return;
+    }
     const safe = sanitizeSessionProfile(updatedProfile);
     setProfile(safe);
     try {
-      localStorage.setItem('blackworm_user_profile', JSON.stringify(safe));
-    } catch (e) {}
+      localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(safe));
+    } catch {}
   };
 
   if (loading) {
@@ -175,31 +321,45 @@ export default function App() {
 
   const handleLoginSuccess = (userProfile: UserProfile) => {
     const safe = sanitizeSessionProfile(userProfile);
-    setProfile(safe);
+    activeSessionUidRef.current = safe.uid;
+    sessionGenerationRef.current += 1;
     try {
-      localStorage.setItem('blackworm_user_profile', JSON.stringify(safe));
+      localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(safe));
     } catch {}
+    setProfile(safe);
+    broadcastSessionEvent('login', safe.uid);
+    // Sync on Start immediately after login
+    void startBackgroundSync();
+    void pullSecondaryChanges(true);
+    void hydrateAllChannelsFromSecondary(true);
   };
 
   const handleLogout = () => {
-    setProfile(null);
+    activeSessionUidRef.current = null;
+    sessionGenerationRef.current += 1;
     try {
-      localStorage.removeItem('blackworm_user_profile');
+      localStorage.removeItem(PROFILE_STORAGE_KEY);
     } catch {}
+    try {
+      window.history.replaceState({ loggedOut: true }, '');
+    } catch {}
+    setProfile(null);
+    broadcastSessionEvent('logout', null);
   };
 
   return (
     <div className="antialiased">
-      <ErrorBoundary>
+      <ErrorBoundary key={profile?.uid || 'logged-out'} resetKey={profile?.uid || 'logged-out'}>
         {profile ? (
-          <Dashboard 
-            profile={profile} 
-            lang={lang} 
+          <Dashboard
+            key={profile.uid}
+            profile={profile}
+            lang={lang}
             onLogout={handleLogout}
-            onProfileUpdate={handleUpdateProfile} 
+            onProfileUpdate={handleUpdateProfile}
           />
         ) : (
-          <Login onLoginSuccess={handleLoginSuccess} />
+          <Login key={`login-${sessionGenerationRef.current}`} onLoginSuccess={handleLoginSuccess} />
         )}
       </ErrorBoundary>
     </div>

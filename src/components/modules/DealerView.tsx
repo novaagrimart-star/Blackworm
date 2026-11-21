@@ -352,7 +352,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
             unsubSeq = null;
           }
           if (isQuotaExceededError(err)) {
-            setQuotaBlocked(15 * 60 * 1000);
+            setQuotaBlocked(2 * 60 * 1000);
           }
           console.warn('Dealer sequence sync notice:', err);
           void pullSeqFromSecondary();
@@ -364,10 +364,18 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
 
     const handleResync = () => { void pullSeqFromSecondary(); attachSeqListener(); };
     const handleQuotaCleared = () => { attachSeqListener(); };
+    const handleLocalMutation = (e: Event) => {
+      const detail = (e as CustomEvent)?.detail;
+      if (detail?.collection === 'config' && detail?.id === 'dealer_sequence' && detail?.doc && !detail?.deleted) {
+        const val = Number(detail.doc.currentSequence) || 0;
+        setGlobalSequence((prev) => Math.max(prev, val));
+      }
+    };
     window.addEventListener('blackworm_data_refresh', handleResync);
     window.addEventListener('blackworm_secondary_resync', handleResync);
     window.addEventListener('blackworm_quota_blocked', pullSeqFromSecondary);
     window.addEventListener('blackworm_quota_cleared', handleQuotaCleared);
+    window.addEventListener('blackworm_local_record_mutation', handleLocalMutation as EventListener);
 
     attachSeqListener();
     return () => {
@@ -377,6 +385,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
       window.removeEventListener('blackworm_secondary_resync', handleResync);
       window.removeEventListener('blackworm_quota_blocked', pullSeqFromSecondary);
       window.removeEventListener('blackworm_quota_cleared', handleQuotaCleared);
+      window.removeEventListener('blackworm_local_record_mutation', handleLocalMutation as EventListener);
     };
   }, []);
 
@@ -397,7 +406,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
             }
           });
         } catch (e: any) {
-          if (isQuotaExceededError(e)) setQuotaBlocked(15 * 60 * 1000);
+          if (isQuotaExceededError(e)) setQuotaBlocked(2 * 60 * 1000);
           console.warn('Server fetch for reindex skipped:', e);
         }
       }
@@ -451,8 +460,8 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
         updatedDealers.push(updatedItem);
         localMap[item.id] = updatedItem;
 
-        // Sync to Firestore if remote is accessible and code changed
-        if (!isQuotaBlocked() && item.dealerCode !== targetCode) {
+        // Sync changed serial code immediately across Primary writes and Secondary DB
+        if (item.dealerCode !== targetCode) {
           safeFirestoreSet('dealers_application', item.id, {
             dealerCode: targetCode,
             updatedAt: new Date().toISOString(),
@@ -466,14 +475,12 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
       setGlobalSequence(totalDealers);
       setDealersOptimistic(() => updatedDealers);
 
-      // Sync counter config
-      if (!isQuotaBlocked()) {
-        safeFirestoreSet('config', 'dealer_sequence', {
-          currentSequence: totalDealers,
-          updatedAt: new Date().toISOString(),
-          lastAllocatedAt: new Date().toISOString(),
-        }, { merge: true }).catch(() => {});
-      }
+      // Sync counter config immediately
+      safeFirestoreSet('config', 'dealer_sequence', {
+        currentSequence: totalDealers,
+        updatedAt: new Date().toISOString(),
+        lastAllocatedAt: new Date().toISOString(),
+      }, { merge: true }).catch(() => {});
 
       if (showModalAlert) {
         setDialogConfig({
@@ -640,7 +647,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
       } catch (txErr: any) {
         if (timerId) clearTimeout(timerId);
         if (isQuotaExceededError(txErr)) {
-          setQuotaBlocked(15 * 60 * 1000);
+          setQuotaBlocked(2 * 60 * 1000);
         }
         console.warn('Atomic transaction sequence fallback (offline or quota retry):', txErr);
         const baseNum = Math.max(maxKnown, globalSequence || 0);
@@ -972,6 +979,17 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
         payload.createdAt = new Date().toISOString();
       }
 
+      // Immediately update shared in-memory state before network write
+      setDealersOptimistic((prev) => {
+        const idx = prev.findIndex((d) => d.id === id);
+        if (idx >= 0) {
+          const updated = [...prev];
+          updated[idx] = payload;
+          return updated;
+        }
+        return [payload, ...prev];
+      });
+
       await safeFirestoreSet('dealers_application', id, payload, { merge: true });
       // Auto-link Dealer Village/Location to Location Mapping (zero duplicate writes if in official LGD Master or cached)
       if (payload.village && payload.district) {
@@ -995,17 +1013,6 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
         `${isNewRecord ? 'Created' : 'Updated'} Dealership Form for ${payload.firmName} (${payload.dealerCode}) by ${payload.officerName}`,
         profile
       ).catch(() => {});
-
-      // Immediately update shared in-memory state
-      setDealersOptimistic((prev) => {
-        const idx = prev.findIndex((d) => d.id === id);
-        if (idx >= 0) {
-          const updated = [...prev];
-          updated[idx] = payload;
-          return updated;
-        }
-        return [payload, ...prev];
-      });
 
       setCurrentId(id);
       setDealerCode(finalCode);

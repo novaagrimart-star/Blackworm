@@ -440,6 +440,8 @@ export interface OrderProductLine {
   subtotal: number;
 }
 
+export type WarehouseOrderStatus = 'fresh' | 'dispatched' | 'delivered';
+
 export interface OrderItem {
   id: string;
   orderNumber: string;
@@ -460,6 +462,13 @@ export interface OrderItem {
   balanceAmount: number;
   paymentMode: string;
   status: 'pending' | 'pending_approval' | 'confirmed' | 'dispatched' | 'delivered' | 'collected' | 'complete' | 'approved';
+  warehouseStatus?: WarehouseOrderStatus;
+  transportName?: string;
+  transportDetails?: string;
+  warehouseDispatchedAt?: string;
+  warehouseDispatchedBy?: string;
+  warehouseDeliveredAt?: string;
+  warehouseDeliveredBy?: string;
   approvedBy?: string;
   approvedAt?: string;
   dispatchedAt?: string;
@@ -476,6 +485,16 @@ export interface OrderItem {
   isArchived?: boolean;
 }
 
+export const getWarehouseOrderStatus = (o?: Partial<OrderItem> | null): WarehouseOrderStatus => {
+  if (!o) return 'fresh';
+  if (o.warehouseStatus === 'fresh' || o.warehouseStatus === 'dispatched' || o.warehouseStatus === 'delivered') {
+    return o.warehouseStatus;
+  }
+  if (o.status === 'delivered' || o.status === 'collected') return 'delivered';
+  if (o.status === 'dispatched') return 'dispatched';
+  return 'fresh';
+};
+
 export const isOrderApprovedForGodown = (o?: Partial<OrderItem> | null): boolean => {
   if (!o) return false;
   return (
@@ -491,149 +510,280 @@ export const isOrderApprovedForGodown = (o?: Partial<OrderItem> | null): boolean
 export interface GodownOrderSlipCardProps {
   order: OrderItem;
   resolvedItems: OrderProductLine[];
-  isDownloading?: boolean;
-  isSharing?: boolean;
-  isCopied?: boolean;
-  onDownloadImage?: (order: OrderItem) => void;
-  onSharePhoto?: (order: OrderItem) => void;
-  onCopyText?: (order: OrderItem) => void;
+  isUpdating?: boolean;
+  onDispatchOrder?: (order: OrderItem, transportText: string) => Promise<void> | void;
+  onUpdateTransport?: (order: OrderItem, transportText: string) => Promise<void> | void;
+  onConfirmDelivered?: (order: OrderItem) => Promise<void> | void;
 }
 
 export const GodownOrderSlipCard: React.FC<GodownOrderSlipCardProps> = ({
   order,
   resolvedItems,
-  isDownloading = false,
-  isSharing = false,
-  isCopied = false,
-  onDownloadImage,
-  onSharePhoto,
-  onCopyText,
+  isUpdating = false,
+  onDispatchOrder,
+  onUpdateTransport,
+  onConfirmDelivered,
 }) => {
+  const whStatus = getWarehouseOrderStatus(order);
+  const existingTransport = (order.transportDetails || order.transportName || order.dispatchNote || '').trim();
+  const [transportInput, setTransportInput] = useState(existingTransport);
+  const [isEditingTransport, setIsEditingTransport] = useState(false);
+
+  useEffect(() => {
+    setTransportInput((order.transportDetails || order.transportName || order.dispatchNote || '').trim());
+    setIsEditingTransport(false);
+  }, [order.id, order.transportDetails, order.transportName, order.dispatchNote]);
+
+  const statusMeta =
+    whStatus === 'delivered'
+      ? {
+          label: 'Delivered',
+          icon: PackageCheck,
+          textClass: 'text-emerald-700',
+          barClass: 'border-t-emerald-500',
+        }
+      : whStatus === 'dispatched'
+      ? {
+          label: 'Dispatched',
+          icon: Truck,
+          textClass: 'text-amber-700',
+          barClass: 'border-t-amber-500',
+        }
+      : {
+          label: 'Fresh Order',
+          icon: Clock,
+          textClass: 'text-sky-700',
+          barClass: 'border-t-sky-600',
+        };
+  const StatusIcon = statusMeta.icon;
+
   return (
-    <div className="bg-white p-4 border-2 border-slate-900 rounded-2xl font-sans text-slate-900 space-y-2.5 shadow-xs">
-      {/* Header Bar: Company, Order No & Date — Identical to Downloaded Image */}
-      <div className="flex items-center justify-between border-b-2 border-slate-900 pb-2 gap-2">
-        <div className="min-w-0">
-          <p className="text-[11px] font-black text-rose-600 uppercase tracking-tight truncate">
-            BLACKWORM AGRITECH PVT LTD
-          </p>
-          <div className="flex items-center gap-1.5 mt-0.5">
-            <p className="text-xs font-black text-purple-800 font-mono">{order.orderNumber}</p>
-            <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[9px] font-black uppercase">
-              <CheckCircle2 className="w-2.5 h-2.5" />
-              Approved
-            </span>
+    <div
+      className={cn(
+        'bg-white p-3.5 sm:p-4 border border-slate-200 border-t-[3px] rounded-2xl font-sans text-slate-900 space-y-3 shadow-2xs flex flex-col justify-between',
+        statusMeta.barClass
+      )}
+    >
+      <div className="space-y-3">
+        {/* Card Header: Order No + Explicit Status + Date */}
+        <div className="flex items-start justify-between gap-2 pb-2.5 border-b border-slate-100">
+          <div className="min-w-0 space-y-0.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-bold text-slate-900 font-mono tabular-nums">
+                {order.orderNumber}
+              </span>
+              <span
+                className={cn(
+                  'inline-flex items-center gap-1 text-xs font-bold tracking-tight',
+                  statusMeta.textClass
+                )}
+              >
+                <StatusIcon className="w-3.5 h-3.5 shrink-0" />
+                <span>{statusMeta.label}</span>
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-500 truncate">
+              Booked by {toTitleCase(order.createdByName || 'Officer')}
+              {order.cropName ? ` · ${order.cropName}` : ''}
+            </p>
+          </div>
+          <div className="text-right shrink-0">
+            <p className="text-[10px] font-medium text-slate-400 uppercase tracking-wide">Order Date</p>
+            <p className="text-xs font-semibold text-slate-900 font-mono tabular-nums">
+              {new Date(order.createdAt).toLocaleDateString('en-GB')}
+            </p>
           </div>
         </div>
-        <div className="text-right shrink-0">
-          <p className="text-[10px] font-bold text-slate-500">Order Date</p>
-          <p className="text-[11px] font-black text-slate-900 font-mono">
-            {new Date(order.createdAt).toLocaleDateString('en-GB')}
+
+        {/* Dealer & Delivery Location */}
+        <div className="bg-slate-50/80 px-3 py-2.5 rounded-xl text-xs space-y-1">
+          <p className="text-sm font-bold text-slate-900 leading-snug">
+            {toTitleCase(order.dealerName)}
           </p>
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-600">
+            {order.farmerName && <span>Prop: {toTitleCase(order.farmerName)}</span>}
+            {order.farmerName && order.dealerContact && <span aria-hidden="true">·</span>}
+            {order.dealerContact && (
+              <span className="font-mono tabular-nums text-slate-700">{order.dealerContact}</span>
+            )}
+          </div>
+          {(order.dealerVillage || order.dealerDistrict) && (
+            <p className="text-[11px] text-slate-500 flex items-center gap-1">
+              <MapPin className="w-3 h-3 text-slate-400 shrink-0" />
+              <span>
+                {[toTitleCase(order.dealerVillage), toTitleCase(order.dealerDistrict)]
+                  .filter(Boolean)
+                  .join(', ')}
+              </span>
+            </p>
+          )}
         </div>
-      </div>
 
-      {/* Dealer & Location Information */}
-      <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs space-y-1">
-        <p className="text-slate-800">
-          <span className="font-bold text-slate-500">Dealer:</span>{' '}
-          <strong className="text-sm font-black text-slate-900">{toTitleCase(order.dealerName)}</strong>
-        </p>
-        <p className="text-slate-800">
-          <span className="font-bold text-slate-500">Proprietor Name:</span>{' '}
-          <strong className="text-slate-900">{toTitleCase(order.farmerName || '-')}</strong>
-        </p>
-        <p className="text-slate-800">
-          <span className="font-bold text-slate-500">Contact Number:</span>{' '}
-          <strong className="font-mono text-slate-900">{order.dealerContact || '-'}</strong>
-        </p>
-        <p className="text-slate-800">
-          <span className="font-bold text-slate-500">Location:</span>{' '}
-          <strong className="text-slate-900">
-            {[toTitleCase(order.dealerVillage), toTitleCase(order.dealerDistrict)].filter(Boolean).join(', ') || '-'}
-          </strong>
-        </p>
-      </div>
-
-      {/* Order Quantity Section — Strictly ONLY Product Name, Packing & Quantity (Box / Nos) */}
-      <div>
-        <p className="text-xs font-black text-slate-800 uppercase tracking-wide mb-1.5">Order Quantity:</p>
-        <table className="w-full text-left border-collapse text-[11px]">
-          <thead>
-            <tr className="bg-slate-900 text-white font-black text-[10px] uppercase">
-              <th className="p-1.5 pl-2"># Product</th>
-              <th className="p-1.5 text-center w-24">Packing</th>
-              <th className="p-1.5 text-center w-24">Quantity</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-slate-200 border-b border-slate-200 font-semibold">
-            {resolvedItems.map((it, idx) => (
-              <tr key={idx} className={idx % 2 === 1 ? 'bg-slate-50/70' : ''}>
-                <td className="p-1.5 pl-2 font-bold text-sky-700 text-[11px]">
-                  {idx + 1}. {it.gradeName || it.productName}
+        {/* Order Quantity Table — Strictly Product Name, Packing & Quantity */}
+        <div className="border border-slate-200 rounded-xl overflow-hidden">
+          <table className="w-full text-left border-collapse text-[11px]">
+            <thead>
+              <tr className="bg-slate-900 text-white font-semibold text-[10px] uppercase tracking-wider">
+                <th className="py-1.5 px-2.5"># Product</th>
+                <th className="py-1.5 px-2 text-center w-20">Packing</th>
+                <th className="py-1.5 px-2.5 text-right w-20">Qty</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100 font-medium">
+              {resolvedItems.map((it, idx) => (
+                <tr key={idx} className={idx % 2 === 1 ? 'bg-slate-50/60' : ''}>
+                  <td className="py-1.5 px-2.5 font-semibold text-slate-800">
+                    {idx + 1}. {it.gradeName || it.productName}
+                  </td>
+                  <td className="py-1.5 px-2 text-center text-slate-600 tabular-nums">
+                    {it.packingSize}
+                  </td>
+                  <td className="py-1.5 px-2.5 text-right font-mono font-bold text-slate-900 tabular-nums whitespace-nowrap">
+                    {it.quantity} {getOrderLineUnit(it)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot className="bg-slate-50 border-t border-slate-200 font-bold text-slate-900 text-[11px]">
+              <tr>
+                <td colSpan={2} className="py-1.5 px-2.5 text-right uppercase text-[10px] text-slate-500 tracking-wide">
+                  Total Quantity
                 </td>
-                <td className="p-1.5 text-center text-slate-600 text-[10px] font-bold">{it.packingSize}</td>
-                <td className="p-1.5 text-center font-mono font-black text-slate-900 text-xs">
-                  {it.quantity} {getOrderLineUnit(it)}
+                <td className="py-1.5 px-2.5 text-right font-mono font-bold text-xs text-slate-900 tabular-nums whitespace-nowrap">
+                  {formatOrderTotalQuantity(resolvedItems, order.totalQuantity)}
                 </td>
               </tr>
-            ))}
-          </tbody>
-          <tfoot className="bg-emerald-50 font-black text-emerald-950 text-[11px]">
-            <tr>
-              <td colSpan={2} className="p-2 pl-2 text-right uppercase">
-                Total Quantity:
-              </td>
-              <td className="p-2 text-center font-mono font-black text-sm text-emerald-900">
-                {formatOrderTotalQuantity(resolvedItems, order.totalQuantity)}
-              </td>
-            </tr>
-          </tfoot>
-        </table>
-      </div>
-
-      <div className="flex justify-between items-center pt-1 border-t border-slate-200 text-[10px] text-slate-500 font-bold">
-        <span>Booked by: {toTitleCase(order.createdByName || 'Officer')}</span>
-        <span>{order.cropName ? `Crop: ${order.cropName}` : ''}</span>
-      </div>
-
-      {(onDownloadImage || onSharePhoto || onCopyText) && (
-        <div className="pt-1 flex items-center gap-1.5 border-t border-slate-100">
-          {onDownloadImage && (
-            <button
-              type="button"
-              onClick={() => onDownloadImage(order)}
-              disabled={isDownloading}
-              className="flex-1 py-1.5 px-2.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-lg text-[11px] font-bold flex items-center justify-center gap-1.5 transition active:scale-95 cursor-pointer"
-              title="Download Order Image"
-            >
-              {isDownloading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
-              <span>Download Order Image</span>
-            </button>
-          )}
-          {onSharePhoto && (
-            <button
-              type="button"
-              onClick={() => onSharePhoto(order)}
-              disabled={isSharing}
-              className="p-1.5 px-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-[11px] font-bold flex items-center justify-center gap-1 transition active:scale-95 cursor-pointer"
-              title="Share Order Photo"
-            >
-              {isSharing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Camera className="w-3.5 h-3.5" />}
-            </button>
-          )}
-          {onCopyText && (
-            <button
-              type="button"
-              onClick={() => onCopyText(order)}
-              className="p-1.5 px-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-bold flex items-center justify-center gap-1 transition active:scale-95 cursor-pointer"
-              title="Copy Order Slip Text"
-            >
-              {isCopied ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-            </button>
-          )}
+            </tfoot>
+          </table>
         </div>
-      )}
+      </div>
+
+      {/* Dispatch & Delivery Action Footer */}
+      <div className="pt-2.5 border-t border-slate-100 space-y-2">
+        {whStatus === 'fresh' && onDispatchOrder && (
+          <div className="flex flex-col sm:flex-row sm:items-center gap-1.5">
+            <input
+              type="text"
+              value={transportInput}
+              onChange={(e) => setTransportInput(e.target.value)}
+              placeholder="Transport Name / Details (e.g. VRL, Own Vehicle)"
+              className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 focus:bg-white text-xs text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900"
+            />
+            <button
+              type="button"
+              disabled={isUpdating}
+              onClick={() => void onDispatchOrder(order, transportInput)}
+              className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-xs font-semibold transition active:scale-95 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              {isUpdating ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+              ) : (
+                <Truck className="w-3.5 h-3.5 shrink-0" />
+              )}
+              <span>Dispatched</span>
+            </button>
+          </div>
+        )}
+
+        {whStatus === 'dispatched' && (
+          <div className="space-y-2">
+            {isEditingTransport && onUpdateTransport ? (
+              <div className="flex flex-col sm:flex-row sm:items-center gap-1.5">
+                <input
+                  type="text"
+                  value={transportInput}
+                  onChange={(e) => setTransportInput(e.target.value)}
+                  placeholder="Enter Transport Name / Details"
+                  className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 focus:bg-white text-xs text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900"
+                />
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    disabled={isUpdating}
+                    onClick={async () => {
+                      await onUpdateTransport(order, transportInput);
+                      setIsEditingTransport(false);
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-900 hover:bg-black text-white text-xs font-semibold whitespace-nowrap cursor-pointer"
+                  >
+                    Save
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setTransportInput(existingTransport);
+                      setIsEditingTransport(false);
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-semibold whitespace-nowrap cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0 flex-1 space-y-0.5 text-[11px]">
+                  <p className="text-slate-700 truncate">
+                    <span className="font-semibold text-slate-500">Transport:</span>{' '}
+                    <span className="font-semibold text-slate-900">
+                      {existingTransport || 'Not entered'}
+                    </span>
+                    {onUpdateTransport && (
+                      <button
+                        type="button"
+                        onClick={() => setIsEditingTransport(true)}
+                        className="ml-2 text-sky-700 hover:text-sky-900 font-semibold underline underline-offset-2 cursor-pointer"
+                      >
+                        Edit
+                      </button>
+                    )}
+                  </p>
+                  {(order.warehouseDispatchedAt || order.dispatchedAt) && (
+                    <p className="text-slate-400 font-mono tabular-nums text-[10.5px]">
+                      Dispatched: {formatDisplayDate(order.warehouseDispatchedAt || order.dispatchedAt, true)}
+                    </p>
+                  )}
+                </div>
+
+                {onConfirmDelivered && (
+                  <button
+                    type="button"
+                    disabled={isUpdating}
+                    onClick={() => void onConfirmDelivered(order)}
+                    className="inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-semibold transition active:scale-95 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    {isUpdating ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                    ) : (
+                      <PackageCheck className="w-3.5 h-3.5 shrink-0" />
+                    )}
+                    <span>Delivered</span>
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {whStatus === 'delivered' && (
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+            <div className="flex items-center gap-1.5 text-emerald-700 font-semibold">
+              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+              <span>
+                Delivered
+                {order.warehouseDeliveredAt || order.deliveredAt
+                  ? ` · ${formatDisplayDate(order.warehouseDeliveredAt || order.deliveredAt, true)}`
+                  : ''}
+              </span>
+            </div>
+            {existingTransport && (
+              <span className="text-slate-500 truncate">
+                Transport: <strong className="text-slate-800">{existingTransport}</strong>
+              </span>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 };
@@ -728,6 +878,13 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         balanceAmount: Number(data.balanceAmount ?? data.totalAmount) || 0,
         paymentMode: data.paymentMode || 'Credit',
         status: data.status || 'pending_approval',
+        warehouseStatus: data.warehouseStatus,
+        transportName: data.transportName || '',
+        transportDetails: data.transportDetails || '',
+        warehouseDispatchedAt: data.warehouseDispatchedAt,
+        warehouseDispatchedBy: data.warehouseDispatchedBy,
+        warehouseDeliveredAt: data.warehouseDeliveredAt,
+        warehouseDeliveredBy: data.warehouseDeliveredBy,
         approvedBy: data.approvedBy,
         approvedAt: data.approvedAt,
         dispatchedAt: data.dispatchedAt,
@@ -793,6 +950,8 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   }, [sharedMasterProducts]);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('pending');
+  const [warehouseStatusFilter, setWarehouseStatusFilter] = useState<'all' | WarehouseOrderStatus>('all');
+  const [updatingWarehouseOrderId, setUpdatingWarehouseOrderId] = useState<string | null>(null);
   
   // Modals state
   const [showNewOrderModal, setShowNewOrderModal] = useState(false);
@@ -1336,9 +1495,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           updatedByName: profile.fullName || profile.loginId || 'Officer',
         };
 
-        const saveRes = await safeFirestoreSet('orders', editingOrderId, updatedOrderPayload, { merge: true });
-
-        // Immediately update shared in-memory orders
+        // Immediately update shared in-memory orders before waiting on network sync
         setOrdersOptimistic((prev) => {
           const idx = prev.findIndex((o) => o.id === editingOrderId);
           if (idx >= 0) {
@@ -1348,6 +1505,8 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           }
           return prev;
         });
+
+        await safeFirestoreSet('orders', editingOrderId, updatedOrderPayload, { merge: true });
 
         void logAudit(
           'UPDATE',
@@ -1397,10 +1556,10 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         isArchived: false,
       };
 
-      await safeFirestoreSet('orders', orderId, newOrder);
-
-      // Immediately add to shared in-memory orders
+      // Immediately add to shared in-memory orders before waiting on network sync
       setOrdersOptimistic((prev) => [newOrder, ...prev]);
+
+      await safeFirestoreSet('orders', orderId, newOrder);
 
       void logAudit(
         'CREATE',
@@ -1607,13 +1766,15 @@ ${itemsListText}
   const handleApproveOrder = async (order: OrderItem) => {
     if (!isAdmin(profile)) return;
 
+    const nowIso = new Date().toISOString();
     const updatedData = {
       status: 'complete' as const,
+      warehouseStatus: 'fresh' as const,
       approvedBy: profile.fullName || 'Admin',
-      approvedAt: new Date().toISOString(),
-      dispatchedAt: new Date().toISOString(),
-      deliveredAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      approvedAt: nowIso,
+      dispatchedAt: nowIso,
+      deliveredAt: nowIso,
+      updatedAt: nowIso,
     };
 
     // Update shared state immediately
@@ -1637,7 +1798,104 @@ ${itemsListText}
     }
   };
 
-  // Workflow Action 2: Mark Delivered & Complete Order
+  // Warehouse Workflow Action A: Mark Dispatched + Save Transport Details (Warehouse Incharge Only)
+  const handleWarehouseDispatch = async (order: OrderItem, transportText: string) => {
+    const cleanTransport = transportText.trim();
+    const nowIso = new Date().toISOString();
+    setUpdatingWarehouseOrderId(order.id);
+    try {
+      const updatedData = {
+        warehouseStatus: 'dispatched' as const,
+        transportName: cleanTransport,
+        transportDetails: cleanTransport,
+        dispatchNote: cleanTransport,
+        warehouseDispatchedAt: nowIso,
+        warehouseDispatchedBy: profile.fullName || profile.loginId || 'Warehouse Incharge',
+        updatedAt: nowIso,
+      };
+      setOrdersOptimistic((prev) =>
+        prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
+      );
+      await safeFirestoreSet('orders', order.id, updatedData, { merge: true });
+      void logAudit(
+        'UPDATE',
+        'orders',
+        order.id,
+        `Warehouse Dispatched order ${order.orderNumber}${cleanTransport ? ` via ${cleanTransport}` : ''}`,
+        profile
+      ).catch(() => {});
+      setSaveToast(true);
+      setTimeout(() => setSaveToast(false), 3000);
+    } finally {
+      setUpdatingWarehouseOrderId(null);
+    }
+  };
+
+  // Warehouse Workflow Action B: Update Transport Details on a Dispatched Order
+  const handleWarehouseUpdateTransport = async (order: OrderItem, transportText: string) => {
+    const cleanTransport = transportText.trim();
+    const nowIso = new Date().toISOString();
+    setUpdatingWarehouseOrderId(order.id);
+    try {
+      const updatedData = {
+        transportName: cleanTransport,
+        transportDetails: cleanTransport,
+        dispatchNote: cleanTransport,
+        updatedAt: nowIso,
+      };
+      setOrdersOptimistic((prev) =>
+        prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
+      );
+      await safeFirestoreSet('orders', order.id, updatedData, { merge: true });
+      setSaveToast(true);
+      setTimeout(() => setSaveToast(false), 3000);
+    } finally {
+      setUpdatingWarehouseOrderId(null);
+    }
+  };
+
+  // Warehouse Workflow Action C: Confirm Delivered to Dealer (Warehouse Incharge Only)
+  const handleWarehouseConfirmDelivered = (order: OrderItem) => {
+    setDialogConfig({
+      isOpen: true,
+      type: 'confirm',
+      title: 'Confirm Delivery',
+      message: `Confirm that order ${order.orderNumber} for ${toTitleCase(order.dealerName)} has been delivered?`,
+      confirmText: 'Confirm Delivered',
+      cancelText: 'Cancel',
+      onConfirm: async () => {
+        setDialogConfig((prev) => ({ ...prev, isOpen: false }));
+        const nowIso = new Date().toISOString();
+        setUpdatingWarehouseOrderId(order.id);
+        try {
+          const updatedData = {
+            warehouseStatus: 'delivered' as const,
+            warehouseDeliveredAt: nowIso,
+            warehouseDeliveredBy: profile.fullName || profile.loginId || 'Warehouse Incharge',
+            updatedAt: nowIso,
+          };
+          setOrdersOptimistic((prev) =>
+            prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
+          );
+          await safeFirestoreSet('orders', order.id, updatedData, { merge: true });
+          void logAudit(
+            'UPDATE',
+            'orders',
+            order.id,
+            `Warehouse confirmed Delivered for order ${order.orderNumber}`,
+            profile
+          ).catch(() => {});
+          setSaveToast(true);
+          setTimeout(() => setSaveToast(false), 3000);
+        } finally {
+          setUpdatingWarehouseOrderId(null);
+        }
+      },
+      onCancel: () => setDialogConfig((prev) => ({ ...prev, isOpen: false })),
+    });
+  };
+
+  // Workflow Action 2: Mark Delivered & Complete Order (Admin/Sales Officers)
   const handleMarkDelivered = async (order: OrderItem) => {
     if (!isAdmin(profile) && !isUserRecord(order, profile)) return;
 
@@ -1766,11 +2024,15 @@ ${itemsListText}
       String(o.farmerName || '').toLowerCase().includes(queryStr) ||
       String(o.dealerVillage || '').toLowerCase().includes(queryStr) ||
       String(o.dealerDistrict || '').toLowerCase().includes(queryStr) ||
+      String(o.transportName || o.transportDetails || o.dispatchNote || '').toLowerCase().includes(queryStr) ||
       (Array.isArray(o.items) && o.items.some((it) => String(it?.productName || '').toLowerCase().includes(queryStr)));
 
     if (!matchSearch) return false;
 
-    if (isGodownView) return true;
+    if (isGodownView) {
+      if (warehouseStatusFilter === 'all') return true;
+      return getWarehouseOrderStatus(o) === warehouseStatusFilter;
+    }
 
     if (statusFilter === 'all') return true;
     if (statusFilter === 'pending') return o.status === 'pending_approval' || o.status === 'pending';
@@ -1780,6 +2042,23 @@ ${itemsListText}
     if (statusFilter === 'collected') return o.status === 'collected';
     return true;
   });
+
+  const warehouseStatusCounts = useMemo(() => {
+    if (!isGodownView) return { all: 0, fresh: 0, dispatched: 0, delivered: 0 };
+    let all = 0;
+    let fresh = 0;
+    let dispatched = 0;
+    let delivered = 0;
+    orders.forEach((o) => {
+      if (!isOrderApprovedForGodown(o)) return;
+      all += 1;
+      const st = getWarehouseOrderStatus(o);
+      if (st === 'fresh') fresh += 1;
+      else if (st === 'dispatched') dispatched += 1;
+      else if (st === 'delivered') delivered += 1;
+    });
+    return { all, fresh, dispatched, delivered };
+  }, [orders, isGodownView]);
 
   return (
     <div className="space-y-3 sm:space-y-4 max-w-5xl mx-auto pb-16">
@@ -1796,11 +2075,11 @@ ${itemsListText}
         </div>
       )}
 
-      {/* Header Banner - Compact without subtitle */}
+      {/* Header Banner */}
       <div className="flex justify-between items-center bg-white px-3.5 py-2.5 rounded-2xl border border-slate-200 shadow-xs">
         <h2 className="text-base sm:text-lg font-black text-slate-900 flex items-center gap-2">
           <ShoppingBag className="w-5 h-5 text-purple-600" />
-          <span>{isGodownView ? 'मंजूर ऑर्डर्स (Godown Dispatch Slips)' : 'Order Management'}</span>
+          <span>{isGodownView ? 'Warehouse Order Management' : 'Order Management'}</span>
         </h2>
         {!isGodownView && (
           <button
@@ -1816,13 +2095,17 @@ ${itemsListText}
         )}
       </div>
 
-      {/* Search & Filter Bar - Ultra Compact Small Buttons */}
-      <div className="flex flex-col sm:flex-row gap-2">
-        <div className="relative flex-1">
+      {/* Search & Filter Bar - Single Row on Desktop/Tablet, Compact Crisp Controls */}
+      <div className={cn('flex gap-2', isGodownView ? 'flex-col lg:flex-row lg:items-center' : 'flex-col sm:flex-row')}>
+        <div className="relative flex-1 min-w-0">
           <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-slate-400" />
           <input
             type="text"
-            placeholder="Search Order No, Dealer Name, Contact, Product..."
+            placeholder={
+              isGodownView
+                ? 'Search Order No, Dealer, Village, Product, Transport...'
+                : 'Search Order No, Dealer Name, Contact, Product...'
+            }
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="w-full pl-8 pr-3 py-1.5 rounded-xl border border-slate-200 bg-white text-xs font-medium focus:outline-none focus:ring-2 focus:ring-purple-500 shadow-xs"
@@ -1851,10 +2134,39 @@ ${itemsListText}
           </div>
         )}
 
-        {/* Status filter buttons: Pending (default), Complete, All (Hidden for Godown Incharge / Office Staff) */}
+        {/* Warehouse Status Filter Bar vs Admin/Sales Officer Filter Bar */}
         {isGodownView ? (
-          <div className="flex items-center px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-black shrink-0">
-            <span>मंजूर ऑर्डर्स: {filteredOrders.length}</span>
+          <div className="flex items-center gap-1 overflow-x-auto no-scrollbar p-1 bg-slate-100 rounded-xl shrink-0">
+            {(
+              [
+                { id: 'all', label: 'All', count: warehouseStatusCounts.all },
+                { id: 'fresh', label: 'Fresh Order', count: warehouseStatusCounts.fresh },
+                { id: 'dispatched', label: 'Dispatched', count: warehouseStatusCounts.dispatched },
+                { id: 'delivered', label: 'Delivered', count: warehouseStatusCounts.delivered },
+              ] as const
+            ).map((st) => (
+              <button
+                key={st.id}
+                type="button"
+                onClick={() => setWarehouseStatusFilter(st.id)}
+                className={cn(
+                  'px-2.5 py-1 rounded-lg text-[11px] font-semibold transition whitespace-nowrap shrink-0 cursor-pointer active:scale-95 flex items-center gap-1.5',
+                  warehouseStatusFilter === st.id
+                    ? 'bg-slate-900 text-white shadow-2xs'
+                    : 'text-slate-600 hover:bg-white/80 hover:text-slate-900'
+                )}
+              >
+                <span>{st.label}</span>
+                <span
+                  className={cn(
+                    'font-mono tabular-nums text-[10px]',
+                    warehouseStatusFilter === st.id ? 'text-slate-300' : 'text-slate-400'
+                  )}
+                >
+                  {st.count}
+                </span>
+              </button>
+            ))}
           </div>
         ) : (
           <div className="flex gap-1 overflow-x-auto pb-0.5 no-scrollbar items-center">
@@ -1905,11 +2217,15 @@ ${itemsListText}
         <div className="bg-white rounded-2xl border border-dashed border-slate-300 p-8 text-center space-y-2">
           <ShoppingBag className="w-10 h-10 text-slate-300 mx-auto" />
           <p className="text-xs font-bold text-slate-700">
-            {isGodownView ? 'सध्या कोणतीही मंजूर (Approved) ऑर्डर नाही' : 'No orders found'}
+            {isGodownView
+              ? warehouseStatusFilter === 'all'
+                ? 'No approved orders available in Warehouse'
+                : `No ${warehouseStatusFilter === 'fresh' ? 'Fresh' : warehouseStatusFilter === 'dispatched' ? 'Dispatched' : 'Delivered'} orders found`
+              : 'No orders found'}
           </p>
           <p className="text-[11px] text-slate-400">
             {isGodownView
-              ? 'Admin ने ऑर्डर Approve केल्यानंतर ती येथे तात्काळ (Product, Packing व Quantity स्वरूपात) दिसेल.'
+              ? 'Admin-approved orders appear here immediately for dispatch and delivery tracking.'
               : "Click on 'New Order' button above to create a new order."}
           </p>
         </div>
@@ -1924,12 +2240,10 @@ ${itemsListText}
                 key={o.id}
                 order={o}
                 resolvedItems={resolvedCardItems}
-                isDownloading={downloadingOrderId === o.id}
-                isSharing={isGeneratingImage && capturingOrder?.id === o.id}
-                isCopied={copiedOrderId === o.id}
-                onDownloadImage={handleDownloadOrderImage}
-                onSharePhoto={handleShareOnWhatsApp}
-                onCopyText={handleCopyOrderText}
+                isUpdating={updatingWarehouseOrderId === o.id}
+                onDispatchOrder={handleWarehouseDispatch}
+                onUpdateTransport={handleWarehouseUpdateTransport}
+                onConfirmDelivered={handleWarehouseConfirmDelivered}
               />
             );
           })}
@@ -3250,6 +3564,9 @@ ${itemsListText}
               {selectedOrderDetails.approvedBy && (
                 <p>Approved by: <span className="font-bold text-slate-900">{selectedOrderDetails.approvedBy}</span> ({formatDisplayDate(selectedOrderDetails.approvedAt, false) || '-'})</p>
               )}
+              {(selectedOrderDetails.transportDetails || selectedOrderDetails.transportName || selectedOrderDetails.dispatchNote) && (
+                <p>Transport: <span className="font-bold text-slate-900">{selectedOrderDetails.transportDetails || selectedOrderDetails.transportName || selectedOrderDetails.dispatchNote}</span></p>
+              )}
               {selectedOrderDetails.deliveredAt && (
                 <p>Delivered on: <span className="font-bold text-emerald-700">{formatDisplayDate(selectedOrderDetails.deliveredAt, true) || '-'}</span></p>
               )}
@@ -3257,38 +3574,42 @@ ${itemsListText}
 
             {/* Actions Inside Modal */}
             <div className="pt-1 flex flex-wrap gap-2">
-              <button
-                onClick={() => handleDownloadOrderImage(selectedOrderDetails)}
-                disabled={downloadingOrderId !== null}
-                className="flex-1 py-1.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
-              >
-                {downloadingOrderId === selectedOrderDetails.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
-                <span>Download Image</span>
-              </button>
+              {!isGodownView && (
+                <>
+                  <button
+                    onClick={() => handleDownloadOrderImage(selectedOrderDetails)}
+                    disabled={downloadingOrderId !== null}
+                    className="flex-1 py-1.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
+                  >
+                    {downloadingOrderId === selectedOrderDetails.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                    <span>Download Image</span>
+                  </button>
 
-              {/* Direct Photo Share on WhatsApp */}
-              <button
-                onClick={() => handleShareOnWhatsApp(selectedOrderDetails)}
-                disabled={isGeneratingImage}
-                className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
-              >
-                {isGeneratingImage ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Camera className="w-3.5 h-3.5" />}
-                <span>Share Photo</span>
-              </button>
+                  {/* Direct Photo Share on WhatsApp */}
+                  <button
+                    onClick={() => handleShareOnWhatsApp(selectedOrderDetails)}
+                    disabled={isGeneratingImage}
+                    className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
+                  >
+                    {isGeneratingImage ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Camera className="w-3.5 h-3.5" />}
+                    <span>Share Photo</span>
+                  </button>
 
-              {/* Copy Order Text */}
-              <button
-                onClick={() => handleCopyOrderText(selectedOrderDetails)}
-                className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer active:scale-95 shrink-0"
-                title="Copy Order Text for WhatsApp"
-              >
-                {copiedOrderId === selectedOrderDetails.id ? (
-                  <Check className="w-3.5 h-3.5 text-emerald-600" />
-                ) : (
-                  <Copy className="w-3.5 h-3.5" />
-                )}
-                <span>{copiedOrderId === selectedOrderDetails.id ? "Copied!" : "Copy"}</span>
-              </button>
+                  {/* Copy Order Text */}
+                  <button
+                    onClick={() => handleCopyOrderText(selectedOrderDetails)}
+                    className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg text-xs font-bold transition flex items-center justify-center gap-1 cursor-pointer active:scale-95 shrink-0"
+                    title="Copy Order Text for WhatsApp"
+                  >
+                    {copiedOrderId === selectedOrderDetails.id ? (
+                      <Check className="w-3.5 h-3.5 text-emerald-600" />
+                    ) : (
+                      <Copy className="w-3.5 h-3.5" />
+                    )}
+                    <span>{copiedOrderId === selectedOrderDetails.id ? "Copied!" : "Copy"}</span>
+                  </button>
+                </>
+              )}
 
               {!isGodownView && (selectedOrderDetails.status === 'pending_approval' || selectedOrderDetails.status === 'pending') && isAdmin(profile) && (
                 <button

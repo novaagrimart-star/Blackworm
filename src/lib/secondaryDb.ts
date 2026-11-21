@@ -1,4 +1,6 @@
 import { loadCollectionFromVault, saveCollectionToVault } from './localVault';
+import { resolveApiUrl, triggerVersionCheckFromSse } from './appVersion';
+import { isRecordDeleted, mergeTravelSheetDocs } from './travelMerge';
 
 export interface SecondaryDeltaEvent {
   collection: string;
@@ -16,18 +18,7 @@ export interface SecondaryUpsertPayload {
   updatedAtMs?: number;
   deleted?: boolean;
   merge?: boolean;
-}
-
-export type CloudMirrorType = 'none' | 'supabase' | 'relay' | 'peer';
-
-export interface CloudMirrorPublicConfig {
-  configured: boolean;
-  type: CloudMirrorType;
-  url: string;
-  hasKey: boolean;
-  lastCloudSyncAtMs?: number;
-  lastCloudError?: string;
-  cloudMirroredCount?: number;
+  isBootstrap?: boolean;
 }
 
 export interface SecondarySyncStatus {
@@ -36,10 +27,6 @@ export interface SecondarySyncStatus {
   latestRevision: number;
   serverEpoch?: string;
   lastSyncAtMs: number;
-  cloudMirrorConfigured?: boolean;
-  cloudMirrorType?: CloudMirrorType;
-  lastCloudSyncAtMs?: number;
-  lastCloudError?: string;
   totalRecords?: number;
 }
 
@@ -47,12 +34,6 @@ export interface SecondarySummary {
   ok: boolean;
   engine?: string;
   serverEpoch?: string;
-  supabaseMirror?: boolean;
-  cloudMirrorConfigured?: boolean;
-  cloudMirrorType?: CloudMirrorType;
-  lastCloudSyncAtMs?: number;
-  lastCloudError?: string;
-  cloudMirroredCount?: number;
   totalRecords?: number;
   latestRevision?: number;
   connectedClients?: number;
@@ -64,8 +45,7 @@ const EPOCH_STORAGE_KEY = 'blackworm_secondary_epoch';
 const BC_CHANNEL_NAME = 'blackworm_sync_bc_v1';
 
 const listenersByCollection = new Map<string, Set<(events: SecondaryDeltaEvent[]) => void>>();
-const bootstrappedCollections = new Set<string>();
-const lastBootstrapCount = new Map<string, number>();
+const bootstrapDocSigMap = new Map<string, Map<string, string>>();
 
 const CORE_COLLECTIONS_TO_HYDRATE = [
   'users',
@@ -223,10 +203,6 @@ export function getSecondarySyncStatus(): SecondarySyncStatus {
     latestRevision: getStoredRevision(),
     serverEpoch: getStoredEpoch() || lastSummaryCache?.serverEpoch,
     lastSyncAtMs,
-    cloudMirrorConfigured: lastSummaryCache?.cloudMirrorConfigured,
-    cloudMirrorType: lastSummaryCache?.cloudMirrorType || 'none',
-    lastCloudSyncAtMs: lastSummaryCache?.lastCloudSyncAtMs,
-    lastCloudError: lastSummaryCache?.lastCloudError,
     totalRecords: lastSummaryCache?.totalRecords,
   };
 }
@@ -253,9 +229,32 @@ function persistDeltasBatchToLocalCache(colName: string, events: SecondaryDeltaE
     const map: Record<string, any> = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
     let mutated = false;
 
+    const pendingLocalTs = new Map<string, { ts: number; needsSecondary: boolean }>();
+    try {
+      const pRaw = localStorage.getItem('blackworm_pending_sync');
+      if (pRaw) {
+        const pQueue = JSON.parse(pRaw);
+        if (Array.isArray(pQueue)) {
+          for (const pq of pQueue) {
+            if (pq && pq.collection === colName && pq.id && pq.needsSecondary !== false) {
+              pendingLocalTs.set(String(pq.id), {
+                ts: Number(pq.timestamp) || Number(pq.data?._syncUpdatedAtMs) || 0,
+                needsSecondary: true,
+              });
+            }
+          }
+        }
+      }
+    } catch {}
+
     for (const evt of events) {
       if (!evt?.id) continue;
-      if (evt.deleted || evt.doc?.isArchived) {
+      const pendingInfo = pendingLocalTs.get(evt.id);
+      const evtTs = Number(evt.updatedAtMs) || 0;
+      if (pendingInfo && pendingInfo.needsSecondary && pendingInfo.ts > evtTs) {
+        continue;
+      }
+      if (evt.deleted || isRecordDeleted(evt.doc)) {
         if (evt.id in map) {
           delete map[evt.id];
           mutated = true;
@@ -263,19 +262,73 @@ function persistDeltasBatchToLocalCache(colName: string, events: SecondaryDeltaE
         continue;
       }
       if (evt.doc && typeof evt.doc === 'object') {
-        const incoming = {
+        const incoming: Record<string, any> = {
           ...evt.doc,
           id: evt.id,
           ...(evt.updatedAtMs ? { _syncUpdatedAtMs: evt.updatedAtMs } : {}),
         };
         const prev = map[evt.id];
         const prevTs = parseSyncTs(prev);
-        const nextTs = Math.max(Number(evt.updatedAtMs) || 0, parseSyncTs(incoming));
-        if (!prev || nextTs >= prevTs) {
-          const merged = prev ? { ...prev, ...incoming } : incoming;
-          delete merged._localSavedAt;
-          map[evt.id] = merged;
+        const nextTs = Math.max(evtTs, parseSyncTs(incoming));
+        if (colName === 'travel_sheets' && prev && Array.isArray(prev.rows) && Array.isArray(incoming.rows)) {
+          const mergedTravel = mergeTravelSheetDocs(prev, incoming);
+          delete mergedTravel._localSavedAt;
+          if (JSON.stringify(prev) !== JSON.stringify(mergedTravel)) {
+            map[evt.id] = mergedTravel;
+            mutated = true;
+          }
+          if (mergedTravel.userId && mergedTravel.yearNumber && mergedTravel.monthName) {
+            try {
+              const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+              const mIdx = typeof mergedTravel.monthIndex === 'number'
+                ? mergedTravel.monthIndex
+                : monthNames.findIndex((m) => m.toLowerCase() === String(mergedTravel.monthName || '').toLowerCase());
+              const mm = mIdx >= 0 ? String(mIdx + 1).padStart(2, '0') : '';
+              const sheetCacheKey = mm ? `travel_sheet_${mergedTravel.userId}_${mergedTravel.yearNumber}_${mm}` : '';
+              if (sheetCacheKey) {
+                const rawDraft = localStorage.getItem(sheetCacheKey);
+                if (rawDraft) {
+                  const parsedDraft = JSON.parse(rawDraft);
+                  const draftMerged = mergeTravelSheetDocs(parsedDraft, mergedTravel);
+                  localStorage.setItem(sheetCacheKey, JSON.stringify(draftMerged));
+                } else {
+                  localStorage.setItem(sheetCacheKey, JSON.stringify(mergedTravel));
+                }
+              }
+            } catch {}
+          }
+        } else if (!prev || nextTs > prevTs) {
+          const cleanDoc: Record<string, any> = prev
+            ? {
+                ...(prev.createdAt && !incoming.createdAt ? { createdAt: prev.createdAt } : {}),
+                ...incoming,
+              }
+            : incoming;
+          delete cleanDoc._localSavedAt;
+          map[evt.id] = cleanDoc;
           mutated = true;
+
+          // Keep TravelView/ReportView per-sheet localStorage mirrors in sync when a newer remote travel_sheet arrives
+          if (colName === 'travel_sheets' && cleanDoc.userId && cleanDoc.yearNumber && cleanDoc.monthName) {
+            try {
+              const monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+              const mIdx = typeof cleanDoc.monthIndex === 'number'
+                ? cleanDoc.monthIndex
+                : monthNames.findIndex((m) => m.toLowerCase() === String(cleanDoc.monthName || '').toLowerCase());
+              const mm = mIdx >= 0 ? String(mIdx + 1).padStart(2, '0') : '';
+              const sheetCacheKey = mm ? `travel_sheet_${cleanDoc.userId}_${cleanDoc.yearNumber}_${mm}` : '';
+              if (sheetCacheKey) {
+                const rawDraft = localStorage.getItem(sheetCacheKey);
+                if (rawDraft) {
+                  const parsedDraft = JSON.parse(rawDraft);
+                  const draftMerged = mergeTravelSheetDocs(parsedDraft, cleanDoc);
+                  localStorage.setItem(sheetCacheKey, JSON.stringify(draftMerged));
+                } else {
+                  localStorage.setItem(sheetCacheKey, JSON.stringify(cleanDoc));
+                }
+              }
+            } catch {}
+          }
         }
       }
     }
@@ -303,8 +356,49 @@ function initBroadcastChannel() {
       const payload = msg?.data;
       if (payload?.type === 'deltas' && Array.isArray(payload.events)) {
         dispatchDeltaBatch(payload.events as SecondaryDeltaEvent[], false);
+      } else if (payload?.type === 'local_mutation' && payload.detail?.collection && payload.detail?.id) {
+        const d = payload.detail;
+        const deltaEvt: SecondaryDeltaEvent = {
+          collection: String(d.collection),
+          id: String(d.id),
+          doc: d.doc && typeof d.doc === 'object' ? d.doc : null,
+          deleted: Boolean(d.deleted),
+          updatedAtMs: Number(d.updatedAtMs) || Date.now(),
+          revision: 0,
+        };
+        persistDeltasBatchToLocalCache(deltaEvt.collection, [deltaEvt]);
+        const set = listenersByCollection.get(deltaEvt.collection);
+        if (set && set.size > 0) {
+          set.forEach((cb) => {
+            try {
+              cb([deltaEvt]);
+            } catch {}
+          });
+        }
+        try {
+          window.dispatchEvent(
+            new CustomEvent('blackworm_local_record_mutation', {
+              detail: { ...d, fromRemote: true },
+            })
+          );
+        } catch {}
       }
     };
+  } catch {}
+}
+
+export function broadcastLocalMutation(detail: {
+  collection: string;
+  id: string;
+  doc?: Record<string, any> | null;
+  merge?: boolean;
+  deleted?: boolean;
+  updatedAtMs?: number;
+}) {
+  if (typeof window === 'undefined' || !detail?.collection || !detail?.id) return;
+  initBroadcastChannel();
+  try {
+    broadcastChannel?.postMessage({ type: 'local_mutation', detail });
   } catch {}
 }
 
@@ -355,6 +449,21 @@ function dispatchDeltaBatch(events: SecondaryDeltaEvent[], relayToOtherTabs = tr
   }
   try {
     if (typeof window !== 'undefined' && validEvents.length > 0) {
+      for (const evt of validEvents) {
+        window.dispatchEvent(
+          new CustomEvent('blackworm_local_record_mutation', {
+            detail: {
+              collection: evt.collection,
+              id: evt.id,
+              doc: evt.doc,
+              merge: true,
+              deleted: Boolean(evt.deleted || isRecordDeleted(evt.doc)),
+              updatedAtMs: evt.updatedAtMs,
+              fromRemote: true,
+            },
+          })
+        );
+      }
       window.dispatchEvent(new CustomEvent('blackworm_secondary_delta', { detail: validEvents[validEvents.length - 1] }));
     }
   } catch {}
@@ -373,80 +482,62 @@ export async function pullSecondaryChanges(forceFullResyncIfZero = false): Promi
   if (isPullingChanges) return 0;
 
   isPullingChanges = true;
+  let totalPulled = 0;
+  const PAGE_LIMIT = 2000;
   try {
-    let rev = getStoredRevision();
-    const epoch = getStoredEpoch();
+    for (let page = 0; page < 6; page++) {
+      let rev = getStoredRevision();
+      const epoch = getStoredEpoch();
 
-    if (rev === 0) {
-      if (forceFullResyncIfZero || !zeroResyncDispatchedOnce) {
+      if (page === 0 && rev === 0 && (forceFullResyncIfZero || !zeroResyncDispatchedOnce)) {
         zeroResyncDispatchedOnce = true;
         window.dispatchEvent(new CustomEvent('blackworm_secondary_resync', { detail: { reason: 'rev_zero' } }));
       }
-      // Also pull changes since 0 cleanly so collections/configs get updated without waiting
+
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 7000);
-      const res = await fetch(`/api/sync/changes?since=0&epoch=${encodeURIComponent(epoch)}&limit=1000`, {
-        signal: controller.signal,
-      });
+      const timer = setTimeout(() => controller.abort(), 8000);
+      const res = await fetch(
+        resolveApiUrl(`/api/sync/changes?since=${encodeURIComponent(String(rev))}&epoch=${encodeURIComponent(epoch)}&limit=${PAGE_LIMIT}`),
+        { signal: controller.signal }
+      );
       clearTimeout(timer);
-      if (!res.ok) return 0;
+
+      if (!res.ok) break;
       const json = await res.json();
-      if (json?.serverEpoch) setStoredEpoch(String(json.serverEpoch));
+
+      const wasReset =
+        rev > 0 &&
+        (Boolean(json?.resetRequired) || reconcileServerEpochAndRev(json?.serverEpoch, json?.latestRevision));
+
+      if (json?.serverEpoch) {
+        setStoredEpoch(String(json.serverEpoch));
+      }
+
       const events: SecondaryDeltaEvent[] = Array.isArray(json?.events) ? json.events : [];
-      dispatchDeltaBatch(events);
-      // Advance revision cursor only up to the last event returned (so if >1000 exist, next poll picks up the rest!)
       if (events.length > 0) {
+        totalPulled += events.length;
+        dispatchDeltaBatch(events);
+        if (rev > 0 && !wasReset && eventSource && Date.now() - Math.max(lastSseDeltaAtMs, lastSseConnectedAtMs) > 8000) {
+          try {
+            eventSource.close();
+          } catch {}
+          eventSource = null;
+          setTimeout(() => initSecondaryStream(), 500);
+        }
         const lastEvtRev = Number(events[events.length - 1].revision) || 0;
-        if (lastEvtRev > 0) setStoredRevision(lastEvtRev);
+        if (lastEvtRev > 0) {
+          setStoredRevision(lastEvtRev, wasReset);
+        }
       } else if (json?.latestRevision) {
-        setStoredRevision(Number(json.latestRevision));
+        setStoredRevision(Number(json.latestRevision), wasReset);
       }
+
       markSecondaryHealthy(eventSource && eventSource.readyState === 1 ? 'sse' : 'polling');
-      return events.length;
+      if (events.length < PAGE_LIMIT) break;
     }
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 7000);
-    const res = await fetch(
-      `/api/sync/changes?since=${encodeURIComponent(String(rev))}&epoch=${encodeURIComponent(epoch)}&limit=1000`,
-      { signal: controller.signal }
-    );
-    clearTimeout(timer);
-
-    if (!res.ok) return 0;
-    const json = await res.json();
-
-    const wasReset =
-      Boolean(json?.resetRequired) ||
-      reconcileServerEpochAndRev(json?.serverEpoch, json?.latestRevision);
-
-    if (json?.serverEpoch) {
-      setStoredEpoch(String(json.serverEpoch));
-    }
-
-    const events: SecondaryDeltaEvent[] = Array.isArray(json?.events) ? json.events : [];
-    if (events.length > 0) {
-      dispatchDeltaBatch(events);
-      // If SSE was supposedly OPEN yet missed events for >8s since connect/last delta, recycle stale SSE connection
-      if (!wasReset && eventSource && Date.now() - Math.max(lastSseDeltaAtMs, lastSseConnectedAtMs) > 8000) {
-        try {
-          eventSource.close();
-        } catch {}
-        eventSource = null;
-        setTimeout(() => initSecondaryStream(), 500);
-      }
-      const lastEvtRev = Number(events[events.length - 1].revision) || 0;
-      if (lastEvtRev > 0) {
-        setStoredRevision(lastEvtRev, wasReset);
-      }
-    } else if (json?.latestRevision) {
-      setStoredRevision(Number(json.latestRevision), wasReset);
-    }
-
-    markSecondaryHealthy(eventSource && eventSource.readyState === 1 ? 'sse' : 'polling');
-    return events.length;
+    return totalPulled;
   } catch {
-    return 0;
+    return totalPulled;
   } finally {
     isPullingChanges = false;
   }
@@ -476,12 +567,12 @@ function attachVisibilityAndPollingHooks() {
     });
   }
 
-  // Reliable 6s active-tab HTTP delta heartbeat (works even when mobile carrier/proxy silently drops SSE)
+  // Reliable 4s active-tab HTTP delta heartbeat (works even when mobile carrier/proxy silently drops SSE)
   deltaPollTimer = setInterval(() => {
     if (typeof navigator !== 'undefined' && !navigator.onLine) return;
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
     void pullSecondaryChanges(false);
-  }, 6000);
+  }, 4000);
 }
 
 export function initSecondaryStream(): void {
@@ -498,7 +589,7 @@ export function initSecondaryStream(): void {
   try {
     const rev = getStoredRevision();
     const epoch = getStoredEpoch();
-    const url = `/api/sync/stream?sinceRevision=${encodeURIComponent(String(rev))}&epoch=${encodeURIComponent(epoch)}`;
+    const url = resolveApiUrl(`/api/sync/stream?sinceRevision=${encodeURIComponent(String(rev))}&epoch=${encodeURIComponent(epoch)}`);
     const es = new EventSource(url);
     eventSource = es;
 
@@ -508,6 +599,9 @@ export function initSecondaryStream(): void {
       reconnectDelayMs = 2000;
       try {
         const parsed = JSON.parse(e.data);
+        if (parsed?.buildId) {
+          triggerVersionCheckFromSse(String(parsed.buildId));
+        }
         const latestRev = Number(parsed?.latestRevision) || 0;
         const srvEpoch = String(parsed?.serverEpoch || '').trim();
         const didReset = reconcileServerEpochAndRev(srvEpoch, latestRev);
@@ -517,12 +611,19 @@ export function initSecondaryStream(): void {
         if (rev === 0 && latestRev > 0) {
           zeroResyncDispatchedOnce = true;
           window.dispatchEvent(new CustomEvent('blackworm_secondary_resync', { detail: { reason: 'initial_connect' } }));
-          // Pull deltas cleanly via HTTP after initial resync trigger
-          setTimeout(() => {
-            void pullSecondaryChanges(false);
-          }, 1500);
+          // Pull deltas immediately on initial connect
+          void pullSecondaryChanges(false);
         } else if (latestRev > rev) {
           void pullSecondaryChanges(false);
+        }
+      } catch {}
+    });
+
+    es.addEventListener('build_update', (e: MessageEvent) => {
+      try {
+        const parsed = JSON.parse(e.data);
+        if (parsed?.buildId) {
+          triggerVersionCheckFromSse(String(parsed.buildId));
         }
       } catch {}
     });
@@ -600,7 +701,7 @@ export async function pushToSecondary(
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3500);
-    const res = await fetch('/api/sync/upsert', {
+    const res = await fetch(resolveApiUrl('/api/sync/upsert'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -619,8 +720,13 @@ export async function pushToSecondary(
       setStoredEpoch(String(json.serverEpoch));
     }
     if (json?.stored) {
-      if (json.stored.revision) {
-        setStoredRevision(Number(json.stored.revision));
+      const storedRev = Number(json.stored.revision) || 0;
+      const curRev = getStoredRevision();
+      // Advance cursor only when strictly contiguous so intervening deltas from other devices are never skipped
+      if (storedRev > 0 && storedRev === curRev + 1) {
+        setStoredRevision(storedRev);
+      } else if (storedRev > curRev + 1) {
+        void pullSecondaryChanges(false);
       }
       // Share immediately across same-browser tabs
       broadcastToTabs([json.stored as SecondaryDeltaEvent]);
@@ -646,9 +752,10 @@ export async function pushBatchToSecondary(
   try {
     let totalCount = 0;
     const CHUNK = 200;
+    let maxServerRev = 0;
     for (let i = 0; i < items.length; i += CHUNK) {
       const slice = items.slice(i, i + CHUNK);
-      const res = await fetch('/api/sync/batch', {
+      const res = await fetch(resolveApiUrl('/api/sync/batch'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ items: slice }),
@@ -662,8 +769,28 @@ export async function pushBatchToSecondary(
         setStoredEpoch(String(json.serverEpoch));
       }
       if (json?.latestRevision) {
-        setStoredRevision(Number(json.latestRevision));
+        maxServerRev = Math.max(maxServerRev, Number(json.latestRevision) || 0);
       }
+      const nonBootstrapEvents: SecondaryDeltaEvent[] = [];
+      const fallbackNow = Date.now();
+      slice.forEach((it) => {
+        if (!it.isBootstrap && it.collection && it.id) {
+          nonBootstrapEvents.push({
+            collection: it.collection,
+            id: it.id,
+            doc: it.doc || null,
+            deleted: Boolean(it.deleted),
+            updatedAtMs: Number(it.updatedAtMs) || fallbackNow,
+            revision: 0,
+          });
+        }
+      });
+      if (nonBootstrapEvents.length > 0) {
+        broadcastToTabs(nonBootstrapEvents);
+      }
+    }
+    if (maxServerRev > getStoredRevision()) {
+      void pullSecondaryChanges(false);
     }
     markSecondaryHealthy(eventSource && eventSource.readyState === 1 ? 'sse' : 'polling');
     return { ok: true, count: totalCount };
@@ -693,7 +820,7 @@ export async function fetchSecondaryCollection(
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(`/api/sync/collection/${encodeURIComponent(colName)}?${params.toString()}`, {
+    const res = await fetch(resolveApiUrl(`/api/sync/collection/${encodeURIComponent(colName)}?${params.toString()}`), {
       signal: controller.signal,
     });
     clearTimeout(timer);
@@ -706,10 +833,8 @@ export async function fetchSecondaryCollection(
       reconcileServerEpochAndRev(String(json.serverEpoch), Number(json?.revision));
       setStoredEpoch(String(json.serverEpoch));
     }
-    // Only advance stored revision if we already pulled past 0 or after full resync
-    if (json?.revision && getStoredRevision() > 0) {
-      setStoredRevision(Number(json.revision));
-    }
+    // Never advance the global delta stream cursor from a single-collection query
+    // (that would skip pending changes on all other collections).
     markSecondaryHealthy(eventSource && eventSource.readyState === 1 ? 'sse' : 'polling');
     return {
       ok: true,
@@ -729,7 +854,7 @@ export async function fetchSecondarySummary(): Promise<SecondarySummary | null> 
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3500);
-    const res = await fetch('/api/sync/summary', { signal: controller.signal });
+    const res = await fetch(resolveApiUrl('/api/sync/summary'), { signal: controller.signal });
     clearTimeout(timer);
     if (!res.ok) return null;
     const json = (await res.json()) as SecondarySummary;
@@ -798,14 +923,15 @@ export async function autoHydrateServerFromLocalCache(force = false): Promise<nu
       );
       if (localItems.length === 0) continue;
 
-      if (serverCount === 0 || (force && localItems.length > serverCount)) {
+      if (serverCount === 0 || force) {
         localItems.forEach((it: any) => {
           batchPayloads.push({
             collection: colName,
             id: String(it.id),
             doc: it,
-            deleted: Boolean(it.isArchived),
+            deleted: isRecordDeleted(it),
             merge: true,
+            isBootstrap: true,
           });
         });
       }
@@ -822,86 +948,43 @@ export async function autoHydrateServerFromLocalCache(force = false): Promise<nu
 }
 
 /**
- * Passively mirrors Firebase-hydrated docs into the Secondary Database once per session
- * (or when item count increases) so the Secondary DB stays warm and complete for failover.
+ * Passively mirrors Firebase-hydrated docs into the Secondary Database on initial load
+ * AND whenever any document's timestamp or archive state changes so edits from Firestore
+ * are always propagated into SQLite + SSE.
  */
 export function bootstrapCollectionToSecondary(colName: string, items: any[]): void {
   if (typeof window === 'undefined' || !Array.isArray(items) || items.length === 0) return;
   if (typeof navigator !== 'undefined' && !navigator.onLine) return;
   if (isSecondaryBlocked()) return;
 
-  const prevCount = lastBootstrapCount.get(colName) || 0;
-  if (bootstrappedCollections.has(colName) && items.length <= prevCount) {
-    return;
+  let sigMap = bootstrapDocSigMap.get(colName);
+  if (!sigMap) {
+    sigMap = new Map<string, string>();
+    bootstrapDocSigMap.set(colName, sigMap);
   }
-  bootstrappedCollections.add(colName);
-  lastBootstrapCount.set(colName, items.length);
 
-  const payloads: SecondaryUpsertPayload[] = items
-    .filter((it) => it && it.id && !String(it.id).startsWith('temp_'))
-    .map((it) => ({
+  const payloads: SecondaryUpsertPayload[] = [];
+  for (const it of items) {
+    if (!it || !it.id) continue;
+    const id = String(it.id);
+    if (id.startsWith('temp_')) continue;
+    const ts = parseSyncTs(it);
+    const del = isRecordDeleted(it);
+    const sig = `${ts}:${del ? 1 : 0}`;
+    if (sigMap.get(id) === sig) continue;
+    sigMap.set(id, sig);
+    payloads.push({
       collection: colName,
-      id: String(it.id),
+      id,
       doc: it,
-      deleted: Boolean(it.isArchived),
+      deleted: del,
       merge: true,
-    }));
+      isBootstrap: true,
+    });
+  }
 
   if (payloads.length > 0) {
     void pushBatchToSecondary(payloads);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// PATH 3 HELPERS: Cloud Mirror Config (Supabase / Apps Script Relay / Peer)
-// ---------------------------------------------------------------------------
-export async function getCloudMirrorConfig(): Promise<CloudMirrorPublicConfig | null> {
-  if (typeof window === 'undefined') return null;
-  try {
-    const res = await fetch('/api/sync/cloud-config');
-    if (!res.ok) return null;
-    return (await res.json()) as CloudMirrorPublicConfig;
-  } catch {
-    return null;
-  }
-}
-
-export async function saveCloudMirrorConfig(cfg: {
-  type: CloudMirrorType;
-  url: string;
-  apiKey?: string;
-}): Promise<{ ok: boolean; restored?: number; pushed?: number; error?: string; config?: CloudMirrorPublicConfig }> {
-  try {
-    const res = await fetch('/api/sync/cloud-config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(cfg),
-    });
-    const json = await res.json();
-    if (json?.ok) {
-      window.dispatchEvent(new CustomEvent('blackworm_secondary_resync', { detail: { reason: 'cloud_config' } }));
-    }
-    return json;
-  } catch (err: any) {
-    return { ok: false, error: err?.message || 'Failed to save cloud mirror config' };
-  }
-}
-
-export async function triggerCloudMirrorSync(): Promise<{
-  ok: boolean;
-  pushed?: number;
-  restored?: number;
-  error?: string;
-}> {
-  try {
-    const res = await fetch('/api/sync/force-cloud-sync', { method: 'POST' });
-    const json = await res.json();
-    if (json?.ok) {
-      window.dispatchEvent(new CustomEvent('blackworm_secondary_resync', { detail: { reason: 'cloud_sync' } }));
-    }
-    return json;
-  } catch (err: any) {
-    return { ok: false, error: err?.message || 'Cloud sync failed' };
   }
 }
 
@@ -910,7 +993,7 @@ export async function exportAllRowsFromSecondary(sinceMs = 0): Promise<{
   rows: Array<{ collection: string; id: string; doc: Record<string, any>; updatedAtMs: number; deleted: boolean }>;
 }> {
   try {
-    const res = await fetch(`/api/sync/export-all?sinceMs=${Math.max(0, Number(sinceMs) || 0)}`);
+    const res = await fetch(resolveApiUrl(`/api/sync/export-all?sinceMs=${Math.max(0, Number(sinceMs) || 0)}`));
     if (!res.ok) return { ok: false, rows: [] };
     const json = await res.json();
     return { ok: Boolean(json?.ok), rows: Array.isArray(json?.rows) ? json.rows : [] };

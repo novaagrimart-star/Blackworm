@@ -2,8 +2,8 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Language } from '../../lib/i18n';
 import { UserProfile, isAdmin, isGodownIncharge, isOfficeOrFactoryStaff } from '../../lib/auth';
 import { toTitleCase } from '../../lib/utils';
-import { mergeWithLocalData, triggerBlobDownload, startBackgroundSync, safeLocalStorageSet, getPendingSyncMap, toTimestampMs } from '../../lib/dataService';
-import { useSharedUsers, useSharedTravelSheets, useSharedYearlyTargets, useSharedCollectionEntries } from '../../lib/realtimeStore';
+import { mergeWithLocalData, triggerBlobDownload, safeLocalStorageSet, getPendingSyncMap, toTimestampMs, forceMultiTierSyncAll } from '../../lib/dataService';
+import { useSharedUsers, useSharedTravelSheets, useSharedYearlyTargets, useSharedTargets, useSharedCollectionEntries, hydrateAllChannelsFromSecondary } from '../../lib/realtimeStore';
 import html2canvas from 'html2canvas-pro';
 import { 
   BarChart3, 
@@ -11,7 +11,6 @@ import {
   Search, 
   Loader2, 
   Table as TableIcon, 
-  CheckCircle2, 
   RefreshCw,
   Camera,
   Check,
@@ -212,7 +211,16 @@ export function buildReportRows(
       uniqueOfficersMap.set(key, o);
     }
   });
-  const uniqueOfficers = Array.from(uniqueOfficersMap.values());
+  const uniqueOfficers = Array.from(uniqueOfficersMap.values()).sort((a, b) => {
+    const aCode = (a.userCode ? String(a.userCode) : '').replace(/\D/g, '');
+    const bCode = (b.userCode ? String(b.userCode) : '').replace(/\D/g, '');
+    const aNum = parseInt(aCode, 10);
+    const bNum = parseInt(bCode, 10);
+    if (!isNaN(aNum) && !isNaN(bNum) && aNum !== bNum) return aNum - bNum;
+    if (!isNaN(aNum) && isNaN(bNum)) return -1;
+    if (isNaN(aNum) && !isNaN(bNum)) return 1;
+    return (a.fullName || '').localeCompare(b.fullName || '');
+  });
 
   // Build target maps
   const yearlyTargetMap = new Map<string, any>();
@@ -260,7 +268,7 @@ export function buildReportRows(
       // STRICT MONTH & YEAR CHECK: Sheet MUST belong to this selected month & year!
       const matchesMonthYear = 
         sId.includes(sheetMonthKey) ||
-        (Number(s.yearNumber) === year && (Number(s.monthIndex) === monthIndex || String(s.monthName || '').toLowerCase().includes(targetMonthName.toLowerCase()) || String(s.monthName || '').toLowerCase().includes('nov'))) ||
+        (Number(s.yearNumber) === year && (Number(s.monthIndex) === monthIndex || String(s.monthName || '').toLowerCase() === targetMonthName.toLowerCase())) ||
         (Array.isArray(s.rows) && s.rows.some((r: any) => r && r.date && r.date.trim() === selectedDate.trim()));
 
       if (matchesMonthYear) {
@@ -292,10 +300,22 @@ export function buildReportRows(
       }
     } catch (e) {}
 
-    if (hasPendingLocalTravel && cachedSheetParsed) {
+    const cachedTs = cachedSheetParsed
+      ? Math.max(Number(cachedSheetParsed._syncUpdatedAtMs) || 0, toTimestampMs(cachedSheetParsed.updatedAt))
+      : 0;
+    const liveTs =
+      matchingLiveSheets.length > 0
+        ? Math.max(
+            Number(matchingLiveSheets[0]?._syncUpdatedAtMs) || 0,
+            toTimestampMs(matchingLiveSheets[0]?.updatedAt || matchingLiveSheets[0]?.createdAt)
+          )
+        : 0;
+
+    if ((hasPendingLocalTravel && cachedSheetParsed) || (cachedSheetParsed && cachedTs > liveTs)) {
       candidateSheets.push(cachedSheetParsed, ...matchingLiveSheets);
     } else if (matchingLiveSheets.length > 0) {
       candidateSheets.push(...matchingLiveSheets);
+      if (cachedSheetParsed) candidateSheets.push(cachedSheetParsed);
     } else if (cachedSheetParsed) {
       candidateSheets.push(cachedSheetParsed);
     }
@@ -449,40 +469,60 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
   const { users, loaded: usersLoaded } = useSharedUsers();
   const { travelSheets, loaded: travelLoaded } = useSharedTravelSheets();
   const { yearlyTargets, loaded: targetsLoaded, refreshAllYearlyTargetsFromServer } = useSharedYearlyTargets();
+  const { targets: sharedTargets, loaded: monthlyTargetsLoaded } = useSharedTargets();
   const { collectionEntries } = useSharedCollectionEntries();
 
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isCapturingPhoto, setIsCapturingPhoto] = useState(false);
   const [photoSavedToast, setPhotoSavedToast] = useState(false);
+  const [localMutationTick, setLocalMutationTick] = useState(0);
+
+  // Pull latest SQLite WAL deltas quietly on Report mount and react immediately to local travel_sheets mutations
+  useEffect(() => {
+    void hydrateAllChannelsFromSecondary(false);
+    const handleLocalMutation = (e: Event) => {
+      const detail = (e as CustomEvent)?.detail;
+      if (detail?.collection === 'travel_sheets') {
+        setLocalMutationTick((t) => t + 1);
+      }
+    };
+    window.addEventListener('blackworm_local_record_mutation', handleLocalMutation as EventListener);
+    return () => {
+      window.removeEventListener('blackworm_local_record_mutation', handleLocalMutation as EventListener);
+    };
+  }, []);
 
   const reportData = useMemo<OfficerDailyReport[]>(() => {
     const activeDate = /^\d{4}-\d{2}-\d{2}$/.test(String(selectedDate || '').trim())
       ? selectedDate
       : getTodayLocalDate();
-    const resolvedUsers = usersLoaded || users.length > 0 ? users : getInitialCachedUsers();
-    const resolvedTravel = travelLoaded || travelSheets.length > 0 ? travelSheets : getInitialCachedTravel();
-    const resolvedTargets = targetsLoaded || yearlyTargets.length > 0 ? yearlyTargets : (reportStaticCache?.yearlyTargets || []);
+    const resolvedUsers = usersLoaded ? users : (users.length > 0 ? users : getInitialCachedUsers());
+    const resolvedTravel = travelLoaded ? travelSheets : (travelSheets.length > 0 ? travelSheets : getInitialCachedTravel());
+    const resolvedTargets = targetsLoaded ? yearlyTargets : (yearlyTargets.length > 0 ? yearlyTargets : (reportStaticCache?.yearlyTargets || []));
+    const resolvedFallbackTargets = monthlyTargetsLoaded
+      ? sharedTargets
+      : (sharedTargets.length > 0 ? sharedTargets : (reportStaticCache?.targets || []));
 
     const rows = buildReportRows(
       resolvedUsers,
       resolvedTravel,
       resolvedTargets,
-      reportStaticCache?.targets || [],
+      resolvedFallbackTargets,
       collectionEntries,
       activeDate,
       profile
     );
     safeLocalStorageSet(`${LOCAL_STORAGE_DAILY_PREFIX}${activeDate}`, JSON.stringify(rows));
     return rows;
-  }, [users, usersLoaded, travelSheets, travelLoaded, yearlyTargets, targetsLoaded, collectionEntries, selectedDate, profile]);
+  }, [users, usersLoaded, travelSheets, travelLoaded, yearlyTargets, targetsLoaded, sharedTargets, monthlyTargetsLoaded, collectionEntries, selectedDate, profile, localMutationTick]);
 
-  const loading = !usersLoaded && reportData.length === 0;
+  const loading = (!usersLoaded || !travelLoaded) && reportData.length === 0;
 
-  // Lightweight manual refresh: flush pending queue + optionally pull server yearly targets without full 4-collection re-fetch
+  // Full multi-tier manual refresh: clear transient cooldown, re-attach dropped listeners, pull server deltas & targets
   const handleRefresh = async () => {
     setIsRefreshing(true);
     try {
-      await startBackgroundSync();
+      await forceMultiTierSyncAll(true);
       await refreshAllYearlyTargetsFromServer();
     } finally {
       setTimeout(() => {
@@ -566,10 +606,6 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
     } catch {}
   };
 
-  const handleToday = () => {
-    setSelectedDate(getTodayLocalDate());
-  };
-
   const totalKmSum = reportData.reduce((acc, r) => acc + r.totalKm, 0);
   const totalCollectionSum = reportData.reduce((acc, r) => acc + r.paymentCollection, 0);
   const totalExpenseSum = reportData.reduce((acc, r) => acc + r.dailyExpense, 0);
@@ -577,98 +613,74 @@ export const ReportView: React.FC<Props> = ({ profile }) => {
   const totalAchieveSum = addDecimal2(...reportData.map(r => r.monthlyAchievement));
   const totalBacklogSum = addDecimal2(...reportData.map(r => r.targetBacklog));
 
-  const filledCount = reportData.filter(r => (r.route && r.route !== '-') || r.totalKm > 0 || r.dailyExpense > 0 || r.openingKm > 0 || r.closingKm > 0).length;
-
   return (
     <div className="space-y-4 w-full pb-20 font-sans">
-      {/* Header Bar: Report Title with Date Option and Actions */}
-      <div className="bg-white p-3 sm:p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-wrap items-center justify-between gap-3 no-print">
-        <div className="flex items-center gap-3 flex-wrap">
-          <div className="flex items-center gap-2">
-            <BarChart3 className="w-5 h-5 sm:w-6 sm:h-6 text-indigo-600 shrink-0" />
-            <h2 className="text-lg sm:text-xl font-bold text-slate-900 tracking-tight">Report</h2>
-          </div>
+      {/* Compact Single-Line Header Bar: Report Title, Date Navigator, Refresh & Photo (Live sync continues in background) */}
+      <div className="bg-white px-1.5 py-2 sm:p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-nowrap items-center justify-between gap-1 sm:gap-2.5 no-print">
+        <div className="flex items-center gap-1 sm:gap-2 shrink-0">
+          <BarChart3 className="w-3.5 h-3.5 sm:w-5 sm:h-5 text-indigo-600 shrink-0" />
+          <h2 className="text-[11px] sm:text-xl font-bold text-slate-900 tracking-tight whitespace-nowrap">
+            Report
+          </h2>
+        </div>
 
-          {/* Quick Date Navigator (Prev, Input, Next) */}
-          <div className="flex items-center bg-slate-100 rounded-xl p-0.5 border border-slate-200 shadow-2xs">
+        <div className="flex flex-nowrap items-center justify-end gap-1 sm:gap-2 min-w-0">
+          {/* Compact Date Navigator (Prev, Date, Next) */}
+          <div className="flex items-center bg-slate-100 rounded-xl p-0.5 border border-slate-200 shadow-2xs min-w-0 shrink">
             <button
               type="button"
               onClick={handlePrevDay}
-              className="p-1.5 hover:bg-white rounded-lg text-slate-700 hover:text-slate-900 transition shadow-2xs cursor-pointer active:scale-95"
+              className="p-1 sm:p-1.5 hover:bg-white rounded-lg text-slate-700 hover:text-slate-900 transition shadow-2xs cursor-pointer active:scale-95 shrink-0"
               title="मागील दिवस (Previous Day)"
             >
-              <ChevronLeft className="w-4 h-4" />
+              <ChevronLeft className="w-3 h-3 sm:w-4 sm:h-4" />
             </button>
-            <div className="relative">
-              <Calendar className="w-3.5 h-3.5 absolute left-2.5 top-2 text-slate-400 pointer-events-none" />
+            <div className="relative min-w-0">
+              <Calendar className="hidden sm:block w-3.5 h-3.5 absolute left-2.5 top-2 text-slate-400 pointer-events-none" />
               <input 
                 type="date"
                 value={selectedDate}
                 onChange={(e) => setSelectedDate(e.target.value)}
-                className="pl-8 pr-2 py-1 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-900 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer"
+                className="w-[86px] sm:w-auto px-0.5 sm:pl-8 sm:pr-2 py-1 bg-white border border-slate-200 rounded-lg text-[9.5px] sm:text-xs font-bold text-slate-900 focus:outline-none focus:ring-1 focus:ring-indigo-500 cursor-pointer"
               />
             </div>
             <button
               type="button"
               onClick={handleNextDay}
-              className="p-1.5 hover:bg-white rounded-lg text-slate-700 hover:text-slate-900 transition shadow-2xs cursor-pointer active:scale-95"
+              className="p-1 sm:p-1.5 hover:bg-white rounded-lg text-slate-700 hover:text-slate-900 transition shadow-2xs cursor-pointer active:scale-95 shrink-0"
               title="पुढील दिवस (Next Day)"
             >
-              <ChevronRight className="w-4 h-4" />
+              <ChevronRight className="w-3 h-3 sm:w-4 sm:h-4" />
             </button>
           </div>
 
-          {/* Quick Today jump button */}
-          <button
-            type="button"
-            onClick={handleToday}
-            className="px-2.5 py-1.5 text-xs font-bold bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl transition border border-slate-200 cursor-pointer active:scale-95"
-            title="आजच्या तारखेवर जा"
-          >
-            Today (आज)
-          </button>
-
-          {/* Manual Refresh Button */}
+          {/* Refresh Button */}
           <button
             type="button"
             onClick={handleRefresh}
             disabled={isRefreshing}
-            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold bg-slate-100 hover:bg-indigo-50 text-slate-700 hover:text-indigo-600 rounded-xl transition border border-slate-200 cursor-pointer active:scale-95 disabled:opacity-60"
+            className="flex items-center gap-0.5 sm:gap-1.5 px-1.5 sm:px-2.5 py-1.5 text-[9.5px] sm:text-xs font-bold bg-slate-100 hover:bg-indigo-50 text-slate-700 hover:text-indigo-600 rounded-xl transition border border-slate-200 cursor-pointer active:scale-95 disabled:opacity-60 shrink-0 whitespace-nowrap"
             title="डेटा रिफ्रेश करा (Refresh Report Data)"
           >
-            <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-indigo-600' : ''}`} />
+            <RefreshCw className={`w-3 h-3 sm:w-3.5 sm:h-3.5 shrink-0 ${isRefreshing ? 'animate-spin text-indigo-600' : ''}`} />
             <span>Refresh</span>
           </button>
 
-          {/* Officer Submissions Count Badge */}
-          <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-900 text-xs font-bold">
-            <span>रिपोर्ट भरलेले:</span>
-            <span className="px-1.5 py-0.5 bg-indigo-600 text-white rounded-md text-[11px] font-black">
-              {filledCount} / {reportData.length}
-            </span>
-          </div>
-
-          {/* Camera Button: Save Photo to Gallery */}
+          {/* Photo Button: Save Photo to Gallery */}
           <button 
             type="button"
             onClick={handleCaptureReportPhoto}
             disabled={isCapturingPhoto}
-            className="flex items-center gap-1.5 px-3 py-1.5 sm:py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold transition shadow-xs disabled:opacity-50 shrink-0 cursor-pointer active:scale-95"
+            className="flex items-center gap-0.5 sm:gap-1.5 px-1.5 sm:px-3 py-1.5 sm:py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-[9.5px] sm:text-xs font-bold transition shadow-xs disabled:opacity-50 shrink-0 cursor-pointer active:scale-95 whitespace-nowrap"
             title="Save Report Photo directly to Mobile Gallery"
           >
             {isCapturingPhoto ? (
-              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <Loader2 className="w-3 h-3 sm:w-3.5 sm:h-3.5 animate-spin shrink-0" />
             ) : (
-              <Camera className="w-3.5 h-3.5" />
+              <Camera className="w-3 h-3 sm:w-3.5 sm:h-3.5 shrink-0" />
             )}
             <span>Photo</span>
           </button>
-
-          {/* Instant Live Sync indicator */}
-          <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-bold">
-            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-            <span>Live Sync Active</span>
-          </div>
         </div>
       </div>
 
