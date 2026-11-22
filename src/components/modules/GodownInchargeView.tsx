@@ -273,29 +273,76 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
     }
   }, [userIsAdmin, activeTab]);
 
+  const openSubTab = (tab: Exclude<ModuleTab, null>) => {
+    if (tab === 'incharge_form' && !userIsAdmin) return;
+    if (tab === 'orders') {
+      setWarehouseStatusFilter('fresh');
+    }
+    setStaffViewMode('list');
+    setActiveTab(tab);
+    try {
+      if (!window.history.state?.warehouseTab) {
+        window.history.pushState({ tab: 'office_staff', warehouseTab: tab }, '');
+      } else {
+        window.history.replaceState({ tab: 'office_staff', warehouseTab: tab }, '');
+      }
+    } catch {}
+  };
+
+  const handleReturnToHub = () => {
+    try {
+      if (window.history.state?.tab === 'office_staff' && window.history.state?.warehouseStaffFormOpen) {
+        setStaffViewMode('list');
+        setActiveTab(null);
+        window.history.go(-2);
+        return;
+      }
+      if (window.history.state?.tab === 'office_staff' && window.history.state?.warehouseTab) {
+        window.history.back();
+        return;
+      }
+    } catch {}
+    setStaffViewMode('list');
+    setActiveTab(null);
+  };
+
+  const handleCloseStaffForm = () => {
+    try {
+      if (window.history.state?.tab === 'office_staff' && window.history.state?.warehouseStaffFormOpen) {
+        window.history.back();
+        return;
+      }
+    } catch {}
+    setStaffViewMode('list');
+  };
+
+  useEffect(() => {
+    const handlePopState = (e: PopStateEvent) => {
+      if (isUnmountingRef.current) return;
+      const st = e.state;
+      if (st?.tab === 'office_staff') {
+        const nextTab = (st.warehouseTab || null) as ModuleTab;
+        const nextForm = Boolean(st.warehouseStaffFormOpen && nextTab === 'attendance');
+        setActiveTab(nextTab && (nextTab !== 'incharge_form' || userIsAdmin) ? nextTab : null);
+        setStaffViewMode(nextForm ? 'form' : 'list');
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
+    };
+  }, [userIsAdmin]);
+
   useEffect(() => {
     if (staffViewMode === 'form') {
-      if (!staffFormHistoryPushedRef.current && !window.history.state?.warehouseStaffFormOpen) {
-        window.history.pushState({ tab: 'office_staff', warehouseStaffFormOpen: true }, '');
-        staffFormHistoryPushedRef.current = true;
-      }
-      const handlePopState = () => {
-        staffFormHistoryPushedRef.current = false;
-        setStaffViewMode('list');
-      };
-      window.addEventListener('popstate', handlePopState);
-      return () => {
-        window.removeEventListener('popstate', handlePopState);
-      };
-    } else if (staffFormHistoryPushedRef.current) {
-      staffFormHistoryPushedRef.current = false;
-      if (
-        !isUnmountingRef.current &&
-        window.history.state?.tab === 'office_staff' &&
-        window.history.state?.warehouseStaffFormOpen
-      ) {
-        window.history.back();
-      }
+      try {
+        if (!window.history.state?.warehouseStaffFormOpen) {
+          window.history.pushState(
+            { tab: 'office_staff', warehouseTab: 'attendance', warehouseStaffFormOpen: true },
+            ''
+          );
+        }
+      } catch {}
     }
   }, [staffViewMode]);
 
@@ -842,8 +889,7 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
 
   const openAdminInchargeTab = () => {
     if (!userIsAdmin) return;
-    setStaffViewMode('list');
-    setActiveTab('incharge_form');
+    openSubTab('incharge_form');
     if (warehouseInchargeUsers.length > 0) {
       const target =
         (incUid ? warehouseInchargeUsers.find((u) => u.uid === incUid) : null) ||
@@ -1274,7 +1320,7 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
 
         setOfficeStaffOptimistic((prev) => prev.filter((item) => !removeSet.has(item.id)));
         if (editingStaffId && removeSet.has(editingStaffId)) {
-          setStaffViewMode('list');
+          handleCloseStaffForm();
         }
         await Promise.all(
           idsToRemove.map((id) =>
@@ -1520,10 +1566,7 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
             {activeTab !== null ? (
               <button
                 type="button"
-                onClick={() => {
-                  setStaffViewMode('list');
-                  setActiveTab(null);
-                }}
+                onClick={handleReturnToHub}
                 className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl bg-white/10 hover:bg-white/20 border border-white/15 text-white text-xs font-bold transition shrink-0 cursor-pointer active:scale-95"
                 title="Back to Warehouse Options"
               >
@@ -1548,9 +1591,15 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
                   : 'Warehouse Incharge'}
               </h2>
               <p className="text-[11px] sm:text-xs text-slate-300 truncate">
-                {activeTab === null
-                  ? 'Select an option below to open'
-                  : 'Orders · Attendance · Monthly Review'}
+                {activeTab === 'orders'
+                  ? 'Order Dispatch & Delivery'
+                  : activeTab === 'attendance'
+                  ? 'Staff Daily Attendance'
+                  : activeTab === 'report'
+                  ? 'Monthly Attendance Summary'
+                  : activeTab === 'incharge_form'
+                  ? 'Login & Profile Details'
+                  : 'Select an option below to open'}
               </p>
             </div>
           </div>
@@ -1567,8 +1616,8 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
           )}
         </div>
 
-        {/* Attractive Major Icon Navigation Cards: Expanded Showcase on Initial Hub (activeTab === null), Compact Bar When Inside Section */}
-        {activeTab === null ? (
+        {/* Initial 4 Hub Option Cards (Shown only when activeTab === null) */}
+        {activeTab === null && (
           <div
             className={cn(
               'p-4 sm:p-6 bg-slate-50/70 grid gap-3 sm:gap-4',
@@ -1578,11 +1627,7 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
             {/* 1. Orders */}
             <button
               type="button"
-              onClick={() => {
-                setWarehouseStatusFilter('fresh');
-                setStaffViewMode('list');
-                setActiveTab('orders');
-              }}
+              onClick={() => openSubTab('orders')}
               className="group relative flex flex-col items-center justify-center gap-3 p-5 sm:p-6 rounded-2xl bg-gradient-to-b from-white to-blue-50/60 border border-blue-200/80 hover:border-blue-400 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all cursor-pointer active:scale-95 text-center"
             >
               <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-gradient-to-br from-blue-600 to-indigo-600 text-white shadow-sm flex items-center justify-center group-hover:scale-105 transition-transform">
@@ -1601,10 +1646,7 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
             {/* 2. Attendance */}
             <button
               type="button"
-              onClick={() => {
-                setStaffViewMode('list');
-                setActiveTab('attendance');
-              }}
+              onClick={() => openSubTab('attendance')}
               className="group relative flex flex-col items-center justify-center gap-3 p-5 sm:p-6 rounded-2xl bg-gradient-to-b from-white to-emerald-50/60 border border-emerald-200/80 hover:border-emerald-400 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all cursor-pointer active:scale-95 text-center"
             >
               <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-gradient-to-br from-emerald-600 to-teal-600 text-white shadow-sm flex items-center justify-center group-hover:scale-105 transition-transform">
@@ -1623,10 +1665,7 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
             {/* 3. Monthly Review */}
             <button
               type="button"
-              onClick={() => {
-                setStaffViewMode('list');
-                setActiveTab('report');
-              }}
+              onClick={() => openSubTab('report')}
               className="group relative flex flex-col items-center justify-center gap-3 p-5 sm:p-6 rounded-2xl bg-gradient-to-b from-white to-amber-50/60 border border-amber-200/80 hover:border-amber-400 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all cursor-pointer active:scale-95 text-center"
             >
               <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-gradient-to-br from-amber-500 to-orange-600 text-white shadow-sm flex items-center justify-center group-hover:scale-105 transition-transform">
@@ -1660,81 +1699,6 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
                     {warehouseInchargeUsers.length > 0 ? `${warehouseInchargeUsers.length} Form` : 'Login & Profile'}
                   </span>
                 </div>
-              </button>
-            )}
-          </div>
-        ) : (
-          <div
-            className={cn(
-              'p-2 bg-slate-100/80 grid gap-2',
-              userIsAdmin ? 'grid-cols-2 sm:grid-cols-4' : 'grid-cols-3'
-            )}
-          >
-            <button
-              type="button"
-              onClick={() => {
-                setWarehouseStatusFilter('fresh');
-                setStaffViewMode('list');
-                setActiveTab('orders');
-              }}
-              className={cn(
-                'flex items-center justify-center gap-2 py-2.5 px-2.5 rounded-xl border transition-all cursor-pointer active:scale-95',
-                activeTab === 'orders'
-                  ? 'bg-slate-900 text-white border-slate-900 shadow-sm'
-                  : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
-              )}
-            >
-              <PackageCheck className={cn('w-4 h-4 shrink-0', activeTab === 'orders' ? 'text-emerald-300' : 'text-blue-600')} />
-              <span className="text-xs font-bold whitespace-nowrap">Orders</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setStaffViewMode('list');
-                setActiveTab('attendance');
-              }}
-              className={cn(
-                'flex items-center justify-center gap-2 py-2.5 px-2.5 rounded-xl border transition-all cursor-pointer active:scale-95',
-                activeTab === 'attendance'
-                  ? 'bg-slate-900 text-white border-slate-900 shadow-sm'
-                  : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
-              )}
-            >
-              <ClipboardCheck className={cn('w-4 h-4 shrink-0', activeTab === 'attendance' ? 'text-emerald-300' : 'text-emerald-600')} />
-              <span className="text-xs font-bold whitespace-nowrap">Attendance</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setStaffViewMode('list');
-                setActiveTab('report');
-              }}
-              className={cn(
-                'flex items-center justify-center gap-2 py-2.5 px-2.5 rounded-xl border transition-all cursor-pointer active:scale-95',
-                activeTab === 'report'
-                  ? 'bg-slate-900 text-white border-slate-900 shadow-sm'
-                  : 'bg-white text-slate-700 border-slate-200 hover:border-slate-300'
-              )}
-            >
-              <BarChart3 className={cn('w-4 h-4 shrink-0', activeTab === 'report' ? 'text-emerald-300' : 'text-amber-600')} />
-              <span className="text-xs font-bold whitespace-nowrap">Monthly Review</span>
-            </button>
-
-            {userIsAdmin && (
-              <button
-                type="button"
-                onClick={openAdminInchargeTab}
-                className={cn(
-                  'flex items-center justify-center gap-2 py-2.5 px-2.5 rounded-xl border transition-all cursor-pointer active:scale-95',
-                  activeTab === 'incharge_form'
-                    ? 'bg-red-600 text-white border-red-600 shadow-sm'
-                    : 'bg-white text-slate-700 border-slate-200 hover:border-red-300'
-                )}
-              >
-                <ShieldCheck className={cn('w-4 h-4 shrink-0', activeTab === 'incharge_form' ? 'text-white' : 'text-red-600')} />
-                <span className="text-xs font-bold whitespace-nowrap">Warehouse Incharge</span>
               </button>
             )}
           </div>
@@ -2570,7 +2534,7 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
             <div className="bg-slate-50 border-b border-slate-200 px-2.5 py-1.5 sm:px-4 sm:py-2 flex items-center justify-between gap-1.5 no-print sticky left-0 w-full z-10">
               <button
                 type="button"
-                onClick={() => setStaffViewMode('list')}
+                onClick={handleCloseStaffForm}
                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white border border-slate-300 hover:bg-slate-100 text-xs font-bold text-slate-700 transition cursor-pointer shrink-0"
               >
                 <ChevronLeft className="w-3.5 h-3.5" />

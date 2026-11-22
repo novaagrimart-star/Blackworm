@@ -2,11 +2,11 @@ import firebaseConfig from '../../firebase-applet-config.json';
 import { safeClearTransientCaches } from './localVault';
 
 export const APP_VERSION: string =
-  typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.1';
+  (import.meta as any)?.env?.VITE_APP_VERSION || (typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.1');
 export const APP_BUILD_ID: string =
-  typeof __APP_BUILD_ID__ !== 'undefined' ? __APP_BUILD_ID__ : 'dev';
+  (import.meta as any)?.env?.VITE_APP_BUILD_ID || (typeof __APP_BUILD_ID__ !== 'undefined' ? __APP_BUILD_ID__ : 'dev');
 export const APP_BUILD_TIME: string =
-  typeof __APP_BUILD_TIME__ !== 'undefined' ? __APP_BUILD_TIME__ : '';
+  (import.meta as any)?.env?.VITE_APP_BUILD_TIME || (typeof __APP_BUILD_TIME__ !== 'undefined' ? __APP_BUILD_TIME__ : '');
 
 export const SINGLE_SOURCE_OF_TRUTH = {
   firebaseProjectId: firebaseConfig.projectId,
@@ -39,10 +39,24 @@ export function isPackagedApkShell(): boolean {
   try {
     const proto = String(window.location.protocol || '').toLowerCase();
     const host = String(window.location.hostname || '').toLowerCase();
-    if (proto === 'file:' || proto === 'capacitor:' || proto === 'ionic:' || proto === 'app:') {
+    if (
+      proto === 'file:' ||
+      proto === 'capacitor:' ||
+      proto === 'ionic:' ||
+      proto === 'app:' ||
+      proto === 'asset:' ||
+      proto === 'content:'
+    ) {
       return true;
     }
-    if (proto === 'http:' && (host === 'localhost' || host === '127.0.0.1') && window.location.port !== '3000') {
+    if (host === 'appassets.androidplatform.net' || host.endsWith('.androidplatform.net')) {
+      return true;
+    }
+    if ((host === 'localhost' || host === '127.0.0.1') && window.location.port !== '3000') {
+      return true;
+    }
+    const w = window as any;
+    if (w?.Capacitor?.isNativePlatform?.() || w?.cordova || w?.AndroidBridge || w?.ReactNativeWebView) {
       return true;
     }
     return false;
@@ -51,14 +65,30 @@ export function isPackagedApkShell(): boolean {
   }
 }
 
+function isLocalOrDevOrigin(orig: string): boolean {
+  return orig.includes('ais-dev-') || orig.includes('://localhost') || orig.includes('://127.0.0.1');
+}
+
+function clearPoisonedOriginCache(badOrigin: string): void {
+  try {
+    const saved = String(localStorage.getItem(ORIGIN_STORAGE_KEY) || '').trim().replace(/\/+$/, '');
+    if (saved && saved === badOrigin.replace(/\/+$/, '')) {
+      localStorage.removeItem(ORIGIN_STORAGE_KEY);
+    }
+  } catch {}
+}
+
 export function getHostedWebAppOrigin(): string {
   if (typeof window === 'undefined') return DEFAULT_HOSTED_ORIGIN;
   try {
     const envOrigin = String((import.meta as any)?.env?.VITE_PUBLIC_APP_URL || '').trim().replace(/\/+$/, '');
     if (envOrigin && envOrigin.startsWith('http')) return envOrigin;
     const saved = String(localStorage.getItem(ORIGIN_STORAGE_KEY) || '').trim().replace(/\/+$/, '');
-    if (saved && saved.startsWith('http')) return saved;
-    if (!isPackagedApkShell()) {
+    const inPackagedShell = isPackagedApkShell();
+    if (saved && saved.startsWith('http') && (!inPackagedShell || !isLocalOrDevOrigin(saved))) {
+      return saved;
+    }
+    if (!inPackagedShell) {
       const origin = String(window.location.origin || '').trim().replace(/\/+$/, '');
       if (origin && origin.startsWith('http')) return origin;
     }
@@ -68,28 +98,25 @@ export function getHostedWebAppOrigin(): string {
 
 /**
  * Resolves the API base origin cleanly for Web, TWA, Android WebView, and packaged Capacitor APKs.
- * Same-origin HTTPS web/TWA uses '' (relative path); local file:///capacitor:// shells route to the hosted backend.
+ * Same-origin HTTPS web/TWA uses '' (relative path); local file:///capacitor:// & https://localhost/appassets APK shells route to the hosted backend.
  */
 export function getSyncApiBaseUrl(): string {
   if (typeof window === 'undefined') return '';
   try {
+    if (isPackagedApkShell()) {
+      return getHostedWebAppOrigin();
+    }
     const proto = String(window.location.protocol || '').toLowerCase();
     const host = String(window.location.hostname || '').toLowerCase();
 
     // Normal Web / PWA / TWA / Vite dev server running on HTTPS or localhost:3000 -> relative paths
     if (proto === 'https:' || (proto === 'http:' && host !== 'localhost' && host !== '127.0.0.1')) {
-      try {
-        if (window.location.origin && !window.location.origin.includes('null')) {
-          localStorage.setItem(ORIGIN_STORAGE_KEY, window.location.origin);
-        }
-      } catch {}
       return '';
     }
     if (proto === 'http:' && (host === 'localhost' || host === '127.0.0.1') && window.location.port === '3000') {
       return '';
     }
 
-    // Packaged APK WebView / Capacitor (capacitor://localhost, file://, or http://localhost without port 3000)
     return getHostedWebAppOrigin();
   } catch {
     return '';
@@ -106,34 +133,65 @@ export function getLatestRemoteVersionInfo(): RemoteVersionInfo | null {
   return latestRemoteInfo;
 }
 
-async function fetchRemoteVersionPayload(): Promise<RemoteVersionInfo | null> {
+async function fetchRemoteVersionPayload(): Promise<{
+  info: RemoteVersionInfo | null;
+  saw404: boolean;
+  source: 'api-version' | 'version-json' | 'health' | 'none';
+}> {
   const bust = Date.now();
-  const candidates = [
-    resolveApiUrl(`/api/app-version?t=${bust}`),
-    resolveApiUrl(`/version.json?t=${bust}`),
+  const base = getSyncApiBaseUrl();
+  const candidates: Array<{ url: string; source: 'api-version' | 'version-json' | 'health' }> = [
+    { url: resolveApiUrl(`/api/app-version?t=${bust}`), source: 'api-version' },
+    { url: resolveApiUrl(`/version.json?t=${bust}`), source: 'version-json' },
+    { url: resolveApiUrl(`/api/health?t=${bust}`), source: 'health' },
   ];
 
-  for (const url of candidates) {
+  let saw404 = false;
+
+  for (const candidate of candidates) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 7500);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
-      const res = await fetch(url, {
+      const res = await fetch(candidate.url, {
         cache: 'no-store',
-        headers: {
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
-          Pragma: 'no-cache',
-        },
+        credentials: base ? 'omit' : 'same-origin',
         signal: controller.signal,
       });
-      clearTimeout(timer);
-      if (!res.ok) continue;
-      const json = (await res.json()) as RemoteVersionInfo;
-      if (json && typeof json.buildId === 'string' && json.buildId.trim()) {
-        return json;
+      if (res.status === 404) {
+        saw404 = true;
+        continue;
       }
-    } catch {}
+      if (!res.ok) continue;
+      if (res.url && res.url.includes('__cookie_check')) continue;
+      const ct = String(res.headers.get('content-type') || '').toLowerCase();
+      if (ct && !ct.includes('json') && !ct.includes('text/plain')) continue;
+
+      const rawText = await res.text().catch(() => '');
+      if (!rawText || rawText.trim().startsWith('<')) continue;
+      const json = JSON.parse(rawText) as RemoteVersionInfo;
+      if (json && typeof json.buildId === 'string' && json.buildId.trim()) {
+        // Persist confirmed healthy non-local public origin for future packaged launches
+        if (!base && typeof window !== 'undefined') {
+          try {
+            const orig = String(window.location.origin || '').trim().replace(/\/+$/, '');
+            if (orig && orig.startsWith('https://') && !isLocalOrDevOrigin(orig) && !orig.includes('null')) {
+              localStorage.setItem(ORIGIN_STORAGE_KEY, orig);
+            }
+          } catch {}
+        }
+        return { info: json, saw404: false, source: candidate.source };
+      }
+    } catch {
+      // Try next endpoint candidate
+    } finally {
+      clearTimeout(timer);
+    }
   }
-  return null;
+
+  if (saw404 && base) {
+    clearPoisonedOriginCache(base);
+  }
+  return { info: null, saw404, source: 'none' };
 }
 
 function canAttemptReloadForBuild(targetBuildId: string, manual = false): boolean {
@@ -159,22 +217,40 @@ function canAttemptReloadForBuild(targetBuildId: string, manual = false): boolea
 }
 
 async function isOriginHtmlReachable(origin: string): Promise<boolean> {
-  try {
+  const probes = [`${origin}/?probe=${Date.now()}`, `${origin}/index.html?probe=${Date.now()}`];
+  for (const probeUrl of probes) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4500);
-    const res = await fetch(`${origin}/index.html?probe=${Date.now()}`, {
-      cache: 'no-store',
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    return res.ok;
-  } catch {
-    return false;
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const res = await fetch(probeUrl, {
+        cache: 'no-store',
+        credentials: 'same-origin',
+        signal: controller.signal,
+      });
+      if (!res.ok) continue;
+      if (res.url && res.url.includes('__cookie_check')) continue;
+      const ct = String(res.headers.get('content-type') || '').toLowerCase();
+      if (ct && !ct.includes('text/html')) continue;
+      const bodySnippet = (await res.text().catch(() => '')).slice(0, 4096);
+      if (
+        bodySnippet.includes('id="root"') ||
+        bodySnippet.includes("id='root'") ||
+        bodySnippet.includes('Blackworm Agritech')
+      ) {
+        return true;
+      }
+    } catch {
+      // Try next probe
+    } finally {
+      clearTimeout(timer);
+    }
   }
+  return false;
 }
 
 export async function applyRemoteAppUpdate(remoteBuildId?: string, version?: string): Promise<boolean> {
   if (typeof window === 'undefined') return false;
+  if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
   const tag = String(remoteBuildId || Date.now()).trim();
 
   try {
@@ -185,11 +261,21 @@ export async function applyRemoteAppUpdate(remoteBuildId?: string, version?: str
     );
   } catch {}
 
+  // Update active Service Worker smoothly while preserving offline precache safety
+  try {
+    if ('serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg) {
+        await Promise.race([reg.update(), new Promise((r) => setTimeout(r, 1800))]);
+      }
+    }
+  } catch {}
+
   await Promise.race([
-    safeClearTransientCaches(),
-    new Promise((r) => setTimeout(r, 2000)),
+    safeClearTransientCaches({ includeServiceWorker: false }),
+    new Promise((r) => setTimeout(r, 1500)),
   ]);
-  await new Promise((r) => setTimeout(r, 350));
+  await new Promise((r) => setTimeout(r, 250));
 
   try {
     if (isPackagedApkShell()) {
@@ -202,21 +288,30 @@ export async function applyRemoteAppUpdate(remoteBuildId?: string, version?: str
         window.location.replace(target.toString());
         return true;
       }
+      return false;
+    }
+
+    const origin = window.location.origin;
+    if (origin && origin.startsWith('http')) {
+      const reachable = await isOriginHtmlReachable(origin);
+      if (reachable) {
+        const nextUrl = new URL(`${origin}/`);
+        nextUrl.searchParams.set('v', tag);
+        if (window.location.hash) {
+          nextUrl.hash = window.location.hash;
+        }
+        window.location.replace(nextUrl.toString());
+        return true;
+      }
+      // Same-origin API confirmed a new build, reload current document cleanly without redirecting
       window.location.reload();
       return true;
     }
 
-    const nextUrl = new URL(window.location.href);
-    nextUrl.searchParams.set('v', tag);
-    window.location.replace(nextUrl.toString());
+    window.location.reload();
     return true;
   } catch {
-    try {
-      window.location.reload();
-      return true;
-    } catch {
-      return false;
-    }
+    return false;
   }
 }
 
@@ -232,6 +327,7 @@ export async function checkRemoteAppVersion(options: {
   remoteBuildId?: string;
   remote?: RemoteVersionInfo | null;
   error?: string;
+  source?: string;
 }> {
   if (typeof window === 'undefined') {
     return { checked: false, hasUpdate: false, reloaded: false, localBuildId: APP_BUILD_ID };
@@ -256,9 +352,17 @@ export async function checkRemoteAppVersion(options: {
   lastVersionCheckAt = now;
 
   try {
-    const remote = await fetchRemoteVersionPayload();
+    const result = await fetchRemoteVersionPayload();
+    const remote = result.info;
     if (!remote) {
-      return { checked: false, hasUpdate: false, reloaded: false, localBuildId: APP_BUILD_ID, error: 'unreachable' };
+      return {
+        checked: false,
+        hasUpdate: false,
+        reloaded: false,
+        localBuildId: APP_BUILD_ID,
+        error: result.saw404 ? 'hosted_origin_404' : 'unreachable',
+        source: result.source,
+      };
     }
     latestRemoteInfo = remote;
 
@@ -275,6 +379,7 @@ export async function checkRemoteAppVersion(options: {
           localBuildId: APP_BUILD_ID,
           remoteBuildId,
           remote,
+          source: result.source,
         };
       }
     }
@@ -286,6 +391,7 @@ export async function checkRemoteAppVersion(options: {
       localBuildId: APP_BUILD_ID,
       remoteBuildId,
       remote,
+      source: result.source,
     };
   } finally {
     isCheckingVersion = false;

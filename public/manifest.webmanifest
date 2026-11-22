@@ -1,0 +1,32 @@
+{
+  "id": "/",
+  "name": "Blackworm Agritech MIS",
+  "short_name": "Blackworm MIS",
+  "description": "Official Management Information System for Blackworm Agritech Pvt Ltd. Secure dashboard for orders, targets, and field records.",
+  "theme_color": "#e11d48",
+  "background_color": "#f8fafc",
+  "display": "standalone",
+  "orientation": "portrait",
+  "scope": "/",
+  "start_url": "/",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

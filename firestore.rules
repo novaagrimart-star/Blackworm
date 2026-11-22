@@ -159,6 +159,22 @@ service cloud.firestore {
         && isOptStrOrNum(d, 'pinCode', 20);
     }
 
+    function isValidLocationDealer(d) {
+      return isValidLocationRecord(d)
+        && isOptStr(d, 'firmName', 250)
+        && isOptStr(d, 'proprietorName', 200)
+        && isOptStrOrNum(d, 'contactNumber', 40)
+        && isOptStr(d, 'category', 120)
+        && isOptStr(d, 'address', 500)
+        && isOptStr(d, 'notes', 500)
+        && isOptStr(d, 'userId', 180)
+        && isOptStr(d, 'ownerId', 180)
+        && isOptStr(d, 'createdByUid', 180)
+        && isOptStr(d, 'createdByName', 200)
+        && isOptStr(d, 'updatedByUid', 180)
+        && isOptStr(d, 'updatedByName', 200);
+    }
+
     function isValidOfficeStaffMember(d) {
       return isValidBaseWrite(d)
         && isOptStr(d, 'fullName', 200)
@@ -260,6 +276,13 @@ service cloud.firestore {
       allow get: if isValidDocId(docId);
       allow list: if true;
       allow create, update: if isValidDocId(docId) && isValidLocationRecord(incoming());
+      allow delete: if false;
+    }
+
+    match /location_dealers/{docId} {
+      allow get: if isValidDocId(docId);
+      allow list: if true;
+      allow create, update: if isValidDocId(docId) && isValidLocationDealer(incoming());
       allow delete: if false;
     }
 

@@ -14,16 +14,18 @@ if (typeof window !== 'undefined') {
   // Prevent unhandled promise rejections from killing the app
   window.addEventListener('unhandledrejection', (event) => {
     const reasonMsg = String((event.reason as any)?.message || event.reason || '').toLowerCase();
+    const isOnlineNow = typeof navigator === 'undefined' || navigator.onLine;
     if (
-      reasonMsg.includes('dynamically imported module') ||
-      reasonMsg.includes('chunkloaderror') ||
-      reasonMsg.includes('loading chunk')
+      isOnlineNow &&
+      (reasonMsg.includes('dynamically imported module') ||
+        reasonMsg.includes('chunkloaderror') ||
+        reasonMsg.includes('loading chunk'))
     ) {
       try {
         const lastReload = Number(sessionStorage.getItem('blackworm_chunk_reload_at') || '0');
         if (Date.now() - lastReload > 15000) {
           sessionStorage.setItem('blackworm_chunk_reload_at', String(Date.now()));
-          void safeClearTransientCaches().finally(() => {
+          void safeClearTransientCaches({ includeServiceWorker: false }).finally(() => {
             window.location.reload();
           });
           return;
@@ -34,14 +36,15 @@ if (typeof window !== 'undefined') {
     event.preventDefault();
   });
 
-  // Automatically recover once if Vite preload / chunk error triggers
+  // Automatically recover once if Vite preload / chunk error triggers while online
   window.addEventListener('vite:preloadError', (event) => {
     event.preventDefault();
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
     try {
       const lastReload = Number(sessionStorage.getItem('blackworm_chunk_reload_at') || '0');
       if (Date.now() - lastReload > 15000) {
         sessionStorage.setItem('blackworm_chunk_reload_at', String(Date.now()));
-        void safeClearTransientCaches().finally(() => {
+        void safeClearTransientCaches({ includeServiceWorker: false }).finally(() => {
           window.location.reload();
         });
       }
@@ -71,6 +74,7 @@ if (typeof window !== 'undefined') {
       if ('serviceWorker' in navigator) {
         navigator.serviceWorker.addEventListener('controllerchange', () => {
           if (!hadControllerAtBoot) return;
+          if (typeof navigator !== 'undefined' && !navigator.onLine) return;
           try {
             const lastReload = Number(sessionStorage.getItem('blackworm_sw_reload_at') || '0');
             if (Date.now() - lastReload > 60000) {
@@ -86,6 +90,7 @@ if (typeof window !== 'undefined') {
           if (!registration) return;
           const checkForUpdate = () => {
             if (document.visibilityState === 'hidden') return;
+            if (typeof navigator !== 'undefined' && !navigator.onLine) return;
             const now = Date.now();
             if (now - lastSwCheckAt < 30 * 1000) return;
             lastSwCheckAt = now;
@@ -98,16 +103,12 @@ if (typeof window !== 'undefined') {
           setInterval(checkForUpdate, 60 * 1000);
         },
         onNeedRefresh() {
+          if (typeof navigator !== 'undefined' && !navigator.onLine) return;
           try {
             const lastReload = Number(sessionStorage.getItem('blackworm_sw_reload_at') || '0');
             if (Date.now() - lastReload > 60000) {
               sessionStorage.setItem('blackworm_sw_reload_at', String(Date.now()));
               void updateSW(true);
-              setTimeout(() => {
-                void safeClearTransientCaches().finally(() => {
-                  window.location.reload();
-                });
-              }, 1500);
             }
           } catch {}
         },

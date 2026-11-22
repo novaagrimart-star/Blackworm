@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { UserProfile, isAdmin } from '../../lib/auth';
 import { logAudit, safeFirestoreSet, getLocalDateStr, getPendingSyncMap, toTimestampMs, safeLocalStorageSet } from '../../lib/dataService';
 import { loadCollectionFromVault } from '../../lib/localVault';
@@ -951,27 +951,77 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     }
   };
 
+  // Measure longest entered route across all days so the box border hugs the text with a small trailing gap
+  const { routeColWidth, sheetTotalWidth, measureRoutePx } = useMemo(() => {
+    const FIXED_COLS_PX = 552; // Date(74) + Days(46) + Opening(70) + Closing(70) + KM(52) + Amount(68) + OtherExp(88) + Subtotal(84)
+    const MIN_ROUTE_PX = 136;
+    const MAX_ROUTE_PX = 460;
+    const TRAILING_GAP_PX = 22;
+
+    let ctx: CanvasRenderingContext2D | null = null;
+    try {
+      if (typeof document !== 'undefined') {
+        const canvas = document.createElement('canvas');
+        ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.font = '900 10.5px ui-sans-serif, system-ui, -apple-system, sans-serif';
+        }
+      }
+    } catch {}
+
+    const measure = (txt: string): number => {
+      const clean = String(txt || '').trim();
+      if (!clean) return 0;
+      if (ctx) {
+        // Approximate uppercase/bold + slight tracking adjustment cleanly without clipping
+        return Math.ceil(ctx.measureText(clean).width * 1.03);
+      }
+      return Math.ceil(clean.length * 6.8);
+    };
+
+    const rows = Array.isArray(sheet?.rows) ? sheet.rows : [];
+    let maxMeasured = 0;
+    for (const r of rows) {
+      const text = String(r?.route || '').trim();
+      if (!text) continue;
+      const w = measure(text);
+      if (w > maxMeasured) maxMeasured = w;
+    }
+
+    const computedRouteWidth = Math.max(
+      MIN_ROUTE_PX,
+      Math.min(MAX_ROUTE_PX, maxMeasured > 0 ? maxMeasured + TRAILING_GAP_PX : MIN_ROUTE_PX)
+    );
+
+    return {
+      routeColWidth: computedRouteWidth,
+      sheetTotalWidth: FIXED_COLS_PX + computedRouteWidth,
+      measureRoutePx: measure,
+    };
+  }, [sheet?.rows]);
+
   const handleDownloadPdf = async () => {
     if (!printableSheetRef.current) return;
     try {
       setIsGeneratingPdf(true);
       const element = printableSheetRef.current;
+      const targetSheetWidth = sheetTotalWidth;
       
       const canvas = await html2canvas(element, {
-        scale: 2,
+        scale: 2.2,
         useCORS: true,
         logging: false,
         backgroundColor: '#ffffff',
-        width: 980,
-        windowWidth: 1200,
+        width: targetSheetWidth,
+        windowWidth: Math.max(1200, targetSheetWidth + 120),
         scrollX: 0,
         scrollY: 0,
         onclone: (clonedDoc) => {
           const clonedSheet = clonedDoc.querySelector('[data-printable-sheet="true"]') as HTMLElement;
           if (clonedSheet) {
-            clonedSheet.style.width = '980px';
-            clonedSheet.style.minWidth = '980px';
-            clonedSheet.style.maxWidth = '980px';
+            clonedSheet.style.width = `${targetSheetWidth}px`;
+            clonedSheet.style.minWidth = `${targetSheetWidth}px`;
+            clonedSheet.style.maxWidth = `${targetSheetWidth}px`;
             clonedSheet.style.overflow = 'visible';
             clonedSheet.style.margin = '0';
             clonedSheet.style.boxSizing = 'border-box';
@@ -996,11 +1046,18 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
 
             const role = input.getAttribute('data-role');
             if (role === 'route') {
-              textDiv.style.padding = '2px 3px 2px 6px';
+              textDiv.style.padding = '2px 4px 2px 6px';
               textDiv.style.textAlign = 'left';
-              const len = val.length;
-              // Precise font scaling for Route column so even very long village chains fit in a single line!
-              const fontSize = len > 50 ? '7.5px' : len > 38 ? '8.5px' : len > 26 ? '9.5px' : '10.5px';
+              const pxW = measureRoutePx(val);
+              const availW = Math.max(114, routeColWidth - 18);
+              const fontSize =
+                pxW > availW * 1.25
+                  ? '7.5px'
+                  : pxW > availW * 1.1
+                    ? '8.5px'
+                    : pxW > availW
+                      ? '9.5px'
+                      : '10.5px';
               textDiv.style.fontSize = fontSize;
               textDiv.style.letterSpacing = '-0.02em';
             } else if (role === 'officerName') {
@@ -1224,8 +1281,13 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       )}
 
       {/* ======================= STRICT OFFICIAL TRAVELLING SHEET FORM ======================= */}
-      <div className="bg-white rounded-2xl border-2 border-slate-300 shadow-xl overflow-x-auto print:border-none print:shadow-none print:m-0 print:p-0">
-        <div ref={printableSheetRef} data-printable-sheet="true" className="border-2 border-black bg-white shadow-sm w-[980px] min-w-[980px]">
+      <div className="bg-white rounded-2xl border-2 border-slate-300 shadow-xl overflow-x-auto print:border-none print:shadow-none print:m-0 print:p-0 print:overflow-visible">
+        <div
+          ref={printableSheetRef}
+          data-printable-sheet="true"
+          style={{ width: `${sheetTotalWidth}px`, minWidth: `${sheetTotalWidth}px` }}
+          className="border-2 border-black bg-white shadow-sm print:shadow-none"
+        >
           
           {/* 1. Header Section - Logo (Left) and Company Details (Center) */}
           <div className="p-3 relative bg-white border-b-2 border-black">
@@ -1328,26 +1390,41 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
             </div>
           </div>
 
-          {/* 4. Strict Table Columns: Date, Days, Route, Opening KM, Closing KM, KM, Amount, Other Expenses, Subtotal */}
-          <div className="overflow-x-auto bg-white">
-            <table className="w-full text-left border-collapse text-[10.5px]">
+          {/* 4. Strict Table Columns: Date, Days, Route (dynamically sized to longest route), Opening KM, Closing KM, KM, Amount, Other Expenses, Subtotal */}
+          <div className="overflow-x-auto print:overflow-visible bg-white">
+            <table
+              className="official-travel-table w-full text-left border-collapse text-[10.5px]"
+              style={{ tableLayout: 'fixed', width: `${sheetTotalWidth}px` }}
+            >
+              <colgroup>
+                <col style={{ width: `${(74 / sheetTotalWidth) * 100}%` }} />
+                <col style={{ width: `${(46 / sheetTotalWidth) * 100}%` }} />
+                <col style={{ width: `${(routeColWidth / sheetTotalWidth) * 100}%` }} />
+                <col style={{ width: `${(70 / sheetTotalWidth) * 100}%` }} />
+                <col style={{ width: `${(70 / sheetTotalWidth) * 100}%` }} />
+                <col style={{ width: `${(52 / sheetTotalWidth) * 100}%` }} />
+                <col style={{ width: `${(68 / sheetTotalWidth) * 100}%` }} />
+                <col style={{ width: `${(88 / sheetTotalWidth) * 100}%` }} />
+                <col style={{ width: `${(84 / sheetTotalWidth) * 100}%` }} />
+              </colgroup>
               <thead>
                 <tr className="bg-slate-900 text-white font-black uppercase text-center border-b-2 border-black">
-                  <th className="p-1.5 border-r-2 border-black w-16 text-center whitespace-nowrap">Date</th>
-                  <th className="p-1.5 border-r-2 border-black w-12 text-center whitespace-nowrap">Days</th>
-                  <th className="p-1.5 pl-3 border-r-2 border-black w-[410px] min-w-[390px] text-left whitespace-nowrap">Route</th>
-                  <th className="p-1.5 border-r-2 border-black w-16 text-center whitespace-nowrap">Opening KM</th>
-                  <th className="p-1.5 border-r-2 border-black w-16 text-center whitespace-nowrap">Closing KM</th>
-                  <th className="p-1.5 border-r-2 border-black w-14 text-center whitespace-nowrap">KM</th>
-                  <th className="p-1.5 border-r-2 border-black w-16 text-center whitespace-nowrap">Amount</th>
-                  <th className="p-1.5 border-r-2 border-black w-20 text-center whitespace-nowrap">Other Expenses</th>
-                  <th className="p-1.5 text-center w-20 bg-slate-800 whitespace-nowrap">Subtotal</th>
+                  <th className="p-1.5 border-r-2 border-black text-center whitespace-nowrap">Date</th>
+                  <th className="p-1.5 border-r-2 border-black text-center whitespace-nowrap">Days</th>
+                  <th className="p-1.5 pl-2.5 border-r-2 border-black text-left whitespace-nowrap">Route</th>
+                  <th className="p-1.5 border-r-2 border-black text-center whitespace-nowrap">Opening KM</th>
+                  <th className="p-1.5 border-r-2 border-black text-center whitespace-nowrap">Closing KM</th>
+                  <th className="p-1.5 border-r-2 border-black text-center whitespace-nowrap">KM</th>
+                  <th className="p-1.5 border-r-2 border-black text-center whitespace-nowrap">Amount</th>
+                  <th className="p-1.5 border-r-2 border-black text-center whitespace-nowrap">Other Expenses</th>
+                  <th className="p-1.5 text-center bg-slate-800 whitespace-nowrap">Subtotal</th>
                 </tr>
               </thead>
               <tbody className="divide-y-2 divide-black text-black font-black">
                 {sheet.rows.map((row, idx) => {
                   const isSunday = row.days === 'Sun';
-                  const routeLen = (row.route || '').length;
+                  const measuredPx = measureRoutePx(row.route || '');
+                  const availPx = Math.max(114, routeColWidth - 18);
                   return (
                     <tr 
                       key={row.dayNumber} 
@@ -1369,8 +1446,8 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                         </span>
                       </td>
 
-                      {/* Route (Strictly single line, all village names clearly visible without cutting off) */}
-                      <td className="p-0 pl-2 pr-1 border-r-2 border-black align-middle w-[410px] min-w-[390px]">
+                      {/* Route (Dynamically fits longest entered route with compact gap before right border) */}
+                      <td className="p-0 pl-1.5 pr-1 border-r-2 border-black align-middle overflow-hidden">
                         <input 
                           type="text" 
                           data-role="route"
@@ -1379,12 +1456,12 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                           onKeyDown={e => handleRouteKeyDown(idx, e)}
                           onChange={e => updateRow(idx, { route: formatRouteVillages(e.target.value) })}
                           placeholder={isSunday ? "SUNDAY / OFF" : ""}
-                          className={`w-full p-0 m-0 pl-1 pr-0.5 py-0.5 bg-transparent border-none focus:outline-none font-black text-left block leading-tight whitespace-nowrap tracking-tight ${
-                            routeLen > 48
+                          className={`w-full p-0 m-0 pl-0.5 pr-0.5 py-0.5 bg-transparent border-none focus:outline-none font-black text-left block leading-tight whitespace-nowrap tracking-tight ${
+                            measuredPx > availPx * 1.25
                               ? 'text-[7.5px]'
-                              : routeLen > 36
+                              : measuredPx > availPx * 1.1
                                 ? 'text-[8.5px]'
-                                : routeLen > 24
+                                : measuredPx > availPx
                                   ? 'text-[9.5px]'
                                   : 'text-[10.5px]'
                           }`}

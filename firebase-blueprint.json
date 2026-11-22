@@ -290,6 +290,39 @@
       },
       "required": ["id", "state", "district", "taluka", "talukaCode"]
     },
+    "locationDealer": {
+      "title": "Location Master Dealer Record",
+      "description": "Independent area dealer records maintained inside Location Mapping (separate from dealers_application)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "firmName": { "type": "string" },
+        "proprietorName": { "type": "string" },
+        "contactNumber": { "type": "string" },
+        "category": { "type": "string" },
+        "state": { "type": "string" },
+        "stateCode": { "type": "string" },
+        "district": { "type": "string" },
+        "districtCode": { "type": "string" },
+        "taluka": { "type": "string" },
+        "talukaCode": { "type": "string" },
+        "village": { "type": "string" },
+        "villageCode": { "type": "string" },
+        "pinCode": { "type": "string" },
+        "address": { "type": "string" },
+        "notes": { "type": "string" },
+        "userId": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "createdByUid": { "type": "string" },
+        "createdByName": { "type": "string" },
+        "updatedByUid": { "type": "string" },
+        "updatedByName": { "type": "string" },
+        "isArchived": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "firmName", "state", "district", "taluka", "village"]
+    },
     "officeStaffMember": {
       "title": "Office / Factory Staff Member",
       "description": "Office and Factory staff members managed by Godown Incharge & Admin for daily attendance",
@@ -372,6 +405,10 @@
     "location_talukas/{docId}": {
       "schema": "locationTaluka",
       "description": "Admin-added State -> District -> Taluka custom subdistrict mapping"
+    },
+    "location_dealers/{docId}": {
+      "schema": "locationDealer",
+      "description": "Independent area dealer directory records maintained in Location Mapping"
     },
     "office_staff_members/{docId}": {
       "schema": "officeStaffMember",

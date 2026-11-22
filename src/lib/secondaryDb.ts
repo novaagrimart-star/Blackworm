@@ -57,6 +57,7 @@ const CORE_COLLECTIONS_TO_HYDRATE = [
   'outstanding_records',
   'location_villages',
   'location_talukas',
+  'location_dealers',
   'office_staff_members',
   'office_staff_attendance',
   'config',
@@ -496,11 +497,15 @@ export async function pullSecondaryChanges(forceFullResyncIfZero = false): Promi
 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 8000);
-      const res = await fetch(
-        resolveApiUrl(`/api/sync/changes?since=${encodeURIComponent(String(rev))}&epoch=${encodeURIComponent(epoch)}&limit=${PAGE_LIMIT}`),
-        { signal: controller.signal }
-      );
-      clearTimeout(timer);
+      let res: Response;
+      try {
+        res = await fetch(
+          resolveApiUrl(`/api/sync/changes?since=${encodeURIComponent(String(rev))}&epoch=${encodeURIComponent(epoch)}&limit=${PAGE_LIMIT}`),
+          { signal: controller.signal }
+        );
+      } finally {
+        clearTimeout(timer);
+      }
 
       if (!res.ok) break;
       const json = await res.json();
@@ -698,16 +703,15 @@ export async function pushToSecondary(
     return { ok: false, error: 'Secondary cooldown active' };
   }
 
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3500);
     const res = await fetch(resolveApiUrl('/api/sync/upsert'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
       signal: controller.signal,
     });
-    clearTimeout(timer);
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -736,6 +740,8 @@ export async function pushToSecondary(
   } catch (err: any) {
     markSecondaryDown(8000);
     return { ok: false, error: err?.message || 'Network error' };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -820,10 +826,14 @@ export async function fetchSecondaryCollection(
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(resolveApiUrl(`/api/sync/collection/${encodeURIComponent(colName)}?${params.toString()}`), {
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
+    let res: Response;
+    try {
+      res = await fetch(resolveApiUrl(`/api/sync/collection/${encodeURIComponent(colName)}?${params.toString()}`), {
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!res.ok) {
       return { ok: false, items: [], archivedIds: [], revision: 0 };
@@ -851,11 +861,10 @@ export async function fetchSecondaryCollection(
 export async function fetchSecondarySummary(): Promise<SecondarySummary | null> {
   if (typeof window === 'undefined') return null;
   if (typeof navigator !== 'undefined' && !navigator.onLine) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3500);
     const res = await fetch(resolveApiUrl('/api/sync/summary'), { signal: controller.signal });
-    clearTimeout(timer);
     if (!res.ok) return null;
     const json = (await res.json()) as SecondarySummary;
     if (json?.ok) {
@@ -869,6 +878,8 @@ export async function fetchSecondarySummary(): Promise<SecondarySummary | null> 
     return null;
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

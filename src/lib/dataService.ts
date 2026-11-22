@@ -5,7 +5,7 @@ import {
   getDocs, 
   updateDoc
 } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../firebase';
+import { db, handleFirestoreError, OperationType, testFirestoreConnection } from '../firebase';
 import { UserProfile } from './auth';
 import { toTitleCase } from './utils';
 import {
@@ -22,6 +22,7 @@ import {
   fetchSecondaryCollection,
   initSecondaryStream,
   isSecondaryBlocked,
+  checkSecondaryHealth,
   autoHydrateServerFromLocalCache,
   pullSecondaryChanges,
   getSecondarySyncStatus,
@@ -172,7 +173,21 @@ export function purgeStaleReadCachesOnBoot(): void {
 
     quotaExceededUntil = 0;
     if ('caches' in window) {
-      void caches.keys().then((names) => Promise.all(names.map((n) => caches.delete(n)))).catch(() => {});
+      void caches
+        .keys()
+        .then((names) =>
+          Promise.all(
+            names
+              .filter(
+                (n) =>
+                  !n.startsWith('workbox-') &&
+                  n !== 'html-pages-cache' &&
+                  n !== 'images-cache'
+              )
+              .map((n) => caches.delete(n))
+          )
+        )
+        .catch(() => {});
     }
     localStorage.setItem('blackworm_sync_schema_v', CACHE_SCHEMA_VERSION);
   } catch {}
@@ -2099,6 +2114,8 @@ export async function forceMultiTierSyncAll(clearQuotaCooldown = false): Promise
   pendingRemaining: number;
   hydratedCount: number;
   deltasPulled: number;
+  secondaryReachable: boolean;
+  firebaseReachable: boolean;
 }> {
   if (clearQuotaCooldown) {
     setQuotaBlocked(0);
@@ -2112,9 +2129,18 @@ export async function forceMultiTierSyncAll(clearQuotaCooldown = false): Promise
       new Promise<T>((resolve) => setTimeout(() => resolve(fallback), ms)),
     ]);
 
+  const [secondaryReachable, firebaseReachable] = await Promise.all([
+    withBudget(checkSecondaryHealth(), 4500, false),
+    withBudget(testFirestoreConnection(), 5000, false),
+  ]);
+
   await withBudget(startBackgroundSync(), 5000, undefined);
-  const hydratedCount = await withBudget(autoHydrateServerFromLocalCache(true), 4500, 0);
-  const deltasPulled = await withBudget(pullSecondaryChanges(true), 6000, 0);
+  const hydratedCount = secondaryReachable
+    ? await withBudget(autoHydrateServerFromLocalCache(true), 4500, 0)
+    : 0;
+  const deltasPulled = secondaryReachable
+    ? await withBudget(pullSecondaryChanges(true), 6000, 0)
+    : 0;
 
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('blackworm_secondary_resync', { detail: { reason: 'force_sync' } }));
@@ -2124,6 +2150,8 @@ export async function forceMultiTierSyncAll(clearQuotaCooldown = false): Promise
     pendingRemaining: getPendingSyncCount(),
     hydratedCount,
     deltasPulled,
+    secondaryReachable,
+    firebaseReachable,
   };
 }
 
@@ -2176,6 +2204,7 @@ export async function exportSmartSyncPacket(sinceHours = 0): Promise<{
     'outstanding_records',
     'location_villages',
     'location_talukas',
+    'location_dealers',
     'office_staff_members',
     'office_staff_attendance',
     'config',
@@ -2686,6 +2715,7 @@ export async function exportFullDatabaseBackup(profile: UserProfile): Promise<{
     'dealers_application',
     'location_villages',
     'location_talukas',
+    'location_dealers',
     'orders',
     'collection_entries',
     'travel_sheets',

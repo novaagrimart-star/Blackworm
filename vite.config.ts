@@ -71,6 +71,9 @@ export default defineConfig(({ command }) => {
       __APP_VERSION__: JSON.stringify(appVersion),
       __APP_BUILD_ID__: JSON.stringify(buildId),
       __APP_BUILD_TIME__: JSON.stringify(builtAt),
+      'import.meta.env.VITE_APP_VERSION': JSON.stringify(appVersion),
+      'import.meta.env.VITE_APP_BUILD_ID': JSON.stringify(buildId),
+      'import.meta.env.VITE_APP_BUILD_TIME': JSON.stringify(builtAt),
     },
     plugins: [
       react(),
@@ -89,17 +92,18 @@ export default defineConfig(({ command }) => {
           enabled: false,
         },
         workbox: {
-          globPatterns: ['assets/**/*.{js,css}', '*.{ico,png,svg,webp,jpg}', 'pdf.worker.min.mjs'],
-          globIgnores: ['**/index.html', '**/version.json'],
-          ignoreURLParametersMatching: [/^utm_/, /^fbclid$/],
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,webp,jpg,mjs,woff,woff2,webmanifest}'],
+          globIgnores: ['**/version.json', '**/server.js*', '**/*.map'],
+          ignoreURLParametersMatching: [/^utm_/, /^fbclid$/, /^v$/, /^apk_ota$/],
           cleanupOutdatedCaches: true,
           skipWaiting: true,
           clientsClaim: true,
           maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
-          navigateFallback: null,
+          navigateFallback: '/index.html',
+          navigateFallbackDenylist: [/^\/api\//, /^\/data\//, /^\/version\.json$/, /^\/robots\.txt$/, /^\/favicon\.ico$/],
           runtimeCaching: [
             {
-              urlPattern: /\/(?:api\/|version\.json)/i,
+              urlPattern: /\/(?:api\/|data\/|version\.json)/i,
               handler: 'NetworkOnly',
             },
             {
@@ -107,65 +111,19 @@ export default defineConfig(({ command }) => {
               handler: 'NetworkOnly',
             },
             {
-              urlPattern: ({ request }) => request.mode === 'navigate',
-              handler: 'NetworkFirst',
-              options: {
-                cacheName: 'html-pages-cache',
-                networkTimeoutSeconds: 4,
-                cacheableResponse: {
-                  statuses: [200],
-                },
-                expiration: {
-                  maxEntries: 2,
-                  maxAgeSeconds: 2 * 60,
-                },
-              },
-            },
-            {
               urlPattern: /\.(?:png|jpg|jpeg|svg|gif|webp|ico)$/i,
               handler: 'StaleWhileRevalidate',
               options: {
                 cacheName: 'images-cache',
                 expiration: {
-                  maxEntries: 50,
+                  maxEntries: 60,
                   maxAgeSeconds: 30 * 24 * 60 * 60,
                 },
               },
             },
           ],
         },
-        manifest: {
-          id: '/',
-          name: 'Blackworm Agritech MIS',
-          short_name: 'Blackworm MIS',
-          description: 'Official Management Information System for Blackworm Agritech Pvt Ltd',
-          theme_color: '#e11d48',
-          background_color: '#f8fafc',
-          display: 'standalone',
-          orientation: 'portrait',
-          scope: '/',
-          start_url: '/',
-          icons: [
-            {
-              src: '/pwa-192x192.png',
-              sizes: '192x192',
-              type: 'image/png',
-              purpose: 'any',
-            },
-            {
-              src: '/pwa-512x512.png',
-              sizes: '512x512',
-              type: 'image/png',
-              purpose: 'maskable',
-            },
-            {
-              src: '/pwa-512x512.png',
-              sizes: '512x512',
-              type: 'image/png',
-              purpose: 'any',
-            },
-          ],
-        },
+        manifest: false,
       }),
     ],
     resolve: {

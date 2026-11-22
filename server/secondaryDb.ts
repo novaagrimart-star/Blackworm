@@ -121,6 +121,7 @@ export const ALLOWED_SYNC_COLLECTIONS = new Set<string>([
   'users',
   'location_villages',
   'location_talukas',
+  'location_dealers',
   'dealers_application',
   'dealers',
   'outstanding_records',

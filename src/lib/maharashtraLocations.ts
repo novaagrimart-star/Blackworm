@@ -474,3 +474,79 @@ export function deduplicateLocationTalukas(items: any[]): LocationTalukaItem[] {
   });
   return Array.from(map.values()).sort((a, b) => a.taluka.localeCompare(b.taluka));
 }
+
+export interface LocationDealerItem {
+  id: string;
+  firmName: string;
+  proprietorName?: string;
+  contactNumber?: string;
+  category?: string;
+  state: string;
+  stateCode?: string;
+  district: string;
+  districtCode?: string;
+  taluka: string;
+  talukaCode?: string;
+  village: string;
+  villageCode?: string;
+  pinCode?: string;
+  address?: string;
+  notes?: string;
+  userId?: string;
+  ownerId?: string;
+  createdByUid?: string;
+  createdByName?: string;
+  updatedByUid?: string;
+  updatedByName?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  isArchived?: boolean;
+}
+
+export function deduplicateLocationDealers(items: any[]): LocationDealerItem[] {
+  const map = new Map<string, LocationDealerItem>();
+  (items || []).forEach((it) => {
+    if (!it || it.isArchived) return;
+    const firmName = String(it.firmName || '').trim();
+    if (!firmName) return;
+
+    const rawState = normalizeStateName(it.state || resolveStateFromDistrict(it.district) || DEFAULT_STATE);
+    const stateMeta = getStateMeta(it.stateCode || rawState);
+    const state = stateMeta?.name || rawState;
+    const districtMeta = getDistrictMeta(it.districtCode || it.district, stateMeta?.code);
+    const district = districtMeta?.name || canonicalizeDistrictName(it.district || '', state);
+    const talukaMeta = getTalukaMeta(districtMeta?.code || district, it.talukaCode || it.taluka, stateMeta?.code);
+    const taluka = talukaMeta?.name || canonicalizeTalukaName(district, it.taluka || '', state) || String(it.taluka || '').trim();
+    const village = String(it.village || '').trim();
+    const id = String(it.id || '').trim();
+    if (!id) return;
+
+    const normalized: LocationDealerItem = {
+      ...it,
+      id,
+      firmName,
+      proprietorName: String(it.proprietorName || '').trim(),
+      contactNumber: String(it.contactNumber || '').trim(),
+      category: String(it.category || '').trim(),
+      state,
+      stateCode: String(it.stateCode || stateMeta?.code || ''),
+      district,
+      districtCode: String(it.districtCode || districtMeta?.code || ''),
+      taluka,
+      talukaCode: String(it.talukaCode || talukaMeta?.code || ''),
+      village,
+      villageCode: String(it.villageCode || '').trim(),
+      pinCode: String(it.pinCode || '').trim(),
+      address: String(it.address || '').trim(),
+      notes: String(it.notes || '').trim(),
+    };
+    map.set(id, normalized);
+  });
+
+  return Array.from(map.values()).sort((a, b) => {
+    const tA = Date.parse(String(a.updatedAt || a.createdAt || '')) || 0;
+    const tB = Date.parse(String(b.updatedAt || b.createdAt || '')) || 0;
+    if (tA !== tB) return tB - tA;
+    return a.firmName.localeCompare(b.firmName);
+  });
+}

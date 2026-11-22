@@ -113,17 +113,25 @@ export async function loadPendingQueueFromVault(): Promise<any[]> {
 }
 
 /**
- * Safely clears browser HTTP/SW caches while strictly preserving all offline data vaults,
- * pending sync queues, user session, branding, and locally entered sheets.
+ * Safely clears volatile HTTP caches while strictly preserving Workbox offline precaches,
+ * active Service Worker registration, all offline data vaults, pending sync queues, and user session.
  */
-export async function safeClearTransientCaches(): Promise<void> {
+export async function safeClearTransientCaches(options: { includeServiceWorker?: boolean } = {}): Promise<void> {
   try {
     if (typeof window === 'undefined') return;
     if ('caches' in window) {
       const cacheNames = await caches.keys();
-      await Promise.all(cacheNames.map((name) => caches.delete(name)));
+      const targets = cacheNames.filter((name) => {
+        if (options.includeServiceWorker) return true;
+        return (
+          !name.startsWith('workbox-') &&
+          name !== 'html-pages-cache' &&
+          name !== 'images-cache'
+        );
+      });
+      await Promise.all(targets.map((name) => caches.delete(name)));
     }
-    if ('serviceWorker' in navigator) {
+    if (options.includeServiceWorker && 'serviceWorker' in navigator && navigator.onLine) {
       const registrations = await navigator.serviceWorker.getRegistrations();
       for (const reg of registrations) {
         await reg.unregister();
@@ -135,3 +143,4 @@ export async function safeClearTransientCaches(): Promise<void> {
     } catch {}
   } catch {}
 }
+

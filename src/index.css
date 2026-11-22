@@ -32,14 +32,30 @@
       font-weight: 600 !important;
       padding: 0 !important;
     }
-    table {
+    table:not(.official-travel-table) {
       width: 100% !important;
       border-collapse: collapse !important;
       font-size: 8pt !important;
     }
-    th, td {
+    table:not(.official-travel-table) th,
+    table:not(.official-travel-table) td {
       border: 1px solid #ddd !important;
       padding: 4pt !important;
+    }
+    [data-printable-sheet="true"] {
+      width: 100% !important;
+      min-width: 0 !important;
+      max-width: 100% !important;
+      border: 2px solid #000 !important;
+    }
+    .official-travel-table {
+      width: 100% !important;
+      border-collapse: collapse !important;
+      table-layout: fixed !important;
+    }
+    .official-travel-table th,
+    .official-travel-table td {
+      border-color: #000 !important;
     }
   }
 }

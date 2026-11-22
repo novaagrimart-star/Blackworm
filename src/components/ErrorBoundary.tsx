@@ -45,13 +45,13 @@ export class ErrorBoundary extends Component<Props, State> {
   public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
     console.error('Uncaught error caught by ErrorBoundary:', error, errorInfo);
 
-    // Auto-recover once if stale Vite module / chunk load error occurs after an update
-    if (isDynamicImportOrChunkError(error)) {
+    // Auto-recover once if stale Vite module / chunk load error occurs online after an update
+    if (isDynamicImportOrChunkError(error) && (typeof navigator === 'undefined' || navigator.onLine)) {
       try {
         const lastReload = Number(sessionStorage.getItem('blackworm_chunk_reload_at') || '0');
         if (Date.now() - lastReload > 15000) {
           sessionStorage.setItem('blackworm_chunk_reload_at', String(Date.now()));
-          void safeClearTransientCaches().finally(() => {
+          void safeClearTransientCaches({ includeServiceWorker: false }).finally(() => {
             window.location.reload();
           });
           return;
@@ -73,7 +73,8 @@ export class ErrorBoundary extends Component<Props, State> {
 
   private handleSafeCacheRepair = async () => {
     try {
-      await safeClearTransientCaches();
+      const isOnlineNow = typeof navigator === 'undefined' || navigator.onLine;
+      await safeClearTransientCaches({ includeServiceWorker: isOnlineNow });
       // Remove only disposable display caches; NEVER delete blackworm_pending_sync or blackworm_user_profile
       const keysToRemove: string[] = [];
       for (let i = 0; i < localStorage.length; i++) {

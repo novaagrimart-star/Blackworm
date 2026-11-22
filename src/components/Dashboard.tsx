@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 
 import { 
   Target, 
@@ -19,14 +19,24 @@ import {
   ShieldCheck,
   Phone,
   Key,
-  Warehouse
+  Warehouse,
+  Bell
 } from 'lucide-react';
 import { cn, toTitleCase } from '../lib/utils';
 import { UserProfile, isAdmin, canAccessModule } from '../lib/auth';
 import { Language, translations } from '../lib/i18n';
 import { OfflineIndicator } from './OfflineIndicator';
 import { CustomDialogModal } from './CustomDialogModal';
+import { BirthdayNotificationModal, DashboardBirthdayWatcher } from './BirthdayNotificationModal';
+import { BirthdayPerson, getTodayLocalInfo } from '../lib/birthdayNotifier';
+import { DashboardModuleUpdateWatcher, ModuleUpdatePopup } from './ModuleUpdatePopup';
+import {
+  ModuleUpdateBadge,
+  loadAcknowledgedPopupSignature,
+  saveAcknowledgedPopupSignature,
+} from '../lib/moduleUpdates';
 import { useBranding } from '../lib/branding';
+import { isPackagedApkShell } from '../lib/appVersion';
 import { ErrorBoundary } from './ErrorBoundary';
 
 import { TargetSheetView } from './modules/TargetSheetView';
@@ -50,11 +60,97 @@ interface DashboardProps {
   onProfileUpdate?: (profile: UserProfile) => void;
 }
 
+const ROUTE_TO_TAB: Record<string, string> = {
+  '': 'dashboard',
+  dashboard: 'dashboard',
+  'index.html': 'dashboard',
+  login: 'dashboard',
+  target: 'target',
+  targets: 'target',
+  user: 'user',
+  users: 'user',
+  office_staff: 'office_staff',
+  warehouse: 'office_staff',
+  godown: 'office_staff',
+  order: 'order',
+  orders: 'order',
+  collection: 'collection',
+  collections: 'collection',
+  outstanding: 'calculator',
+  calculator: 'calculator',
+  price: 'price',
+  pricelist: 'price',
+  dealer: 'dealer',
+  dealers: 'dealer',
+  location: 'location',
+  locations: 'location',
+  travel: 'travel',
+  traveling: 'travel',
+  scheme: 'scheme',
+  schemes: 'scheme',
+  report: 'report',
+  reports: 'report',
+  setting: 'setting',
+  settings: 'setting',
+};
+
+const TAB_TO_HASH: Record<string, string> = {
+  dashboard: '',
+  target: '#/target',
+  user: '#/user',
+  office_staff: '#/warehouse',
+  order: '#/orders',
+  collection: '#/collections',
+  calculator: '#/outstanding',
+  price: '#/pricelist',
+  dealer: '#/dealers',
+  location: '#/location',
+  travel: '#/travel',
+  scheme: '#/scheme',
+  report: '#/reports',
+  setting: '#/settings',
+};
+
+function canUseCleanHistoryUrl(): boolean {
+  if (typeof window === 'undefined') return false;
+  const proto = String(window.location.protocol || '').toLowerCase();
+  return proto === 'http:' || proto === 'https:';
+}
+
+function buildRouteUrl(tab: string): string {
+  const hash = TAB_TO_HASH[tab] || '';
+  if (typeof window !== 'undefined' && isPackagedApkShell()) {
+    const currentPath = window.location.pathname || '/';
+    return `${currentPath}${hash}`;
+  }
+  return `/${hash}`;
+}
+
+function resolveTabFromLocation(): string | null {
+  try {
+    if (typeof window === 'undefined') return null;
+    const rawHash = String(window.location.hash || '').replace(/^#\/?/, '').trim().toLowerCase();
+    if (rawHash) {
+      const hashSeg = rawHash.split('/')[0] || '';
+      if (ROUTE_TO_TAB[hashSeg]) return ROUTE_TO_TAB[hashSeg];
+    }
+    const rawPath = String(window.location.pathname || '').replace(/^\/+|\/+$/g, '').toLowerCase();
+    const pathSeg = rawPath.split('/')[0] || '';
+    return ROUTE_TO_TAB[pathSeg] ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, onProfileUpdate }) => {
   const t = translations[lang];
   const tabStorageKey = `blackworm_active_tab_${profile.uid}`;
   const [activeTab, setActiveTab] = useState<string>(() => {
     try {
+      const fromUrl = resolveTabFromLocation();
+      if (fromUrl && fromUrl !== 'dashboard' && canAccessModule(profile, fromUrl)) {
+        return fromUrl;
+      }
       const saved = sessionStorage.getItem(`blackworm_active_tab_${profile.uid}`);
       if (saved && saved !== 'dashboard' && canAccessModule(profile, saved)) {
         return saved;
@@ -67,6 +163,93 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
   const { logoUrl, logoSize } = useBranding();
   const [currentUserData, setCurrentUserData] = useState<any>(profile);
   const [isApplyingRemoteUpdate, setIsApplyingRemoteUpdate] = useState(false);
+  const [todaysBirthdays, setTodaysBirthdays] = useState<BirthdayPerson[]>([]);
+  const [birthdayDateKey, setBirthdayDateKey] = useState<string>(() => getTodayLocalInfo().dateKey);
+  const [isBirthdayModalOpen, setIsBirthdayModalOpen] = useState(false);
+  const autoShownBirthdayIdsRef = useRef<Set<string>>(new Set());
+  const [moduleBadges, setModuleBadges] = useState<Record<string, ModuleUpdateBadge>>({});
+  const [moduleUpdateItems, setModuleUpdateItems] = useState<ModuleUpdateBadge[]>([]);
+  const [moduleUpdateSig, setModuleUpdateSig] = useState<string>('');
+  const [isModulePopupOpen, setIsModulePopupOpen] = useState(false);
+
+  const handleModuleBadgesChange = useCallback(
+    (badges: Record<string, ModuleUpdateBadge>, items: ModuleUpdateBadge[], sig: string) => {
+      setModuleBadges(badges);
+      setModuleUpdateItems(items);
+      setModuleUpdateSig(sig);
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (activeTab !== 'dashboard' || isBirthdayModalOpen || moduleUpdateItems.length === 0 || !moduleUpdateSig) {
+      if (activeTab !== 'dashboard' && isModulePopupOpen) {
+        setIsModulePopupOpen(false);
+      }
+      return;
+    }
+    const ackSig = loadAcknowledgedPopupSignature(currentUserData?.uid || profile.uid);
+    if (ackSig !== moduleUpdateSig) {
+      setIsModulePopupOpen(true);
+    }
+  }, [activeTab, isBirthdayModalOpen, moduleUpdateItems.length, moduleUpdateSig, currentUserData?.uid, profile.uid, isModulePopupOpen]);
+
+  const handleCloseModulePopup = useCallback(() => {
+    setIsModulePopupOpen(false);
+    if (moduleUpdateSig) {
+      saveAcknowledgedPopupSignature(currentUserData?.uid || profile.uid, moduleUpdateSig);
+    }
+  }, [currentUserData?.uid, moduleUpdateSig, profile.uid]);
+
+  const handleBirthdaysChange = useCallback((items: BirthdayPerson[], dateKey: string) => {
+    setTodaysBirthdays(items);
+    setBirthdayDateKey((prev) => {
+      if (prev !== dateKey) {
+        autoShownBirthdayIdsRef.current.clear();
+      }
+      return dateKey;
+    });
+  }, []);
+
+  const getSeenBirthdayStorageKey = useCallback(
+    (dateKey: string) => `blackworm_bday_seen_${currentUserData?.uid || profile.uid || 'user'}_${dateKey}`,
+    [currentUserData?.uid, profile.uid]
+  );
+
+  useEffect(() => {
+    if (activeTab !== 'dashboard' || todaysBirthdays.length === 0) return;
+    let persistedSeenIds: string[] = [];
+    try {
+      const raw = localStorage.getItem(getSeenBirthdayStorageKey(birthdayDateKey));
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) persistedSeenIds = parsed.map(String);
+      }
+    } catch {}
+    const persistedSet = new Set(persistedSeenIds);
+    const hasUnseenBirthday = todaysBirthdays.some(
+      (b) => !persistedSet.has(b.id) && !autoShownBirthdayIdsRef.current.has(b.id)
+    );
+    if (hasUnseenBirthday) {
+      todaysBirthdays.forEach((b) => autoShownBirthdayIdsRef.current.add(b.id));
+      setIsBirthdayModalOpen(true);
+    }
+  }, [activeTab, todaysBirthdays, birthdayDateKey, getSeenBirthdayStorageKey]);
+
+  const handleCloseBirthdayModal = useCallback(() => {
+    setIsBirthdayModalOpen(false);
+    try {
+      const storageKey = getSeenBirthdayStorageKey(birthdayDateKey);
+      let existing: string[] = [];
+      const raw = localStorage.getItem(storageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) existing = parsed.map(String);
+      }
+      const merged = Array.from(new Set([...existing, ...todaysBirthdays.map((b) => b.id)]));
+      localStorage.setItem(storageKey, JSON.stringify(merged));
+    } catch {}
+  }, [birthdayDateKey, getSeenBirthdayStorageKey, todaysBirthdays]);
 
   useEffect(() => {
     activeTabRef.current = activeTab;
@@ -157,13 +340,19 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     }
   }, [activeTab, currentUserData]);
 
-  // Handle mobile back button / browser history cleanly without cross-tab popstate races
+  // Handle mobile back button / browser history & URL routing cleanly without cross-tab popstate races
   useEffect(() => {
     try {
       const url = new URL(window.location.href);
       if (url.searchParams.has('v') || url.searchParams.has('apk_ota')) {
         url.searchParams.delete('v');
         url.searchParams.delete('apk_ota');
+      }
+      if (canUseCleanHistoryUrl()) {
+        if (!isPackagedApkShell()) {
+          url.pathname = '/';
+        }
+        url.hash = TAB_TO_HASH[activeTabRef.current] || '';
         window.history.replaceState({ tab: activeTabRef.current }, '', url.toString());
       } else if (!window.history.state?.tab) {
         window.history.replaceState({ tab: activeTabRef.current }, '');
@@ -176,7 +365,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
 
     const handlePopState = (e: PopStateEvent) => {
       const state = e.state;
-      const targetTab = state?.tab;
+      const fromLocation = canUseCleanHistoryUrl() ? resolveTabFromLocation() : null;
+      const targetTab = state?.tab || fromLocation;
       const currentTab = activeTabRef.current;
 
       // Ignore sub-view / inner-hub back events inside office_staff when GodownInchargeView is active and handling its own sub-tab
@@ -194,7 +384,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
           state?.modalOpen) &&
         targetTab !== currentTab
       ) {
-        window.history.replaceState({ tab: currentTab }, '');
+        if (canUseCleanHistoryUrl()) {
+          window.history.replaceState({ tab: currentTab }, '', buildRouteUrl(currentTab));
+        } else {
+          window.history.replaceState({ tab: currentTab }, '');
+        }
         return;
       }
 
@@ -205,7 +399,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
           setActiveTab('dashboard');
         } else {
           // If already on dashboard, keep dashboard on top of history stack
-          window.history.pushState({ tab: 'dashboard' }, '');
+          if (canUseCleanHistoryUrl()) {
+            window.history.pushState({ tab: 'dashboard' }, '', buildRouteUrl('dashboard'));
+          } else {
+            window.history.pushState({ tab: 'dashboard' }, '');
+          }
         }
       }
     };
@@ -218,7 +416,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
 
   const handleTabChange = (tab: string) => {
     if (tab !== activeTab) {
-      window.history.pushState({ tab }, '');
+      if (canUseCleanHistoryUrl()) {
+        window.history.pushState({ tab }, '', buildRouteUrl(tab));
+      } else {
+        window.history.pushState({ tab }, '');
+      }
       setActiveTab(tab);
     }
   };
@@ -261,10 +463,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
           <LocationView
             profile={currentUserData}
             lang={lang}
-            onOpenDealer={(dealerId) => {
-              setPendingOpenDealerId(dealerId);
-              handleTabChange('dealer');
-            }}
           />
         );
         case 'travel': return <TravelView profile={currentUserData} lang={lang} />;
@@ -310,23 +508,34 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
             })()}
 
             <div className="grid grid-cols-3 gap-3 max-w-2xl mx-auto">
-              {visibleModules.map((module) => (
-                <button
-                  key={module.id}
-                  onClick={() => handleTabChange(module.id)}
-                  className="flex flex-col items-center gap-2 p-3 rounded-2xl bg-white border border-slate-100 hover:border-slate-300 hover:shadow-md transition-all active:scale-95 group"
-                >
-                  <div className={cn("w-12 h-12 rounded-2xl flex items-center justify-center transition-transform group-hover:scale-105 shadow-sm", module.bg)}>
-                    <module.icon className={cn("w-6 h-6", module.color)} />
-                  </div>
-                  <div className="flex items-center gap-1 justify-center">
-                    <span className="text-[11px] font-semibold text-slate-700 text-center leading-tight">
-                      {module.label}
-                    </span>
-                    {module.id === 'user' && <UserPlus className="w-3 h-3 text-emerald-500" />}
-                  </div>
-                </button>
-              ))}
+              {visibleModules.map((module) => {
+                const badgeCount = moduleBadges[module.id]?.count || 0;
+                return (
+                  <button
+                    key={module.id}
+                    onClick={() => handleTabChange(module.id)}
+                    className="relative flex flex-col items-center gap-2 p-3 rounded-2xl bg-white border border-slate-100 hover:border-slate-300 hover:shadow-md transition-all active:scale-95 group"
+                  >
+                    <div className={cn("relative w-12 h-12 rounded-2xl flex items-center justify-center transition-transform group-hover:scale-105 shadow-sm", module.bg)}>
+                      <module.icon className={cn("w-6 h-6", module.color)} />
+                      {badgeCount > 0 && (
+                        <span
+                          className="absolute -top-1.5 -right-1.5 min-w-[20px] h-[20px] px-1 rounded-full bg-rose-600 text-white text-[10px] font-black flex items-center justify-center shadow-md ring-2 ring-white leading-none"
+                          title={moduleBadges[module.id]?.message || `${badgeCount} नवीन अपडेट`}
+                        >
+                          {badgeCount > 99 ? '99+' : badgeCount}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1 justify-center">
+                      <span className="text-[11px] font-semibold text-slate-700 text-center leading-tight">
+                        {module.label}
+                      </span>
+                      {module.id === 'user' && <UserPlus className="w-3 h-3 text-emerald-500" />}
+                    </div>
+                  </button>
+                );
+              })}
               
               <button
                 onClick={handleLogoutClick}
@@ -387,29 +596,46 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
           </h1>
         </div>
 
-        {/* Current Active Logged-In User Badge in Header */}
-        {(() => {
-          const headerName = toTitleCase(currentUserData.fullName) || 'User';
-          const headerRole =
-            currentUserData.role === 'owner'
-              ? 'Owner (MD)'
-              : toTitleCase(currentUserData.designation || currentUserData.role);
-          const showHeaderRole =
-            Boolean(headerRole) &&
-            headerRole.trim().toLowerCase() !== headerName.trim().toLowerCase();
-          return (
-            <div className="hidden sm:flex items-center gap-1.5 px-2 shrink-0">
-              <span className="text-xs font-black text-slate-900 leading-none">
-                {headerName}
+        {/* Conditional Birthday Notification Icon (shown ONLY on days with visible birthdays) + Active User Badge */}
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
+          {todaysBirthdays.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setIsBirthdayModalOpen(true)}
+              className="relative p-2 rounded-xl bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-600 transition active:scale-95 cursor-pointer no-print"
+              title={`आजचे वाढदिवस (${todaysBirthdays.length})`}
+              aria-label={`आजचे वाढदिवस (${todaysBirthdays.length})`}
+            >
+              <Bell className="w-4 h-4 sm:w-5 sm:h-5" />
+              <span className="absolute -top-1 -right-1 min-w-[17px] h-[17px] px-1 rounded-full bg-rose-600 text-white text-[10px] font-black flex items-center justify-center shadow-xs leading-none">
+                {todaysBirthdays.length}
               </span>
-              {showHeaderRole && (
-                <span className="text-[9.5px] font-bold text-slate-600 leading-none bg-slate-100 border border-slate-200 px-1 py-0.5 rounded">
-                  {headerRole}
+            </button>
+          )}
+
+          {(() => {
+            const headerName = toTitleCase(currentUserData.fullName) || 'User';
+            const headerRole =
+              currentUserData.role === 'owner'
+                ? 'Owner (MD)'
+                : toTitleCase(currentUserData.designation || currentUserData.role);
+            const showHeaderRole =
+              Boolean(headerRole) &&
+              headerRole.trim().toLowerCase() !== headerName.trim().toLowerCase();
+            return (
+              <div className="hidden sm:flex items-center gap-1.5 px-2 shrink-0">
+                <span className="text-xs font-black text-slate-900 leading-none">
+                  {headerName}
                 </span>
-              )}
-            </div>
-          );
-        })()}
+                {showHeaderRole && (
+                  <span className="text-[9.5px] font-bold text-slate-600 leading-none bg-slate-100 border border-slate-200 px-1 py-0.5 rounded">
+                    {headerRole}
+                  </span>
+                )}
+              </div>
+            );
+          })()}
+        </div>
       </header>
 
       <main className={cn(
@@ -430,25 +656,48 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
       <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 px-4 pt-2 flex justify-around items-center z-20 shadow-lg mobile-safe-nav">
         <NavItem icon={BarChart3} label={t.dashboard} active={activeTab === 'dashboard'} onClick={() => handleTabChange('dashboard')} />
         {canAccessModule(currentUserData, 'target') && (
-          <NavItem icon={Target} label={t.target} active={activeTab === 'target'} onClick={() => handleTabChange('target')} />
+          <NavItem icon={Target} label={t.target} active={activeTab === 'target'} badgeCount={moduleBadges.target?.count} onClick={() => handleTabChange('target')} />
         )}
         {canAccessModule(currentUserData, 'order') && (
-          <NavItem icon={ShoppingBag} label={t.orders} active={activeTab === 'order'} onClick={() => handleTabChange('order')} />
+          <NavItem icon={ShoppingBag} label={t.orders} active={activeTab === 'order'} badgeCount={moduleBadges.order?.count} onClick={() => handleTabChange('order')} />
         )}
         {canAccessModule(currentUserData, 'collection') && (
-          <NavItem icon={IndianRupee} label={t.collections} active={activeTab === 'collection'} onClick={() => handleTabChange('collection')} />
+          <NavItem icon={IndianRupee} label={t.collections} active={activeTab === 'collection'} badgeCount={moduleBadges.collection?.count} onClick={() => handleTabChange('collection')} />
         )}
         {canAccessModule(currentUserData, 'dealer') && (
-          <NavItem icon={Users} label={t.dealer} active={activeTab === 'dealer'} onClick={() => handleTabChange('dealer')} />
+          <NavItem icon={Users} label={t.dealer} active={activeTab === 'dealer'} badgeCount={moduleBadges.dealer?.count} onClick={() => handleTabChange('dealer')} />
         )}
         {canAccessModule(currentUserData, 'travel') && (
-          <NavItem icon={Bike} label={t.travel} active={activeTab === 'travel'} onClick={() => handleTabChange('travel')} />
+          <NavItem icon={Bike} label={t.travel} active={activeTab === 'travel'} badgeCount={moduleBadges.travel?.count} onClick={() => handleTabChange('travel')} />
         )}
         {!isUserAdmin && canAccessModule(currentUserData, 'office_staff') && (
-          <NavItem icon={Warehouse} label="Warehouse" active={activeTab === 'office_staff'} onClick={() => handleTabChange('office_staff')} />
+          <NavItem icon={Warehouse} label="Warehouse" active={activeTab === 'office_staff'} badgeCount={moduleBadges.office_staff?.count} onClick={() => handleTabChange('office_staff')} />
         )}
       </nav>
       <CustomDialogModal {...dialogConfig} />
+      <DashboardBirthdayWatcher
+        profile={currentUserData}
+        onBirthdaysChange={handleBirthdaysChange}
+      />
+      <BirthdayNotificationModal
+        isOpen={isBirthdayModalOpen}
+        onClose={handleCloseBirthdayModal}
+        birthdays={todaysBirthdays}
+      />
+      <DashboardModuleUpdateWatcher
+        profile={currentUserData}
+        activeTab={activeTab}
+        onBadgesChange={handleModuleBadgesChange}
+      />
+      <ModuleUpdatePopup
+        isOpen={isModulePopupOpen && activeTab === 'dashboard' && !isBirthdayModalOpen}
+        items={moduleUpdateItems}
+        onClose={handleCloseModulePopup}
+        onOpenModule={(modId) => {
+          setIsModulePopupOpen(false);
+          handleTabChange(modId);
+        }}
+      />
     </div>
   );
 };
@@ -458,10 +707,11 @@ interface NavItemProps {
   icon: any;
   label: string;
   active?: boolean;
+  badgeCount?: number;
   onClick: () => void;
 }
 
-const NavItem: React.FC<NavItemProps> = ({ icon: Icon, label, active, onClick }) => (
+const NavItem: React.FC<NavItemProps> = ({ icon: Icon, label, active, badgeCount, onClick }) => (
   <button 
     onClick={onClick}
     className={cn(
@@ -470,7 +720,14 @@ const NavItem: React.FC<NavItemProps> = ({ icon: Icon, label, active, onClick })
     )}
     title={label}
   >
-    <Icon className={cn("w-6 h-6 transition-transform", active && "scale-110")} />
+    <div className="relative">
+      <Icon className={cn("w-6 h-6 transition-transform", active && "scale-110")} />
+      {Boolean(badgeCount && badgeCount > 0) && (
+        <span className="absolute -top-1.5 -right-2 min-w-[16px] h-[16px] px-1 rounded-full bg-rose-600 text-white text-[9px] font-black flex items-center justify-center shadow-xs leading-none">
+          {badgeCount! > 99 ? '99+' : badgeCount}
+        </span>
+      )}
+    </div>
     {active && <div className="w-1.5 h-1.5 bg-rose-600 rounded-full absolute -bottom-1" />}
   </button>
 );

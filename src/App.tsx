@@ -9,6 +9,7 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { startBackgroundSync, isQuotaBlocked, setQuotaBlocked, trackFirestoreUsage, toTimestampMs, isRecordDeleted } from './lib/dataService';
 import { subscribeSecondaryCollection, fetchSecondaryCollection, autoHydrateServerFromLocalCache, pullSecondaryChanges } from './lib/secondaryDb';
 import { hydrateAllChannelsFromSecondary } from './lib/realtimeStore';
+import { isPackagedApkShell } from './lib/appVersion';
 
 const PROFILE_STORAGE_KEY = 'blackworm_user_profile';
 const SESSION_BC_NAME = 'blackworm_session_channel';
@@ -354,7 +355,13 @@ export default function App() {
       localStorage.removeItem(PROFILE_STORAGE_KEY);
     } catch {}
     try {
-      window.history.replaceState({ loggedOut: true }, '');
+      const proto = String(window.location.protocol || '').toLowerCase();
+      if (proto === 'http:' || proto === 'https:') {
+        const logoutTarget = isPackagedApkShell() ? (window.location.pathname || '/') : '/';
+        window.history.replaceState({ loggedOut: true }, '', logoutTarget);
+      } else {
+        window.history.replaceState({ loggedOut: true }, '');
+      }
     } catch {}
     setProfile(null);
     broadcastSessionEvent('logout', null);

@@ -54,16 +54,15 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
 
       // Fast server-side credential verification when online (keeps raw passwords off login responses)
       if (isOnline) {
+        const authController = new AbortController();
+        const authTimer = setTimeout(() => authController.abort(), 3000);
         try {
-          const authController = new AbortController();
-          const authTimer = setTimeout(() => authController.abort(), 3000);
           const authResp = await fetch(resolveApiUrl('/api/auth/login'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ loginId: trimmedId, password: trimmedPass }),
             signal: authController.signal,
           });
-          clearTimeout(authTimer);
           const authJson = await authResp.json().catch(() => null);
           if (authJson?.status === 'verified' && authJson?.profile) {
             onLoginSuccess(authJson.profile as UserProfile);
@@ -74,7 +73,11 @@ export const Login: React.FC<LoginProps> = ({ onLoginSuccess }) => {
             return;
           }
           // If Secondary DB had the user and password didn't match, still double-check Firestore below ONLY in case password was just changed on Firestore
-        } catch {}
+        } catch {
+          // Non-blocking fallback to Firestore + local vault login
+        } finally {
+          clearTimeout(authTimer);
+        }
       }
 
       const lowerId = trimmedId.toLowerCase();

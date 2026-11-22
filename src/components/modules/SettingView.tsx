@@ -70,17 +70,20 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
   }, []);
 
   const loadServerBackups = async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 4500);
       const res = await fetch(resolveApiUrl('/api/sync/backups'), { signal: controller.signal });
-      clearTimeout(timer);
       if (!res.ok) return;
       const json = await res.json();
       if (json?.ok && Array.isArray(json.backups)) {
         setServerBackups(json.backups);
       }
-    } catch {}
+    } catch {
+      // Non-blocking fallback when offline or standalone APK
+    } finally {
+      clearTimeout(timer);
+    }
   };
 
   useEffect(() => {
@@ -204,23 +207,22 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
         return;
       }
 
-      // 1. Bounded multi-tier sync & channel refresh (never hangs)
-      const syncResult = await Promise.race([
-        (async () => {
-          const summary = await forceMultiTierSyncAll(true);
-          await hydrateAllChannelsFromSecondary(true);
-          return { ok: true as const, summary };
-        })(),
-        new Promise<{ ok: false; summary: null }>((resolve) =>
-          setTimeout(() => resolve({ ok: false, summary: null }), 10000)
-        ),
-      ]).catch(() => ({ ok: false as const, summary: null }));
-
-      // 2. Check remote build version without forcing blind redirect yet
-      const verRes = await checkRemoteAppVersion({
-        manual: true,
-        forceReloadOnUpdate: false,
-      });
+      // 1. Run lightweight version check FIRST/concurrently so parallel sync fetches cannot starve it
+      const [verRes, syncResult] = await Promise.all([
+        checkRemoteAppVersion({
+          manual: true,
+          forceReloadOnUpdate: false,
+        }),
+        Promise.race([
+          (async () => {
+            const summary = await forceMultiTierSyncAll(true);
+            return { ok: true as const, summary };
+          })(),
+          new Promise<{ ok: false; summary: null }>((resolve) =>
+            setTimeout(() => resolve({ ok: false, summary: null }), 12000)
+          ),
+        ]).catch(() => ({ ok: false as const, summary: null })),
+      ]);
 
       if (verRes.hasUpdate && verRes.remoteBuildId) {
         setRefreshStatus({
@@ -231,30 +233,55 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
         return;
       }
 
-      // 3. Clear only transient HTTP/SW caches when on current build and report crisp outcome
+      // 2. Refresh active channel state if secondary server is reachable, then clean volatile HTTP caches
+      if (verRes.checked || (syncResult.ok && syncResult.summary?.secondaryReachable)) {
+        await Promise.race([
+          hydrateAllChannelsFromSecondary(true),
+          new Promise((r) => setTimeout(r, 5000)),
+        ]).catch(() => {});
+      }
+
       await Promise.race([
-        safeClearTransientCaches(),
+        safeClearTransientCaches({ includeServiceWorker: false }),
         new Promise((r) => setTimeout(r, 2000)),
       ]);
+      try {
+        if ('serviceWorker' in navigator) {
+          const reg = await navigator.serviceWorker.getRegistration();
+          if (reg) await Promise.race([reg.update(), new Promise((r) => setTimeout(r, 1500))]);
+        }
+      } catch {}
 
-      if (!verRes.checked) {
+      const serverOnline = Boolean(verRes.checked || (syncResult.ok && syncResult.summary?.secondaryReachable));
+      const cloudOnline = Boolean(syncResult.ok && syncResult.summary?.firebaseReachable);
+      const pulled = syncResult.ok && syncResult.summary ? syncResult.summary.deltasPulled : 0;
+      const pending = syncResult.ok && syncResult.summary ? syncResult.summary.pendingRemaining : 0;
+
+      if (serverOnline) {
         setRefreshStatus({
-          type: 'error',
-          text: syncResult.ok
-            ? 'स्थानिक डेटा रिफ्रेश झाला, परंतु सर्व्हर तपासताना अडचण आली. कृपया पुन्हा प्रयत्न करा.'
-            : 'सर्व्हरशी संपर्क होऊ शकला नाही. कृपया इंटरनेट तपासून पुन्हा Refresh करा.',
+          type: 'success',
+          text:
+            pending > 0
+              ? `रिफ्रेश पूर्ण! ${pulled} नोंदी सिंक झाल्या (${pending} नोंदी रांगेत).`
+              : `रिफ्रेश यशस्वी! सर्व डेटा सिंक झाला असून ॲप अद्ययावत आहे.`,
         });
         return;
       }
 
-      const pulled = syncResult.ok && syncResult.summary ? syncResult.summary.deltasPulled : 0;
-      const pending = syncResult.ok && syncResult.summary ? syncResult.summary.pendingRemaining : 0;
+      if (cloudOnline) {
+        setRefreshStatus({
+          type: 'success',
+          text:
+            pending > 0
+              ? `मुख्य क्लाउड डेटाबेस सिंक पूर्ण झाले (${pending} नोंदी रांगेत, ऑफलाइन डेटा सुरक्षित आहे).`
+              : `मुख्य क्लाउड डेटाबेस सिंक यशस्वी! सर्व नोंदी अद्ययावत व सुरक्षित आहेत.`,
+        });
+        return;
+      }
+
       setRefreshStatus({
-        type: 'success',
-        text:
-          pending > 0
-            ? `रिफ्रेश पूर्ण! ${pulled} नोंदी सिंक झाल्या (${pending} नोंदी रांगेत).`
-            : `रिफ्रेश यशस्वी! सर्व डेटा सिंक झाला असून ॲप अद्ययावत आहे.`,
+        type: 'error',
+        text: 'सर्व्हरशी संपर्क होऊ शकला नाही. स्थानिक डेटा सुरक्षित आहे, कृपया इंटरनेट तपासून पुन्हा Refresh करा.',
       });
     } catch (err: any) {
       setRefreshStatus({
@@ -293,16 +320,15 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
     if (isCreatingServerBackup) return;
     setIsCreatingServerBackup(true);
     setBackupStatusMessage(null);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8000);
       const res = await fetch(resolveApiUrl('/api/sync/backup'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: 'manual_permanent_snapshot' }),
         signal: controller.signal,
       });
-      clearTimeout(timer);
       const json = await res.json();
       if (!res.ok || !json?.ok) {
         throw new Error(json?.error || 'Server backup failed');
@@ -318,6 +344,7 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
         text: getFriendlyErrorMessage(err, 'सर्व्हर बॅकअप तयार करताना त्रुटी आली. कृपया पुन्हा प्रयत्न करा.'),
       });
     } finally {
+      clearTimeout(timer);
       setIsCreatingServerBackup(false);
     }
   };

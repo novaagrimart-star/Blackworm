@@ -1,0 +1,30 @@
+{
+  "version": "1.0.1",
+  "lockedAt": "2026-11-22T15:39:00.000Z",
+  "description": "Core Module Lock & Schema Protection Manifest for Blackworm Agritech MIS",
+  "lockedFiles": {
+    "src/components/modules/TargetSheetView.tsx": "caf54ef2f6c44941c89f49582e5c3df912f5145f7158cf5eb3870f63c310eac1",
+    "firebase-applet-config.json": "f2565ef8150a173c624914e0201f0bfaa132ab2ffd9dd36f91c1e7c4811d5245",
+    "firebase-blueprint.json": "7ffe5ce830e91373a0f4f9debc539a7f0f2901e3c111f29181cc3e3c71a9ed44",
+    "firestore.rules": "19d42162d5daf02206e0e0b1e6b929df12785ca415e21dd7fc895b0ad7f56011",
+    "public/manifest.webmanifest": "ddaa6916dbf0025283a722457a97618fa50ed5dec39335831551643732cec83e"
+  },
+  "requiredCollections": [
+    "users",
+    "orders",
+    "dealers_application",
+    "collection_entries",
+    "yearly_targets",
+    "travel_sheets",
+    "outstanding_records",
+    "location_villages",
+    "location_talukas",
+    "location_dealers",
+    "office_staff_members",
+    "office_staff_attendance",
+    "config",
+    "products_pricelist_v2",
+    "targets",
+    "user_approval_requests"
+  ]
+}

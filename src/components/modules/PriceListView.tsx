@@ -5,6 +5,7 @@ import { UserProfile, isAdmin } from '../../lib/auth';
 import { Language } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
 import { cn } from '../../lib/utils';
+import { resolveApiUrl } from '../../lib/appVersion';
 import { 
   Upload, 
   Download, 
@@ -1338,7 +1339,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
             const formData = new FormData();
             formData.append('file', file);
 
-            const response = await fetch('/api/parse-pricelist', {
+            const response = await fetch(resolveApiUrl('/api/parse-pricelist'), {
               method: 'POST',
               body: formData,
             });

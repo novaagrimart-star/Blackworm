@@ -44,20 +44,26 @@ export function toTitleCase(str: string | undefined | null): string {
  * without getting blocked by popup blockers or sandbox restrictions.
  */
 export function openExternalLinkSafely(url: string): void {
-  if (!url) return;
+  if (!url || typeof window === 'undefined') return;
+  const trimmed = String(url).trim();
+  const isSafeProtocol = /^(https?:|tel:|mailto:|whatsapp:|blob:|data:image\/|data:application\/pdf)/i.test(trimmed);
+  if (!isSafeProtocol) return;
+
   try {
     const link = document.createElement('a');
-    link.href = url;
+    link.href = trimmed;
     link.target = '_blank';
     link.rel = 'noopener noreferrer';
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-  } catch (e) {
+  } catch {
     try {
-      window.open(url, '_blank', 'noopener,noreferrer');
-    } catch (e2) {
-      window.location.assign(url);
+      window.open(trimmed, '_blank', 'noopener,noreferrer');
+    } catch {
+      if (/^(tel:|mailto:|whatsapp:)/i.test(trimmed)) {
+        window.location.assign(trimmed);
+      }
     }
   }
 }

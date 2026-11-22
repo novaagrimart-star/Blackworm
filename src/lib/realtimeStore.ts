@@ -31,10 +31,12 @@ import {
 } from './dataService';
 import {
   DEFAULT_STATE,
+  LocationDealerItem,
   LocationTalukaItem,
   LocationVillageItem,
   canonicalizeDistrictName,
   canonicalizeTalukaName,
+  deduplicateLocationDealers,
   deduplicateLocationTalukas,
   deduplicateLocationVillages,
   getDistrictMeta,
@@ -1258,11 +1260,12 @@ export function useSharedTravelSheets() {
 interface MasterPricelistState {
   products: any[];
   validityDate: string;
+  updatedAtMs: number;
 }
 
 function loadInitialMasterPricelist(): MasterPricelistState {
   try {
-    if (typeof window === 'undefined') return { products: [], validityDate: '' };
+    if (typeof window === 'undefined') return { products: [], validityDate: '', updatedAtMs: 0 };
     const masterRaw = localStorage.getItem('blackworm_master_pricelist');
     if (masterRaw) {
       const parsed = JSON.parse(masterRaw);
@@ -1270,6 +1273,7 @@ function loadInitialMasterPricelist(): MasterPricelistState {
         return {
           products: deduplicateProducts(parsed.products),
           validityDate: parsed.validityDate || '',
+          updatedAtMs: Math.max(Number(parsed._syncUpdatedAtMs) || 0, toTimestampMs(parsed.updatedAt)),
         };
       }
     }
@@ -1277,20 +1281,20 @@ function loadInitialMasterPricelist(): MasterPricelistState {
     if (cachedRaw) {
       const parsed = JSON.parse(cachedRaw);
       if (Array.isArray(parsed) && parsed.length > 0) {
-        return { products: deduplicateProducts(parsed), validityDate: '' };
+        return { products: deduplicateProducts(parsed), validityDate: '', updatedAtMs: 0 };
       }
     }
   } catch {}
-  return { products: [], validityDate: '' };
+  return { products: [], validityDate: '', updatedAtMs: 0 };
 }
 
 const masterPricelistChannel = createChannel<MasterPricelistState>(loadInitialMasterPricelist());
 
-let masterPricelistDocTs = 0;
+let masterPricelistDocTs = masterPricelistChannel.data.updatedAtMs || 0;
 
 function applyMasterPricelistDoc(data: any, authoritativeServer = false) {
   if (!data || !Array.isArray(data.products) || data.products.length === 0) return;
-  const incomingTs = getDocSyncTs(data);
+  const incomingTs = Math.max(Number(data._syncUpdatedAtMs) || 0, toTimestampMs(data.updatedAt));
   if (!authoritativeServer && masterPricelistDocTs > 0 && incomingTs > 0 && masterPricelistDocTs > incomingTs + 500) {
     return;
   }
@@ -1299,6 +1303,7 @@ function applyMasterPricelistDoc(data: any, authoritativeServer = false) {
   const nextState: MasterPricelistState = {
     products: clean,
     validityDate: data.validityDate || '',
+    updatedAtMs: masterPricelistDocTs,
   };
   safeLocalStorageSet('blackworm_master_pricelist', JSON.stringify({ ...data, products: clean }));
   safeLocalStorageSet('blackworm_cached_pricelist', JSON.stringify(clean));
@@ -1382,6 +1387,7 @@ export function setMasterPricelistStateOptimistic(products: any[], validityDate?
   const nextState: MasterPricelistState = {
     products: clean,
     validityDate: resolvedValidity,
+    updatedAtMs: masterPricelistDocTs,
   };
   safeLocalStorageSet(
     'blackworm_master_pricelist',
@@ -1410,6 +1416,7 @@ export function useSharedMasterPricelist() {
   return {
     products: state.products,
     validityDate: state.validityDate,
+    updatedAtMs: state.updatedAtMs || masterPricelistDocTs,
     loaded,
     setMasterPricelistOptimistic: setMasterPricelistStateOptimistic,
   };
@@ -1627,6 +1634,10 @@ function startSchemeDiscountsListener() {
   }
 }
 
+export function getSchemeDiscountsUpdatedAtMs(): number {
+  return schemeDiscountsDocTs;
+}
+
 export function useSharedSchemeDiscounts() {
   const [discounts, setDiscounts] = useState<Record<string, number>>(() => schemeDiscountsChannel.data);
   const [loaded, setLoaded] = useState<boolean>(() => schemeDiscountsChannel.loaded);
@@ -1645,7 +1656,7 @@ export function useSharedSchemeDiscounts() {
     notifyChannel(schemeDiscountsChannel, next, schemeDiscountsChannel.loaded);
   };
 
-  return { discounts, loaded, setDiscountsOptimistic };
+  return { discounts, loaded, updatedAtMs: schemeDiscountsDocTs, setDiscountsOptimistic };
 }
 
 // ---------------------------------------------------------------------------
@@ -2010,6 +2021,138 @@ export function useSharedLocationTalukas() {
 }
 
 export { getLocationTalukaDocId };
+
+// ---------------------------------------------------------------------------
+// 11B. SHARED LOCATION DEALERS STORE (Independent Location Mapping Dealers)
+// ---------------------------------------------------------------------------
+const LOCATION_DEALERS_CACHE_KEY = 'blackworm_cached_location_dealers';
+
+function loadInitialLocationDealers(): LocationDealerItem[] {
+  try {
+    if (typeof window === 'undefined') return [];
+    const local = mergeWithLocalData<any>('location_dealers', []);
+    if (local.length > 0) return deduplicateLocationDealers(local);
+    const cached = localStorage.getItem(LOCATION_DEALERS_CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed)) return deduplicateLocationDealers(parsed);
+    }
+  } catch {}
+  return [];
+}
+
+const locationDealersChannel = createChannel<LocationDealerItem[]>(loadInitialLocationDealers());
+
+function finalizeLocationDealersList(
+  rawItems: any[],
+  archivedIds: Set<string>,
+  authoritative: boolean
+): LocationDealerItem[] {
+  const merged = mergeWithLocalData<any>('location_dealers', rawItems, {
+    archivedIds,
+    authoritativeServer: authoritative,
+  });
+  const deduped = deduplicateLocationDealers(merged);
+  safeLocalStorageSet(LOCATION_DEALERS_CACHE_KEY, JSON.stringify(deduped));
+  return deduped;
+}
+
+function startLocationDealersListener() {
+  ensureGlobalResyncListeners();
+  if (!locationDealersChannel.secUnsub) {
+    locationDealersChannel.secUnsub = subscribeSecondaryCollection('location_dealers', (events) => {
+      const updated = applySecondaryDeltas(locationDealersChannel, 'location_dealers', events);
+      if (updated) {
+        notifyChannel(
+          locationDealersChannel,
+          finalizeLocationDealersList(updated, locationDealersChannel.archivedIds, false),
+          true
+        );
+      }
+    });
+  }
+
+  if (!locationDealersChannel.secPulledOnce) {
+    locationDealersChannel.secPulledOnce = true;
+    void pullSecondaryIntoChannel(locationDealersChannel, 'location_dealers', finalizeLocationDealersList);
+  }
+
+  if (locationDealersChannel.unsub) return;
+  if (isQuotaBlocked()) {
+    void pullSecondaryIntoChannel(locationDealersChannel, 'location_dealers', finalizeLocationDealersList);
+    return;
+  }
+
+  try {
+    const q = query(collection(db, 'location_dealers'), limit(3000));
+    locationDealersChannel.unsub = onSnapshot(
+      q,
+      (snap) => {
+        const { items, skipNotify } = applyIncrementalSnapshot(locationDealersChannel, 'location_dealers', snap, 3000);
+        if (skipNotify) return;
+        const sorted = finalizeLocationDealersList(
+          items,
+          locationDealersChannel.archivedIds,
+          !snap.metadata?.fromCache
+        );
+        notifyChannel(locationDealersChannel, sorted, true);
+        if (!snap.metadata?.fromCache && sorted.length > 0) {
+          bootstrapCollectionToSecondary('location_dealers', sorted);
+        }
+      },
+      (err) => {
+        console.warn('Shared location_dealers sync notice:', err);
+        if (locationDealersChannel.unsub) {
+          try { locationDealersChannel.unsub(); } catch {}
+          locationDealersChannel.unsub = null;
+        }
+        if (isQuotaError(err)) setQuotaBlocked(2 * 60 * 1000);
+        void pullSecondaryIntoChannel(locationDealersChannel, 'location_dealers', finalizeLocationDealersList);
+      }
+    );
+  } catch (e) {
+    console.warn('Failed to start shared location_dealers listener:', e);
+    locationDealersChannel.unsub = null;
+    void pullSecondaryIntoChannel(locationDealersChannel, 'location_dealers', finalizeLocationDealersList);
+  }
+}
+
+export function useSharedLocationDealers() {
+  const [locationDealers, setLocationDealers] = useState<LocationDealerItem[]>(
+    () => locationDealersChannel.data
+  );
+  const [loaded, setLoaded] = useState<boolean>(() => locationDealersChannel.loaded);
+
+  useEffect(() => {
+    return subscribeChannel(locationDealersChannel, startLocationDealersListener, (val, isLoaded) => {
+      setLocationDealers(val);
+      setLoaded(isLoaded);
+    });
+  }, []);
+
+  const setLocationDealersOptimistic = (
+    updater: SetStateAction<LocationDealerItem[]>
+  ) => {
+    const nowMs = Date.now();
+    const rawNext = typeof updater === 'function' ? updater(locationDealersChannel.data) : updater;
+    const next = deduplicateLocationDealers(rawNext);
+    const nextIds = new Set<string>();
+    next.forEach((d: any) => {
+      if (d?.id) {
+        nextIds.add(d.id);
+        locationDealersChannel.archivedIds.delete(d.id);
+        locationDealersChannel.docMap.set(d.id, { ...d, _syncUpdatedAtMs: Math.max(Number(d._syncUpdatedAtMs) || 0, nowMs) });
+      }
+    });
+    Array.from(locationDealersChannel.docMap.keys()).forEach((k) => {
+      if (!nextIds.has(k)) locationDealersChannel.docMap.delete(k);
+    });
+    safeLocalStorageSet(LOCATION_DEALERS_CACHE_KEY, JSON.stringify(next));
+    notifyChannel(locationDealersChannel, next, locationDealersChannel.loaded);
+  };
+
+  return { locationDealers, loaded, setLocationDealersOptimistic };
+}
 
 // ---------------------------------------------------------------------------
 // 12. SHARED OFFICE / FACTORY STAFF ROSTER (Godown Incharge & Admin)
@@ -2534,6 +2677,7 @@ const channelRegistry: Record<
   outstanding_records: { channel: outstandingChannel, finalize: finalizeOutstandingList },
   location_villages: { channel: locationVillagesChannel, finalize: finalizeLocationVillagesList },
   location_talukas: { channel: locationTalukasChannel, finalize: finalizeLocationTalukasList },
+  location_dealers: { channel: locationDealersChannel, finalize: finalizeLocationDealersList },
   office_staff_members: { channel: officeStaffChannel, finalize: finalizeOfficeStaffList },
   office_staff_attendance: { channel: officeAttendanceChannel, finalize: finalizeOfficeAttendanceList },
   targets: { channel: targetsChannel, finalize: finalizeTargetsList },
@@ -2668,6 +2812,9 @@ export async function hydrateAllChannelsFromSecondary(force = false): Promise<vo
   if (shouldPull(locationTalukasChannel)) {
     jobs.push(pullSecondaryIntoChannel(locationTalukasChannel, 'location_talukas', finalizeLocationTalukasList));
   }
+  if (shouldPull(locationDealersChannel)) {
+    jobs.push(pullSecondaryIntoChannel(locationDealersChannel, 'location_dealers', finalizeLocationDealersList));
+  }
   if (shouldPull(officeStaffChannel)) {
     jobs.push(pullSecondaryIntoChannel(officeStaffChannel, 'office_staff_members', finalizeOfficeStaffList));
   }
@@ -2698,6 +2845,7 @@ function reattachAllActiveListeners() {
   if (schemeDiscountsChannel.subscribers.size > 0 && !schemeDiscountsChannel.unsub) startSchemeDiscountsListener();
   if (locationVillagesChannel.subscribers.size > 0 && !locationVillagesChannel.unsub) startLocationVillagesListener();
   if (locationTalukasChannel.subscribers.size > 0 && !locationTalukasChannel.unsub) startLocationTalukasListener();
+  if (locationDealersChannel.subscribers.size > 0 && !locationDealersChannel.unsub) startLocationDealersListener();
   if (officeStaffChannel.subscribers.size > 0 && !officeStaffChannel.unsub) startOfficeStaffListener();
   if (officeAttendanceChannel.subscribers.size > 0 && !officeAttendanceChannel.unsub) startOfficeAttendanceListener();
 }

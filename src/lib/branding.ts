@@ -188,5 +188,9 @@ export function useBranding() {
     );
   };
 
-  return { ...branding, saveBranding };
+  return { ...branding, updatedAtMs: brandingDocTs, saveBranding };
+}
+
+export function getBrandingUpdatedAtMs(): number {
+  return brandingDocTs;
 }

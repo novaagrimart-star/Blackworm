@@ -5,6 +5,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
+import { fileURLToPath } from 'url';
 import { secondarySyncDb, isValidSyncCollection, isValidSyncDocId } from './server/secondaryDb';
 
 dotenv.config();
@@ -85,7 +86,7 @@ const upload = multer({
 async function createServer() {
   const app = express();
   app.disable('x-powered-by');
-  const port = 3000;
+  const port = Number(process.env.PORT) || 3000;
 
   // Safe HTTP Security Headers (preserving AI Studio iframe compatibility — NO X-Frame-Options)
   app.use((_req, res, next) => {
@@ -96,17 +97,56 @@ async function createServer() {
     next();
   });
 
+  const isAllowedOrigin = (origin: string, hostHeader?: string): boolean => {
+    const norm = String(origin || '').trim().toLowerCase();
+    if (!norm) return false;
+    if (norm === 'null') return true; // file:// packaged Android WebView
+    try {
+      const parsed = new URL(norm);
+      const proto = parsed.protocol;
+      const host = parsed.hostname;
+      if (hostHeader && parsed.host.toLowerCase() === hostHeader.toLowerCase()) return true;
+      if (proto === 'capacitor:' || proto === 'ionic:' || proto === 'app:' || proto === 'file:') return true;
+      if (host === 'localhost' || host === '127.0.0.1') return true;
+      if (host === 'appassets.androidplatform.net' || host.endsWith('.androidplatform.net')) return true;
+      if (host.endsWith('.run.app') || host.endsWith('.aistudio.google.com') || host.endsWith('.web.app') || host.endsWith('.firebaseapp.com')) {
+        return true;
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  };
+
   // Enable cross-origin API, root HTML, & version checks so packaged Android APK WebViews / Capacitor shells share exact same backend and OTA updates
   app.use((req, res, next) => {
     const reqPath = (req.url || '').split('?')[0];
-    if (
-      reqPath.startsWith('/api') ||
+    const isPublicReadRoute =
       reqPath === '/version.json' ||
+      reqPath === '/manifest.webmanifest' ||
+      reqPath === '/sw.js' ||
+      reqPath === '/api/app-version' ||
+      reqPath === '/api/health' ||
+      reqPath.startsWith('/assets/') ||
       reqPath === '/' ||
-      reqPath === '/index.html'
-    ) {
+      reqPath === '/index.html';
+
+    if (isPublicReadRoute) {
       res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control, Pragma');
+      if (req.method === 'OPTIONS') {
+        res.status(204).end();
+        return;
+      }
+    } else if (reqPath.startsWith('/api')) {
+      const reqOrigin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
+      const hostHeader = typeof req.headers.host === 'string' ? req.headers.host : '';
+      if (reqOrigin && isAllowedOrigin(reqOrigin, hostHeader)) {
+        res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+        res.setHeader('Vary', 'Origin');
+      }
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Cache-Control, Pragma');
       if (req.method === 'OPTIONS') {
         res.status(204).end();
@@ -617,9 +657,30 @@ async function createServer() {
     }
   });
 
+  // Lightweight health check endpoint for uptime & APK probes
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true, version: SERVER_BUILD_INFO.version, buildId: SERVER_BUILD_INFO.buildId });
+  });
+
   // Return clean JSON 404 for unmatched API routes before SPA middlewares handle them
   app.all('/api/*', (_req, res) => {
     res.status(404).json({ error: 'API route not found' });
+  });
+
+  // Serve robots.txt & favicon cleanly so browsers, probes & Android WebViews never hit unexpected errors
+  app.get('/robots.txt', (_req, res) => {
+    res.type('text/plain').send('User-agent: *\nAllow: /\n');
+  });
+
+  app.get('/favicon.ico', (_req, res) => {
+    const distIcon = path.join(process.cwd(), 'dist', 'pwa-192x192.png');
+    const pubIcon = path.join(process.cwd(), 'public', 'pwa-192x192.png');
+    const targetIcon = fs.existsSync(distIcon) ? distIcon : pubIcon;
+    if (fs.existsSync(targetIcon)) {
+      res.type('image/png').sendFile(targetIcon);
+      return;
+    }
+    res.status(204).end();
   });
 
   // Never cache Service Worker, manifest, or version manifest
@@ -638,10 +699,32 @@ async function createServer() {
         'Expires': '0',
       });
     }
+    if (reqPath === '/manifest.webmanifest') {
+      res.type('application/manifest+json');
+    }
     next();
   });
 
-  if (process.env.NODE_ENV !== 'production') {
+  const currentModuleDir = path.dirname(fileURLToPath(import.meta.url));
+  const cwdDistPath = path.join(process.cwd(), 'dist');
+  const distPath = fs.existsSync(path.join(cwdDistPath, 'index.html'))
+    ? cwdDistPath
+    : fs.existsSync(path.join(currentModuleDir, 'index.html'))
+      ? currentModuleDir
+      : cwdDistPath;
+  const indexPath = path.join(distPath, 'index.html');
+  const isRunningBuiltServer =
+    (typeof import.meta?.url === 'string' && import.meta.url.includes('/dist/')) ||
+    Boolean(process.argv[1] && process.argv[1].includes('dist'));
+  const useProductionDist =
+    fs.existsSync(indexPath) && (process.env.NODE_ENV === 'production' || isRunningBuiltServer);
+
+  // Never fall back to HTML for missing static data JSON files
+  app.use('/data', (_req, res) => {
+    res.status(404).json({ ok: false, error: 'Data file not found' });
+  });
+
+  if (!useProductionDist) {
     app.get(['/dev-sw.js', '/sw.js'], (_req, res) => {
       res.set({
         'Content-Type': 'application/javascript; charset=utf-8',
@@ -656,12 +739,13 @@ async function createServer() {
     });
   }
 
-  const distPath = path.join(process.cwd(), 'dist');
-  const indexPath = path.join(distPath, 'index.html');
-
-  if (process.env.NODE_ENV === 'production' && fs.existsSync(indexPath)) {
+  if (useProductionDist) {
     console.log('Serving production-ready application from dist/');
     app.use('/assets', express.static(path.join(distPath, 'assets'), { maxAge: '1y', immutable: true }));
+    // Return crisp 404 for missing hashed chunks instead of HTML so ErrorBoundary / preload handler can cleanly reload
+    app.use('/assets', (_req, res) => {
+      res.status(404).type('text/plain').send('Asset not found');
+    });
     app.use(
       express.static(distPath, {
         index: false,
@@ -674,10 +758,14 @@ async function createServer() {
         },
       })
     );
-    
-    app.get('*', (req, res) => {
-      if (req.url.startsWith('/api/')) {
+
+    app.use((req, res) => {
+      if (req.path.startsWith('/api/')) {
         res.status(404).json({ error: 'API route not found' });
+        return;
+      }
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.status(404).json({ error: 'Route not found' });
         return;
       }
       res.set({
@@ -697,8 +785,11 @@ async function createServer() {
 
     app.use('*', async (req, res, next) => {
       const url = req.originalUrl;
-      if (url.startsWith('/api/')) {
+      if (req.path.startsWith('/api/')) {
         return res.status(404).json({ error: 'API route not found' });
+      }
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        return res.status(404).json({ error: 'Route not found' });
       }
       try {
         let template = fs.readFileSync(path.resolve(process.cwd(), 'index.html'), 'utf-8');
