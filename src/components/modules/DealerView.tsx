@@ -41,6 +41,8 @@ import { toTitleCase } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
 import { compressImageFile } from '../../lib/imageCompression';
 import { Language } from '../../lib/i18n';
+import { getRecordUpdateMs } from '../../lib/moduleUpdates';
+import { ModuleUpdateBanner, useModuleRecordHighlights } from '../ModuleUpdateBanner';
 import { CustomDialogModal } from '../CustomDialogModal';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas-pro';
@@ -125,6 +127,8 @@ export interface DealershipFormItem {
   userId?: string;
   loginId?: string;
   createdByUid?: string;
+  updatedByUid?: string;
+  updatedByName?: string;
   userCode?: string;
 }
 
@@ -167,6 +171,12 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
   const { locationVillages } = useSharedLocationVillages();
   const { locationTalukas } = useSharedLocationTalukas();
   const { officers, usersMap } = useSharedUsers();
+  const {
+    badge: dealerBadge,
+    unreadById: dealerUnreadById,
+    markViewed: markDealerViewed,
+    markAllViewed: markAllDealersViewed,
+  } = useModuleRecordHighlights(profile, 'dealer', { dealers });
   const [searchQuery, setSearchQuery] = useState('');
   
   const [viewMode, setViewMode] = useState<'list' | 'form'>('list');
@@ -237,6 +247,14 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
   const formSessionIdRef = useRef<string>('');
 
   const dealerFormHistoryPushedRef = useRef(false);
+  const dealerMountedRef = useRef(true);
+  useEffect(() => {
+    dealerMountedRef.current = true;
+    return () => {
+      dealerMountedRef.current = false;
+      dealerFormHistoryPushedRef.current = false;
+    };
+  }, []);
   useEffect(() => {
     if (viewMode === 'form') {
       if (!dealerFormHistoryPushedRef.current && !window.history.state?.dealerFormOpen) {
@@ -253,7 +271,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
       };
     } else if (dealerFormHistoryPushedRef.current) {
       dealerFormHistoryPushedRef.current = false;
-      if (window.history.state?.dealerFormOpen) {
+      if (dealerMountedRef.current && window.history.state?.dealerFormOpen) {
         window.history.back();
       }
     }
@@ -317,7 +335,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
   useEffect(() => {
     const pullSeqFromSecondary = async () => {
       try {
-        const res = await fetchSecondaryCollection('config', { limit: 50 });
+        const res = await fetchSecondaryCollection('config', { limit: 1000 });
         const seqDoc = res.items.find((it) => it?.id === 'dealer_sequence');
         if (seqDoc) {
           const val = Number(seqDoc.currentSequence) || 0;
@@ -749,6 +767,7 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
   // Do not revert this behavior under any circumstances!
   // ============================================================================
   const loadDealerToForm = (item: DealershipFormItem, editMode: boolean = true) => {
+    markDealerViewed(item.id, getRecordUpdateMs(item));
     const canEdit = isAdmin(profile) || isCreatedByOfficer(item, profile.uid);
     setCurrentId(item.id);
     formSessionIdRef.current = item.id;
@@ -972,12 +991,11 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
         userId: finalCreatorId || '',
         loginId: (currentId && existingDealerRec?.loginId) ? existingDealerRec.loginId : (profile.loginId || ''),
         createdByUid: finalCreatorId || '',
+        updatedByUid: profile.uid || '',
+        updatedByName: profile.fullName || profile.loginId || 'OFFICER',
+        createdAt: existingDealerRec?.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
-
-      if (isNewRecord) {
-        payload.createdAt = new Date().toISOString();
-      }
 
       // Immediately update shared in-memory state before network write
       setDealersOptimistic((prev) => {
@@ -1346,6 +1364,16 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
       {/* ======================= VIEW MODE: LIST ======================= */}
       {viewMode === 'list' && (
         <div className="space-y-4 no-print">
+          <ModuleUpdateBanner
+            badge={dealerBadge}
+            onMarkAllViewed={() => markAllDealersViewed()}
+            onMarkSingleViewed={(rec) => markDealerViewed(rec.id, rec.updatedAtMs)}
+            onSelectRecord={(rec) => {
+              markDealerViewed(rec.id, rec.updatedAtMs);
+              const match = dealers.find((d) => d.id === rec.id);
+              if (match) loadDealerToForm(match, true);
+            }}
+          />
 
           {/* Filter Pills in a Single Inline Row on Mobile & Desktop */}
           <div className="flex items-center gap-1.5 px-1 overflow-x-auto whitespace-nowrap py-1 scrollbar-none">
@@ -1418,11 +1446,13 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100 font-medium">
-                  {filteredDealers.map((d, index) => (
+                  {filteredDealers.map((d, index) => {
+                    const unreadMeta = dealerUnreadById.get(d.id);
+                    return (
                     <tr
                       key={d.id}
                       onClick={() => loadDealerToForm(d, true)}
-                      className="hover:bg-red-50/60 transition cursor-pointer group"
+                      className={`transition cursor-pointer group ${unreadMeta ? 'bg-amber-50/75 hover:bg-amber-100/70' : 'hover:bg-red-50/60'}`}
                     >
                       <td className="p-3 text-center font-mono font-bold text-slate-500">
                         {index + 1}
@@ -1444,6 +1474,13 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
                         >
                           {toTitleCase(d.firmName) || 'Unnamed Dealership'}
                         </button>
+                        {unreadMeta && (
+                          <div className="flex items-center gap-1 mt-0.5 text-[10px] font-bold text-amber-800">
+                            <span>{unreadMeta.actorName}</span>
+                            <span className="text-amber-500" aria-hidden="true">·</span>
+                            <span>{unreadMeta.actionLabel}</span>
+                          </div>
+                        )}
                       </td>
                       <td className="p-3 font-bold text-slate-700">
                         {toTitleCase(d.proprietorName) || '-'}
@@ -1457,20 +1494,37 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
                         )}
                       </td>
                       <td className="p-3 text-center">
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            loadDealerToForm(d, true);
-                          }}
-                          className="inline-flex items-center px-2.5 py-1 bg-red-600 text-white rounded-lg text-[11px] font-black hover:bg-red-700 transition shadow-xs cursor-pointer active:scale-95"
-                          title="फॉर्म उघडा"
-                        >
-                          <span>उघडा</span>
-                        </button>
+                        <div className="inline-flex items-center gap-1">
+                          {unreadMeta && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                markDealerViewed(d.id, unreadMeta.updatedAtMs);
+                              }}
+                              className="inline-flex items-center gap-0.5 px-2 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-lg text-[10px] font-bold transition cursor-pointer whitespace-nowrap"
+                              title="पाहिले (Mark Viewed)"
+                            >
+                              <Check className="w-3 h-3" />
+                              <span>पाहिले</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              loadDealerToForm(d, true);
+                            }}
+                            className="inline-flex items-center px-2.5 py-1 bg-red-600 text-white rounded-lg text-[11px] font-black hover:bg-red-700 transition shadow-xs cursor-pointer active:scale-95"
+                            title="फॉर्म उघडा"
+                          >
+                            <span>उघडा</span>
+                          </button>
+                        </div>
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                   {filteredDealers.length === 0 && (
                     <tr>
                       <td colSpan={7} className="p-8 text-center text-slate-400">
@@ -1492,11 +1546,16 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
                   .filter(Boolean)
                   .map((p) => toTitleCase(p))
                   .join(', ');
+                const unreadMeta = dealerUnreadById.get(d.id);
                 return (
                   <div
                     key={d.id}
                     onClick={() => loadDealerToForm(d, true)}
-                    className="bg-white rounded-xl border border-slate-200 hover:border-red-400 hover:shadow-xs px-3 py-2.5 sm:px-3.5 sm:py-3 transition-all cursor-pointer flex items-center gap-2.5 group relative"
+                    className={`rounded-xl border hover:shadow-xs px-3 py-2.5 sm:px-3.5 sm:py-3 transition-all cursor-pointer flex items-center gap-2.5 group relative ${
+                      unreadMeta
+                        ? 'bg-amber-50/50 border-amber-400 ring-1 ring-amber-200 hover:border-amber-500'
+                        : 'bg-white border-slate-200 hover:border-red-400'
+                    }`}
                   >
                     <div className="flex items-center shrink-0">
                       <span
@@ -1518,7 +1577,27 @@ export const DealerView: React.FC<Props> = ({ profile, initialDealerId, onConsum
                           ({toTitleCase((d.userId && usersMap[d.userId]) || (d.created_by_user_id && usersMap[d.created_by_user_id]) || (d.createdByUid && usersMap[d.createdByUid]) || (d.loginId && usersMap[String(d.loginId).toLowerCase()]) || d.officerName || d.created_by_name || 'Officer')})
                         </span>
                       </span>
+                      {unreadMeta && (
+                        <span className="text-[10px] font-bold text-amber-800 block truncate mt-0.5">
+                          {unreadMeta.actorName} · {unreadMeta.actionLabel}
+                        </span>
+                      )}
                     </div>
+
+                    {unreadMeta && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          markDealerViewed(d.id, unreadMeta.updatedAtMs);
+                        }}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-[10px] font-bold transition whitespace-nowrap shrink-0 cursor-pointer"
+                        title="पाहिले (Mark Viewed)"
+                      >
+                        <Check className="w-3 h-3 shrink-0" />
+                        <span>पाहिले</span>
+                      </button>
+                    )}
                   </div>
                 );
               })}

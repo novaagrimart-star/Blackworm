@@ -76,7 +76,12 @@ export const DashboardBirthdayWatcher: React.FC<{
     [profile, users, dealers, officeStaff, canSubscribeDealers, canSubscribeStaff, dateKey]
   );
 
+  const lastEmittedBirthdaySigRef = React.useRef<string>('');
+
   useEffect(() => {
+    const sig = `${dateKey}::${birthdays.map((b) => `${b.id}:${b.name}`).join(',')}`;
+    if (lastEmittedBirthdaySigRef.current === sig) return;
+    lastEmittedBirthdaySigRef.current = sig;
     onBirthdaysChange(birthdays, dateKey);
   }, [birthdays, dateKey, onBirthdaysChange]);
 

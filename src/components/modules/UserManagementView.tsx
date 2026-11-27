@@ -9,6 +9,8 @@ import { subscribeSecondaryCollection, fetchSecondaryCollection } from '../../li
 import { toTitleCase } from '../../lib/utils';
 import { compressImageFile } from '../../lib/imageCompression';
 import { Language, translations } from '../../lib/i18n';
+import { getRecordUpdateMs } from '../../lib/moduleUpdates';
+import { ModuleUpdateBanner, useModuleRecordHighlights } from '../ModuleUpdateBanner';
 import { CustomDialogModal } from '../CustomDialogModal';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas-pro';
@@ -202,6 +204,8 @@ export interface DetailedUserProfile extends UserProfile {
   panNo?: string;
   status?: 'Active' | 'Inactive';
   allowedModules?: string[];
+  updatedByUid?: string;
+  updatedByName?: string;
   updatedAt?: string;
   createdAt: string;
 }
@@ -265,6 +269,16 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const [pendingRequests, setPendingRequests] = useState<any[]>([]);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
+  const {
+    badge: userBadge,
+    unreadById: userUnreadById,
+    markViewed: markUserItemViewed,
+    markAllViewed: markAllUserItemsViewed,
+  } = useModuleRecordHighlights(profile, 'user', {
+    users,
+    userApprovalRequests: pendingRequests,
+  });
+
   // UI state & refs
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [showPhotoModal, setShowPhotoModal] = useState(false);
@@ -275,6 +289,14 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   const hasAutoOpenedRef = useRef(false);
 
   const userFormHistoryPushedRef = useRef(false);
+  const userMountedRef = useRef(true);
+  useEffect(() => {
+    userMountedRef.current = true;
+    return () => {
+      userMountedRef.current = false;
+      userFormHistoryPushedRef.current = false;
+    };
+  }, []);
 
   // Mobile Hardware / Navigation Back Button Integration
   useEffect(() => {
@@ -293,7 +315,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
       };
     } else if (userFormHistoryPushedRef.current) {
       userFormHistoryPushedRef.current = false;
-      if (window.history.state?.userFormOpen) {
+      if (userMountedRef.current && window.history.state?.userFormOpen) {
         window.history.back();
       }
     }
@@ -438,6 +460,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   }, []);
 
   const handleApproveRequest = async (req: any) => {
+    markUserItemViewed(`req:${req.id}`, getRecordUpdateMs(req));
     setActionLoading(req.id);
     try {
       const updatedAtIso = new Date().toISOString();
@@ -508,6 +531,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
   };
 
   const handleRejectRequest = async (req: any) => {
+    markUserItemViewed(`req:${req.id}`, getRecordUpdateMs(req));
     setActionLoading(req.id);
     try {
       setPendingRequests((prev) => prev.filter((r) => r.id !== req.id));
@@ -617,6 +641,7 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
         return;
       }
     }
+    markUserItemViewed(u.uid, getRecordUpdateMs(u));
     setCurrentUid(u.uid);
     setUserCode(u.userCode || calculateNextUserCode(u.role || 'field_officer', users));
     setFullName(u.fullName || '');
@@ -757,6 +782,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
       ifscCode: ifscCode.trim().toUpperCase(),
       hasSecurityCheque: !!hasSecurityCheque || !!securityChequeNumber.trim(),
       securityChequeNumber: securityChequeNumber.trim().toUpperCase(),
+      updatedByUid: profile.uid || '',
+      updatedByName: profile.fullName || profile.loginId || '',
       updatedAt: new Date().toISOString(),
       createdAt: currentUid ? (formatSafeDateString(users.find(u => u.uid === currentUid)?.createdAt) || new Date().toISOString()) : new Date().toISOString(),
     };
@@ -1056,12 +1083,27 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
 
   return (
     <div className="space-y-4 font-sans">
+      {viewMode === 'list' && (
+        <ModuleUpdateBanner
+          badge={userBadge}
+          onMarkAllViewed={() => markAllUserItemsViewed()}
+          onMarkSingleViewed={(rec) => markUserItemViewed(rec.id, rec.updatedAtMs)}
+          onSelectRecord={(rec) => {
+            markUserItemViewed(rec.id, rec.updatedAtMs);
+            if (rec.subType !== 'approval') {
+              const match = users.find((u) => u.uid === rec.id);
+              if (match) loadUserToForm(match, true);
+            }
+          }}
+        />
+      )}
+
       {/* ======================= PENDING APPROVALS SECTION (FOR ADMIN) ======================= */}
       {isAdmin(profile) && pendingRequests.length > 0 && viewMode === 'list' && (
-        <div className="bg-amber-50 border-2 border-amber-300 rounded-2xl p-4 space-y-3 shadow-md animate-in fade-in no-print">
+        <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 space-y-3 shadow-sm no-print">
           <div className="flex items-center justify-between border-b border-amber-200 pb-2">
             <div className="flex items-center gap-2">
-              <Clock className="w-5 h-5 text-amber-700 animate-pulse" />
+              <Clock className="w-5 h-5 text-amber-700" />
               <h3 className="text-sm font-black text-amber-950 uppercase tracking-tight">
                 बदल मंजुरी विनंत्या (Pending Profile Approvals: {pendingRequests.length})
               </h3>
@@ -1072,10 +1114,16 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
           </div>
 
           <div className="space-y-2.5">
-            {pendingRequests.map((req) => (
+            {pendingRequests.map((req) => {
+              const reqUnread = userUnreadById.get(`req:${req.id}`);
+              return (
               <div 
                 key={req.id} 
-                className="bg-white rounded-xl border border-amber-200 p-3 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-sm hover:border-amber-400 transition"
+                className={`rounded-xl border p-3 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 shadow-sm transition ${
+                  reqUnread
+                    ? 'bg-amber-50/70 border-amber-400 ring-1 ring-amber-200'
+                    : 'bg-white border-amber-200 hover:border-amber-400'
+                }`}
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
@@ -1091,12 +1139,23 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
                     <span>मोबाईल: <strong className="text-slate-900">{req.proposedData?.mobileNumber || '-'}</strong></span>
                     <span>सेंटर: <strong className="text-slate-900">{req.proposedData?.center || '-'}</strong></span>
                   </div>
-                  <p className="text-[10px] text-slate-400 font-bold mt-1">
-                    विनंती दिनांक: {formatDisplayDate(req.createdAt, true) || '-'} ({req.requestedByName} द्वारे)
+                  <p className="text-[10px] text-slate-500 font-bold mt-1">
+                    विनंती दिनांक: {formatDisplayDate(req.createdAt, true) || '-'} · {req.requestedByName} द्वारे
                   </p>
                 </div>
 
                 <div className="flex items-center gap-2 w-full sm:w-auto justify-end shrink-0">
+                  {reqUnread && (
+                    <button
+                      type="button"
+                      onClick={() => markUserItemViewed(`req:${req.id}`, reqUnread.updatedAtMs)}
+                      className="inline-flex items-center gap-1 px-2.5 py-2 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-xs font-bold transition cursor-pointer whitespace-nowrap"
+                      title="पाहिले (Mark Viewed)"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>पाहिले</span>
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => handleApproveRequest(req)}
@@ -1120,7 +1179,8 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
                   </button>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -1210,11 +1270,16 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
           {/* User Cards Grid: Strictly Code and Full Name in Single Line */}
           <div className="space-y-2.5">
             {filteredUsers.map((u) => {
+              const userUnread = userUnreadById.get(u.uid);
               return (
                 <div
                   key={u.uid}
                   onClick={() => loadUserToForm(u, true)}
-                  className="bg-white rounded-2xl border border-slate-200 hover:border-red-400 hover:shadow-md p-3.5 sm:p-4 transition-all cursor-pointer flex items-center justify-between gap-3 group relative overflow-hidden"
+                  className={`rounded-2xl border hover:shadow-md p-3.5 sm:p-4 transition-all cursor-pointer flex items-center justify-between gap-3 group relative overflow-hidden ${
+                    userUnread
+                      ? 'bg-amber-50/50 border-amber-400 ring-1 ring-amber-200 hover:border-amber-500'
+                      : 'bg-white border-slate-200 hover:border-red-400'
+                  }`}
                 >
                   <div className="flex items-center gap-4 min-w-0 flex-1">
                     <span className="text-xs font-black text-red-600 bg-red-50 border border-red-200 px-3 py-1.5 rounded-lg uppercase tracking-wider shrink-0 font-mono shadow-sm">
@@ -1228,10 +1293,29 @@ export const UserManagementView: React.FC<Props> = ({ profile, lang, onProfileUp
                       <span className="text-[9.5px] font-bold text-slate-600 block mt-0.5 truncate whitespace-nowrap">
                         {toTitleCase(u.designation || u.role)} {u.center && `• ${toTitleCase(u.center)}`}
                       </span>
+                      {userUnread && (
+                        <span className="text-[10px] font-bold text-amber-800 block mt-0.5 truncate">
+                          {userUnread.actorName} · {userUnread.actionLabel}
+                        </span>
+                      )}
                     </div>
                   </div>
 
                   <div className="flex items-center gap-2 shrink-0 no-print">
+                    {userUnread && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          markUserItemViewed(u.uid, userUnread.updatedAtMs);
+                        }}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-[10px] font-bold transition whitespace-nowrap cursor-pointer"
+                        title="पाहिले (Mark Viewed)"
+                      >
+                        <Check className="w-3 h-3 shrink-0" />
+                        <span>पाहिले</span>
+                      </button>
+                    )}
                     <span className="text-xs font-bold text-slate-400 group-hover:text-red-600 transition">
                       👉
                     </span>

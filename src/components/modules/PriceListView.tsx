@@ -893,7 +893,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
         })(),
         (async () => {
           try {
-            const secCfg = await fetchSecondaryCollection('config', { limit: 50 });
+            const secCfg = await fetchSecondaryCollection('config', { limit: 1000 });
             if (secCfg.ok) {
               const found = secCfg.items.find((it) => it?.id === 'master_pricelist');
               if (found && Array.isArray(found.products) && found.products.length > 0) {
@@ -991,7 +991,7 @@ export const PriceListView: React.FC<Props> = ({ profile }) => {
     };
 
     const pullMetaFromSecondary = () => {
-      void fetchSecondaryCollection('config', { limit: 50 }).then((res) => {
+      void fetchSecondaryCollection('config', { limit: 1000 }).then((res) => {
         if (!res.ok) return;
         const found = res.items.find((it) => it?.id === 'pricelist_meta');
         if (found) applyMeta(found, false);

@@ -4,6 +4,7 @@ import { collection, onSnapshot, query } from 'firebase/firestore';
 import { db } from '../firebase';
 import { UserProfile, canAccessModule, isAdmin, isGodownIncharge } from '../lib/auth';
 import {
+  MODULE_SEEN_EVENT,
   ModuleSeenMap,
   ModuleUpdateBadge,
   RemoteAppUpdateSignal,
@@ -11,9 +12,13 @@ import {
   computePricelistFingerprint,
   computeSchemeFingerprint,
   computeSettingFingerprint,
+  getDefaultInitialBaselineMs,
   loadModuleSeenMap,
+  markModuleAllViewed,
+  notifyModuleSeenUpdated,
   saveModuleSeenMap,
 } from '../lib/moduleUpdates';
+import { useModuleSeenCloudSync } from '../lib/moduleSeenSync';
 import {
   useSharedCollectionEntries,
   useSharedDealers,
@@ -38,7 +43,7 @@ import {
   APP_BUILD_ID,
 } from '../lib/appVersion';
 import { isQuotaBlocked, setQuotaBlocked, toTimestampMs } from '../lib/dataService';
-import { fetchSecondaryCollection, subscribeSecondaryCollection } from '../lib/secondaryDb';
+import { bootstrapCollectionToSecondary, fetchSecondaryCollection, subscribeSecondaryCollection } from '../lib/secondaryDb';
 
 interface SourceState<T> {
   data: T;
@@ -194,13 +199,19 @@ const AdminApprovalRequestsSource: React.FC<{ onUpdate: (s: SourceState<any[]>) 
         unsub = onSnapshot(
           query(collection(db, 'user_approval_requests')),
           (snap) => {
+            const syncedList: any[] = [];
             snap.forEach((d) => {
               const data = d.data();
+              const item = { ...data, id: d.id };
+              syncedList.push(item);
               if (data?.isArchived) reqMap.delete(d.id);
-              else reqMap.set(d.id, { ...data, id: d.id });
+              else reqMap.set(d.id, item);
             });
             hydrated = true;
             emit();
+            if (!snap.metadata?.fromCache && syncedList.length > 0) {
+              bootstrapCollectionToSecondary('user_approval_requests', syncedList);
+            }
           },
           (err) => {
             if (unsub) {
@@ -301,11 +312,118 @@ export const DashboardModuleUpdateWatcher: React.FC<DashboardModuleUpdateWatcher
     };
   });
 
+  const { cloudHydrated } = useModuleSeenCloudSync(uid);
   const [seenMap, setSeenMap] = useState<ModuleSeenMap>(() => loadModuleSeenMap(uid));
+  const seenMapRef = useRef<ModuleSeenMap>(seenMap);
   const prevTabRef = useRef<string>(activeTab);
+  const lastEmittedBadgesSigRef = useRef<string>('__uninitialized__');
+
+  const updateOrdersState = useCallback((next: SourceState<any[]>) => {
+    setOrdersState((prev) => (prev.data === next.data && prev.loaded === next.loaded ? prev : next));
+  }, []);
+  const updateDealersState = useCallback((next: SourceState<any[]>) => {
+    setDealersState((prev) => (prev.data === next.data && prev.loaded === next.loaded ? prev : next));
+  }, []);
+  const updateStaffState = useCallback((next: SourceState<any[]>) => {
+    setStaffState((prev) => (prev.data === next.data && prev.loaded === next.loaded ? prev : next));
+  }, []);
+  const updateAttendanceState = useCallback((next: SourceState<any[]>) => {
+    setAttendanceState((prev) => (prev.data === next.data && prev.loaded === next.loaded ? prev : next));
+  }, []);
+  const updatePricelistState = useCallback(
+    (next: { products: any[]; validityDate: string; updatedAtMs: number; loaded: boolean }) => {
+      setPricelistState((prev) =>
+        prev.products === next.products &&
+        prev.validityDate === next.validityDate &&
+        prev.updatedAtMs === next.updatedAtMs &&
+        prev.loaded === next.loaded
+          ? prev
+          : next
+      );
+    },
+    []
+  );
+  const updateSchemeState = useCallback(
+    (next: { discounts: Record<string, number>; updatedAtMs: number; loaded: boolean }) => {
+      setSchemeState((prev) =>
+        prev.discounts === next.discounts &&
+        prev.updatedAtMs === next.updatedAtMs &&
+        prev.loaded === next.loaded
+          ? prev
+          : next
+      );
+    },
+    []
+  );
+  const updateCollectionsState = useCallback((next: SourceState<any[]>) => {
+    setCollectionsState((prev) => (prev.data === next.data && prev.loaded === next.loaded ? prev : next));
+  }, []);
+  const updateOutstandingState = useCallback((next: SourceState<any[]>) => {
+    setOutstandingState((prev) => (prev.data === next.data && prev.loaded === next.loaded ? prev : next));
+  }, []);
+  const updateTargetsState = useCallback(
+    (next: { yearlyTargets: any[]; monthlyTargets: any[]; loaded: boolean }) => {
+      setTargetsState((prev) =>
+        prev.yearlyTargets === next.yearlyTargets &&
+        prev.monthlyTargets === next.monthlyTargets &&
+        prev.loaded === next.loaded
+          ? prev
+          : next
+      );
+    },
+    []
+  );
+  const updateTravelState = useCallback((next: SourceState<any[]>) => {
+    setTravelState((prev) => (prev.data === next.data && prev.loaded === next.loaded ? prev : next));
+  }, []);
+  const updateLocationState = useCallback(
+    (next: { villages: any[]; talukas: any[]; locationDealers: any[]; loaded: boolean }) => {
+      setLocationState((prev) =>
+        prev.villages === next.villages &&
+        prev.talukas === next.talukas &&
+        prev.locationDealers === next.locationDealers &&
+        prev.loaded === next.loaded
+          ? prev
+          : next
+      );
+    },
+    []
+  );
+  const updateApprovalReqState = useCallback((next: SourceState<any[]>) => {
+    setApprovalReqState((prev) => {
+      if (prev.loaded === next.loaded && prev.data.length === next.data.length) {
+        try {
+          if (JSON.stringify(prev.data) === JSON.stringify(next.data)) return prev;
+        } catch {}
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
-    setSeenMap(loadModuleSeenMap(uid));
+    const next = loadModuleSeenMap(uid);
+    try {
+      if (JSON.stringify(seenMapRef.current) === JSON.stringify(next)) return;
+    } catch {}
+    seenMapRef.current = next;
+    setSeenMap(next);
+  }, [uid]);
+
+  useEffect(() => {
+    const syncSeenMap = () => {
+      const next = loadModuleSeenMap(uid);
+      try {
+        if (JSON.stringify(seenMapRef.current) === JSON.stringify(next)) return;
+      } catch {}
+      seenMapRef.current = next;
+      setSeenMap(next);
+    };
+    window.addEventListener(MODULE_SEEN_EVENT, syncSeenMap);
+    window.addEventListener('storage', syncSeenMap);
+    return () => {
+      window.removeEventListener(MODULE_SEEN_EVENT, syncSeenMap);
+      window.removeEventListener('storage', syncSeenMap);
+    };
   }, [uid]);
 
   // Periodically check remote app version non-destructively for Setting update badge
@@ -316,10 +434,20 @@ export const DashboardModuleUpdateWatcher: React.FC<DashboardModuleUpdateWatcher
       try {
         const res = await checkRemoteAppVersion({ forceReloadOnUpdate: false });
         if (!cancelled && res.checked) {
-          setRemoteAppVersion({
-            hasUpdate: res.hasUpdate,
-            remoteBuildId: res.remoteBuildId,
-            version: res.remote?.version,
+          setRemoteAppVersion((prev) => {
+            if (
+              prev &&
+              prev.hasUpdate === res.hasUpdate &&
+              prev.remoteBuildId === res.remoteBuildId &&
+              prev.version === res.remote?.version
+            ) {
+              return prev;
+            }
+            return {
+              hasUpdate: res.hasUpdate,
+              remoteBuildId: res.remoteBuildId,
+              version: res.remote?.version,
+            };
           });
         }
       } catch {}
@@ -372,64 +500,80 @@ export const DashboardModuleUpdateWatcher: React.FC<DashboardModuleUpdateWatcher
     ]
   );
 
-  // Initialize one-time baseline when stores first load on a fresh device (without flashing old history)
+  // Initialize one-time baseline ONLY AFTER cloud seen-state has hydrated on a fresh device
   useEffect(() => {
-    setSeenMap((prev) => {
-      let changed = false;
-      const next: ModuleSeenMap = { ...prev };
-      const now = Date.now();
+    if (!cloudHydrated) return;
+    const prev = seenMapRef.current;
+    let changed = false;
+    const next: ModuleSeenMap = { ...prev };
+    const now = Date.now();
 
-      const ensureBaseline = (modId: string, isLoaded: boolean, keepPendingVisible = false) => {
-        if (!isLoaded || next[modId] !== undefined || keepPendingVisible) return;
-        next[modId] = {
-          seenAtMs: now,
-          fingerprint: getCurrentModuleFingerprint(modId),
-        };
-        changed = true;
+    const ensureBaseline = (
+      modId: string,
+      isLoaded: boolean,
+      keepPendingVisible = false,
+      baselineTs = now
+    ) => {
+      if (!isLoaded || next[modId] !== undefined || keepPendingVisible) return;
+      next[modId] = {
+        seenAtMs: baselineTs,
+        fingerprint: getCurrentModuleFingerprint(modId),
       };
+      changed = true;
+    };
+    const recentLookbackMs = getDefaultInitialBaselineMs(now);
 
-      const hasAdminPendingOrders =
-        userIsAdmin &&
-        ordersState.data.some((o) => {
-          const st = String(o?.status || '').toLowerCase();
-          return !o?.isArchived && (st === 'pending' || st === 'pending_approval');
-        });
+    const hasAdminPendingOrders =
+      userIsAdmin &&
+      ordersState.data.some((o) => {
+        const st = String(o?.status || '').toLowerCase();
+        return !o?.isArchived && (st === 'pending' || st === 'pending_approval');
+      });
 
-      const hasInchargeFreshOrders =
-        isGodownIncharge(profile) &&
-        ordersState.data.some((o) => {
-          const st = String(o?.status || '').toLowerCase();
-          const wh = String(o?.warehouseStatus || 'fresh').toLowerCase();
-          return !o?.isArchived && st === 'approved' && wh === 'fresh';
-        });
+    const hasInchargeFreshOrders =
+      isGodownIncharge(profile) &&
+      ordersState.data.some((o) => {
+        const st = String(o?.status || '').toLowerCase();
+        const wh = String(o?.warehouseStatus || 'fresh').toLowerCase();
+        const isApprovedOrder =
+          st === 'complete' ||
+          st === 'approved' ||
+          st === 'dispatched' ||
+          st === 'delivered' ||
+          st === 'collected' ||
+          st === 'confirmed';
+        return !o?.isArchived && isApprovedOrder && wh === 'fresh';
+      });
 
-      const hasAdminPendingReqs =
-        userIsAdmin && approvalReqState.data.some((r) => r && !r.isArchived && r.status === 'pending');
+    const hasAdminPendingReqs =
+      userIsAdmin && approvalReqState.data.some((r) => r && !r.isArchived && r.status === 'pending');
 
-      ensureBaseline('order', ordersState.loaded, hasAdminPendingOrders);
-      ensureBaseline('dealer', dealersState.loaded);
-      ensureBaseline('user', usersLoaded && (!userIsAdmin || approvalReqState.loaded), hasAdminPendingReqs);
-      ensureBaseline(
-        'office_staff',
-        staffState.loaded && attendanceState.loaded && ordersState.loaded,
-        hasInchargeFreshOrders
-      );
-      ensureBaseline('price', pricelistState.loaded && pricelistState.products.length > 0);
-      ensureBaseline('scheme', schemeState.loaded);
-      ensureBaseline('collection', collectionsState.loaded);
-      ensureBaseline('calculator', outstandingState.loaded);
-      ensureBaseline('target', targetsState.loaded);
-      ensureBaseline('travel', travelState.loaded);
-      ensureBaseline('location', locationState.loaded);
-      ensureBaseline('setting', true, Boolean(remoteAppVersion?.hasUpdate));
+    ensureBaseline('order', ordersState.loaded, hasAdminPendingOrders, recentLookbackMs);
+    ensureBaseline('dealer', dealersState.loaded, false, recentLookbackMs);
+    ensureBaseline('user', usersLoaded && (!userIsAdmin || approvalReqState.loaded), hasAdminPendingReqs, recentLookbackMs);
+    ensureBaseline(
+      'office_staff',
+      staffState.loaded && attendanceState.loaded && ordersState.loaded,
+      hasInchargeFreshOrders,
+      recentLookbackMs
+    );
+    ensureBaseline('price', pricelistState.loaded && pricelistState.products.length > 0, false, now);
+    ensureBaseline('scheme', schemeState.loaded, false, now);
+    ensureBaseline('collection', collectionsState.loaded, false, recentLookbackMs);
+    ensureBaseline('calculator', outstandingState.loaded, false, recentLookbackMs);
+    ensureBaseline('target', targetsState.loaded, false, recentLookbackMs);
+    ensureBaseline('travel', travelState.loaded, false, recentLookbackMs);
+    ensureBaseline('location', locationState.loaded, false, recentLookbackMs);
+    ensureBaseline('setting', true, Boolean(remoteAppVersion?.hasUpdate), now);
 
-      if (changed) {
-        saveModuleSeenMap(uid, next);
-        return next;
-      }
-      return prev;
-    });
+    if (changed) {
+      saveModuleSeenMap(uid, next);
+      seenMapRef.current = next;
+      setSeenMap(next);
+      notifyModuleSeenUpdated(uid, '_baseline', 'local');
+    }
   }, [
+    cloudHydrated,
     uid,
     profile,
     userIsAdmin,
@@ -453,39 +597,61 @@ export const DashboardModuleUpdateWatcher: React.FC<DashboardModuleUpdateWatcher
     getCurrentModuleFingerprint,
   ]);
 
-  // Mark module seen when opening, staying inside, or leaving a module tab
-  useEffect(() => {
-    const prevTab = prevTabRef.current;
-    prevTabRef.current = activeTab;
-
-    const tabsToMark = new Set<string>();
-    if (activeTab && activeTab !== 'dashboard') tabsToMark.add(activeTab);
-    if (prevTab && prevTab !== 'dashboard' && prevTab !== activeTab) tabsToMark.add(prevTab);
-    if (tabsToMark.size === 0) return;
-
-    setSeenMap((prev) => {
-      const next: ModuleSeenMap = { ...prev };
-      const stamp = Date.now() + 1500;
-      tabsToMark.forEach((modId) => {
-        next[modId] = {
-          seenAtMs: stamp,
-          fingerprint: getCurrentModuleFingerprint(modId),
-        };
-      });
-      saveModuleSeenMap(uid, next);
-      return next;
+  const computed = useMemo(() => {
+    if (!cloudHydrated && Object.keys(seenMap).length === 0) {
+      return { badges: {}, items: [], totalCount: 0, signature: '' };
+    }
+    return computeModuleUpdates({
+      profile,
+      seenMap,
+      orders: canOrder || canWarehouse ? ordersState.data : [],
+      dealers: canDealer ? dealersState.data : [],
+      users,
+      userApprovalRequests: userIsAdmin ? approvalReqState.data : [],
+      officeStaff: canWarehouse ? staffState.data : [],
+      officeAttendance: canWarehouse ? attendanceState.data : [],
+      pricelist: canPrice ? pricelistState : undefined,
+      schemeDiscounts: canScheme ? schemeState : undefined,
+      collections: canCollection ? collectionsState.data : [],
+      outstandingRecords: canOutstanding ? outstandingState.data : [],
+      yearlyTargets: canTarget ? targetsState.yearlyTargets : [],
+      monthlyTargets: canTarget ? targetsState.monthlyTargets : [],
+      travelSheets: canTravel ? travelState.data : [],
+      locationVillages: canLocation ? locationState.villages : [],
+      locationTalukas: canLocation ? locationState.talukas : [],
+      locationDealers: canLocation ? locationState.locationDealers : [],
+      branding: canSetting ? branding : undefined,
+      remoteAppVersion: canSetting ? remoteAppVersion : null,
     });
   }, [
-    activeTab,
-    uid,
-    getCurrentModuleFingerprint,
+    cloudHydrated,
+    profile,
+    seenMap,
+    canOrder,
+    canWarehouse,
+    canDealer,
+    canPrice,
+    canScheme,
+    canCollection,
+    canOutstanding,
+    canTarget,
+    canTravel,
+    canLocation,
+    canSetting,
+    userIsAdmin,
     ordersState.data,
     dealersState.data,
     users,
+    approvalReqState.data,
     staffState.data,
     attendanceState.data,
+    pricelistState.products,
+    pricelistState.validityDate,
     pricelistState.updatedAtMs,
+    pricelistState.loaded,
+    schemeState.discounts,
     schemeState.updatedAtMs,
+    schemeState.loaded,
     collectionsState.data,
     outstandingState.data,
     targetsState.yearlyTargets,
@@ -493,91 +659,77 @@ export const DashboardModuleUpdateWatcher: React.FC<DashboardModuleUpdateWatcher
     travelState.data,
     locationState.villages,
     locationState.talukas,
+    locationState.locationDealers,
+    branding.logoUrl,
+    branding.logoSize,
     branding.updatedAtMs,
+    remoteAppVersion?.hasUpdate,
+    remoteAppVersion?.remoteBuildId,
+    remoteAppVersion?.version,
   ]);
 
-  const computed = useMemo(
-    () =>
-      computeModuleUpdates({
-        profile,
-        seenMap,
-        orders: canOrder || canWarehouse ? ordersState.data : [],
-        dealers: canDealer ? dealersState.data : [],
-        users,
-        userApprovalRequests: userIsAdmin ? approvalReqState.data : [],
-        officeStaff: canWarehouse ? staffState.data : [],
-        officeAttendance: canWarehouse ? attendanceState.data : [],
-        pricelist: canPrice ? pricelistState : undefined,
-        schemeDiscounts: canScheme ? schemeState : undefined,
-        collections: canCollection ? collectionsState.data : [],
-        outstandingRecords: canOutstanding ? outstandingState.data : [],
-        yearlyTargets: canTarget ? targetsState.yearlyTargets : [],
-        monthlyTargets: canTarget ? targetsState.monthlyTargets : [],
-        travelSheets: canTravel ? travelState.data : [],
-        locationVillages: canLocation ? locationState.villages : [],
-        locationTalukas: canLocation ? locationState.talukas : [],
-        locationDealers: canLocation ? locationState.locationDealers : [],
-        branding: canSetting ? branding : undefined,
-        remoteAppVersion: canSetting ? remoteAppVersion : null,
-      }),
-    [
-      profile,
-      seenMap,
-      canOrder,
-      canWarehouse,
-      canDealer,
-      canPrice,
-      canScheme,
-      canCollection,
-      canOutstanding,
-      canTarget,
-      canTravel,
-      canLocation,
-      canSetting,
-      userIsAdmin,
-      ordersState.data,
-      dealersState.data,
-      users,
-      approvalReqState.data,
-      staffState.data,
-      attendanceState.data,
-      pricelistState,
-      schemeState,
-      collectionsState.data,
-      outstandingState.data,
-      targetsState.yearlyTargets,
-      targetsState.monthlyTargets,
-      travelState.data,
-      locationState.villages,
-      locationState.talukas,
-      locationState.locationDealers,
-      branding,
-      remoteAppVersion,
-    ]
-  );
+  // Auto-mark singleton/non-row modules (target, price, scheme, setting) viewed shortly after opening
+  // AND when leaving the tab, syncing cleanly across all devices without needing a "सर्व पाहिले" banner.
+  useEffect(() => {
+    const SINGLETON_AUTO_MARK_ALL = new Set(['target', 'price', 'scheme', 'setting']);
+    const prevTab = prevTabRef.current;
+    prevTabRef.current = activeTab;
+
+    if (prevTab && prevTab !== activeTab && SINGLETON_AUTO_MARK_ALL.has(prevTab) && cloudHydrated) {
+      markModuleAllViewed(uid, prevTab, getCurrentModuleFingerprint(prevTab));
+    }
+  }, [activeTab, uid, cloudHydrated, getCurrentModuleFingerprint]);
+
+  const activeSingletonBadgeLatestMs = computed.badges[activeTab]?.latestAtMs || 0;
+  const activeSingletonBadgeCount = computed.badges[activeTab]?.count || 0;
+  useEffect(() => {
+    const SINGLETON_AUTO_MARK_ALL = new Set(['target', 'price', 'scheme', 'setting']);
+    if (!cloudHydrated || !SINGLETON_AUTO_MARK_ALL.has(activeTab) || activeSingletonBadgeCount <= 0) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      markModuleAllViewed(
+        uid,
+        activeTab,
+        getCurrentModuleFingerprint(activeTab),
+        activeSingletonBadgeLatestMs
+      );
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [
+    activeTab,
+    activeSingletonBadgeCount,
+    activeSingletonBadgeLatestMs,
+    cloudHydrated,
+    uid,
+    getCurrentModuleFingerprint,
+  ]);
+
 
   useEffect(() => {
+    if (lastEmittedBadgesSigRef.current === computed.signature) return;
+    lastEmittedBadgesSigRef.current = computed.signature;
     onBadgesChange(computed.badges, computed.items, computed.signature);
   }, [computed.badges, computed.items, computed.signature, onBadgesChange]);
 
   return (
     <>
-      {(canOrder || canWarehouse) && <OrdersSource onUpdate={setOrdersState} />}
-      {canDealer && <DealersSource onUpdate={setDealersState} />}
-      {userIsAdmin && <AdminApprovalRequestsSource onUpdate={setApprovalReqState} />}
+      {(canOrder || canWarehouse) && <OrdersSource onUpdate={updateOrdersState} />}
+      {canDealer && <DealersSource onUpdate={updateDealersState} />}
+      {userIsAdmin && <AdminApprovalRequestsSource onUpdate={updateApprovalReqState} />}
       {canWarehouse && (
         <>
-          <OfficeStaffSource onUpdate={setStaffState} />
-          <OfficeAttendanceSource onUpdate={setAttendanceState} />
+          <OfficeStaffSource onUpdate={updateStaffState} />
+          <OfficeAttendanceSource onUpdate={updateAttendanceState} />
         </>
       )}
-      {canPrice && <PricelistSource onUpdate={setPricelistState} />}
-      {canScheme && <SchemeSource onUpdate={setSchemeState} />}
-      {canCollection && <CollectionsSource onUpdate={setCollectionsState} />}
-      {canOutstanding && <OutstandingSource onUpdate={setOutstandingState} />}
-      {canTarget && <TargetsSource onUpdate={setTargetsState} />}
-      {canTravel && <TravelSource onUpdate={setTravelState} />}
-      {canLocation && <LocationSource onUpdate={setLocationState} />}
+      {canPrice && <PricelistSource onUpdate={updatePricelistState} />}
+      {canScheme && <SchemeSource onUpdate={updateSchemeState} />}
+      {canCollection && <CollectionsSource onUpdate={updateCollectionsState} />}
+      {canOutstanding && <OutstandingSource onUpdate={updateOutstandingState} />}
+      {canTarget && <TargetsSource onUpdate={updateTargetsState} />}
+      {canTravel && <TravelSource onUpdate={updateTravelState} />}
+      {canLocation && <LocationSource onUpdate={updateLocationState} />}
     </>
   );
 };

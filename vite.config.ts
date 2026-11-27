@@ -94,7 +94,7 @@ export default defineConfig(({ command }) => {
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,webp,jpg,mjs,woff,woff2,webmanifest}'],
           globIgnores: ['**/version.json', '**/server.js*', '**/*.map'],
-          ignoreURLParametersMatching: [/^utm_/, /^fbclid$/, /^v$/, /^apk_ota$/],
+          ignoreURLParametersMatching: [/^utm_/, /^fbclid$/],
           cleanupOutdatedCaches: true,
           skipWaiting: true,
           clientsClaim: true,
@@ -133,6 +133,7 @@ export default defineConfig(({ command }) => {
     },
     server: {
       hmr: false,
+      allowedHosts: true,
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },
   };

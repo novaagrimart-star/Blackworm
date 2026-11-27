@@ -31,7 +31,9 @@ interface StoredRow {
   revision: number;
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
+const DATA_DIR = process.env.BLACKWORM_DATA_DIR
+  ? path.resolve(process.env.BLACKWORM_DATA_DIR)
+  : path.resolve(process.cwd(), 'data');
 const DB_PATH = path.join(DATA_DIR, 'secondary_sync.sqlite');
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 const FALLBACK_JSON_PATH = path.join(DATA_DIR, 'secondary_sync_backup.json');
@@ -115,6 +117,80 @@ function mergeTravelRowsServer(
   });
 
   return Array.from(byKey.values()).sort((a, b) => (Number(a?.dayNumber) || 0) - (Number(b?.dayNumber) || 0));
+}
+
+function sanitizeSeenEntryServer(raw: any): { seenAtMs: number; fingerprint?: string; viewedRecords?: Record<string, number> } | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const seenAtMs = Math.max(0, Number(raw.seenAtMs) || 0);
+  const fingerprint = typeof raw.fingerprint === 'string' && raw.fingerprint ? raw.fingerprint : undefined;
+  const viewedEntries =
+    raw.viewedRecords && typeof raw.viewedRecords === 'object' && !Array.isArray(raw.viewedRecords)
+      ? Object.entries(raw.viewedRecords)
+          .filter(([k, v]) => Boolean(k) && Number.isFinite(Number(v)) && Number(v) > seenAtMs)
+          .sort((a, b) => Number(b[1]) - Number(a[1]))
+          .slice(0, 250)
+      : [];
+  const viewedRecords: Record<string, number> = {};
+  for (const [k, v] of viewedEntries) {
+    viewedRecords[k] = Number(v);
+  }
+  return {
+    seenAtMs,
+    ...(fingerprint !== undefined ? { fingerprint } : {}),
+    ...(Object.keys(viewedRecords).length > 0 ? { viewedRecords } : {}),
+  };
+}
+
+function mergeUserSeenMapsServer(aRaw: any, bRaw: any): Record<string, any> {
+  const aObj = aRaw && typeof aRaw === 'object' && !Array.isArray(aRaw) ? aRaw : {};
+  const bObj = bRaw && typeof bRaw === 'object' && !Array.isArray(bRaw) ? bRaw : {};
+  const keys = new Set<string>([...Object.keys(aObj), ...Object.keys(bObj)]);
+  const out: Record<string, any> = {};
+  for (const k of keys) {
+    const ae = sanitizeSeenEntryServer(aObj[k]);
+    const be = sanitizeSeenEntryServer(bObj[k]);
+    if (ae && !be) {
+      out[k] = ae;
+      continue;
+    }
+    if (!ae && be) {
+      out[k] = be;
+      continue;
+    }
+    if (!ae || !be) continue;
+    const seenAtMs = Math.max(ae.seenAtMs, be.seenAtMs);
+    const fingerprint =
+      ae.seenAtMs > be.seenAtMs
+        ? ae.fingerprint ?? be.fingerprint
+        : be.seenAtMs > ae.seenAtMs
+          ? be.fingerprint ?? ae.fingerprint
+          : be.fingerprint || ae.fingerprint;
+    const combined: Record<string, number> = { ...(ae.viewedRecords || {}) };
+    for (const [rk, rv] of Object.entries(be.viewedRecords || {})) {
+      const ts = Number(rv) || 0;
+      if (ts > (combined[rk] || 0)) combined[rk] = ts;
+    }
+    const mergedEntry = sanitizeSeenEntryServer({ seenAtMs, fingerprint, viewedRecords: combined });
+    if (mergedEntry) out[k] = mergedEntry;
+  }
+  return out;
+}
+
+function mergeUserBdaySeenServer(aRaw: any, bRaw: any): Record<string, string[]> {
+  const aObj = aRaw && typeof aRaw === 'object' && !Array.isArray(aRaw) ? aRaw : {};
+  const bObj = bRaw && typeof bRaw === 'object' && !Array.isArray(bRaw) ? bRaw : {};
+  const dateKeys = Array.from(new Set<string>([...Object.keys(aObj), ...Object.keys(bObj)]))
+    .filter((k) => /^\d{4}-\d{2}-\d{2}$/.test(k))
+    .sort()
+    .slice(-14);
+  const out: Record<string, string[]> = {};
+  for (const dk of dateKeys) {
+    const arrA = Array.isArray(aObj[dk]) ? aObj[dk].map(String) : [];
+    const arrB = Array.isArray(bObj[dk]) ? bObj[dk].map(String) : [];
+    const merged = Array.from(new Set([...arrA, ...arrB])).filter(Boolean).sort();
+    if (merged.length > 0) out[dk] = merged;
+  }
+  return out;
 }
 
 export const ALLOWED_SYNC_COLLECTIONS = new Set<string>([
@@ -330,6 +406,9 @@ class SecondarySyncDatabase {
     for (const res of Array.from(this.sseClients)) {
       try {
         res.write(payload);
+        if (typeof (res as any).flush === 'function') {
+          (res as any).flush();
+        }
       } catch {
         this.sseClients.delete(res);
       }
@@ -342,10 +421,17 @@ class SecondarySyncDatabase {
     for (const res of Array.from(this.sseClients)) {
       try {
         res.write(payload);
+        if (typeof (res as any).flush === 'function') {
+          (res as any).flush();
+        }
       } catch {
         this.sseClients.delete(res);
       }
     }
+  }
+
+  public getConnectedClientsCount(): number {
+    return this.sseClients.size;
   }
 
   private getRow(collection: string, id: string): StoredRow | null {
@@ -479,6 +565,62 @@ class SecondarySyncDatabase {
         collection: col,
         id,
         doc: mergedTravelDoc,
+        deleted: false,
+        updatedAtMs: effectiveTs,
+        revision: this.revisionCounter,
+      };
+      if (broadcast) this.broadcastDelta(deltaEvent);
+      return { applied: true, stored: deltaEvent, row: mergedRow };
+    }
+
+    // Monotonic merge for per-user read/seen state (prevents concurrent device writes from overwriting each other)
+    if (col === 'config' && id.startsWith('user_seen_') && !isDeleted && existing && existingDoc) {
+      const mergedSeenMap = mergeUserSeenMapsServer(existingDoc.seenMap, incomingDoc.seenMap);
+      const mergedBdaySeen = mergeUserBdaySeenServer(existingDoc.bdaySeen, incomingDoc.bdaySeen);
+      const baseChanged =
+        JSON.stringify(existingDoc.seenMap || {}) !== JSON.stringify(mergedSeenMap) ||
+        JSON.stringify(existingDoc.bdaySeen || {}) !== JSON.stringify(mergedBdaySeen);
+
+      if (!baseChanged && existing.deleted === 0) {
+        return {
+          applied: false,
+          stored: {
+            collection: col,
+            id,
+            doc: existingDoc,
+            deleted: false,
+            updatedAtMs: existing.updated_at_ms,
+            revision: existing.revision,
+          },
+        };
+      }
+
+      const effectiveTs = Math.max(existing.updated_at_ms, incomingTs, Date.now());
+      const mergedUserSeenDoc: Record<string, any> = {
+        ...existingDoc,
+        ...incomingDoc,
+        id,
+        seenMap: mergedSeenMap,
+        bdaySeen: mergedBdaySeen,
+        isArchived: false,
+        _syncUpdatedAtMs: effectiveTs,
+        updatedAt: new Date(effectiveTs).toISOString(),
+      };
+      const mergedStr = JSON.stringify(mergedUserSeenDoc);
+      this.revisionCounter += 1;
+      const mergedRow: StoredRow = {
+        collection: col,
+        id,
+        data: mergedStr,
+        updated_at_ms: effectiveTs,
+        deleted: 0,
+        revision: this.revisionCounter,
+      };
+      this.putRow(mergedRow);
+      const deltaEvent: SyncDeltaEvent = {
+        collection: col,
+        id,
+        doc: mergedUserSeenDoc,
         deleted: false,
         updatedAtMs: effectiveTs,
         revision: this.revisionCounter,

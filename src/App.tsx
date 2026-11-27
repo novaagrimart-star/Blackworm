@@ -7,7 +7,7 @@ import { Login } from './components/Login';
 import { Language } from './lib/i18n';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { startBackgroundSync, isQuotaBlocked, setQuotaBlocked, trackFirestoreUsage, toTimestampMs, isRecordDeleted } from './lib/dataService';
-import { subscribeSecondaryCollection, fetchSecondaryCollection, autoHydrateServerFromLocalCache, pullSecondaryChanges } from './lib/secondaryDb';
+import { subscribeSecondaryCollection, fetchSecondaryCollection, autoHydrateServerFromLocalCache, pullSecondaryChanges, initSecondaryStream } from './lib/secondaryDb';
 import { hydrateAllChannelsFromSecondary } from './lib/realtimeStore';
 import { isPackagedApkShell } from './lib/appVersion';
 
@@ -137,6 +137,7 @@ export default function App() {
 
   // Initialize background sync + Sync on Start once on app load
   useEffect(() => {
+    initSecondaryStream();
     void startBackgroundSync();
     void pullSecondaryChanges(true);
     void hydrateAllChannelsFromSecondary(true);
@@ -191,6 +192,11 @@ export default function App() {
           ...freshData,
           uid: currentUid,
         });
+        try {
+          if (JSON.stringify(prev) === JSON.stringify(merged)) {
+            return prev;
+          }
+        } catch {}
         try {
           if (isSessionStillValid()) {
             localStorage.setItem(PROFILE_STORAGE_KEY, JSON.stringify(merged));
@@ -267,6 +273,7 @@ export default function App() {
     };
     window.addEventListener('blackworm_local_record_mutation', handleLocalMutation);
     window.addEventListener('focus', pullProfileFromSecondary);
+    window.addEventListener('online', pullProfileFromSecondary);
     window.addEventListener('blackworm_data_refresh', pullProfileFromSecondary);
     window.addEventListener('blackworm_secondary_resync', pullProfileFromSecondary);
     window.addEventListener('blackworm_quota_blocked', pullProfileFromSecondary);
@@ -293,6 +300,7 @@ export default function App() {
       }
       window.removeEventListener('blackworm_local_record_mutation', handleLocalMutation);
       window.removeEventListener('focus', pullProfileFromSecondary);
+      window.removeEventListener('online', pullProfileFromSecondary);
       window.removeEventListener('blackworm_data_refresh', pullProfileFromSecondary);
       window.removeEventListener('blackworm_secondary_resync', pullProfileFromSecondary);
       window.removeEventListener('blackworm_quota_blocked', pullProfileFromSecondary);

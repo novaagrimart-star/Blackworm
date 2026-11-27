@@ -144,6 +144,27 @@ export function isUserRecord(record: any, user?: Partial<UserProfile> | null): b
   const recMobile = (record.mobileNumber || record.contactNumber || '').toString().replace(/\D/g, '').slice(-10);
   if (userMobile && recMobile && recMobile.length >= 10 && recMobile === userMobile) return true;
 
+  // 6. Orphaned-record fallback: if ALL primary creator/owner metadata is missing, match updater
+  const hasPrimaryOwnerMeta = Boolean(
+    record.userId ||
+      record.ownerId ||
+      record.created_by_user_id ||
+      record.createdByUid ||
+      record.collectedByUid ||
+      record.uid ||
+      record.createdByName ||
+      record.created_by_name ||
+      record.officerName ||
+      record.loginId ||
+      record.userCode
+  );
+  if (!hasPrimaryOwnerMeta) {
+    const updUid = (record.updatedByUid || '').toString().trim().toLowerCase();
+    if (userUid && updUid && updUid === userUid) return true;
+    const updName = (record.updatedByName || '').toString().replace(/\s+/g, ' ').trim().toLowerCase();
+    if (userName && updName && updName === userName) return true;
+  }
+
   return false;
 }
 

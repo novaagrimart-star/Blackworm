@@ -572,12 +572,12 @@ function attachVisibilityAndPollingHooks() {
     });
   }
 
-  // Reliable 4s active-tab HTTP delta heartbeat (works even when mobile carrier/proxy silently drops SSE)
+  // Reliable 3s active-tab HTTP delta heartbeat (works even when mobile carrier/proxy silently drops SSE)
   deltaPollTimer = setInterval(() => {
     if (typeof navigator !== 'undefined' && !navigator.onLine) return;
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
     void pullSecondaryChanges(false);
-  }, 4000);
+  }, 3000);
 }
 
 export function initSecondaryStream(): void {

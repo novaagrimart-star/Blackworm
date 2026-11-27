@@ -29,13 +29,16 @@ import { OfflineIndicator } from './OfflineIndicator';
 import { CustomDialogModal } from './CustomDialogModal';
 import { BirthdayNotificationModal, DashboardBirthdayWatcher } from './BirthdayNotificationModal';
 import { BirthdayPerson, getTodayLocalInfo } from '../lib/birthdayNotifier';
-import { DashboardModuleUpdateWatcher, ModuleUpdatePopup } from './ModuleUpdatePopup';
+import { DashboardModuleUpdateWatcher } from './ModuleUpdatePopup';
+import { ModuleUpdateBadge } from '../lib/moduleUpdates';
 import {
-  ModuleUpdateBadge,
-  loadAcknowledgedPopupSignature,
-  saveAcknowledgedPopupSignature,
-} from '../lib/moduleUpdates';
+  BLACKWORM_BDAY_SEEN_EVENT,
+  loadSyncedBirthdaySeenIds,
+  markBirthdaySeenSynced,
+  useModuleSeenCloudSync,
+} from '../lib/moduleSeenSync';
 import { useBranding } from '../lib/branding';
+import { useUiConfig, CustomDashboardOption } from '../lib/uiConfig';
 import { isPackagedApkShell } from '../lib/appVersion';
 import { ErrorBoundary } from './ErrorBoundary';
 
@@ -119,9 +122,19 @@ function canUseCleanHistoryUrl(): boolean {
 
 function buildRouteUrl(tab: string): string {
   const hash = TAB_TO_HASH[tab] || '';
-  if (typeof window !== 'undefined' && isPackagedApkShell()) {
-    const currentPath = window.location.pathname || '/';
-    return `${currentPath}${hash}`;
+  if (typeof window !== 'undefined') {
+    if (isPackagedApkShell()) {
+      const currentPath = window.location.pathname || '/';
+      return `${currentPath}${hash}`;
+    }
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('v');
+      url.searchParams.delete('apk_ota');
+      url.pathname = '/';
+      url.hash = hash;
+      return `${url.pathname}${url.search}${url.hash}`;
+    } catch {}
   }
   return `/${hash}`;
 }
@@ -161,6 +174,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
   const activeTabRef = useRef<string>(activeTab);
   const [pendingOpenDealerId, setPendingOpenDealerId] = useState<string | null>(null);
   const { logoUrl, logoSize } = useBranding();
+  const { uiConfig } = useUiConfig();
+  const [selectedCustomOption, setSelectedCustomOption] = useState<CustomDashboardOption | null>(null);
   const [currentUserData, setCurrentUserData] = useState<any>(profile);
   const [isApplyingRemoteUpdate, setIsApplyingRemoteUpdate] = useState(false);
   const [todaysBirthdays, setTodaysBirthdays] = useState<BirthdayPerson[]>([]);
@@ -168,40 +183,29 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
   const [isBirthdayModalOpen, setIsBirthdayModalOpen] = useState(false);
   const autoShownBirthdayIdsRef = useRef<Set<string>>(new Set());
   const [moduleBadges, setModuleBadges] = useState<Record<string, ModuleUpdateBadge>>({});
-  const [moduleUpdateItems, setModuleUpdateItems] = useState<ModuleUpdateBadge[]>([]);
-  const [moduleUpdateSig, setModuleUpdateSig] = useState<string>('');
-  const [isModulePopupOpen, setIsModulePopupOpen] = useState(false);
+  const lastBadgesSigRef = useRef<string>('');
+  const lastBirthdaysSigRef = useRef<string>('');
 
   const handleModuleBadgesChange = useCallback(
-    (badges: Record<string, ModuleUpdateBadge>, items: ModuleUpdateBadge[], sig: string) => {
+    (badges: Record<string, ModuleUpdateBadge>, _items?: ModuleUpdateBadge[], signature?: string) => {
+      const sig =
+        typeof signature === 'string'
+          ? signature
+          : Object.entries(badges)
+              .map(([k, v]) => `${k}:${v?.count || 0}:${v?.latestAtMs || 0}`)
+              .sort()
+              .join('|');
+      if (lastBadgesSigRef.current === sig) return;
+      lastBadgesSigRef.current = sig;
       setModuleBadges(badges);
-      setModuleUpdateItems(items);
-      setModuleUpdateSig(sig);
     },
     []
   );
 
-  useEffect(() => {
-    if (activeTab !== 'dashboard' || isBirthdayModalOpen || moduleUpdateItems.length === 0 || !moduleUpdateSig) {
-      if (activeTab !== 'dashboard' && isModulePopupOpen) {
-        setIsModulePopupOpen(false);
-      }
-      return;
-    }
-    const ackSig = loadAcknowledgedPopupSignature(currentUserData?.uid || profile.uid);
-    if (ackSig !== moduleUpdateSig) {
-      setIsModulePopupOpen(true);
-    }
-  }, [activeTab, isBirthdayModalOpen, moduleUpdateItems.length, moduleUpdateSig, currentUserData?.uid, profile.uid, isModulePopupOpen]);
-
-  const handleCloseModulePopup = useCallback(() => {
-    setIsModulePopupOpen(false);
-    if (moduleUpdateSig) {
-      saveAcknowledgedPopupSignature(currentUserData?.uid || profile.uid, moduleUpdateSig);
-    }
-  }, [currentUserData?.uid, moduleUpdateSig, profile.uid]);
-
   const handleBirthdaysChange = useCallback((items: BirthdayPerson[], dateKey: string) => {
+    const sig = `${dateKey}::${items.map((b) => `${b.id}:${b.name}`).join(',')}`;
+    if (lastBirthdaysSigRef.current === sig) return;
+    lastBirthdaysSigRef.current = sig;
     setTodaysBirthdays(items);
     setBirthdayDateKey((prev) => {
       if (prev !== dateKey) {
@@ -211,22 +215,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
     });
   }, []);
 
-  const getSeenBirthdayStorageKey = useCallback(
-    (dateKey: string) => `blackworm_bday_seen_${currentUserData?.uid || profile.uid || 'user'}_${dateKey}`,
-    [currentUserData?.uid, profile.uid]
-  );
+  const activeSeenUid = currentUserData?.uid || profile.uid || 'user';
+  const { cloudHydrated: seenCloudHydrated } = useModuleSeenCloudSync(activeSeenUid);
 
   useEffect(() => {
-    if (activeTab !== 'dashboard' || todaysBirthdays.length === 0) return;
-    let persistedSeenIds: string[] = [];
-    try {
-      const raw = localStorage.getItem(getSeenBirthdayStorageKey(birthdayDateKey));
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) persistedSeenIds = parsed.map(String);
-      }
-    } catch {}
-    const persistedSet = new Set(persistedSeenIds);
+    if (!seenCloudHydrated || activeTab !== 'dashboard' || todaysBirthdays.length === 0) return;
+    const persistedSet = new Set(loadSyncedBirthdaySeenIds(activeSeenUid, birthdayDateKey));
     const hasUnseenBirthday = todaysBirthdays.some(
       (b) => !persistedSet.has(b.id) && !autoShownBirthdayIdsRef.current.has(b.id)
     );
@@ -234,22 +228,29 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
       todaysBirthdays.forEach((b) => autoShownBirthdayIdsRef.current.add(b.id));
       setIsBirthdayModalOpen(true);
     }
-  }, [activeTab, todaysBirthdays, birthdayDateKey, getSeenBirthdayStorageKey]);
+  }, [seenCloudHydrated, activeTab, todaysBirthdays, birthdayDateKey, activeSeenUid]);
+
+  // If the same login dismissed today's birthday modal on another device, close it here too
+  useEffect(() => {
+    if (!isBirthdayModalOpen || todaysBirthdays.length === 0) return;
+    const onBdaySeenSync = () => {
+      const persistedSet = new Set(loadSyncedBirthdaySeenIds(activeSeenUid, birthdayDateKey));
+      if (todaysBirthdays.every((b) => persistedSet.has(b.id))) {
+        setIsBirthdayModalOpen(false);
+      }
+    };
+    window.addEventListener(BLACKWORM_BDAY_SEEN_EVENT, onBdaySeenSync);
+    return () => window.removeEventListener(BLACKWORM_BDAY_SEEN_EVENT, onBdaySeenSync);
+  }, [isBirthdayModalOpen, activeSeenUid, birthdayDateKey, todaysBirthdays]);
 
   const handleCloseBirthdayModal = useCallback(() => {
     setIsBirthdayModalOpen(false);
-    try {
-      const storageKey = getSeenBirthdayStorageKey(birthdayDateKey);
-      let existing: string[] = [];
-      const raw = localStorage.getItem(storageKey);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) existing = parsed.map(String);
-      }
-      const merged = Array.from(new Set([...existing, ...todaysBirthdays.map((b) => b.id)]));
-      localStorage.setItem(storageKey, JSON.stringify(merged));
-    } catch {}
-  }, [birthdayDateKey, getSeenBirthdayStorageKey, todaysBirthdays]);
+    markBirthdaySeenSynced(
+      activeSeenUid,
+      birthdayDateKey,
+      todaysBirthdays.map((b) => b.id)
+    );
+  }, [activeSeenUid, birthdayDateKey, todaysBirthdays]);
 
   useEffect(() => {
     activeTabRef.current = activeTab;
@@ -305,7 +306,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
 
 
 
-  const modules = [
+  const baseModules = [
     { id: 'target', label: t.targetSheet, icon: Target, color: 'text-blue-500', bg: 'bg-blue-50' },
     { id: 'user', label: 'User Form', icon: UserPlus, color: 'text-emerald-500', bg: 'bg-emerald-50' },
     { id: 'office_staff', label: 'Warehouse Incharge', icon: Warehouse, color: 'text-indigo-600', bg: 'bg-indigo-50' },
@@ -323,12 +324,61 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
 
   const isUserAdmin = isAdmin(currentUserData);
 
+  const modules = baseModules
+    .map((m, idx) => {
+      const ov = uiConfig.moduleOverrides?.[m.id];
+      return {
+        ...m,
+        label: ov?.label || m.label,
+        hidden: Boolean(ov?.hidden && !(m.id === 'setting' && isUserAdmin)),
+        sortOrder: typeof ov?.order === 'number' ? ov.order : idx,
+        isCustom: false as const,
+      };
+    })
+    .filter((m) => !m.hidden);
+
+  const visibleCustomOptions = (uiConfig.customOptions || [])
+    .filter((opt) => opt.enabled !== false)
+    .map((opt, idx) => ({
+      id: opt.id,
+      label: opt.label,
+      subtitle: opt.subtitle,
+      description: opt.description,
+      url: opt.url,
+      icon: Bell,
+      color: opt.color || 'text-indigo-600',
+      bg: opt.bg || 'bg-indigo-50',
+      sortOrder: typeof opt.order === 'number' ? opt.order : 100 + idx,
+      isCustom: true as const,
+      raw: opt,
+    }));
+
   // Filter visible modules:
-  // If user is Admin (or has Admin designation now or in future): FULL ACCESS to all modules.
+  // If user is Admin (or has Admin designation now or in future): FULL ACCESS to all non-hidden modules.
   // If user is not Admin: ONLY show options explicitly permitted by Admin in allowedModules.
-  const visibleModules = modules.filter((m) => {
-    return canAccessModule(currentUserData, m.id);
-  });
+  const visibleModules = [
+    ...modules.filter((m) => canAccessModule(currentUserData, m.id)),
+    ...visibleCustomOptions,
+  ].sort((a, b) => a.sortOrder - b.sortOrder);
+
+  const gridColsClass =
+    uiConfig.gridColumns === 2
+      ? 'grid-cols-2'
+      : uiConfig.gridColumns === 4
+        ? 'grid-cols-2 sm:grid-cols-4'
+        : 'grid-cols-3';
+  const cardDensityClass =
+    uiConfig.layoutDensity === 'compact'
+      ? 'p-2 gap-1.5 rounded-xl'
+      : uiConfig.layoutDensity === 'spacious'
+        ? 'p-4 gap-2.5 rounded-2xl'
+        : 'p-3 gap-2 rounded-2xl';
+  const iconBoxDensityClass =
+    uiConfig.layoutDensity === 'compact'
+      ? 'w-10 h-10 rounded-xl'
+      : uiConfig.layoutDensity === 'spacious'
+        ? 'w-14 h-14 rounded-2xl'
+        : 'w-12 h-12 rounded-2xl';
 
   // Guard active tab: If user's permissions change or user navigates to an unpermitted tab, return to dashboard
   useEffect(() => {
@@ -507,16 +557,25 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
               );
             })()}
 
-            <div className="grid grid-cols-3 gap-3 max-w-2xl mx-auto">
-              {visibleModules.map((module) => {
-                const badgeCount = moduleBadges[module.id]?.count || 0;
+            <div className={cn("grid gap-3 max-w-2xl mx-auto", gridColsClass)}>
+              {visibleModules.map((module: any) => {
+                const badgeCount = !module.isCustom ? (moduleBadges[module.id]?.count || 0) : 0;
                 return (
                   <button
                     key={module.id}
-                    onClick={() => handleTabChange(module.id)}
-                    className="relative flex flex-col items-center gap-2 p-3 rounded-2xl bg-white border border-slate-100 hover:border-slate-300 hover:shadow-md transition-all active:scale-95 group"
+                    onClick={() => {
+                      if (module.isCustom) {
+                        setSelectedCustomOption(module.raw);
+                      } else {
+                        handleTabChange(module.id);
+                      }
+                    }}
+                    className={cn(
+                      "relative flex flex-col items-center bg-white border border-slate-100 hover:border-slate-300 hover:shadow-md transition-all active:scale-95 group cursor-pointer",
+                      cardDensityClass
+                    )}
                   >
-                    <div className={cn("relative w-12 h-12 rounded-2xl flex items-center justify-center transition-transform group-hover:scale-105 shadow-sm", module.bg)}>
+                    <div className={cn("relative flex items-center justify-center transition-transform group-hover:scale-105 shadow-sm", iconBoxDensityClass, module.bg)}>
                       <module.icon className={cn("w-6 h-6", module.color)} />
                       {badgeCount > 0 && (
                         <span
@@ -527,11 +586,18 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
                         </span>
                       )}
                     </div>
-                    <div className="flex items-center gap-1 justify-center">
-                      <span className="text-[11px] font-semibold text-slate-700 text-center leading-tight">
-                        {module.label}
-                      </span>
-                      {module.id === 'user' && <UserPlus className="w-3 h-3 text-emerald-500" />}
+                    <div className="flex flex-col items-center gap-0.5 justify-center">
+                      <div className="flex items-center gap-1 justify-center">
+                        <span className="text-[11px] font-semibold text-slate-700 text-center leading-tight">
+                          {module.label}
+                        </span>
+                        {module.id === 'user' && <UserPlus className="w-3 h-3 text-emerald-500" />}
+                      </div>
+                      {module.isCustom && module.subtitle && (
+                        <span className="text-[9.5px] text-slate-400 font-medium text-center leading-tight">
+                          {module.subtitle}
+                        </span>
+                      )}
                     </div>
                   </button>
                 );
@@ -539,9 +605,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
               
               <button
                 onClick={handleLogoutClick}
-                className="flex flex-col items-center gap-2 p-3 rounded-2xl bg-white border border-slate-100 hover:border-rose-200 hover:shadow-md transition-all active:scale-95 group"
+                className={cn(
+                  "flex flex-col items-center bg-white border border-slate-100 hover:border-rose-200 hover:shadow-md transition-all active:scale-95 group cursor-pointer",
+                  cardDensityClass
+                )}
               >
-                <div className="w-12 h-12 rounded-2xl bg-rose-50 flex items-center justify-center shadow-sm group-hover:scale-105 transition-transform">
+                <div className={cn("bg-rose-50 flex items-center justify-center shadow-sm group-hover:scale-105 transition-transform", iconBoxDensityClass)}>
                   <LogOut className="w-6 h-6 text-rose-500" />
                 </div>
                 <span className="text-[11px] font-semibold text-slate-700 text-center leading-tight">
@@ -592,7 +661,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
                 : "text-[clamp(11.5px,3.65vw,19px)]"
             )}
           >
-            BLACKWORM AGRITECH PVT LTD
+            {uiConfig.appTitle || 'BLACKWORM AGRITECH PVT LTD'}
           </h1>
         </div>
 
@@ -689,15 +758,47 @@ export const Dashboard: React.FC<DashboardProps> = ({ profile, lang, onLogout, o
         activeTab={activeTab}
         onBadgesChange={handleModuleBadgesChange}
       />
-      <ModuleUpdatePopup
-        isOpen={isModulePopupOpen && activeTab === 'dashboard' && !isBirthdayModalOpen}
-        items={moduleUpdateItems}
-        onClose={handleCloseModulePopup}
-        onOpenModule={(modId) => {
-          setIsModulePopupOpen(false);
-          handleTabChange(modId);
-        }}
-      />
+      {selectedCustomOption && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={() => setSelectedCustomOption(null)}
+        >
+          <div
+            className="bg-white rounded-2xl border border-slate-200 shadow-xl max-w-md w-full p-5 space-y-3"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-2.5">
+              <div>
+                <h3 className="text-base font-black text-slate-900">{selectedCustomOption.label}</h3>
+                {selectedCustomOption.subtitle && (
+                  <p className="text-xs font-semibold text-slate-500 mt-0.5">{selectedCustomOption.subtitle}</p>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedCustomOption(null)}
+                className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-xs font-bold text-slate-700 cursor-pointer"
+              >
+                बंद करा
+              </button>
+            </div>
+            {selectedCustomOption.description && (
+              <p className="text-xs sm:text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
+                {selectedCustomOption.description}
+              </p>
+            )}
+            {selectedCustomOption.url && /^(https?:\/\/|\/)/i.test(selectedCustomOption.url) && (
+              <a
+                href={selectedCustomOption.url}
+                rel="noopener noreferrer"
+                className="inline-flex items-center justify-center w-full py-2.5 px-4 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-black transition"
+              >
+                लिंक उघडा
+              </a>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };

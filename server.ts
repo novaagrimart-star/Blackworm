@@ -17,7 +17,9 @@ if (process.env.NODE_ENV !== 'production' && !process.env.BLACKWORM_BUILD_ID) {
 function getServerBuildMetadata() {
   const pkgPath = path.join(process.cwd(), 'package.json');
   const fbPath = path.join(process.cwd(), 'firebase-applet-config.json');
-  const distVersionPath = path.join(process.cwd(), 'dist', 'version.json');
+  const distVersionPath = process.env.BLACKWORM_VERSION_FILE
+    ? path.resolve(process.env.BLACKWORM_VERSION_FILE)
+    : path.join(process.cwd(), 'dist', 'version.json');
   let version = '1.0.1';
   let firebaseProjectId = '';
   let firestoreDatabaseId = '';
@@ -31,7 +33,11 @@ function getServerBuildMetadata() {
     firestoreDatabaseId = String(fb?.firestoreDatabaseId || '');
   } catch {}
 
-  if (process.env.NODE_ENV === 'production' && fs.existsSync(distVersionPath)) {
+  const isRunningBuilt =
+    (typeof import.meta?.url === 'string' && import.meta.url.includes('/dist/')) ||
+    Boolean(process.argv[1] && process.argv[1].includes('dist'));
+
+  if ((process.env.NODE_ENV === 'production' || isRunningBuilt) && fs.existsSync(distVersionPath)) {
     try {
       const distMeta = JSON.parse(fs.readFileSync(distVersionPath, 'utf-8'));
       return {
@@ -52,8 +58,6 @@ function getServerBuildMetadata() {
     firestoreDatabaseId,
   };
 }
-
-const SERVER_BUILD_INFO = getServerBuildMetadata();
 
 
 const ai = new GoogleGenAI({
@@ -172,6 +176,8 @@ async function createServer() {
   app.get(['/api/app-version', '/version.json'], (_req, res) => {
     res.set({
       'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      'CDN-Cache-Control': 'no-store',
+      'Surrogate-Control': 'no-store',
       Pragma: 'no-cache',
       Expires: '0',
     });
@@ -179,9 +185,10 @@ async function createServer() {
     try {
       serverEpoch = secondarySyncDb.getStats().serverEpoch || '';
     } catch {}
+    const buildInfo = getServerBuildMetadata();
     res.json({
       ok: true,
-      ...SERVER_BUILD_INFO,
+      ...buildInfo,
       serverEpoch,
     });
   });
@@ -489,9 +496,16 @@ async function createServer() {
   });
 
   app.get('/api/sync/stream', (req, res) => {
+    try {
+      req.socket?.setNoDelay?.(true);
+      req.socket?.setTimeout?.(0);
+    } catch {}
+
     res.set({
       'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache, no-transform',
+      'Cache-Control': 'no-store, no-cache, no-transform',
+      'CDN-Cache-Control': 'no-store',
+      'Surrogate-Control': 'no-store',
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
@@ -502,13 +516,14 @@ async function createServer() {
     const sinceRev = Number(req.query.sinceRevision) || 0;
     const clientEpoch = String(req.query.epoch || '').trim();
     const stats = secondarySyncDb.getStats();
+    const buildInfo = getServerBuildMetadata();
     res.write(
       `event: connected\ndata: ${JSON.stringify({
         latestRevision: stats.latestRevision,
         serverEpoch: stats.serverEpoch,
         engine: stats.engine,
-        version: SERVER_BUILD_INFO.version,
-        buildId: SERVER_BUILD_INFO.buildId,
+        version: buildInfo.version,
+        buildId: buildInfo.buildId,
       })}\n\n`
     );
 
@@ -659,7 +674,8 @@ async function createServer() {
 
   // Lightweight health check endpoint for uptime & APK probes
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, version: SERVER_BUILD_INFO.version, buildId: SERVER_BUILD_INFO.buildId });
+    const buildInfo = getServerBuildMetadata();
+    res.json({ ok: true, version: buildInfo.version, buildId: buildInfo.buildId });
   });
 
   // Return clean JSON 404 for unmatched API routes before SPA middlewares handle them
@@ -695,6 +711,8 @@ async function createServer() {
     ) {
       res.set({
         'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        'CDN-Cache-Control': 'no-store',
+        'Surrogate-Control': 'no-store',
         'Pragma': 'no-cache',
         'Expires': '0',
       });
@@ -770,6 +788,8 @@ async function createServer() {
       }
       res.set({
         'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+        'CDN-Cache-Control': 'no-store',
+        'Surrogate-Control': 'no-store',
         'Pragma': 'no-cache',
         'Expires': '0',
       });
@@ -797,6 +817,8 @@ async function createServer() {
         res.status(200).set({
           'Content-Type': 'text/html',
           'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+          'CDN-Cache-Control': 'no-store',
+          'Surrogate-Control': 'no-store',
           'Pragma': 'no-cache',
           'Expires': '0',
         }).end(template);
@@ -806,9 +828,36 @@ async function createServer() {
     });
   }
 
-  app.listen(port, '0.0.0.0', () => {
+  let lastBroadcastedBuildId = getServerBuildMetadata().buildId;
+  const checkAndBroadcastBuildUpdate = () => {
+    try {
+      const latest = getServerBuildMetadata();
+      if (latest.buildId && latest.buildId !== lastBroadcastedBuildId) {
+        lastBroadcastedBuildId = latest.buildId;
+        secondarySyncDb.broadcastEvent('build_update', latest);
+      }
+    } catch {}
+  };
+  const distVersionFile = process.env.BLACKWORM_VERSION_FILE
+    ? path.resolve(process.env.BLACKWORM_VERSION_FILE)
+    : path.join(process.cwd(), 'dist', 'version.json');
+  try {
+    if (fs.existsSync(path.dirname(distVersionFile))) {
+      fs.watch(path.dirname(distVersionFile), (_evt, filename) => {
+        if (!filename || filename === path.basename(distVersionFile)) {
+          setTimeout(checkAndBroadcastBuildUpdate, 150);
+        }
+      });
+    }
+  } catch {}
+  const buildWatchTimer = setInterval(checkAndBroadcastBuildUpdate, 2500);
+  buildWatchTimer.unref?.();
+
+  const httpServer = app.listen(port, '0.0.0.0', () => {
     console.log(`Server running at http://0.0.0.0:${port}`);
   });
+  httpServer.keepAliveTimeout = 65000;
+  httpServer.headersTimeout = 66000;
 }
 
 createServer();

@@ -28,6 +28,7 @@ import {
   getPendingSyncMap,
   isRecordDeleted,
   mergeTravelSheetDocs,
+  mergeOrderBaseFields,
 } from './dataService';
 import {
   DEFAULT_STATE,
@@ -235,7 +236,10 @@ function applyIncrementalSnapshot(
       }
     }
     ch.secIds.delete(id);
-    ch.docMap.set(id, incoming);
+    ch.docMap.set(
+      id,
+      colName === 'orders' && existing ? mergeOrderBaseFields(existing, incoming) : incoming
+    );
   };
 
   if (!fromCache && !ch.hasServerSnapshot && Array.isArray(snap.docs)) {
@@ -333,9 +337,11 @@ function applySecondaryDeltas(
         ch.archivedIds.delete(evt.id);
         ch.docMap.set(
           evt.id,
-          existing && existing.createdAt && !incoming.createdAt
-            ? { createdAt: existing.createdAt, ...incoming }
-            : incoming
+          colName === 'orders' && existing
+            ? mergeOrderBaseFields(existing, incoming)
+            : existing && existing.createdAt && !incoming.createdAt
+              ? { createdAt: existing.createdAt, ...incoming }
+              : incoming
         );
         mutated = true;
       }
@@ -1311,7 +1317,7 @@ function applyMasterPricelistDoc(data: any, authoritativeServer = false) {
 }
 
 function pullMasterPricelistFromSecondary() {
-  void fetchSecondaryCollection('config', { limit: 50 }).then((res) => {
+  void fetchSecondaryCollection('config', { limit: 1000 }).then((res) => {
     if (!res.ok) return;
     const match = res.items.find((it) => it?.id === 'master_pricelist');
     if (match) applyMasterPricelistDoc(match);
@@ -1567,7 +1573,7 @@ function applySchemeDiscountsDoc(data: any, authoritativeServer = false) {
 }
 
 function pullSchemeDiscountsFromSecondary() {
-  void fetchSecondaryCollection('config', { limit: 50 }).then((res) => {
+  void fetchSecondaryCollection('config', { limit: 1000 }).then((res) => {
     if (!res.ok) return;
     const match = res.items.find((it) => it?.id === 'schemes_extra_discounts');
     if (match) applySchemeDiscountsDoc(match);
@@ -1872,6 +1878,8 @@ export async function ensureLocationVillageLinked(params: {
     isCustom: true,
     createdByUid: existing?.createdByUid || params.user?.uid || '',
     createdByName: existing?.createdByName || params.user?.fullName || params.user?.loginId || '',
+    updatedByUid: params.user?.uid || existing?.updatedByUid || '',
+    updatedByName: params.user?.fullName || params.user?.loginId || existing?.updatedByName || '',
     createdAt: existing?.createdAt || nowIso,
     updatedAt: nowIso,
     isArchived: false,
@@ -2190,6 +2198,8 @@ export interface OfficeStaffMember {
   linkedUserUid?: string;
   createdByUid?: string;
   createdByName?: string;
+  updatedByUid?: string;
+  updatedByName?: string;
   isArchived?: boolean;
   createdAt?: string;
   updatedAt?: string;
@@ -2403,6 +2413,8 @@ export interface OfficeStaffAttendanceRecord {
   note?: string;
   markedByUid?: string;
   markedByName?: string;
+  updatedByUid?: string;
+  updatedByName?: string;
   markedAt?: string;
   isArchived?: boolean;
   createdAt?: string;

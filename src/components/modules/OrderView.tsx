@@ -1,10 +1,12 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { getFriendlyErrorMessage } from '../../firebase';
 import { UserProfile, isAdmin, isUserRecord, isGodownOrOfficeStaff } from '../../lib/auth';
-import { softDeleteRecord, logAudit, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, formatDisplayDate, triggerBlobDownload, deduplicateProducts } from '../../lib/dataService';
+import { softDeleteRecord, logAudit, safeFirestoreSet, safeFirestoreDelete, toTimestampMs, formatDisplayDate, triggerBlobDownload, deduplicateProducts, deriveOrderCreatedAt } from '../../lib/dataService';
 import { useSharedOrders, useSharedDealers, useSharedUsers, useSharedMasterPricelist } from '../../lib/realtimeStore';
 import { Language } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
+import { ModuleUpdateBanner, useModuleRecordHighlights } from '../ModuleUpdateBanner';
+import { UnreadRecordMeta, getDefaultInitialBaselineMs, getRecordUpdateMs } from '../../lib/moduleUpdates';
 import { cn, toTitleCase, openExternalLinkSafely } from '../../lib/utils';
 import { OFFICIAL_REFERENCE_DATA, DynamicPriceProduct, calculateWithGst } from './PriceListView';
 import { getStandardBillingDiscount } from './SchemeView';
@@ -476,12 +478,17 @@ export interface OrderItem {
   deliveredAt?: string;
   ownerId: string;
   userId?: string;
+  createdByUid?: string;
+  created_by_user_id?: string;
+  created_by_name?: string;
   loginId?: string;
   userCode?: string;
   createdByName: string;
   createdAt: string;
   updatedAt?: string;
   updatedByName?: string;
+  updatedByUid?: string;
+  _syncUpdatedAtMs?: number;
   isArchived?: boolean;
 }
 
@@ -511,6 +518,8 @@ export interface GodownOrderSlipCardProps {
   order: OrderItem;
   resolvedItems: OrderProductLine[];
   isUpdating?: boolean;
+  unreadMeta?: UnreadRecordMeta;
+  onMarkViewed?: (order: OrderItem) => void;
   onDispatchOrder?: (order: OrderItem, transportText: string) => Promise<void> | void;
   onUpdateTransport?: (order: OrderItem, transportText: string) => Promise<void> | void;
   onConfirmDelivered?: (order: OrderItem) => Promise<void> | void;
@@ -520,6 +529,8 @@ export const GodownOrderSlipCard: React.FC<GodownOrderSlipCardProps> = ({
   order,
   resolvedItems,
   isUpdating = false,
+  unreadMeta,
+  onMarkViewed,
   onDispatchOrder,
   onUpdateTransport,
   onConfirmDelivered,
@@ -560,11 +571,30 @@ export const GodownOrderSlipCard: React.FC<GodownOrderSlipCardProps> = ({
   return (
     <div
       className={cn(
-        'bg-white p-3.5 sm:p-4 border border-slate-200 border-t-[3px] rounded-2xl font-sans text-slate-900 space-y-3 shadow-2xs flex flex-col justify-between',
+        'bg-white p-3.5 sm:p-4 border border-t-[3px] rounded-2xl font-sans text-slate-900 space-y-3 shadow-2xs flex flex-col justify-between transition',
+        unreadMeta ? 'border-amber-400 ring-2 ring-amber-200/80 bg-amber-50/20' : 'border-slate-200',
         statusMeta.barClass
       )}
     >
       <div className="space-y-3">
+        {unreadMeta && (
+          <div className="flex items-center justify-between gap-2 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 text-[11px]">
+            <span className="font-bold text-amber-900 truncate">
+              अपडेट: {unreadMeta.actorName} · {unreadMeta.actionLabel}
+            </span>
+            {onMarkViewed && (
+              <button
+                type="button"
+                onClick={() => onMarkViewed(order)}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-700 hover:bg-amber-800 text-white text-[10px] font-bold whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                <Check className="w-3 h-3" />
+                <span>पाहिले</span>
+              </button>
+            )}
+          </div>
+        )}
+
         {/* Card Header: Order No + Explicit Status + Date */}
         <div className="flex items-start justify-between gap-2 pb-2.5 border-b border-slate-100">
           <div className="min-w-0 space-y-0.5">
@@ -590,7 +620,7 @@ export const GodownOrderSlipCard: React.FC<GodownOrderSlipCardProps> = ({
           <div className="text-right shrink-0">
             <p className="text-[10px] font-medium text-slate-400 uppercase tracking-wide">Order Date</p>
             <p className="text-xs font-semibold text-slate-900 font-mono tabular-nums">
-              {new Date(order.createdAt).toLocaleDateString('en-GB')}
+              {formatDisplayDate(order.createdAt) || '-'}
             </p>
           </div>
         </div>
@@ -849,56 +879,69 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
   const { products: sharedMasterProducts } = useSharedMasterPricelist();
 
   const orders = useMemo<OrderItem[]>(() => {
-    return rawSharedOrders.map((data: any) => {
-      const cleanedItems = (data.items || []).map((it: any) => {
-        const cleanName = getCleanGradeName(it);
+    return rawSharedOrders
+      .map((data: any) => {
+        const cleanedItems = (data.items || []).map((it: any) => {
+          const cleanName = getCleanGradeName(it);
+          return {
+            ...it,
+            productName: cleanName,
+            gradeName: cleanName,
+          };
+        });
         return {
-          ...it,
-          productName: cleanName,
-          gradeName: cleanName,
+          id: data.id,
+          orderNumber: data.orderNumber || `BW-${String(data.id || '').slice(-6)}`,
+          cropName: data.cropName || '',
+          dealerId: data.dealerId || '',
+          dealerName: data.dealerName || 'General Dealer',
+          dealerCode: data.dealerCode || '',
+          dealerContact: data.dealerContact || '',
+          dealerVillage: data.dealerVillage || '',
+          dealerDistrict: data.dealerDistrict || '',
+          farmerName: data.farmerName || '',
+          items: cleanedItems,
+          totalQuantity: data.totalQuantity || (data.items?.reduce((a: number, b: any) => a + (b.quantity || 0), 0) || 0),
+          grossAmount: Number(data.grossAmount) || 0,
+          discountAmount: Number(data.discountAmount) || 0,
+          totalAmount: Number(data.totalAmount) || 0,
+          paidAmount: Number(data.paidAmount) || 0,
+          balanceAmount: Number(data.balanceAmount ?? data.totalAmount) || 0,
+          paymentMode: data.paymentMode || 'Credit',
+          status: data.status || 'pending_approval',
+          warehouseStatus: data.warehouseStatus,
+          transportName: data.transportName || '',
+          transportDetails: data.transportDetails || '',
+          warehouseDispatchedAt: data.warehouseDispatchedAt,
+          warehouseDispatchedBy: data.warehouseDispatchedBy,
+          warehouseDeliveredAt: data.warehouseDeliveredAt,
+          warehouseDeliveredBy: data.warehouseDeliveredBy,
+          approvedBy: data.approvedBy,
+          approvedAt: data.approvedAt,
+          dispatchedAt: data.dispatchedAt,
+          dispatchNote: data.dispatchNote,
+          deliveredAt: data.deliveredAt,
+          ownerId: data.ownerId || '',
+          userId: data.userId,
+          createdByUid: data.createdByUid,
+          created_by_user_id: data.created_by_user_id,
+          created_by_name: data.created_by_name,
+          loginId: data.loginId,
+          userCode: data.userCode,
+          createdByName: data.createdByName || data.created_by_name || data.officerName || 'User',
+          createdAt: deriveOrderCreatedAt(data),
+          updatedAt: data.updatedAt,
+          updatedByName: data.updatedByName,
+          updatedByUid: data.updatedByUid,
+          _syncUpdatedAtMs: data._syncUpdatedAtMs,
+          isArchived: data.isArchived || false,
         };
-      });
-      return {
-        id: data.id,
-        orderNumber: data.orderNumber || `BW-${String(data.id || '').slice(-6)}`,
-        cropName: data.cropName || '',
-        dealerId: data.dealerId || '',
-        dealerName: data.dealerName || 'General Dealer',
-        dealerCode: data.dealerCode || '',
-        dealerContact: data.dealerContact || '',
-        dealerVillage: data.dealerVillage || '',
-        dealerDistrict: data.dealerDistrict || '',
-        farmerName: data.farmerName || '',
-        items: cleanedItems,
-        totalQuantity: data.totalQuantity || (data.items?.reduce((a: number, b: any) => a + (b.quantity || 0), 0) || 0),
-        grossAmount: Number(data.grossAmount) || 0,
-        discountAmount: Number(data.discountAmount) || 0,
-        totalAmount: Number(data.totalAmount) || 0,
-        paidAmount: Number(data.paidAmount) || 0,
-        balanceAmount: Number(data.balanceAmount ?? data.totalAmount) || 0,
-        paymentMode: data.paymentMode || 'Credit',
-        status: data.status || 'pending_approval',
-        warehouseStatus: data.warehouseStatus,
-        transportName: data.transportName || '',
-        transportDetails: data.transportDetails || '',
-        warehouseDispatchedAt: data.warehouseDispatchedAt,
-        warehouseDispatchedBy: data.warehouseDispatchedBy,
-        warehouseDeliveredAt: data.warehouseDeliveredAt,
-        warehouseDeliveredBy: data.warehouseDeliveredBy,
-        approvedBy: data.approvedBy,
-        approvedAt: data.approvedAt,
-        dispatchedAt: data.dispatchedAt,
-        dispatchNote: data.dispatchNote,
-        deliveredAt: data.deliveredAt,
-        ownerId: data.ownerId || '',
-        userId: data.userId,
-        loginId: data.loginId,
-        userCode: data.userCode,
-        createdByName: data.createdByName || 'User',
-        createdAt: data.createdAt || new Date().toISOString(),
-        isArchived: data.isArchived || false,
-      };
-    });
+      })
+      .sort(
+        (a, b) =>
+          (toTimestampMs(b.createdAt) || toTimestampMs(b.updatedAt)) -
+          (toTimestampMs(a.createdAt) || toTimestampMs(a.updatedAt))
+      );
   }, [rawSharedOrders]);
 
   const dealers = useMemo<SavedDealer[]>(() => {
@@ -923,6 +966,35 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       }))
       .sort((a, b) => (a.firmName || '').localeCompare(b.firmName || ''));
   }, [rawSharedDealers]);
+
+  const dealersById = useMemo(() => {
+    const map = new Map<string, SavedDealer>();
+    dealers.forEach((d) => {
+      if (d?.id) map.set(d.id, d);
+    });
+    return map;
+  }, [dealers]);
+
+  const doesOrderBelongToOfficer = useCallback(
+    (order: OrderItem, officer: { uid: string; fullName?: string; loginId?: string; userCode?: string }) => {
+      if (isUserRecord(order, officer as any)) return true;
+      const anyOrder = order as any;
+      const hasPrimaryOwner = Boolean(
+        anyOrder.userId ||
+          anyOrder.ownerId ||
+          anyOrder.created_by_user_id ||
+          anyOrder.createdByUid ||
+          (anyOrder.createdByName && anyOrder.createdByName !== 'User') ||
+          anyOrder.created_by_name
+      );
+      if (!hasPrimaryOwner && order.dealerId) {
+        const linkedDealer = dealersById.get(order.dealerId);
+        if (linkedDealer && isUserRecord(linkedDealer, officer as any)) return true;
+      }
+      return false;
+    },
+    [dealersById]
+  );
 
   const officers = useMemo(
     () =>
@@ -949,9 +1021,49 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
     );
   }, [sharedMasterProducts]);
   const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState('pending');
+  const userSelectedStatusFilterRef = useRef(false);
+  const [statusFilter, setStatusFilter] = useState<string>(() => (isAdmin(profile) ? 'pending' : 'all'));
   const [warehouseStatusFilter, setWarehouseStatusFilter] = useState<'all' | WarehouseOrderStatus>('all');
   const [updatingWarehouseOrderId, setUpdatingWarehouseOrderId] = useState<string | null>(null);
+
+  const orderModuleId = isGodownView ? 'office_staff' : 'order';
+  const {
+    badge: orderUnreadBadge,
+    getUnreadMeta,
+    markViewed: markModuleItemViewed,
+    markAllViewed: markAllOrdersViewed,
+  } = useModuleRecordHighlights(profile, orderModuleId, {
+    orders: rawSharedOrders,
+  });
+
+  const getOrderUnreadMeta = (orderId: string) =>
+    getUnreadMeta(isGodownView ? `order:${orderId}` : orderId) || getUnreadMeta(orderId);
+
+  const markOrderViewed = (order: OrderItem) => {
+    const key = isGodownView ? `order:${order.id}` : order.id;
+    markModuleItemViewed(key, getRecordUpdateMs(order));
+  };
+
+  // Prevent Admin or Officers from landing on empty Pending (0) tab when today's Complete/All orders exist
+  useEffect(() => {
+    if (isGodownView || userSelectedStatusFilterRef.current) return;
+    const targetOfficer =
+      isAdmin(profile) && selectedOfficerFilter !== 'all'
+        ? officers.find((off) => off.uid === selectedOfficerFilter)
+        : undefined;
+    const roleScoped = orders.filter((o) => {
+      if (isAdmin(profile)) {
+        return targetOfficer ? doesOrderBelongToOfficer(o, targetOfficer) : true;
+      }
+      return isUserRecord(o, profile);
+    });
+    const pendingCnt = roleScoped.filter(
+      (o) => o.status === 'pending_approval' || o.status === 'pending'
+    ).length;
+    if (statusFilter === 'pending' && pendingCnt === 0 && roleScoped.length > 0) {
+      setStatusFilter('all');
+    }
+  }, [orders, isGodownView, profile, statusFilter, selectedOfficerFilter, officers, doesOrderBelongToOfficer]);
   
   // Modals state
   const [showNewOrderModal, setShowNewOrderModal] = useState(false);
@@ -1023,6 +1135,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       return;
     }
 
+    markOrderViewed(order);
     setSelectedOrderDetails(null);
     setEditingOrderId(order.id);
     const foundDealer = dealers.find((d) => d.id === order.dealerId) || {
@@ -1078,6 +1191,14 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
 
   // Mobile back button integration for modals
   const modalHistoryPushedRef = useRef(false);
+  const orderMountedRef = useRef(true);
+  useEffect(() => {
+    orderMountedRef.current = true;
+    return () => {
+      orderMountedRef.current = false;
+      modalHistoryPushedRef.current = false;
+    };
+  }, []);
   const anyOrderModalOpen = Boolean(showNewOrderModal || selectedOrderDetails || successOrder);
   useEffect(() => {
     if (anyOrderModalOpen) {
@@ -1097,7 +1218,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       };
     } else if (modalHistoryPushedRef.current) {
       modalHistoryPushedRef.current = false;
-      if (window.history.state?.orderModalOpen) {
+      if (orderMountedRef.current && window.history.state?.orderModalOpen) {
         window.history.back();
       }
     }
@@ -1476,7 +1597,41 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       // If editing an existing order
       if (editingOrderId) {
         const existingOrder = orders.find(o => o.id === editingOrderId);
+        const anyExisting = existingOrder as any;
+        const anyDealer = dealerToUse as any;
+        const resolvedOwnerUid =
+          existingOrder?.userId ||
+          existingOrder?.ownerId ||
+          existingOrder?.createdByUid ||
+          anyExisting?.created_by_user_id ||
+          anyDealer?.createdByUid ||
+          anyDealer?.created_by_user_id ||
+          anyDealer?.userId ||
+          profile.uid ||
+          '';
+        const resolvedOwnerName =
+          (existingOrder?.createdByName && existingOrder.createdByName !== 'User'
+            ? existingOrder.createdByName
+            : '') ||
+          anyExisting?.created_by_name ||
+          anyDealer?.officerName ||
+          anyDealer?.created_by_name ||
+          profile.fullName ||
+          'Officer';
         const updatedOrderPayload: Partial<OrderItem> = {
+          id: editingOrderId,
+          orderNumber: existingOrder?.orderNumber || `BW-${String(editingOrderId).slice(-6)}`,
+          createdAt: existingOrder ? deriveOrderCreatedAt(existingOrder) : new Date().toISOString(),
+          userId: resolvedOwnerUid,
+          ownerId: existingOrder?.ownerId || resolvedOwnerUid,
+          createdByUid: existingOrder?.createdByUid || resolvedOwnerUid,
+          ...(anyExisting?.created_by_user_id || resolvedOwnerUid
+            ? { created_by_user_id: anyExisting?.created_by_user_id || resolvedOwnerUid }
+            : {}),
+          createdByName: resolvedOwnerName,
+          ...(existingOrder?.loginId ? { loginId: existingOrder.loginId } : {}),
+          ...(existingOrder?.userCode ? { userCode: existingOrder.userCode } : {}),
+          isArchived: false,
           dealerId: dealerToUse.id || '',
           dealerName: dealerToUse.firmName || '',
           dealerCode: dealerToUse.dealerCode || '',
@@ -1493,6 +1648,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
           balanceAmount: Math.max(0, totalBill - (existingOrder?.paidAmount || 0)),
           updatedAt: new Date().toISOString(),
           updatedByName: profile.fullName || profile.loginId || 'Officer',
+          updatedByUid: profile.uid || '',
         };
 
         // Immediately update shared in-memory orders before waiting on network sync
@@ -1526,6 +1682,7 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
       // Creating a brand new order
       const orderId = `order_${Date.now()}`;
       const orderNumber = `BW-${Math.floor(100000 + Math.random() * 900000)}`;
+      const nowIso = new Date().toISOString();
 
       const newOrder: OrderItem = {
         id: orderId,
@@ -1549,10 +1706,14 @@ export const OrderView: React.FC<Props> = ({ profile }) => {
         status: 'pending_approval',
         ownerId: profile.uid || '',
         userId: profile.uid || '',
+        createdByUid: profile.uid || '',
         loginId: profile.loginId || '',
         userCode: profile.userCode || '',
         createdByName: profile.fullName || 'Officer',
-        createdAt: new Date().toISOString(),
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        updatedByName: profile.fullName || 'Officer',
+        updatedByUid: profile.uid || '',
         isArchived: false,
       };
 
@@ -1617,6 +1778,7 @@ ${itemsListText}
 
   // Copy Order Text to Clipboard for WhatsApp
   const handleCopyOrderText = async (order: OrderItem) => {
+    markOrderViewed(order);
     const text = generateWhatsAppMessage(order);
     try {
       await navigator.clipboard.writeText(text);
@@ -1645,6 +1807,7 @@ ${itemsListText}
 
   // Direct WhatsApp Share Trigger with Generated Order Photo & Status
   const handleShareOnWhatsApp = async (order: OrderItem) => {
+    markOrderViewed(order);
     setIsGeneratingImage(true);
     setCapturingOrder(order);
 
@@ -1710,6 +1873,7 @@ ${itemsListText}
   // Direct Order Image Download to Device / Gallery (without Share popup)
   const handleDownloadOrderImage = async (order: OrderItem) => {
     if (downloadingOrderId) return;
+    markOrderViewed(order);
     setDownloadingOrderId(order.id);
     setCapturingOrder(order);
 
@@ -1765,6 +1929,7 @@ ${itemsListText}
   // Workflow Action 1: Approve Order & Move to Complete
   const handleApproveOrder = async (order: OrderItem) => {
     if (!isAdmin(profile)) return;
+    markOrderViewed(order);
 
     const nowIso = new Date().toISOString();
     const updatedData = {
@@ -1775,6 +1940,8 @@ ${itemsListText}
       dispatchedAt: nowIso,
       deliveredAt: nowIso,
       updatedAt: nowIso,
+      updatedByName: profile.fullName || 'Admin',
+      updatedByUid: profile.uid || '',
     };
 
     // Update shared state immediately
@@ -1800,6 +1967,7 @@ ${itemsListText}
 
   // Warehouse Workflow Action A: Mark Dispatched + Save Transport Details (Warehouse Incharge Only)
   const handleWarehouseDispatch = async (order: OrderItem, transportText: string) => {
+    markOrderViewed(order);
     const cleanTransport = transportText.trim();
     const nowIso = new Date().toISOString();
     setUpdatingWarehouseOrderId(order.id);
@@ -1812,6 +1980,8 @@ ${itemsListText}
         warehouseDispatchedAt: nowIso,
         warehouseDispatchedBy: profile.fullName || profile.loginId || 'Warehouse Incharge',
         updatedAt: nowIso,
+        updatedByName: profile.fullName || profile.loginId || 'Warehouse Incharge',
+        updatedByUid: profile.uid || '',
       };
       setOrdersOptimistic((prev) =>
         prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
@@ -1833,6 +2003,7 @@ ${itemsListText}
 
   // Warehouse Workflow Action B: Update Transport Details on a Dispatched Order
   const handleWarehouseUpdateTransport = async (order: OrderItem, transportText: string) => {
+    markOrderViewed(order);
     const cleanTransport = transportText.trim();
     const nowIso = new Date().toISOString();
     setUpdatingWarehouseOrderId(order.id);
@@ -1842,6 +2013,8 @@ ${itemsListText}
         transportDetails: cleanTransport,
         dispatchNote: cleanTransport,
         updatedAt: nowIso,
+        updatedByName: profile.fullName || profile.loginId || 'Warehouse Incharge',
+        updatedByUid: profile.uid || '',
       };
       setOrdersOptimistic((prev) =>
         prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
@@ -1856,6 +2029,7 @@ ${itemsListText}
 
   // Warehouse Workflow Action C: Confirm Delivered to Dealer (Warehouse Incharge Only)
   const handleWarehouseConfirmDelivered = (order: OrderItem) => {
+    markOrderViewed(order);
     setDialogConfig({
       isOpen: true,
       type: 'confirm',
@@ -1873,6 +2047,8 @@ ${itemsListText}
             warehouseDeliveredAt: nowIso,
             warehouseDeliveredBy: profile.fullName || profile.loginId || 'Warehouse Incharge',
             updatedAt: nowIso,
+            updatedByName: profile.fullName || profile.loginId || 'Warehouse Incharge',
+            updatedByUid: profile.uid || '',
           };
           setOrdersOptimistic((prev) =>
             prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
@@ -1898,11 +2074,15 @@ ${itemsListText}
   // Workflow Action 2: Mark Delivered & Complete Order (Admin/Sales Officers)
   const handleMarkDelivered = async (order: OrderItem) => {
     if (!isAdmin(profile) && !isUserRecord(order, profile)) return;
+    markOrderViewed(order);
 
+    const nowIso = new Date().toISOString();
     const updatedData = {
       status: 'delivered' as const,
-      deliveredAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      deliveredAt: nowIso,
+      updatedAt: nowIso,
+      updatedByName: profile.fullName || profile.loginId || 'User',
+      updatedByUid: profile.uid || '',
     };
 
     setOrdersOptimistic((prev) =>
@@ -1981,6 +2161,8 @@ ${itemsListText}
     });
   };
 
+  const recentActivityCutoffMs = getDefaultInitialBaselineMs();
+
   // Filter Orders List (Godown/Office Staff see ALL Admin-approved orders strictly; other non-admins see own records)
   const filteredOrders = orders.filter((o) => {
     if (isGodownView) {
@@ -1994,24 +2176,8 @@ ${itemsListText}
     } else {
       if (selectedOfficerFilter !== 'all') {
         const targetOfficer = officers.find((off) => off.uid === selectedOfficerFilter);
-        if (targetOfficer) {
-          const anyOrder = o as any;
-          const recUid = (anyOrder.userId || anyOrder.ownerId || anyOrder.created_by_user_id || anyOrder.createdByUid || '').toString().toLowerCase().trim();
-          const targetUid = String(targetOfficer.uid || '').toLowerCase().trim();
-          const targetName = String(targetOfficer.fullName || '').replace(/\s+/g, ' ').toLowerCase().trim();
-          const targetLogin = String(targetOfficer.loginId || '').toLowerCase().trim();
-          const targetCode = String(targetOfficer.userCode || '').toLowerCase().trim();
-          const recName = String(anyOrder.createdByName || anyOrder.created_by_name || '').replace(/\s+/g, ' ').toLowerCase().trim();
-          const recLogin = String(anyOrder.loginId || '').toLowerCase().trim();
-          const recCode = String(anyOrder.userCode || '').toLowerCase().trim();
-
-          const match =
-            (targetUid && recUid === targetUid) ||
-            (targetName && recName && recName === targetName) ||
-            (targetLogin && recLogin && recLogin === targetLogin) ||
-            (targetCode && recCode && recCode === targetCode);
-
-          if (!match) return false;
+        if (targetOfficer && !doesOrderBelongToOfficer(o, targetOfficer)) {
+          return false;
         }
       }
     }
@@ -2024,6 +2190,8 @@ ${itemsListText}
       String(o.farmerName || '').toLowerCase().includes(queryStr) ||
       String(o.dealerVillage || '').toLowerCase().includes(queryStr) ||
       String(o.dealerDistrict || '').toLowerCase().includes(queryStr) ||
+      String(o.updatedByName || '').toLowerCase().includes(queryStr) ||
+      String(o.warehouseDispatchedBy || '').toLowerCase().includes(queryStr) ||
       String(o.transportName || o.transportDetails || o.dispatchNote || '').toLowerCase().includes(queryStr) ||
       (Array.isArray(o.items) && o.items.some((it) => String(it?.productName || '').toLowerCase().includes(queryStr)));
 
@@ -2035,6 +2203,9 @@ ${itemsListText}
     }
 
     if (statusFilter === 'all') return true;
+    if (statusFilter === 'updates') {
+      return Boolean(getOrderUnreadMeta(o.id)) || getRecordUpdateMs(o) > recentActivityCutoffMs;
+    }
     if (statusFilter === 'pending') return o.status === 'pending_approval' || o.status === 'pending';
     if (statusFilter === 'complete') return o.status === 'complete' || o.status === 'approved' || o.status === 'delivered';
     if (statusFilter === 'dispatched') return o.status === 'dispatched' || o.status === 'confirmed';
@@ -2042,6 +2213,10 @@ ${itemsListText}
     if (statusFilter === 'collected') return o.status === 'collected';
     return true;
   });
+
+  if (!isGodownView && statusFilter === 'updates') {
+    filteredOrders.sort((a, b) => getRecordUpdateMs(b) - getRecordUpdateMs(a));
+  }
 
   const warehouseStatusCounts = useMemo(() => {
     if (!isGodownView) return { all: 0, fresh: 0, dispatched: 0, delivered: 0 };
@@ -2117,13 +2292,16 @@ ${itemsListText}
           <div className="shrink-0 flex items-center">
             <select
               value={selectedOfficerFilter}
-              onChange={(e) => setSelectedOfficerFilter(e.target.value)}
+              onChange={(e) => {
+                userSelectedStatusFilterRef.current = false;
+                setSelectedOfficerFilter(e.target.value);
+              }}
               className="px-2.5 py-1.5 rounded-xl border border-purple-200 bg-purple-50 text-purple-900 text-xs font-bold focus:outline-none focus:ring-2 focus:ring-purple-500 shadow-xs cursor-pointer"
               title="Filter by Officer"
             >
               <option value="all">All Officers</option>
               {officers.map((off) => {
-                const offOrdersCount = orders.filter((o) => isUserRecord(o, off as any)).length;
+                const offOrdersCount = orders.filter((o) => doesOrderBelongToOfficer(o, off)).length;
                 return (
                   <option key={off.uid} value={off.uid}>
                     {toTitleCase(off.fullName || 'Officer')} ({offOrdersCount})
@@ -2172,6 +2350,7 @@ ${itemsListText}
           <div className="flex gap-1 overflow-x-auto pb-0.5 no-scrollbar items-center">
             {[
               { id: 'pending', label: 'Pending' },
+              { id: 'updates', label: 'Updates' },
               { id: 'complete', label: 'Complete' },
               { id: 'all', label: 'All' },
             ].map((st) => {
@@ -2180,9 +2359,12 @@ ${itemsListText}
                   if (!isUserRecord(o, profile)) return false;
                 } else if (selectedOfficerFilter !== 'all') {
                   const targetOfficer = officers.find((off) => off.uid === selectedOfficerFilter);
-                  if (targetOfficer && !isUserRecord(o, targetOfficer as any)) return false;
+                  if (targetOfficer && !doesOrderBelongToOfficer(o, targetOfficer)) return false;
                 }
                 if (st.id === 'pending') return o.status === 'pending_approval' || o.status === 'pending';
+                if (st.id === 'updates') {
+                  return Boolean(getOrderUnreadMeta(o.id)) || getRecordUpdateMs(o) > recentActivityCutoffMs;
+                }
                 if (st.id === 'complete') return o.status === 'complete' || o.status === 'approved' || o.status === 'delivered';
                 return true;
               }).length;
@@ -2190,7 +2372,10 @@ ${itemsListText}
               return (
                 <button
                   key={st.id}
-                  onClick={() => setStatusFilter(st.id)}
+                  onClick={() => {
+                    userSelectedStatusFilterRef.current = true;
+                    setStatusFilter(st.id);
+                  }}
                   className={cn(
                     "px-2.5 py-1 rounded text-xs font-bold transition whitespace-nowrap cursor-pointer active:scale-95 flex items-center gap-1",
                     statusFilter === st.id
@@ -2200,7 +2385,7 @@ ${itemsListText}
                 >
                   <span>{st.label}</span>
                   <span className={cn(
-                    "px-1.5 py-0.2 rounded-full text-[10px] font-mono",
+                    "px-1.5 py-0.2 rounded-full text-[10px] font-mono tabular-nums",
                     statusFilter === st.id ? "bg-white/25 text-white" : "bg-slate-100 text-slate-700"
                   )}>
                     {count}
@@ -2211,6 +2396,42 @@ ${itemsListText}
           </div>
         )}
       </div>
+
+      {/* Unread Per-Order Highlight Banner with Employee Attribution */}
+      <ModuleUpdateBanner
+        badge={
+          isGodownView && orderUnreadBadge
+            ? {
+                ...orderUnreadBadge,
+                unreadRecords: (orderUnreadBadge.unreadRecords || []).filter(
+                  (r) => !r.subType || r.subType === 'order'
+                ),
+                count: (orderUnreadBadge.unreadRecords || []).filter(
+                  (r) => !r.subType || r.subType === 'order'
+                ).length,
+              }
+            : orderUnreadBadge
+        }
+        onSelectRecord={(item) => {
+          const targetId = item.id.replace(/^order:/, '');
+          const found = orders.find((o) => o.id === targetId);
+          if (found) {
+            markOrderViewed(found);
+            if (isGodownView) {
+              setWarehouseStatusFilter('all');
+              setSearch(found.orderNumber || '');
+            } else {
+              userSelectedStatusFilterRef.current = true;
+              setStatusFilter('all');
+              setSelectedOrderDetails(found);
+            }
+          }
+        }}
+        onMarkSingleViewed={(item) => {
+          markModuleItemViewed(item.id, item.updatedAtMs);
+        }}
+        onMarkAllViewed={() => markAllOrdersViewed()}
+      />
 
       {/* Orders List */}
       {filteredOrders.length === 0 ? (
@@ -2241,6 +2462,8 @@ ${itemsListText}
                 order={o}
                 resolvedItems={resolvedCardItems}
                 isUpdating={updatingWarehouseOrderId === o.id}
+                unreadMeta={getOrderUnreadMeta(o.id)}
+                onMarkViewed={markOrderViewed}
                 onDispatchOrder={handleWarehouseDispatch}
                 onUpdateTransport={handleWarehouseUpdateTransport}
                 onConfirmDelivered={handleWarehouseConfirmDelivered}
@@ -2255,19 +2478,44 @@ ${itemsListText}
             const isComplete = o.status === 'complete' || o.status === 'approved' || o.status === 'delivered';
             const isDispatched = o.status === 'dispatched' || o.status === 'confirmed';
             const isCollected = o.status === 'collected';
+            const unreadMeta = getOrderUnreadMeta(o.id);
 
             return (
               <div
                 key={o.id}
-                className="bg-white rounded-2xl border border-slate-200 p-3 sm:p-3.5 shadow-xs space-y-2 hover:border-purple-200 transition"
+                className={cn(
+                  "bg-white rounded-2xl border p-3 sm:p-3.5 shadow-xs space-y-2 transition",
+                  unreadMeta
+                    ? "border-amber-400 ring-2 ring-amber-200/80 bg-amber-50/20"
+                    : "border-slate-200 hover:border-purple-200"
+                )}
               >
+                {unreadMeta && (
+                  <div className="flex items-center justify-between gap-2 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1 text-[10.5px]">
+                    <span className="font-bold text-amber-900 truncate">
+                      {unreadMeta.actorName} · {unreadMeta.actionLabel}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => markOrderViewed(o)}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-700 hover:bg-amber-800 text-white text-[10px] font-bold whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      <Check className="w-3 h-3" />
+                      <span>पाहिले</span>
+                    </button>
+                  </div>
+                )}
+
                 {/* Header: Order No, Dealer Code & STATUS BADGE RIGHT IN FRONT OF CODE */}
                 <div className="flex justify-between items-start gap-1.5">
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-1.5 flex-wrap">
                       <button
                         type="button"
-                        onClick={() => setSelectedOrderDetails(o)}
+                        onClick={() => {
+                          markOrderViewed(o);
+                          setSelectedOrderDetails(o);
+                        }}
                         className="font-mono text-xs font-black text-purple-700 bg-purple-50 hover:bg-purple-100 border border-purple-200 px-2 py-0.5 rounded-md transition cursor-pointer"
                         title="View Order Details"
                       >
@@ -2499,11 +2747,47 @@ ${itemsListText}
                   )}
                 </div>
 
-                {/* Footer Creator Tag */}
-                <div className="text-[9px] text-slate-400 font-medium pt-0.5 flex justify-between items-center border-t border-slate-100">
-                  <span>Booked by: {toTitleCase(o.createdByName)}</span>
-                  <span>{new Date(o.createdAt).toLocaleDateString('en-GB')}</span>
-                </div>
+                {/* Footer Creator & Latest Update Tag */}
+                {(() => {
+                  const createdMs = toTimestampMs(o.createdAt);
+                  const latestMs = getRecordUpdateMs(o);
+                  const hasPostUpdate = latestMs > 0 && (!createdMs || latestMs - createdMs > 2000);
+                  const lastActor =
+                    o.warehouseStatus === 'delivered'
+                      ? toTitleCase(o.warehouseDeliveredBy || o.updatedByName || o.approvedBy || '')
+                      : o.warehouseStatus === 'dispatched'
+                        ? toTitleCase(o.warehouseDispatchedBy || o.updatedByName || '')
+                        : toTitleCase(o.updatedByName || o.approvedBy || '');
+                  const lastAction =
+                    o.warehouseStatus === 'delivered' || o.status === 'delivered'
+                      ? 'Delivered'
+                      : o.warehouseStatus === 'dispatched' || o.status === 'dispatched'
+                        ? 'Dispatched'
+                        : o.approvedAt && latestMs <= toTimestampMs(o.approvedAt) + 2000
+                          ? 'Approved'
+                          : 'Updated';
+                  const lastDateIso =
+                    o.warehouseDeliveredAt || o.warehouseDispatchedAt || o.updatedAt || o.approvedAt || o.createdAt;
+                  return (
+                    <div className="text-[9px] text-slate-400 font-medium pt-0.5 border-t border-slate-100 space-y-0.5">
+                      <div className="flex justify-between items-center gap-2">
+                        <span className="truncate">Booked by: {toTitleCase(o.createdByName)}</span>
+                        <span className="font-mono tabular-nums shrink-0">{formatDisplayDate(o.createdAt) || '-'}</span>
+                      </div>
+                      {hasPostUpdate && (
+                        <div className="flex justify-between items-center gap-2 text-indigo-600/90 font-semibold">
+                          <span className="truncate">
+                            {lastAction}: {lastActor || toTitleCase(o.createdByName)}
+                            {o.transportName ? ` · ${o.transportName}` : ''}
+                          </span>
+                          <span className="font-mono tabular-nums shrink-0">
+                            {formatDisplayDate(lastDateIso, true) || '-'}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })}
@@ -2526,8 +2810,8 @@ ${itemsListText}
               </div>
               <div className="text-right">
                 <p className="text-[10px] font-bold text-slate-500">Order Date</p>
-                <p className="text-[11px] font-black text-slate-900 font-mono">
-                  {new Date(capturingOrder.createdAt).toLocaleDateString('en-GB')}
+                <p className="text-[11px] font-black text-slate-900 font-mono tabular-nums">
+                  {formatDisplayDate(capturingOrder.createdAt) || '-'}
                 </p>
               </div>
             </div>
@@ -3559,16 +3843,25 @@ ${itemsListText}
 
             {/* Status History & Approvals */}
             <div className="bg-slate-50 p-2.5 rounded-xl border border-slate-200 text-[11px] space-y-0.5 text-slate-600">
-              <p>Booked by: <span className="font-bold text-slate-900">{selectedOrderDetails.createdByName}</span></p>
+              <p>Booked by: <span className="font-bold text-slate-900">{toTitleCase(selectedOrderDetails.createdByName)}</span></p>
               <p>Booking Date: <span className="font-mono">{formatDisplayDate(selectedOrderDetails.createdAt, true) || '-'}</span></p>
               {selectedOrderDetails.approvedBy && (
-                <p>Approved by: <span className="font-bold text-slate-900">{selectedOrderDetails.approvedBy}</span> ({formatDisplayDate(selectedOrderDetails.approvedAt, false) || '-'})</p>
+                <p>Approved by: <span className="font-bold text-slate-900">{toTitleCase(selectedOrderDetails.approvedBy)}</span> ({formatDisplayDate(selectedOrderDetails.approvedAt, true) || '-'})</p>
+              )}
+              {selectedOrderDetails.warehouseDispatchedBy && (
+                <p>Dispatched by: <span className="font-bold text-blue-800">{toTitleCase(selectedOrderDetails.warehouseDispatchedBy)}</span> ({formatDisplayDate(selectedOrderDetails.warehouseDispatchedAt, true) || '-'})</p>
               )}
               {(selectedOrderDetails.transportDetails || selectedOrderDetails.transportName || selectedOrderDetails.dispatchNote) && (
                 <p>Transport: <span className="font-bold text-slate-900">{selectedOrderDetails.transportDetails || selectedOrderDetails.transportName || selectedOrderDetails.dispatchNote}</span></p>
               )}
-              {selectedOrderDetails.deliveredAt && (
+              {selectedOrderDetails.warehouseDeliveredBy && (
+                <p>Delivered by: <span className="font-bold text-emerald-700">{toTitleCase(selectedOrderDetails.warehouseDeliveredBy)}</span> ({formatDisplayDate(selectedOrderDetails.warehouseDeliveredAt, true) || '-'})</p>
+              )}
+              {selectedOrderDetails.deliveredAt && !selectedOrderDetails.warehouseDeliveredBy && (
                 <p>Delivered on: <span className="font-bold text-emerald-700">{formatDisplayDate(selectedOrderDetails.deliveredAt, true) || '-'}</span></p>
+              )}
+              {selectedOrderDetails.updatedByName && selectedOrderDetails.updatedAt && (
+                <p>Last Updated: <span className="font-bold text-indigo-800">{toTitleCase(selectedOrderDetails.updatedByName)}</span> (<span className="font-mono">{formatDisplayDate(selectedOrderDetails.updatedAt, true) || '-'}</span>)</p>
               )}
             </div>
 

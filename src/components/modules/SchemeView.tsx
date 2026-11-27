@@ -187,7 +187,7 @@ export const SchemeView: React.FC<Props> = ({ profile }) => {
               updatedBy: profile.uid,
               updatedByName: profile.fullName || 'Admin',
             },
-            { merge: false }
+            { merge: true }
           );
         } catch (e) {}
         setDialogConfig(prev => ({ ...prev, isOpen: false }));

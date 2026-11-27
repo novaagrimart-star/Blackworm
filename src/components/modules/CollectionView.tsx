@@ -10,6 +10,8 @@ import {
   matchDealerToOutstandingRecords,
 } from '../../lib/pdfOutstandingParser';
 import { Language } from '../../lib/i18n';
+import { getRecordUpdateMs } from '../../lib/moduleUpdates';
+import { ModuleUpdateBanner, useModuleRecordHighlights } from '../ModuleUpdateBanner';
 import { cn, toTitleCase, openExternalLinkSafely } from '../../lib/utils';
 import { CustomDialogModal } from '../CustomDialogModal';
 import { useBranding } from '../../lib/branding';
@@ -31,7 +33,8 @@ import {
   Mail,
   Receipt,
   Pencil,
-  MessageCircle
+  MessageCircle,
+  Check
 } from 'lucide-react';
 
 interface SavedDealer {
@@ -70,6 +73,8 @@ interface CollectionRecord {
   notes?: string;
   collectedByUid?: string;
   collectedByName?: string;
+  updatedByUid?: string;
+  updatedByName?: string;
   createdAt: string;
   updatedAt?: string;
   isArchived?: boolean;
@@ -138,6 +143,12 @@ export const CollectionView: React.FC<Props> = ({ profile }) => {
     [rawSharedDealers]
   );
   const collectionEntries = rawSharedCollections as CollectionRecord[];
+  const {
+    badge: collectionBadge,
+    unreadById: collectionUnreadById,
+    markViewed: markCollectionViewed,
+    markAllViewed: markAllCollectionsViewed,
+  } = useModuleRecordHighlights(profile, 'collection', { collections: rawSharedCollections });
   const [search, setSearch] = useState('');
   const [activeTab, setActiveTab] = useState<'sheet' | 'receipts'>('sheet');
   const [sortBy] = useState<'standing_desc' | 'standing_asc' | 'name_asc'>('standing_desc');
@@ -184,6 +195,14 @@ export const CollectionView: React.FC<Props> = ({ profile }) => {
 
   // Mobile back button integration
   const modalHistoryPushedRef = useRef(false);
+  const collectionMountedRef = useRef(true);
+  useEffect(() => {
+    collectionMountedRef.current = true;
+    return () => {
+      collectionMountedRef.current = false;
+      modalHistoryPushedRef.current = false;
+    };
+  }, []);
   const anyModalOpen = showReceivePaymentModal || showEditReceiptModal;
   useEffect(() => {
     if (anyModalOpen) {
@@ -202,7 +221,10 @@ export const CollectionView: React.FC<Props> = ({ profile }) => {
       };
     } else if (modalHistoryPushedRef.current) {
       modalHistoryPushedRef.current = false;
-      if (window.history.state?.payModalOpen || window.history.state?.modalOpen) {
+      if (
+        collectionMountedRef.current &&
+        (window.history.state?.payModalOpen || window.history.state?.modalOpen)
+      ) {
         window.history.back();
       }
     }
@@ -516,7 +538,10 @@ export const CollectionView: React.FC<Props> = ({ profile }) => {
         notes: remarks.trim(),
         collectedByUid: profile.uid,
         collectedByName: profile.fullName || 'Officer',
-        createdAt: nowIso
+        updatedByUid: profile.uid || '',
+        updatedByName: profile.fullName || 'Officer',
+        createdAt: nowIso,
+        updatedAt: nowIso
       };
 
       const fullEntry = { ...newEntry, id: entryId };
@@ -591,6 +616,7 @@ export const CollectionView: React.FC<Props> = ({ profile }) => {
 
   const handleOpenEditReceipt = (entry: CollectionRecord) => {
     if (!isAdmin(profile)) return;
+    markCollectionViewed(entry.id, getRecordUpdateMs(entry));
     setEditingReceipt(entry);
     setEditAmount(String(entry.amount));
     setEditPaymentMode(entry.paymentMode || 'Cash');
@@ -631,6 +657,8 @@ export const CollectionView: React.FC<Props> = ({ profile }) => {
         bankName: editBankName.trim(),
         date: editDate,
         notes: editRemarks.trim(),
+        updatedByUid: profile.uid || '',
+        updatedByName: profile.fullName || 'Officer',
         updatedAt: nowIso,
       };
       setCollectionsOptimistic((prev) =>
@@ -781,6 +809,17 @@ Blackworm Agritech Pvt. Ltd.`;
         </div>
       )}
 
+      <ModuleUpdateBanner
+        badge={collectionBadge}
+        onMarkAllViewed={() => markAllCollectionsViewed()}
+        onMarkSingleViewed={(rec) => markCollectionViewed(rec.id, rec.updatedAtMs)}
+        onSelectRecord={(rec) => {
+          setActiveTab('receipts');
+          setSearch('');
+          markCollectionViewed(rec.id, rec.updatedAtMs);
+        }}
+      />
+
       {/* Overview Stat Cards - Strictly English */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 no-print">
         <div className="bg-white p-3.5 rounded-xl border border-rose-200 shadow-2xs flex items-center justify-between">
@@ -856,6 +895,11 @@ Blackworm Agritech Pvt. Ltd.`;
           >
             <History className="w-3.5 h-3.5" />
             <span>Payment Receipts ({accessibleCollectionEntries.length})</span>
+            {Boolean(collectionBadge && collectionBadge.count > 0) && (
+              <span className="px-1.5 py-0.5 rounded bg-rose-600 text-white text-[10px] font-black leading-none tabular-nums">
+                {collectionBadge!.count}
+              </span>
+            )}
           </button>
         </div>
 
@@ -1081,8 +1125,16 @@ Blackworm Agritech Pvt. Ltd.`;
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 font-medium">
-                {accessibleCollectionEntries.map((entry, idx) => (
-                  <tr key={entry.id} className="hover:bg-slate-50/80 transition">
+                {accessibleCollectionEntries.map((entry, idx) => {
+                  const unreadMeta = collectionUnreadById.get(entry.id);
+                  return (
+                  <tr
+                    key={entry.id}
+                    className={cn(
+                      'transition',
+                      unreadMeta ? 'bg-amber-50/75 hover:bg-amber-100/70' : 'hover:bg-slate-50/80'
+                    )}
+                  >
                     <td className="p-2.5 text-center font-mono font-bold text-slate-400">
                       {idx + 1}
                     </td>
@@ -1090,7 +1142,12 @@ Blackworm Agritech Pvt. Ltd.`;
                       {entry.date}
                     </td>
                     <td className="p-2.5 font-bold text-slate-900 uppercase">
-                      {entry.dealerName}
+                      <div>{entry.dealerName}</div>
+                      {unreadMeta && (
+                        <div className="text-[10px] font-bold text-amber-800 normal-case mt-0.5">
+                          {unreadMeta.actorName} · {unreadMeta.actionLabel}
+                        </div>
+                      )}
                     </td>
                     <td className="p-2.5">
                       <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-slate-100 text-slate-800 border border-slate-200">
@@ -1111,7 +1168,20 @@ Blackworm Agritech Pvt. Ltd.`;
                       ₹{Number(entry.amount || 0).toLocaleString()}
                     </td>
                     <td className="p-2.5 text-slate-700 font-medium uppercase text-[11px]">
-                      {entry.collectedByName || 'Officer'}
+                      <div className="flex items-center justify-between gap-2">
+                        <span>{entry.collectedByName || 'Officer'}</span>
+                        {unreadMeta && (
+                          <button
+                            type="button"
+                            onClick={() => markCollectionViewed(entry.id, unreadMeta.updatedAtMs)}
+                            className="no-print inline-flex items-center gap-0.5 px-2 py-0.5 rounded-md bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-[10px] font-bold normal-case whitespace-nowrap cursor-pointer"
+                            title="पाहिले (Mark Viewed)"
+                          >
+                            <Check className="w-3 h-3" />
+                            <span>पाहिले</span>
+                          </button>
+                        )}
+                      </div>
                     </td>
                     {isAdmin(profile) && (
                       <td className="p-2.5 no-print">
@@ -1134,7 +1204,8 @@ Blackworm Agritech Pvt. Ltd.`;
                       </td>
                     )}
                   </tr>
-                ))}
+                  );
+                })}
 
                 {accessibleCollectionEntries.length === 0 && (
                   <tr>

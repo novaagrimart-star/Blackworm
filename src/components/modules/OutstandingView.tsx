@@ -10,6 +10,8 @@ import { safeFirestoreSet, safeFirestoreDelete, triggerBlobDownload, getLocalDat
 import { subscribeSecondaryCollection, fetchSecondaryCollection, pushBatchToSecondary } from '../../lib/secondaryDb';
 import { useSharedDealers, useSharedOutstandingRecords } from '../../lib/realtimeStore';
 import { Language } from '../../lib/i18n';
+import { getRecordUpdateMs } from '../../lib/moduleUpdates';
+import { ModuleUpdateBanner, useModuleRecordHighlights } from '../ModuleUpdateBanner';
 import { cn, toTitleCase, openExternalLinkSafely } from '../../lib/utils';
 import { CustomDialogModal } from '../CustomDialogModal';
 import { useBranding } from '../../lib/branding';
@@ -52,7 +54,8 @@ import {
   Users,
   UserPlus,
   Lock,
-  Unlock
+  Unlock,
+  Check
 } from 'lucide-react';
 
 export interface UploadedPdfFile {
@@ -90,6 +93,14 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
   const [summaryModalTab, setSummaryModalTab] = useState<'new' | 'updated'>('new');
   const rawRecords = sharedOutstandingRecords as ExtractedRecord[];
   const setRawRecords = setOutstandingOptimistic as React.Dispatch<React.SetStateAction<ExtractedRecord[]>>;
+  const {
+    badge: outstandingBadge,
+    unreadById: outstandingUnreadById,
+    markViewed: markOutstandingViewed,
+    markAllViewed: markAllOutstandingViewed,
+  } = useModuleRecordHighlights(profile, 'calculator', {
+    outstandingRecords: sharedOutstandingRecords,
+  });
   const [parseError, setParseError] = useState<string>('');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const printableSheetRef = useRef<HTMLDivElement>(null);
@@ -242,7 +253,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
 
     const pullMetaFromSecondary = async () => {
       try {
-        const res = await fetchSecondaryCollection('config', { limit: 50 });
+        const res = await fetchSecondaryCollection('config', { limit: 1000 });
         if (res.ok) {
           const found = res.items.find((it) => it?.id === 'party_master_meta');
           if (found) applyMeta(found);
@@ -464,8 +475,9 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
           statementUpdatedAt: nowIso,
           updatedAt: nowIso,
           updatedBy: profile.fullName || 'Admin',
+          updatedByUid: profile.uid || '',
           _syncUpdatedAtMs: nowMs,
-        } as ExtractedRecord & { _syncUpdatedAtMs?: number; updatedBy?: string }));
+        } as ExtractedRecord & { _syncUpdatedAtMs?: number; updatedBy?: string; updatedByUid?: string }));
 
         setRawRecords(stampedRecords);
         setUploadedFiles(prev => {
@@ -852,6 +864,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
     } catch {}
     setEditingPhoneId(null);
     setTempPhoneInput('');
+    markOutstandingViewed(recordId);
     showToast(`मोबाईल नंबर +91 ${clean10} सेव्ह केला!`);
     return clean10;
   };
@@ -862,6 +875,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
    * Directly triggers WhatsApp with pre-filled bank statement and dynamic outstanding amount!
    */
   const handleAmountClickToSendWhatsApp = (item: MatchedOutstandingItem) => {
+    markOutstandingViewed(item.id, getRecordUpdateMs(item));
     const firm = item.cleanedFirmName || item.rawFirmName;
     const phone = item.contactNumber || phoneOverrides[item.id] || '';
     const clean10 = cleanPhoneNumber(phone);
@@ -887,6 +901,7 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
   // Handle manual phone modal submit
   const handleModalPhoneSubmit = () => {
     if (!missingPhoneModalItem) return;
+    markOutstandingViewed(missingPhoneModalItem.id, getRecordUpdateMs(missingPhoneModalItem));
     const clean10 = savePhoneOverride(missingPhoneModalItem.id, manualPhoneInput);
     if (clean10) {
       const firm = missingPhoneModalItem.cleanedFirmName || missingPhoneModalItem.rawFirmName;
@@ -1172,6 +1187,19 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
       {/* Main Content when Statement Records Exist */}
       {rawRecords.length > 0 && (
         <div className="space-y-3">
+          <ModuleUpdateBanner
+            badge={outstandingBadge}
+            onMarkAllViewed={() => markAllOutstandingViewed()}
+            onMarkSingleViewed={(rec) => markOutstandingViewed(rec.id, rec.updatedAtMs)}
+            onSelectRecord={(rec) => {
+              markOutstandingViewed(rec.id, rec.updatedAtMs);
+              const match = processedRecords.find((r) => r.id === rec.id);
+              if (match?.cleanedFirmName) {
+                setSearchQuery(match.cleanedFirmName);
+              }
+            }}
+          />
+
           {/* Search Bar & Instruction Strip */}
           <div className="bg-white p-2.5 rounded-xl border border-slate-200 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 no-print">
             <div className="relative flex-1 max-w-md">
@@ -1284,11 +1312,15 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
                     filteredRecords.map((item, index) => {
                       const cleanPhone = cleanPhoneNumber(item.contactNumber || phoneOverrides[item.id] || '');
                       const isSent = Boolean(item.whatsappSentAt);
+                      const unreadMeta = outstandingUnreadById.get(item.id);
 
                       return (
                         <tr 
                           key={item.id}
-                          className="group transition-colors hover:bg-amber-50/50"
+                          className={cn(
+                            'group transition-colors',
+                            unreadMeta ? 'bg-amber-50/75 hover:bg-amber-100/70' : 'hover:bg-amber-50/50'
+                          )}
                         >
                           {/* ============================================================== */}
                           {/* COLUMN 1: डीलरचे नाव (Dealer / Firm Name)                     */}
@@ -1309,17 +1341,35 @@ export const OutstandingView: React.FC<Props> = ({ profile }) => {
                                     </span>
                                   )}
                                 </div>
+                                <div className="flex items-center gap-1 shrink-0 no-print">
+                                  {unreadMeta && (
+                                    <button
+                                      type="button"
+                                      onClick={() => markOutstandingViewed(item.id, unreadMeta.updatedAtMs)}
+                                      className="inline-flex items-center gap-0.5 px-2 py-0.5 rounded-md bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-[10px] font-bold whitespace-nowrap cursor-pointer"
+                                      title="पाहिले (Mark Viewed)"
+                                    >
+                                      <Check className="w-3 h-3" />
+                                      <span>पाहिले</span>
+                                    </button>
+                                  )}
                                   {isUserAdmin && (
                                     <button
                                       type="button"
                                       onClick={() => handleDeleteRecord(item.id, item.cleanedFirmName)}
-                                      className="no-print opacity-0 group-hover:opacity-100 p-1 text-slate-300 hover:text-rose-600 transition cursor-pointer"
+                                      className="opacity-0 group-hover:opacity-100 p-1 text-slate-300 hover:text-rose-600 transition cursor-pointer"
                                       title="ही नोंद काढून टाका"
                                     >
                                       <Trash2 className="w-3 h-3" />
                                     </button>
                                   )}
+                                </div>
                               </div>
+                              {unreadMeta && (
+                                <div className="text-[10px] font-bold text-amber-800">
+                                  {unreadMeta.actorName} · {unreadMeta.actionLabel}
+                                </div>
+                              )}
                             </div>
                           </td>
 

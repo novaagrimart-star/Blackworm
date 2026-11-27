@@ -31,6 +31,14 @@ import {
   broadcastLocalMutation,
   SecondarySyncStatus,
 } from './secondaryDb';
+import {
+  SHEETS_FAILOVER_COLLECTIONS,
+  SHEETS_LAST_SYNC_MS_KEY,
+  isSheetsFailoverConfigured,
+  pushRecordToSheetsFailover,
+  pushBatchToSheetsFailover,
+  pullUpdatesFromSheetsFailover,
+} from './sheetsFailover';
 
 export interface AuditLogItem {
   id: string;
@@ -651,7 +659,10 @@ function isQuotaErrorMsg(rawMsg: string): boolean {
   return (
     lower.includes('quota') ||
     lower.includes('resource_exhausted') ||
-    lower.includes('resource-exhausted')
+    lower.includes('resource-exhausted') ||
+    lower.includes('429') ||
+    lower.includes('too many requests') ||
+    lower.includes('daily limit')
   );
 }
 
@@ -719,11 +730,13 @@ export async function safeFirestoreDelete(
     broadcastLocalMutation(delDetail);
   }
 
+  const shouldMirrorSheets = isSheetsFailoverConfigured() && SHEETS_FAILOVER_COLLECTIONS.has(colName);
   const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
   if (isCurrentlyOffline) {
     setPendingSyncItem(colName, docId, archivePayload, { merge: true }, {
       needsFirebase: true,
       needsSecondary: true,
+      needsSheets: shouldMirrorSheets,
       deleted: true,
     });
     return { success: true };
@@ -731,6 +744,7 @@ export async function safeFirestoreDelete(
 
   let needsFirebase = true;
   let needsSecondary = true;
+  let needsSheets = shouldMirrorSheets && (isQuotaBlocked() || isWriteQuotaBlocked());
   let lastErrMsg = '';
   let timedOut = false;
 
@@ -747,7 +761,10 @@ export async function safeFirestoreDelete(
     } catch (err: any) {
       const msg = err instanceof Error ? err.message : String(err);
       lastErrMsg = msg;
-      if (isQuotaErrorMsg(msg)) setWriteQuotaBlocked(2 * 60 * 1000);
+      if (isQuotaErrorMsg(msg)) {
+        setWriteQuotaBlocked(2 * 60 * 1000);
+        if (shouldMirrorSheets) needsSheets = true;
+      }
     }
   };
 
@@ -774,6 +791,19 @@ export async function safeFirestoreDelete(
     secondaryTask(),
   ]);
 
+  if (needsSheets) {
+    const shRes = await pushRecordToSheetsFailover({
+      collection: colName,
+      id: docId,
+      doc: archivePayload,
+      updatedAtMs: nowMs,
+      deleted: true,
+    });
+    if (shRes.ok) {
+      needsSheets = false;
+    }
+  }
+
   if (needsFirebase && !needsSecondary && !isWriteQuotaBlocked()) {
     void pushToSecondary({
       collection: colName,
@@ -785,10 +815,11 @@ export async function safeFirestoreDelete(
     });
   }
 
-  if (needsFirebase || needsSecondary) {
+  if (needsFirebase || needsSecondary || needsSheets) {
     setPendingSyncItem(colName, docId, archivePayload, { merge: true }, {
       needsFirebase,
       needsSecondary,
+      needsSheets,
       deleted: true,
     });
   }
@@ -835,17 +866,20 @@ export async function safeFirestoreSet<T extends Record<string, any>>(
   // 1. Immediate Local Vault save
   writeLocalCollectionRecord(colName, docId, cleanData, options.merge !== false, true);
 
+  const shouldMirrorSheets = isSheetsFailoverConfigured() && SHEETS_FAILOVER_COLLECTIONS.has(colName);
   const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
   if (isCurrentlyOffline) {
     setPendingSyncItem(colName, docId, cleanData, { merge: options.merge !== false }, {
       needsFirebase: true,
       needsSecondary: true,
+      needsSheets: shouldMirrorSheets,
     });
     return { success: true, isCachedLocally: true, syncedTier: 'local' };
   }
 
   let needsFirebase = true;
   let needsSecondary = true;
+  let needsSheets = shouldMirrorSheets && (isQuotaBlocked() || isWriteQuotaBlocked());
   let firebaseError = '';
   let timedOut = false;
 
@@ -863,6 +897,7 @@ export async function safeFirestoreSet<T extends Record<string, any>>(
       firebaseError = rawMsg;
       if (isQuotaErrorMsg(rawMsg)) {
         setWriteQuotaBlocked(2 * 60 * 1000);
+        if (shouldMirrorSheets) needsSheets = true;
         return;
       }
       console.warn(`Primary write notice (${colName}/${docId}):`, rawMsg);
@@ -892,6 +927,19 @@ export async function safeFirestoreSet<T extends Record<string, any>>(
     writeSecondary(),
   ]);
 
+  if (needsSheets) {
+    const shRes = await pushRecordToSheetsFailover({
+      collection: colName,
+      id: docId,
+      doc: cleanData,
+      updatedAtMs: resolvedSyncMs,
+      deleted: Boolean(cleanData.isArchived),
+    });
+    if (shRes.ok) {
+      needsSheets = false;
+    }
+  }
+
   if (needsFirebase && !needsSecondary && !isWriteQuotaBlocked()) {
     void pushToSecondary({
       collection: colName,
@@ -903,10 +951,11 @@ export async function safeFirestoreSet<T extends Record<string, any>>(
     });
   }
 
-  if (needsFirebase || needsSecondary) {
+  if (needsFirebase || needsSecondary || needsSheets) {
     setPendingSyncItem(colName, docId, cleanData, { merge: options.merge !== false }, {
       needsFirebase,
       needsSecondary,
+      needsSheets,
       deleted: Boolean(cleanData.isArchived),
     });
   } else {
@@ -952,7 +1001,7 @@ function setPendingSyncItem(
   docId: string,
   data: any,
   options: any,
-  flags: { needsFirebase?: boolean; needsSecondary?: boolean; deleted?: boolean } = {}
+  flags: { needsFirebase?: boolean; needsSecondary?: boolean; needsSheets?: boolean; deleted?: boolean } = {}
 ) {
   try {
     if (typeof window === 'undefined') return;
@@ -963,8 +1012,9 @@ function setPendingSyncItem(
 
     const needsFirebase = flags.needsFirebase !== undefined ? flags.needsFirebase : true;
     const needsSecondary = flags.needsSecondary !== undefined ? flags.needsSecondary : true;
+    const needsSheets = flags.needsSheets === true;
 
-    if (!needsFirebase && !needsSecondary) {
+    if (!needsFirebase && !needsSecondary && !needsSheets) {
       if (idx >= 0) {
         queue.splice(idx, 1);
         persistPendingQueue(queue);
@@ -980,6 +1030,7 @@ function setPendingSyncItem(
       timestamp: Date.now(),
       needsFirebase,
       needsSecondary,
+      needsSheets,
       deleted: Boolean(flags.deleted || isRecordDeleted(data)),
     };
 
@@ -1059,6 +1110,7 @@ export async function startBackgroundSync() {
 
         let needsFb = item.needsFirebase !== false;
         let needsSec = item.needsSecondary !== false;
+        let needsSh = Boolean(item.needsSheets);
         let dropItem = false;
 
         // 1. Primary (Firebase) replay
@@ -1074,6 +1126,9 @@ export async function startBackgroundSync() {
             const lower = rawMsg.toLowerCase();
             if (isQuotaErrorMsg(rawMsg)) {
               setWriteQuotaBlocked(2 * 60 * 1000);
+              if (isSheetsFailoverConfigured() && SHEETS_FAILOVER_COLLECTIONS.has(item.collection)) {
+                needsSh = true;
+              }
             } else if (
               lower.includes('invalid-argument') ||
               lower.includes('unsupported field value') ||
@@ -1100,13 +1155,31 @@ export async function startBackgroundSync() {
           }
         }
 
-        if (!dropItem && (needsFb || needsSec)) {
+        // 3. Free Google Sheets Failover replay (when quota blocked or flagged)
+        if (
+          !dropItem &&
+          (needsSh || (needsFb && isWriteQuotaBlocked() && isSheetsFailoverConfigured() && SHEETS_FAILOVER_COLLECTIONS.has(item.collection)))
+        ) {
+          const shRes = await pushRecordToSheetsFailover({
+            collection: item.collection,
+            id: item.id,
+            doc: stripUndefined(item.data || {}),
+            updatedAtMs: item.data?._syncUpdatedAtMs || item.timestamp || Date.now(),
+            deleted: Boolean(item.deleted || isRecordDeleted(item.data)),
+          });
+          if (shRes.ok) {
+            needsSh = false;
+          }
+        }
+
+        if (!dropItem && (needsFb || needsSec || needsSh)) {
           remaining.push({
             ...item,
             needsFirebase: needsFb,
             needsSecondary: needsSec,
+            needsSheets: needsSh,
           });
-        } else if (!needsFb && !needsSec) {
+        } else if (!needsFb && !needsSec && !needsSh) {
           clearLocalSavedMarker(item.collection, item.id);
         }
       }
@@ -1166,17 +1239,20 @@ export async function safeFirestoreUpdate(
 
   writeLocalCollectionRecord(colName, docId, cleanData, true, true);
 
+  const shouldMirrorSheets = isSheetsFailoverConfigured() && SHEETS_FAILOVER_COLLECTIONS.has(colName);
   const isCurrentlyOffline = typeof navigator !== 'undefined' && !navigator.onLine;
   if (isCurrentlyOffline) {
     setPendingSyncItem(colName, docId, cleanData, { merge: true }, {
       needsFirebase: true,
       needsSecondary: true,
+      needsSheets: shouldMirrorSheets,
     });
     return { success: true, isCachedLocally: true };
   }
 
   let needsFirebase = true;
   let needsSecondary = true;
+  let needsSheets = shouldMirrorSheets && (isQuotaBlocked() || isWriteQuotaBlocked());
   let firebaseError = '';
   let timedOut = false;
 
@@ -1194,6 +1270,7 @@ export async function safeFirestoreUpdate(
       firebaseError = rawMsg;
       if (isQuotaErrorMsg(rawMsg)) {
         setWriteQuotaBlocked(2 * 60 * 1000);
+        if (shouldMirrorSheets) needsSheets = true;
         return;
       }
       const lower = rawMsg.toLowerCase();
@@ -1234,6 +1311,19 @@ export async function safeFirestoreUpdate(
     updateSecondary(),
   ]);
 
+  if (needsSheets) {
+    const shRes = await pushRecordToSheetsFailover({
+      collection: colName,
+      id: docId,
+      doc: cleanData,
+      updatedAtMs: nowMs,
+      deleted: Boolean(cleanData.isArchived),
+    });
+    if (shRes.ok) {
+      needsSheets = false;
+    }
+  }
+
   if (needsFirebase && !needsSecondary && !isWriteQuotaBlocked()) {
     void pushToSecondary({
       collection: colName,
@@ -1244,10 +1334,11 @@ export async function safeFirestoreUpdate(
     });
   }
 
-  if (needsFirebase || needsSecondary) {
+  if (needsFirebase || needsSecondary || needsSheets) {
     setPendingSyncItem(colName, docId, cleanData, { merge: true }, {
       needsFirebase,
       needsSecondary,
+      needsSheets,
     });
   } else {
     removeFromPendingSync(colName, docId);
@@ -1866,9 +1957,46 @@ export function deduplicateDealers<T = any>(dealers: T[]): T[] {
   return Array.from(map.values()) as unknown as T[];
 }
 
+export function deriveOrderCreatedAt(data: any): string {
+  if (data?.createdAt && toTimestampMs(data.createdAt) > 0) {
+    return String(data.createdAt);
+  }
+  const idStr = String(data?.id || '').trim();
+  const idMatch = idStr.match(/^order_(\d{13})$/);
+  if (idMatch) {
+    const ms = Number(idMatch[1]);
+    if (ms > 1_500_000_000_000 && ms < 2_500_000_000_000) {
+      return new Date(ms).toISOString();
+    }
+  }
+  if (data?.approvedAt && toTimestampMs(data.approvedAt) > 0) return String(data.approvedAt);
+  if (data?.updatedAt && toTimestampMs(data.updatedAt) > 0) return String(data.updatedAt);
+  return new Date().toISOString();
+}
+
+export function mergeOrderBaseFields<T extends Record<string, any>>(older: T, newer: T): T {
+  if (!older || typeof older !== 'object') return newer;
+  if (!newer || typeof newer !== 'object') return older;
+  return {
+    ...older,
+    ...newer,
+    orderNumber: newer.orderNumber || older.orderNumber,
+    createdAt: newer.createdAt || older.createdAt,
+    userId: newer.userId || older.userId,
+    ownerId: newer.ownerId || older.ownerId,
+    createdByUid: newer.createdByUid || older.createdByUid,
+    created_by_user_id: newer.created_by_user_id || older.created_by_user_id,
+    createdByName: newer.createdByName || older.createdByName,
+    created_by_name: newer.created_by_name || older.created_by_name,
+    loginId: newer.loginId || older.loginId,
+    userCode: newer.userCode || older.userCode,
+  };
+}
+
 /**
- * Deduplicates orders so no order is duplicated.
- * Matches by exact ID and non-empty orderNumber, always keeping the most recently updated version.
+ * Deduplicates orders so no order is duplicated or accidentally collapsed.
+ * Matches by exact ID, or by orderNumber ONLY when dealer matches (or one doc is temp_).
+ * Preserves immutable creator/orderNumber/createdAt metadata across partial updates.
  */
 export function deduplicateOrders<T = any>(orders: T[]): T[] {
   if (!orders || !Array.isArray(orders) || orders.length === 0) return [];
@@ -1879,23 +2007,49 @@ export function deduplicateOrders<T = any>(orders: T[]): T[] {
     if (!o) return;
     const docId = String(o.id || '').trim();
     const orderNum = String(o.orderNumber || '').trim().toUpperCase();
+    const dealerSig = String(o.dealerId || o.dealerName || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const orderNumComposite = orderNum && dealerSig ? `${orderNum}::${dealerSig}` : '';
 
-    const mappedKey = (orderNum && orderNumToKey.get(orderNum)) || (docId ? `id_${docId}` : `idx_${idx}`);
+    let mappedKey = docId ? `id_${docId}` : `idx_${idx}`;
+    if (!byKey.has(mappedKey)) {
+      const candidateKey =
+        (orderNumComposite && orderNumToKey.get(orderNumComposite)) ||
+        (orderNum && orderNumToKey.get(orderNum));
+      if (candidateKey) {
+        const candidateDoc = byKey.get(candidateKey);
+        const candId = String(candidateDoc?.id || '').trim();
+        const candDealer = String(candidateDoc?.dealerId || candidateDoc?.dealerName || '')
+          .trim()
+          .toLowerCase()
+          .replace(/\s+/g, ' ');
+        const isSameDocOrTemp =
+          (docId && candId && docId === candId) ||
+          docId.startsWith('temp_') ||
+          candId.startsWith('temp_');
+        const isSameDealer = !dealerSig || !candDealer || dealerSig === candDealer;
+        if (isSameDocOrTemp || isSameDealer) {
+          mappedKey = candidateKey;
+        }
+      }
+    }
+
     const existing = byKey.get(mappedKey);
-
     if (!existing) {
       byKey.set(mappedKey, o);
-      if (orderNum) orderNumToKey.set(orderNum, mappedKey);
+      if (orderNumComposite) orderNumToKey.set(orderNumComposite, mappedKey);
+      if (orderNum && !orderNumToKey.has(orderNum)) orderNumToKey.set(orderNum, mappedKey);
     } else {
       const existingTs = toTimestampMs(existing._syncUpdatedAtMs || existing.updatedAt || existing.createdAt);
       const incomingTs = toTimestampMs(o._syncUpdatedAtMs || o.updatedAt || o.createdAt);
       const preferIncomingId = existing.id?.startsWith('temp_') && o.id && !String(o.id).startsWith('temp_');
       if (incomingTs >= existingTs || preferIncomingId) {
+        const merged = mergeOrderBaseFields(existing, o);
         byKey.set(mappedKey, {
-          ...existing,
-          ...o,
+          ...merged,
           id: preferIncomingId ? o.id : (o.id || existing.id),
         });
+      } else {
+        byKey.set(mappedKey, mergeOrderBaseFields(o, existing));
       }
     }
   });
@@ -2050,7 +2204,14 @@ export function mergeWithLocalData<T extends { id: string }>(
           );
           const serverTime = toTimestampMs(serverItem._syncUpdatedAtMs || serverItem.updatedAt || serverItem.createdAt);
           if (localTime > serverTime) {
-            mergedMap.set(id, { ...serverItem, ...localDoc });
+            mergedMap.set(
+              id,
+              colName === 'orders'
+                ? mergeOrderBaseFields(serverItem, localDoc)
+                : { ...serverItem, ...localDoc }
+            );
+          } else if (colName === 'orders') {
+            mergedMap.set(id, mergeOrderBaseFields(localDoc, serverItem));
           }
         }
       } else if (
@@ -2138,9 +2299,18 @@ export async function forceMultiTierSyncAll(clearQuotaCooldown = false): Promise
   const hydratedCount = secondaryReachable
     ? await withBudget(autoHydrateServerFromLocalCache(true), 4500, 0)
     : 0;
-  const deltasPulled = secondaryReachable
+  let deltasPulled = secondaryReachable
     ? await withBudget(pullSecondaryChanges(true), 6000, 0)
     : 0;
+
+  if (isSheetsFailoverConfigured() && (isQuotaBlocked() || !firebaseReachable || clearQuotaCooldown)) {
+    const shRes = await withBudget(syncWithSheetsFailover({ pushLocal: false, pullRemote: true }), 8000, {
+      ok: false,
+      pushed: 0,
+      pulled: 0,
+    });
+    deltasPulled += shRes.pulled || 0;
+  }
 
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('blackworm_secondary_resync', { detail: { reason: 'force_sync' } }));
@@ -2153,6 +2323,94 @@ export async function forceMultiTierSyncAll(clearQuotaCooldown = false): Promise
     secondaryReachable,
     firebaseReachable,
   };
+}
+
+/**
+ * Synchronizes critical business records with Google Sheets Failover API non-destructively (LWW upsert).
+ */
+export async function syncWithSheetsFailover(
+  options: { pushLocal?: boolean; pullRemote?: boolean } = { pushLocal: true, pullRemote: true }
+): Promise<{ ok: boolean; pushed: number; pulled: number; error?: string }> {
+  if (typeof window === 'undefined' || !isSheetsFailoverConfigured()) {
+    return { ok: false, pushed: 0, pulled: 0, error: 'Google Sheets Failover सेट केलेले नाही.' };
+  }
+  let pushed = 0;
+  let pulled = 0;
+
+  try {
+    if (options.pushLocal) {
+      const itemsToPush: Array<{
+        collection: string;
+        id: string;
+        doc: Record<string, any>;
+        updatedAtMs: number;
+        deleted: boolean;
+      }> = [];
+      SHEETS_FAILOVER_COLLECTIONS.forEach((colName) => {
+        try {
+          const raw = localStorage.getItem(`blackworm_local_${colName}`);
+          if (!raw) return;
+          const map = JSON.parse(raw);
+          if (!map || typeof map !== 'object' || Array.isArray(map)) return;
+          Object.entries(map).forEach(([id, docVal]: [string, any]) => {
+            if (!id || !docVal || typeof docVal !== 'object' || id.startsWith('temp_')) return;
+            const ts = toTimestampMs(docVal._syncUpdatedAtMs || docVal.updatedAt || docVal.createdAt) || Date.now();
+            itemsToPush.push({
+              collection: colName,
+              id,
+              doc: docVal,
+              updatedAtMs: ts,
+              deleted: Boolean(isRecordDeleted(docVal)),
+            });
+          });
+        } catch {}
+      });
+
+      for (let i = 0; i < itemsToPush.length; i += 120) {
+        const chunk = itemsToPush.slice(i, i + 120);
+        const res = await pushBatchToSheetsFailover(chunk);
+        if (res.ok) pushed += res.written;
+      }
+    }
+
+    if (options.pullRemote) {
+      const sinceMs = Number(localStorage.getItem(SHEETS_LAST_SYNC_MS_KEY) || '0') || 0;
+      const pullRes = await pullUpdatesFromSheetsFailover(sinceMs > 0 ? Math.max(0, sinceMs - 60000) : 0);
+      if (pullRes.ok && pullRes.rows.length > 0) {
+        const byCol = new Map<string, any[]>();
+        const batchForSec: any[] = [];
+        pullRes.rows.forEach((r) => {
+          const arr = byCol.get(r.collection) || [];
+          arr.push({
+            ...r.doc,
+            id: r.id,
+            ...(r.updatedAtMs ? { _syncUpdatedAtMs: r.updatedAtMs } : {}),
+            ...(r.deleted ? { isArchived: true } : {}),
+          });
+          byCol.set(r.collection, arr);
+          batchForSec.push({
+            collection: r.collection,
+            id: r.id,
+            doc: r.doc,
+            updatedAtMs: r.updatedAtMs || Date.now(),
+            deleted: Boolean(r.deleted),
+            merge: true,
+          });
+        });
+        byCol.forEach((items, col) => updateCollectionCache(col, items));
+        if (batchForSec.length > 0 && !isSecondaryBlocked()) {
+          await pushBatchToSecondary(batchForSec.slice(0, 400));
+        }
+        pulled = pullRes.rows.length;
+      } else if (!pullRes.ok && pullRes.error) {
+        return { ok: false, pushed, pulled, error: pullRes.error };
+      }
+    }
+
+    return { ok: true, pushed, pulled };
+  } catch (err: any) {
+    return { ok: false, pushed, pulled, error: err?.message || 'Sheets sync failed' };
+  }
 }
 
 /**

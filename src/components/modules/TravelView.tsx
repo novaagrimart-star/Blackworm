@@ -5,6 +5,8 @@ import { loadCollectionFromVault } from '../../lib/localVault';
 import { isRecordDeleted, isTravelRowPopulated, mergeTravelSheetDocs } from '../../lib/travelMerge';
 import { useSharedUsers, useSharedTravelSheets } from '../../lib/realtimeStore';
 import { Language, translations } from '../../lib/i18n';
+import { getRecordUpdateMs } from '../../lib/moduleUpdates';
+import { ModuleUpdateBanner, useModuleRecordHighlights } from '../ModuleUpdateBanner';
 import { cn } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
 import jsPDF from 'jspdf';
@@ -22,7 +24,8 @@ import {
   Phone,
   Mail,
   X,
-  Calendar
+  Calendar,
+  Check
 } from 'lucide-react';
 
 export interface TravelRow {
@@ -177,6 +180,13 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const userIsAdmin = isAdmin(profile);
   const { fieldOfficers: users } = useSharedUsers();
   const { travelSheets: sharedTravelSheets, loaded: sharedTravelLoaded, setTravelSheetsOptimistic } = useSharedTravelSheets();
+  const {
+    badge: travelBadge,
+    unreadRecords: travelUnreadRecords,
+    unreadById: travelUnreadById,
+    markViewed: markTravelViewed,
+    markAllViewed: markAllTravelViewed,
+  } = useModuleRecordHighlights(profile, 'travel', { travelSheets: sharedTravelSheets });
   const usersRef = useRef<UserProfile[]>(users);
   usersRef.current = users;
   const [selectedUserId, setSelectedUserId] = useState<string>(() => {
@@ -366,6 +376,8 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
       ...targetSheet,
       isArchived: false,
       is_deleted: false,
+      updatedByUid: profile.uid || '',
+      updatedByName: profile.fullName || profile.loginId || '',
       updatedAt: saveIso,
       _syncUpdatedAtMs: saveTs,
     } as any;
@@ -939,6 +951,7 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
   const handleSave = async () => {
     const currentSheet = latestSheetRef.current || sheet;
     if (!currentSheet || saving) return;
+    markTravelViewed(currentSheet.id, getRecordUpdateMs(currentSheet));
     setSaving(true);
     try {
       await persistTravelSheet(currentSheet, {
@@ -1131,8 +1144,38 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
     );
   }
 
+  const activeSheetUnread = sheet?.id ? travelUnreadById.get(sheet.id) : undefined;
+
   return (
     <div className="space-y-4 font-sans pb-12">
+      <ModuleUpdateBanner
+        badge={travelBadge}
+        onMarkAllViewed={() => markAllTravelViewed()}
+        onMarkSingleViewed={(rec) => markTravelViewed(rec.id, rec.updatedAtMs)}
+        onSelectRecord={(rec) => {
+          markTravelViewed(rec.id, rec.updatedAtMs);
+          const match = sharedTravelSheets.find((s: any) => s && (s.id === rec.id || s._id === rec.id));
+          if (match) {
+            if (match.userId && userIsAdmin) {
+              setSelectedUserId(String(match.userId));
+            }
+            if (match.yearNumber && match.monthName) {
+              const mIdx = monthNames.findIndex((m) => m.toLowerCase() === String(match.monthName).toLowerCase());
+              if (mIdx >= 0) {
+                setSelectedDate(`${match.yearNumber}-${String(mIdx + 1).padStart(2, '0')}-01`);
+              }
+            } else if (typeof match.id === 'string') {
+              const parts = match.id.split('_');
+              const yr = parts[parts.length - 2];
+              const mo = parts[parts.length - 1];
+              if (/^\d{4}$/.test(yr) && /^\d{2}$/.test(mo)) {
+                setSelectedDate(`${yr}-${mo}-01`);
+              }
+            }
+          }
+        }}
+      />
+
       {/* Top Action Toolbar */}
       <div className="bg-white p-2.5 sm:p-3 rounded-2xl border border-slate-200 shadow-md flex flex-wrap items-center justify-between gap-2.5 no-print">
         
@@ -1180,7 +1223,12 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                     </div>
 
                     <div className="max-h-64 sm:max-h-80 overflow-y-auto p-1.5 divide-y divide-slate-100">
-                      {users.map((u) => (
+                      {users.map((u) => {
+                        const officerUnreadSheets = travelUnreadRecords.filter((rec) => {
+                          const sMatch = sharedTravelSheets.find((s: any) => s && (s.id === rec.id || s._id === rec.id));
+                          return sMatch?.userId === u.uid || rec.id.startsWith(`travel_${u.uid}_`);
+                        });
+                        return (
                         <div
                           key={u.uid}
                           onClick={() => {
@@ -1191,7 +1239,9 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                             "p-2.5 px-3 rounded-xl cursor-pointer transition flex items-center justify-between gap-3 text-xs sm:text-sm",
                             selectedUserId === u.uid 
                               ? "bg-blue-50 text-blue-900 font-bold border border-blue-200" 
-                              : "hover:bg-slate-50 text-slate-800 font-medium"
+                              : officerUnreadSheets.length > 0
+                                ? "bg-amber-50/60 hover:bg-amber-100/60 text-slate-900 font-semibold border border-amber-200"
+                                : "hover:bg-slate-50 text-slate-800 font-medium"
                           )}
                         >
                           <div className="min-w-0 flex-1">
@@ -1200,8 +1250,14 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
                               {u.designation || u.role || 'FIELD OFFICER'}
                             </p>
                           </div>
+                          {officerUnreadSheets.length > 0 && (
+                            <span className="px-2 py-0.5 rounded bg-amber-100 border border-amber-300 text-amber-900 text-[10px] font-black whitespace-nowrap shrink-0">
+                              {officerUnreadSheets.length} अपडेट
+                            </span>
+                          )}
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 </>
@@ -1243,6 +1299,17 @@ export const TravelView: React.FC<Props> = ({ profile, lang }) => {
 
           {/* Action Buttons: Compact Save & PDF to fit on mobile alongside date selector */}
           <div className="flex items-center gap-1.5 shrink-0">
+            {activeSheetUnread && (
+              <button
+                type="button"
+                onClick={() => markTravelViewed(activeSheetUnread.id, activeSheetUnread.updatedAtMs)}
+                className="bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 px-2.5 py-1 rounded-lg text-xs font-bold transition flex items-center gap-1 cursor-pointer whitespace-nowrap"
+                title={`${activeSheetUnread.actorName} · ${activeSheetUnread.actionLabel}`}
+              >
+                <Check className="w-3 h-3 text-emerald-700" />
+                <span>पाहिले</span>
+              </button>
+            )}
             <button 
               type="button"
               onClick={handleSave}

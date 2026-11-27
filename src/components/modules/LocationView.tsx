@@ -1,24 +1,22 @@
 import React, { useState, useMemo, useEffect } from 'react';
 import {
   MapPin,
-  Search,
   Plus,
-  Users,
   Phone,
-  ChevronRight,
   X,
   CheckCircle2,
   Trash2,
-  Layers,
-  Filter,
   Loader2,
   Save,
   Edit3,
   Store,
   UserCheck,
+  Check,
 } from 'lucide-react';
 import { UserProfile, isAdmin, isUserRecord } from '../../lib/auth';
 import { Language } from '../../lib/i18n';
+import { getRecordUpdateMs } from '../../lib/moduleUpdates';
+import { useModuleRecordHighlights } from '../ModuleUpdateBanner';
 import { toTitleCase } from '../../lib/utils';
 import { safeFirestoreSet, safeFirestoreDelete, logAudit } from '../../lib/dataService';
 import {
@@ -44,12 +42,8 @@ import {
   resolveStateFromDistrict,
 } from '../../lib/maharashtraLocations';
 import {
-  OfficialLgdVillage,
   findOfficialLgdVillageSync,
-  getOfficialDistrictVillageCountSync,
-  getOfficialTalukaVillageCountSync,
   getOfficialVillagesByTalukaSync,
-  getOfficialVillagesFilteredSync,
   isLgdStateCachedInMemory,
   loadLgdStateVillages,
 } from '../../lib/lgdCache';
@@ -77,8 +71,6 @@ interface VillageRow {
   dealers: LocationDealerItem[];
 }
 
-const PAGE_STEP = 60;
-
 const LOCATION_DEALER_CATEGORIES = [
   'Agro Center',
   'Fertilizer & Pesticide',
@@ -94,6 +86,27 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
   const { locationVillages } = useSharedLocationVillages();
   const { locationTalukas } = useSharedLocationTalukas();
   const { usersMap } = useSharedUsers();
+
+  const {
+    unreadRecords: locationUnreadRecords,
+    unreadById: locationUnreadById,
+    markViewed: markLocationViewed,
+    markManyViewed: markManyLocationViewed,
+  } = useModuleRecordHighlights(profile, 'location', {
+    locationDealers: rawLocationDealers,
+    locationVillages,
+    locationTalukas,
+  });
+
+  // Auto-mark background taluka/village directory items viewed so Location Master never leaves un-clearable ghost badges
+  useEffect(() => {
+    const metaUnread = locationUnreadRecords
+      .filter((r) => r.subType === 'village' || r.subType === 'taluka')
+      .map((r) => ({ id: r.id, ts: r.updatedAtMs }));
+    if (metaUnread.length > 0) {
+      markManyLocationViewed(metaUnread);
+    }
+  }, [locationUnreadRecords, markManyLocationViewed]);
 
   const userIsAdmin = isAdmin(profile);
 
@@ -111,14 +124,12 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
     [rawLocationDealers, userIsAdmin, profile]
   );
 
-  // Selected state starts unselected ('') so summary buttons appear only after Maharashtra, Karnataka, or All is chosen
+  // Clean cascading dropdown selection states: State -> District -> Taluka -> Village -> Dealer
   const [selectedState, setSelectedState] = useState<string>('');
-  const [selectedDistrict, setSelectedDistrict] = useState<string>('all');
-  const [selectedTaluka, setSelectedTaluka] = useState<string>('all');
-  const [searchQuery, setSearchQuery] = useState<string>('');
-  const [onlyWithDealers, setOnlyWithDealers] = useState<boolean>(false);
-  const [viewFocus, setViewFocus] = useState<'overview' | 'villages' | 'dealers'>('overview');
-  const [visibleLimit, setVisibleLimit] = useState<number>(PAGE_STEP);
+  const [selectedDistrict, setSelectedDistrict] = useState<string>('');
+  const [selectedTaluka, setSelectedTaluka] = useState<string>('');
+  const [selectedVillage, setSelectedVillage] = useState<string>('');
+  const [selectedDealerId, setSelectedDealerId] = useState<string>('');
 
   // Background village directory cache load state
   const [lgdRevision, setLgdRevision] = useState<number>(0);
@@ -177,12 +188,8 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
     };
   }, []);
 
-  useEffect(() => {
-    setVisibleLimit(PAGE_STEP);
-  }, [selectedState, selectedDistrict, selectedTaluka, searchQuery, onlyWithDealers, viewFocus]);
-
   const selectedStateMeta = useMemo(
-    () => (!selectedState || selectedState === 'all' ? undefined : getStateMeta(selectedState)),
+    () => (!selectedState ? undefined : getStateMeta(selectedState)),
     [selectedState]
   );
 
@@ -190,9 +197,6 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
   const dealerMappingIndex = useMemo(() => {
     const dealersByVillageKey = new Map<string, LocationDealerItem[]>();
     const unmappedBuckets = new Map<string, VillageRow>();
-    const dealerCountByStateCode = new Map<string, number>();
-    const dealerCountByDistrictKey = new Map<string, number>();
-    const dealerCountByTalukaKey = new Map<string, number>();
 
     const addDealerToKey = (key: string, d: LocationDealerItem) => {
       const arr = dealersByVillageKey.get(key);
@@ -232,12 +236,6 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
         canonicalizeTalukaName(dName, d.taluka || '', stName) ||
         String(d.taluka || '').trim() ||
         'Other';
-
-      dealerCountByStateCode.set(stCode, (dealerCountByStateCode.get(stCode) || 0) + 1);
-      const distMetricKey = `${stCode}|${normalizeLocationKey(dName)}`;
-      dealerCountByDistrictKey.set(distMetricKey, (dealerCountByDistrictKey.get(distMetricKey) || 0) + 1);
-      const talMetricKey = `${distMetricKey}|${normalizeLocationKey(resolvedTalukaName)}`;
-      dealerCountByTalukaKey.set(talMetricKey, (dealerCountByTalukaKey.get(talMetricKey) || 0) + 1);
 
       const officialHit = findOfficialLgdVillageSync({
         stateCode: stMeta?.code,
@@ -281,9 +279,6 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
     return {
       dealersByVillageKey,
       unmappedBuckets: Array.from(unmappedBuckets.values()),
-      dealerCountByStateCode,
-      dealerCountByDistrictKey,
-      dealerCountByTalukaKey,
     };
   }, [locationDealers, lgdRevision]);
 
@@ -332,64 +327,36 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
     return Array.from(seen.values());
   }, [locationVillages, dealerMappingIndex, lgdRevision]);
 
-  // District summaries for selected State (or All)
-  const districtSummaries = useMemo(() => {
+  // Step 2: Districts for selected State
+  const districtOptions = useMemo(() => {
     if (!selectedState) return [];
-    const baseDistricts = getDistrictsForState(selectedState === 'all' ? 'all' : selectedState);
-    return baseDistricts.map((d) => {
-      const distMetricKey = `${d.stateCode}|${normalizeLocationKey(d.name)}`;
-      const officialVillagesCount = getOfficialDistrictVillageCountSync(d.stateCode, d.code);
-      const customCount = customVillageRows.filter(
-        (cv) => cv.stateCode === d.stateCode && normalizeLocationKey(cv.district) === normalizeLocationKey(d.name)
-      ).length;
-      const officialTalukas = getTalukaMetasForDistrict(d.code, d.stateCode);
-      const customTals = locationTalukas.filter(
-        (lt) => !lt.isArchived && normalizeLocationKey(lt.district) === normalizeLocationKey(d.name)
-      );
-      return {
-        code: d.code,
-        stateCode: d.stateCode,
-        stateName: d.stateName,
-        district: d.name,
-        label: getDistrictDisplayLabel(d.name),
-        totalTalukas: officialTalukas.length + customTals.length,
-        villageCount: officialVillagesCount + customCount,
-        dealerCount: dealerMappingIndex.dealerCountByDistrictKey.get(distMetricKey) || 0,
-      };
-    });
-  }, [selectedState, customVillageRows, locationTalukas, dealerMappingIndex, lgdRevision]);
+    return getDistrictsForState(selectedState).map((d) => ({
+      code: d.code,
+      stateCode: d.stateCode,
+      stateName: d.stateName,
+      district: d.name,
+      label: getDistrictDisplayLabel(d.name),
+    }));
+  }, [selectedState]);
 
   const selectedDistrictMeta = useMemo(() => {
-    if (selectedDistrict === 'all') return undefined;
+    if (!selectedDistrict) return undefined;
     return getDistrictMeta(selectedDistrict, selectedStateMeta?.code);
   }, [selectedDistrict, selectedStateMeta?.code]);
 
-  // Talukas for selected District
-  const talukaSummaries = useMemo(() => {
-    if (!selectedState || selectedDistrict === 'all') return [];
+  // Step 3: Talukas for selected District
+  const talukaOptions = useMemo(() => {
+    if (!selectedState || !selectedDistrict) return [];
     const stCode = selectedDistrictMeta?.stateCode || selectedStateMeta?.code || '';
-    const dName = selectedDistrictMeta?.name || canonicalizeDistrictName(selectedDistrict);
+    const dName = selectedDistrictMeta?.name || canonicalizeDistrictName(selectedDistrict, selectedState);
     const officialTalukas = getTalukaMetasForDistrict(selectedDistrictMeta?.code || dName, stCode);
 
-    const map = new Map<
-      string,
-      { code: string; taluka: string; villageCount: number; dealerCount: number }
-    >();
+    const map = new Map<string, { code: string; taluka: string }>();
 
     officialTalukas.forEach((t) => {
-      const talMetricKey = `${t.stateCode}|${normalizeLocationKey(dName)}|${normalizeLocationKey(t.name)}`;
-      const officialVillages = getOfficialTalukaVillageCountSync(t.stateCode, t.code);
-      const customVillages = customVillageRows.filter(
-        (cv) =>
-          normalizeLocationKey(cv.district) === normalizeLocationKey(dName) &&
-          normalizeLocationKey(cv.taluka) === normalizeLocationKey(t.name)
-      ).length;
-
       map.set(normalizeLocationKey(t.name), {
         code: t.code,
         taluka: t.name,
-        villageCount: officialVillages + customVillages,
-        dealerCount: dealerMappingIndex.dealerCountByTalukaKey.get(talMetricKey) || 0,
       });
     });
 
@@ -398,17 +365,9 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
       if (normalizeLocationKey(lt.district) !== normalizeLocationKey(dName)) return;
       const tk = normalizeLocationKey(lt.taluka);
       if (!map.has(tk)) {
-        const talMetricKey = `${stCode}|${normalizeLocationKey(dName)}|${tk}`;
-        const customVillages = customVillageRows.filter(
-          (cv) =>
-            normalizeLocationKey(cv.district) === normalizeLocationKey(dName) &&
-            normalizeLocationKey(cv.taluka) === tk
-        ).length;
         map.set(tk, {
           code: lt.talukaCode,
           taluka: lt.taluka,
-          villageCount: customVillages,
-          dealerCount: dealerMappingIndex.dealerCountByTalukaKey.get(talMetricKey) || 0,
         });
       }
     });
@@ -416,15 +375,10 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
     dealerMappingIndex.unmappedBuckets.forEach((ub) => {
       if (normalizeLocationKey(ub.district) !== normalizeLocationKey(dName)) return;
       const tk = normalizeLocationKey(ub.taluka);
-      const existing = map.get(tk);
-      if (existing) {
-        existing.villageCount += 1;
-      } else {
+      if (!map.has(tk)) {
         map.set(tk, {
           code: ub.talukaCode || '',
           taluka: ub.taluka,
-          villageCount: 1,
-          dealerCount: ub.dealers.length,
         });
       }
     });
@@ -435,14 +389,12 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
     selectedDistrict,
     selectedDistrictMeta,
     selectedStateMeta?.code,
-    customVillageRows,
     locationTalukas,
     dealerMappingIndex,
-    lgdRevision,
   ]);
 
   const selectedTalukaMeta = useMemo(() => {
-    if (selectedTaluka === 'all' || selectedDistrict === 'all') return undefined;
+    if (!selectedTaluka || !selectedDistrict) return undefined;
     return getTalukaMeta(
       selectedDistrictMeta?.code || selectedDistrict,
       selectedTaluka,
@@ -450,247 +402,130 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
     );
   }, [selectedTaluka, selectedDistrict, selectedDistrictMeta, selectedStateMeta?.code]);
 
-  // Filtered Village Rows
-  const villageQueryResult = useMemo(() => {
-    if (!selectedState) return { items: [] as VillageRow[], totalCount: 0 };
+  // Step 4: Villages for selected Taluka
+  const villageOptions = useMemo(() => {
+    if (!selectedState || !selectedDistrict || !selectedTaluka) return [] as VillageRow[];
 
-    const q = searchQuery.trim().toLowerCase();
-    const stateFilterCode = selectedState === 'all' ? 'all' : selectedStateMeta?.code || '';
-    const distFilterCode = selectedDistrict !== 'all' ? selectedDistrictMeta?.code || '' : 'all';
-    const talFilterCode = selectedTaluka !== 'all' ? selectedTalukaMeta?.code || '' : 'all';
+    const stCode = selectedStateMeta?.code || '';
+    const distName = selectedDistrictMeta?.name || selectedDistrict;
+    const talName = selectedTalukaMeta?.name || selectedTaluka;
 
-    const matchesText = (row: {
-      village: string;
-      pinCode: string;
-      taluka: string;
-      district: string;
-      dealers: LocationDealerItem[];
-    }) => {
-      if (!q) return true;
-      if (
-        row.village.toLowerCase().includes(q) ||
-        row.pinCode.toLowerCase().includes(q) ||
-        row.taluka.toLowerCase().includes(q) ||
-        row.district.toLowerCase().includes(q)
-      ) {
-        return true;
-      }
-      return row.dealers.some(
-        (d) =>
-          (d.firmName || '').toLowerCase().includes(q) ||
-          (d.proprietorName || '').toLowerCase().includes(q) ||
-          (d.contactNumber || '').toLowerCase().includes(q) ||
-          (d.category || '').toLowerCase().includes(q)
-      );
-    };
+    const officialList =
+      stCode && selectedTalukaMeta?.code
+        ? getOfficialVillagesByTalukaSync(stCode, selectedTalukaMeta.code)
+        : [];
 
-    const matchesScope = (row: VillageRow) => {
-      if (stateFilterCode && stateFilterCode !== 'all' && row.stateCode !== stateFilterCode) {
-        return false;
-      }
-      if (
-        selectedDistrict !== 'all' &&
-        normalizeLocationKey(row.district) !== normalizeLocationKey(selectedDistrictMeta?.name || selectedDistrict)
-      ) {
-        return false;
-      }
-      if (
-        selectedTaluka !== 'all' &&
-        normalizeLocationKey(row.taluka) !== normalizeLocationKey(selectedTalukaMeta?.name || selectedTaluka)
-      ) {
-        return false;
-      }
-      return true;
-    };
+    const rowsByKey = new Map<string, VillageRow>();
 
-    const extraRows = [...customVillageRows, ...dealerMappingIndex.unmappedBuckets]
+    officialList.forEach((ov) => {
+      const row: VillageRow = {
+        id: `v_${ov.villageCode}`,
+        villageCode: ov.villageCode,
+        village: ov.villageName,
+        talukaCode: ov.talukaCode,
+        taluka: ov.talukaName,
+        districtCode: ov.districtCode,
+        district: ov.districtName,
+        stateCode: ov.stateCode,
+        state: ov.stateName,
+        pinCode: ov.pinCode,
+        isOfficialLgd: true,
+        isCustomSaved: false,
+        dealers: dealerMappingIndex.dealersByVillageKey.get(`code:${ov.villageCode}`) || [],
+      };
+      rowsByKey.set(normalizeLocationKey(ov.villageName), row);
+    });
+
+    const matchesScope = (row: VillageRow) =>
+      (!stCode || row.stateCode === stCode) &&
+      normalizeLocationKey(row.district) === normalizeLocationKey(distName) &&
+      normalizeLocationKey(row.taluka) === normalizeLocationKey(talName);
+
+    [...customVillageRows, ...dealerMappingIndex.unmappedBuckets]
       .filter(matchesScope)
-      .filter((r) => (!onlyWithDealers || r.dealers.length > 0) && matchesText(r));
-
-    if (onlyWithDealers) {
-      const dealerOfficialRows: VillageRow[] = [];
-      dealerMappingIndex.dealersByVillageKey.forEach((dList, key) => {
-        if (!key.startsWith('code:')) return;
-        const vCode = key.slice(5);
-        const ov = findOfficialLgdVillageSync({ villageCode: vCode });
-        if (!ov) return;
-        const row: VillageRow = {
-          id: `v_${ov.villageCode}`,
-          villageCode: ov.villageCode,
-          village: ov.villageName,
-          talukaCode: ov.talukaCode,
-          taluka: ov.talukaName,
-          districtCode: ov.districtCode,
-          district: ov.districtName,
-          stateCode: ov.stateCode,
-          state: ov.stateName,
-          pinCode: ov.pinCode,
-          isOfficialLgd: true,
-          isCustomSaved: false,
-          dealers: dList,
-        };
-        if (matchesScope(row) && matchesText(row)) {
-          dealerOfficialRows.push(row);
+      .forEach((extra) => {
+        const vKey = normalizeLocationKey(extra.village);
+        const existing = rowsByKey.get(vKey);
+        if (existing) {
+          if (extra.dealers.length > 0) {
+            const existingIds = new Set(existing.dealers.map((d) => d.id));
+            extra.dealers.forEach((d) => {
+              if (!existingIds.has(d.id)) existing.dealers.push(d);
+            });
+          }
+          if (!existing.pinCode && extra.pinCode) existing.pinCode = extra.pinCode;
+        } else {
+          rowsByKey.set(vKey, extra);
         }
       });
 
-      const merged = [...dealerOfficialRows, ...extraRows].sort((a, b) => {
-        const dCmp = a.district.localeCompare(b.district);
-        if (dCmp !== 0) return dCmp;
-        const tCmp = a.taluka.localeCompare(b.taluka);
-        if (tCmp !== 0) return tCmp;
-        return a.village.localeCompare(b.village);
-      });
-
-      return {
-        items: merged.slice(0, visibleLimit),
-        totalCount: merged.length,
-      };
-    }
-
-    const isCustomSelectedTaluka = selectedTaluka !== 'all' && !talFilterCode;
-    if (isCustomSelectedTaluka) {
-      return {
-        items: extraRows.slice(0, visibleLimit),
-        totalCount: extraRows.length,
-      };
-    }
-
-    const toRow = (ov: OfficialLgdVillage): VillageRow => ({
-      id: `v_${ov.villageCode}`,
-      villageCode: ov.villageCode,
-      village: ov.villageName,
-      talukaCode: ov.talukaCode,
-      taluka: ov.talukaName,
-      districtCode: ov.districtCode,
-      district: ov.districtName,
-      stateCode: ov.stateCode,
-      state: ov.stateName,
-      pinCode: ov.pinCode,
-      isOfficialLgd: true,
-      isCustomSaved: false,
-      dealers: dealerMappingIndex.dealersByVillageKey.get(`code:${ov.villageCode}`) || [],
-    });
-
-    const dealerMatchedOfficial: VillageRow[] = [];
-    const seenOfficialCodes = new Set<string>();
-    if (q) {
-      dealerMappingIndex.dealersByVillageKey.forEach((dList, key) => {
-        if (!key.startsWith('code:')) return;
-        const hitDealer = dList.some(
-          (d) =>
-            (d.firmName || '').toLowerCase().includes(q) ||
-            (d.proprietorName || '').toLowerCase().includes(q) ||
-            (d.contactNumber || '').toLowerCase().includes(q)
-        );
-        if (!hitDealer) return;
-        const ov = findOfficialLgdVillageSync({ villageCode: key.slice(5) });
-        if (!ov) return;
-        const row = toRow(ov);
-        if (matchesScope(row)) {
-          seenOfficialCodes.add(ov.villageCode);
-          dealerMatchedOfficial.push(row);
-        }
-      });
-    }
-
-    const officialRes = getOfficialVillagesFilteredSync({
-      stateCode: stateFilterCode || 'all',
-      districtCode: distFilterCode,
-      talukaCode: talFilterCode,
-      query: q,
-      limit: Math.max(visibleLimit, PAGE_STEP),
-    });
-
-    const combined: VillageRow[] = [...extraRows, ...dealerMatchedOfficial];
-    for (const ov of officialRes.items) {
-      if (!seenOfficialCodes.has(ov.villageCode)) {
-        combined.push(toRow(ov));
-      }
-    }
-
-    combined.sort((a, b) => {
-      if (a.dealers.length > 0 && b.dealers.length === 0) return -1;
-      if (b.dealers.length > 0 && a.dealers.length === 0) return 1;
-      const dCmp = a.district.localeCompare(b.district);
-      if (dCmp !== 0) return dCmp;
-      const tCmp = a.taluka.localeCompare(b.taluka);
-      if (tCmp !== 0) return tCmp;
-      return a.village.localeCompare(b.village);
-    });
-
-    return {
-      items: combined.slice(0, visibleLimit),
-      totalCount: officialRes.totalMatched + extraRows.length + dealerMatchedOfficial.length,
-    };
+    return Array.from(rowsByKey.values()).sort((a, b) => a.village.localeCompare(b.village));
   }, [
     selectedState,
     selectedStateMeta?.code,
     selectedDistrict,
-    selectedDistrictMeta,
+    selectedDistrictMeta?.name,
     selectedTaluka,
     selectedTalukaMeta,
-    searchQuery,
-    onlyWithDealers,
-    visibleLimit,
     customVillageRows,
     dealerMappingIndex,
     lgdRevision,
   ]);
 
-  // Filtered flat list of Location Dealers for the active State / District / Taluka / Search
-  const filteredLocationDealers = useMemo(() => {
-    if (!selectedState) return [] as LocationDealerItem[];
-    const q = searchQuery.trim().toLowerCase();
-    return locationDealers.filter((d) => {
-      if (selectedState !== 'all') {
-        const stMeta = getStateMeta(d.stateCode || d.state);
-        if ((stMeta?.name || d.state) !== selectedState) return false;
-      }
-      if (
-        selectedDistrict !== 'all' &&
-        normalizeLocationKey(d.district) !== normalizeLocationKey(selectedDistrictMeta?.name || selectedDistrict)
-      ) {
-        return false;
-      }
-      if (
-        selectedTaluka !== 'all' &&
-        normalizeLocationKey(d.taluka) !== normalizeLocationKey(selectedTalukaMeta?.name || selectedTaluka)
-      ) {
-        return false;
-      }
-      if (!q) return true;
-      return (
-        (d.firmName || '').toLowerCase().includes(q) ||
-        (d.proprietorName || '').toLowerCase().includes(q) ||
-        (d.contactNumber || '').toLowerCase().includes(q) ||
-        (d.village || '').toLowerCase().includes(q) ||
-        (d.taluka || '').toLowerCase().includes(q) ||
-        (d.district || '').toLowerCase().includes(q) ||
-        (d.pinCode || '').toLowerCase().includes(q)
-      );
-    });
-  }, [
-    selectedState,
-    selectedDistrict,
-    selectedDistrictMeta,
-    selectedTaluka,
-    selectedTalukaMeta,
-    searchQuery,
-    locationDealers,
-  ]);
+  const selectedVillageObj = useMemo(
+    () => villageOptions.find((v) => v.id === selectedVillage),
+    [villageOptions, selectedVillage]
+  );
 
-  // Summary metrics
-  const totalStats = useMemo(() => {
-    const districts = districtSummaries.length;
-    const talukas = districtSummaries.reduce((acc, d) => acc + d.totalTalukas, 0);
-    const villages = districtSummaries.reduce((acc, d) => acc + d.villageCount, 0);
-    const dealerCount =
-      selectedState === 'all'
-        ? Array.from(dealerMappingIndex.dealerCountByStateCode.values()).reduce((a, b) => a + b, 0)
-        : dealerMappingIndex.dealerCountByStateCode.get(selectedStateMeta?.code || '') || 0;
-    return { districts, talukas, villages, dealers: dealerCount };
-  }, [districtSummaries, selectedState, selectedStateMeta?.code, dealerMappingIndex]);
+  // Step 5: Dealers for selected Village
+  const dealersForSelectedVillage = useMemo(
+    () => (selectedVillageObj ? selectedVillageObj.dealers : []),
+    [selectedVillageObj]
+  );
+
+  const selectedDealerObj = useMemo(
+    () => dealersForSelectedVillage.find((d) => d.id === selectedDealerId),
+    [dealersForSelectedVillage, selectedDealerId]
+  );
+
+  // Track which states/districts/talukas have unread location_dealers so dropdowns guide the user without a banner
+  const unreadHierarchy = useMemo(() => {
+    const states = new Set<string>();
+    const districts = new Set<string>();
+    const talukas = new Set<string>();
+    if (locationUnreadById.size === 0) return { states, districts, talukas };
+
+    locationDealers.forEach((d) => {
+      if (!locationUnreadById.has(d.id)) return;
+      const stMeta = getStateMeta(d.stateCode || d.state || resolveStateFromDistrict(d.district) || DEFAULT_STATE);
+      const stName = stMeta?.name || normalizeStateName(d.state || DEFAULT_STATE);
+      const dMeta = getDistrictMeta(d.districtCode || d.district, stMeta?.code);
+      const dName = dMeta?.name || canonicalizeDistrictName(d.district || '', stName);
+      const tMeta = getTalukaMeta(dMeta?.code || dName, d.talukaCode || d.taluka, stMeta?.code);
+      const tName = tMeta?.name || canonicalizeTalukaName(dName, d.taluka || '', stName) || d.taluka || '';
+      if (stName) states.add(normalizeLocationKey(stName));
+      if (dName) districts.add(normalizeLocationKey(dName));
+      if (dName && tName) talukas.add(`${normalizeLocationKey(dName)}|${normalizeLocationKey(tName)}`);
+    });
+    return { states, districts, talukas };
+  }, [locationDealers, locationUnreadById]);
+
+  // Mark unread dealers visible in the current selected village card as viewed after brief inspection
+  useEffect(() => {
+    if (!selectedVillageObj || dealersForSelectedVillage.length === 0) return;
+    const targetList = selectedDealerObj ? [selectedDealerObj] : dealersForSelectedVillage;
+    const toMark = targetList
+      .map((d) => {
+        const meta = locationUnreadById.get(d.id);
+        return meta ? { id: d.id, ts: meta.updatedAtMs } : null;
+      })
+      .filter((x): x is { id: string; ts: number } => Boolean(x));
+    if (toMark.length === 0) return;
+    const timer = window.setTimeout(() => {
+      markManyLocationViewed(toMark);
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [selectedVillageObj, selectedDealerObj, dealersForSelectedVillage, locationUnreadById, markManyLocationViewed]);
 
   // Cascading dropdown data inside Location Dealer Form
   const formDistricts = useMemo(() => getDistrictsForState(dealerStateInput), [dealerStateInput]);
@@ -711,7 +546,7 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
     const stMeta = getStateMeta(dealerStateInput);
     const dMeta = getDistrictMeta(dealerDistrictInput, stMeta?.code);
     const tMeta = getTalukaMeta(dMeta?.code || dealerDistrictInput, dealerTalukaInput, stMeta?.code);
-    if (!stMeta?.code || !tMeta?.code) return [] as OfficialLgdVillage[];
+    if (!stMeta?.code || !tMeta?.code) return [];
     return getOfficialVillagesByTalukaSync(stMeta.code, tMeta.code);
   }, [dealerStateInput, dealerDistrictInput, dealerTalukaInput, lgdRevision]);
 
@@ -726,6 +561,7 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
   }) => {
     if (preset?.dealer) {
       const existing = preset.dealer;
+      markLocationViewed(existing.id, getRecordUpdateMs(existing));
       const stMeta = getStateMeta(existing.stateCode || existing.state || DEFAULT_STATE);
       setEditingDealerId(existing.id);
       setDealerStateInput(stMeta?.name || DEFAULT_STATE);
@@ -744,21 +580,19 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
       return;
     }
 
-    const activeState =
-      preset?.state ||
-      (selectedState && selectedState !== 'all' ? selectedState : DEFAULT_STATE);
+    const activeState = preset?.state || selectedState || DEFAULT_STATE;
     const stateDists = getDistrictsForState(activeState);
     const dist =
-      preset?.district && preset.district !== 'all'
+      preset?.district
         ? canonicalizeDistrictName(preset.district, activeState)
-        : selectedDistrict !== 'all'
+        : selectedDistrict
           ? canonicalizeDistrictName(selectedDistrict, activeState)
           : stateDists[0]?.name || 'Sangli';
     const talList = getTalukaMetasForDistrict(dist, activeState).map((t) => t.name);
     const tal =
-      preset?.taluka && preset.taluka !== 'all'
+      preset?.taluka
         ? canonicalizeTalukaName(dist, preset.taluka, activeState)
-        : selectedTaluka !== 'all'
+        : selectedTaluka
           ? canonicalizeTalukaName(dist, selectedTaluka, activeState)
           : talList[0] || '';
 
@@ -766,9 +600,9 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
     setDealerStateInput(activeState);
     setDealerDistrictInput(dist);
     setDealerTalukaInput(tal);
-    setDealerVillageInput(preset?.village || '');
-    setDealerVillageCodeInput(preset?.villageCode || '');
-    setDealerPinCodeInput(preset?.pinCode || '');
+    setDealerVillageInput(preset?.village ?? selectedVillageObj?.village ?? '');
+    setDealerVillageCodeInput(preset?.villageCode ?? selectedVillageObj?.villageCode ?? '');
+    setDealerPinCodeInput(preset?.pinCode ?? selectedVillageObj?.pinCode ?? '');
     setDealerFirmNameInput('');
     setDealerProprietorInput('');
     setDealerMobileInput('');
@@ -791,6 +625,64 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
     } else {
       setDealerVillageCodeInput('');
     }
+  };
+
+  const resolveVillageRowIdForDealer = (dealer: {
+    stateCode?: string;
+    state?: string;
+    districtCode?: string;
+    district: string;
+    talukaCode?: string;
+    taluka: string;
+    villageCode?: string;
+    village: string;
+  }) => {
+    const stMeta = getStateMeta(dealer.stateCode || dealer.state || resolveStateFromDistrict(dealer.district) || DEFAULT_STATE);
+    const stCode = stMeta?.code || '';
+    const stName = stMeta?.name || DEFAULT_STATE;
+    const dMeta = getDistrictMeta(dealer.districtCode || dealer.district, stCode);
+    const dName = dMeta?.name || canonicalizeDistrictName(dealer.district || '', stName);
+    const tMeta = getTalukaMeta(dMeta?.code || dName, dealer.talukaCode || dealer.taluka, stCode);
+    const tName = tMeta?.name || canonicalizeTalukaName(dName, dealer.taluka || '', stName) || dealer.taluka;
+
+    const officialHit = findOfficialLgdVillageSync({
+      stateCode: stCode,
+      talukaCode: tMeta?.code,
+      villageCode: dealer.villageCode,
+      villageName: dealer.village,
+    });
+    if (officialHit) {
+      return {
+        state: stName,
+        district: dName,
+        taluka: tName,
+        villageId: `v_${officialHit.villageCode}`,
+      };
+    }
+
+    const customMatch = customVillageRows.find(
+      (cv) =>
+        (!stCode || cv.stateCode === stCode) &&
+        normalizeLocationKey(cv.district) === normalizeLocationKey(dName) &&
+        normalizeLocationKey(cv.taluka) === normalizeLocationKey(tName) &&
+        normalizeLocationKey(cv.village) === normalizeLocationKey(dealer.village)
+    );
+    if (customMatch) {
+      return {
+        state: stName,
+        district: dName,
+        taluka: tName,
+        villageId: customMatch.id,
+      };
+    }
+
+    const customKey = `${stCode || normalizeLocationKey(stName)}|${normalizeLocationKey(dName)}|${normalizeLocationKey(tName)}|${normalizeLocationKey(dealer.village)}`;
+    return {
+      state: stName,
+      district: dName,
+      taluka: tName,
+      villageId: `loc_dealer_bucket_${customKey}`,
+    };
   };
 
   const handleSaveLocationDealer = async (e: React.FormEvent) => {
@@ -869,6 +761,7 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
       };
 
       setLocationDealersOptimistic((prev) => [record, ...prev.filter((item) => item.id !== record.id)]);
+      markLocationViewed(record.id);
       await safeFirestoreSet('location_dealers', record.id, record, { merge: true });
       void logAudit(
         existing ? 'UPDATE' : 'CREATE',
@@ -878,9 +771,13 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
         profile
       ).catch(() => {});
 
-      if (!selectedState) {
-        setSelectedState(stMeta.name);
-      }
+      const resolved = resolveVillageRowIdForDealer(record);
+      setSelectedState(resolved.state);
+      setSelectedDistrict(resolved.district);
+      setSelectedTaluka(resolved.taluka);
+      setSelectedVillage(resolved.villageId);
+      setSelectedDealerId(record.id);
+
       setShowDealerFormModal(false);
       setEditingDealerId(null);
       setStatusBanner(existing ? 'डीलर नोंद अपडेट केली' : 'नवीन लोकेशन डीलर नोंद सेव्ह केली');
@@ -911,6 +808,9 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
       cancelText: 'रद्द करा',
       onConfirm: async () => {
         setDialogConfig((p) => ({ ...p, isOpen: false }));
+        if (selectedDealerId === dealer.id) {
+          setSelectedDealerId('');
+        }
         setLocationDealersOptimistic((prev) => prev.filter((item) => item.id !== dealer.id));
         await safeFirestoreDelete('location_dealers', dealer.id, { softDelete: true, user: profile });
       },
@@ -924,17 +824,102 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
     return toTitleCase(raw);
   };
 
-  const isDistrictOverviewMode =
-    Boolean(selectedState) &&
-    selectedDistrict === 'all' &&
-    !searchQuery.trim() &&
-    !onlyWithDealers &&
-    viewFocus === 'overview';
+  const renderDealerCard = (d: LocationDealerItem) => {
+    const canModify = userIsAdmin || isUserRecord(d, profile);
+    const officer = getOfficerLabel(d);
+    const unreadMeta = locationUnreadById.get(d.id);
+    return (
+      <div
+        key={d.id}
+        className={`p-3.5 rounded-xl border transition flex items-start justify-between gap-3 ${
+          unreadMeta
+            ? 'bg-amber-50/75 border-amber-200'
+            : 'bg-emerald-50/50 border-emerald-200'
+        }`}
+      >
+        <div className="min-w-0 space-y-1">
+          <div className="flex items-center flex-wrap gap-1.5">
+            <span className="text-xs sm:text-sm font-black text-slate-900">
+              {toTitleCase(d.firmName) || 'Unnamed Firm'}
+            </span>
+            {d.category && (
+              <span className="text-[10px] font-bold bg-white text-emerald-800 border border-emerald-200 px-1.5 py-0.5 rounded">
+                {d.category}
+              </span>
+            )}
+          </div>
+          <div className="text-[11px] font-semibold text-slate-700 flex flex-wrap items-center gap-x-3 gap-y-0.5">
+            {d.proprietorName && (
+              <span className="inline-flex items-center gap-1">
+                <UserCheck className="w-3 h-3 text-slate-400" />
+                {toTitleCase(d.proprietorName)}
+              </span>
+            )}
+            {d.contactNumber && (
+              <span className="inline-flex items-center gap-1 font-mono text-slate-800">
+                <Phone className="w-3 h-3 text-emerald-700" />
+                {d.contactNumber}
+              </span>
+            )}
+          </div>
+          <div className="text-[11px] font-semibold text-slate-500">
+            {toTitleCase(d.village)} → {d.taluka} → {getDistrictDisplayLabel(d.district)} ({d.state})
+            {d.pinCode ? ` • ${d.pinCode}` : ''}
+            {officer ? ` • ${officer}` : ''}
+          </div>
+          {(d.address || d.notes) && (
+            <div className="text-[10px] text-slate-500">
+              {[d.address, d.notes].filter(Boolean).join(' · ')}
+            </div>
+          )}
+          {unreadMeta && (
+            <div className="text-[10px] font-bold text-amber-800">
+              {unreadMeta.actorName} · {unreadMeta.actionLabel}
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-1 shrink-0">
+          {unreadMeta && (
+            <button
+              type="button"
+              onClick={() => markLocationViewed(d.id, unreadMeta.updatedAtMs)}
+              className="inline-flex items-center gap-0.5 px-2 py-1 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 text-[10px] font-bold transition whitespace-nowrap cursor-pointer"
+              title="पाहिले (Mark Viewed)"
+            >
+              <Check className="w-3 h-3" />
+              <span>पाहिले</span>
+            </button>
+          )}
+          {canModify && (
+            <>
+              <button
+                type="button"
+                onClick={() => openDealerForm({ dealer: d })}
+                className="p-1.5 rounded-lg text-slate-500 hover:text-blue-600 hover:bg-blue-50 cursor-pointer"
+                title="Edit"
+              >
+                <Edit3 className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDeleteLocationDealer(d)}
+                className="p-1.5 rounded-lg text-slate-500 hover:text-red-600 hover:bg-red-50 cursor-pointer"
+                title="Delete"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-3 pb-24">
-      {/* Header & Compact State Controls */}
-      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-3.5 sm:p-4 space-y-2.5">
+      {/* Clean Header & Cascading Dropdowns: State -> District -> Taluka -> Village -> Dealer */}
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-4 space-y-3.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 rounded-xl bg-orange-50 text-orange-600 flex items-center justify-center shrink-0">
@@ -943,6 +928,9 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
             <h2 className="text-base sm:text-lg font-black text-slate-900 tracking-tight">
               Location Master
             </h2>
+            {loadingDirectory && (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-orange-600" />
+            )}
           </div>
 
           <button
@@ -955,145 +943,155 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
           </button>
         </div>
 
-        {/* Compact State Switcher Buttons: Maharashtra | Karnataka | All */}
-        <div className="flex items-center gap-1.5 flex-wrap">
-          {LGD_STATES.map((st) => {
-            const active = selectedState === st.name;
-            return (
-              <button
-                key={st.code}
-                type="button"
-                onClick={() => {
-                  setSelectedState(st.name);
-                  setSelectedDistrict('all');
-                  setSelectedTaluka('all');
-                  setOnlyWithDealers(false);
-                  setViewFocus('overview');
-                }}
-                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition cursor-pointer active:scale-95 ${
-                  active
-                    ? 'bg-red-600 text-white border-red-600 shadow-2xs'
-                    : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200/70'
-                }`}
-              >
-                {st.name}
-              </button>
-            );
-          })}
-          <button
-            type="button"
-            onClick={() => {
-              setSelectedState('all');
-              setSelectedDistrict('all');
-              setSelectedTaluka('all');
-              setOnlyWithDealers(false);
-              setViewFocus('overview');
-            }}
-            className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border transition cursor-pointer active:scale-95 ${
-              selectedState === 'all'
-                ? 'bg-slate-900 text-white border-slate-900 shadow-2xs'
-                : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200/70'
-            }`}
-          >
-            All
-          </button>
+        {/* Cascading Dropdown Controls */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+          {/* 1. State Dropdown (Maharashtra / Karnataka) */}
+          <div>
+            <label className="block text-[11px] font-black text-slate-600 uppercase mb-1">
+              State (राज्य)
+            </label>
+            <select
+              value={selectedState}
+              onChange={(e) => {
+                setSelectedState(e.target.value);
+                setSelectedDistrict('');
+                setSelectedTaluka('');
+                setSelectedVillage('');
+                setSelectedDealerId('');
+              }}
+              className="w-full px-3 py-2.5 text-xs font-bold rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-red-500 cursor-pointer"
+            >
+              <option value="">-- राज्य निवडा --</option>
+              {LGD_STATES.map((st) => (
+                <option key={st.code} value={st.name}>
+                  {st.name}
+                  {unreadHierarchy.states.has(normalizeLocationKey(st.name)) ? ' • नवीन' : ''}
+                </option>
+              ))}
+            </select>
+          </div>
 
-          {loadingDirectory && (
-            <span className="ml-auto inline-flex items-center gap-1 text-[10px] font-bold text-orange-700 bg-orange-50 px-2 py-0.5 rounded-md">
-              <Loader2 className="w-3 h-3 animate-spin" />
-              <span>लोड होत आहे...</span>
-            </span>
+          {/* 2. District Dropdown (Shown after State selected) */}
+          {selectedState && (
+            <div>
+              <label className="block text-[11px] font-black text-slate-600 uppercase mb-1">
+                District (जिल्हा)
+              </label>
+              <select
+                value={selectedDistrict}
+                onChange={(e) => {
+                  setSelectedDistrict(e.target.value);
+                  setSelectedTaluka('');
+                  setSelectedVillage('');
+                  setSelectedDealerId('');
+                }}
+                className="w-full px-3 py-2.5 text-xs font-bold rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-red-500 cursor-pointer"
+              >
+                <option value="">-- जिल्हा निवडा --</option>
+                {districtOptions.map((d) => (
+                  <option key={`${d.stateCode}-${d.code}`} value={d.district}>
+                    {d.label}
+                    {unreadHierarchy.districts.has(normalizeLocationKey(d.district)) ? ' • नवीन' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {/* 3. Taluka Dropdown (Shown after District selected) */}
+          {selectedState && selectedDistrict && (
+            <div>
+              <label className="block text-[11px] font-black text-slate-600 uppercase mb-1">
+                Taluka (तालुका)
+              </label>
+              <select
+                value={selectedTaluka}
+                onChange={(e) => {
+                  setSelectedTaluka(e.target.value);
+                  setSelectedVillage('');
+                  setSelectedDealerId('');
+                }}
+                className="w-full px-3 py-2.5 text-xs font-bold rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-red-500 cursor-pointer"
+              >
+                <option value="">-- तालुका निवडा --</option>
+                {talukaOptions.map((t) => {
+                  const dKey = normalizeLocationKey(selectedDistrictMeta?.name || selectedDistrict);
+                  const hasUnread = unreadHierarchy.talukas.has(`${dKey}|${normalizeLocationKey(t.taluka)}`);
+                  return (
+                    <option key={`${t.code}-${t.taluka}`} value={t.taluka}>
+                      {t.taluka}
+                      {hasUnread ? ' • नवीन' : ''}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+          )}
+
+          {/* 4. Village Dropdown (Shown after Taluka selected) */}
+          {selectedState && selectedDistrict && selectedTaluka && (
+            <div>
+              <label className="block text-[11px] font-black text-slate-600 uppercase mb-1">
+                Village (गाव)
+              </label>
+              <select
+                value={selectedVillage}
+                onChange={(e) => {
+                  setSelectedVillage(e.target.value);
+                  setSelectedDealerId('');
+                }}
+                className="w-full px-3 py-2.5 text-xs font-bold rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-red-500 cursor-pointer"
+              >
+                <option value="">-- गाव निवडा --</option>
+                {villageOptions.map((v) => {
+                  const hasUnread = v.dealers.some((d) => locationUnreadById.has(d.id));
+                  return (
+                    <option key={v.id} value={v.id}>
+                      {toTitleCase(v.village)}
+                      {v.pinCode ? ` (${v.pinCode})` : ''}
+                      {v.dealers.length > 0 ? ` • ${v.dealers.length} डीलर` : ''}
+                      {hasUnread ? ' • नवीन' : ''}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+          )}
+
+          {/* 5. Dealer Dropdown (Shown after Village selected) */}
+          {selectedState && selectedDistrict && selectedTaluka && selectedVillageObj && (
+            <div>
+              <label className="block text-[11px] font-black text-slate-600 uppercase mb-1">
+                Dealer (डीलर)
+              </label>
+              <select
+                value={selectedDealerId}
+                onChange={(e) => {
+                  const id = e.target.value;
+                  setSelectedDealerId(id);
+                  if (id) {
+                    const meta = locationUnreadById.get(id);
+                    if (meta) markLocationViewed(id, meta.updatedAtMs);
+                  }
+                }}
+                className="w-full px-3 py-2.5 text-xs font-bold rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-red-500 cursor-pointer"
+              >
+                <option value="">
+                  {dealersForSelectedVillage.length > 0
+                    ? `-- डीलर निवडा (${dealersForSelectedVillage.length}) --`
+                    : '-- डीलर नोंद नाही --'}
+                </option>
+                {dealersForSelectedVillage.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {toTitleCase(d.firmName) || 'Unnamed Firm'}
+                    {d.contactNumber ? ` (${d.contactNumber})` : ''}
+                    {locationUnreadById.has(d.id) ? ' • नवीन' : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
           )}
         </div>
-
-        {/* Compact Districts / Talukas / Villages / Dealers Buttons — Shown ONLY after State / All is selected */}
-        {selectedState && (
-          <div className="grid grid-cols-4 gap-1.5 pt-1">
-            <button
-              type="button"
-              onClick={() => {
-                setSelectedDistrict('all');
-                setSelectedTaluka('all');
-                setOnlyWithDealers(false);
-                setViewFocus('overview');
-              }}
-              className={`rounded-lg px-2 py-1.5 text-center border transition cursor-pointer active:scale-95 ${
-                viewFocus === 'overview' && !onlyWithDealers && selectedDistrict === 'all'
-                  ? 'bg-slate-900 text-white border-slate-900'
-                  : 'bg-slate-50 border-slate-200 text-slate-800 hover:bg-slate-100'
-              }`}
-            >
-              <div
-                className={`text-[9px] font-bold uppercase leading-tight ${
-                  viewFocus === 'overview' && !onlyWithDealers && selectedDistrict === 'all'
-                    ? 'text-slate-300'
-                    : 'text-slate-500'
-                }`}
-              >
-                Districts
-              </div>
-              <div className="text-xs font-black leading-tight mt-0.5">{totalStats.districts}</div>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setOnlyWithDealers(false);
-                setViewFocus('overview');
-              }}
-              className="rounded-lg px-2 py-1.5 text-center bg-blue-50/70 border border-blue-200/80 hover:bg-blue-100/70 transition cursor-pointer active:scale-95"
-            >
-              <div className="text-[9px] font-bold text-blue-700 uppercase leading-tight">Talukas</div>
-              <div className="text-xs font-black text-blue-900 leading-tight mt-0.5">{totalStats.talukas}</div>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setOnlyWithDealers(false);
-                setViewFocus('villages');
-              }}
-              className={`rounded-lg px-2 py-1.5 text-center border transition cursor-pointer active:scale-95 ${
-                viewFocus === 'villages' && !onlyWithDealers
-                  ? 'bg-amber-600 text-white border-amber-600'
-                  : 'bg-amber-50/70 border-amber-200/80 text-amber-900 hover:bg-amber-100/70'
-              }`}
-            >
-              <div
-                className={`text-[9px] font-bold uppercase leading-tight ${
-                  viewFocus === 'villages' && !onlyWithDealers ? 'text-amber-100' : 'text-amber-700'
-                }`}
-              >
-                Villages
-              </div>
-              <div className="text-xs font-black leading-tight mt-0.5">
-                {totalStats.villages.toLocaleString('en-IN')}
-              </div>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => {
-                setOnlyWithDealers(true);
-                setViewFocus('dealers');
-              }}
-              className={`rounded-lg px-2 py-1.5 text-center border transition cursor-pointer active:scale-95 ${
-                viewFocus === 'dealers' || onlyWithDealers
-                  ? 'bg-emerald-600 text-white border-emerald-600'
-                  : 'bg-emerald-50/70 border-emerald-200/80 text-emerald-900 hover:bg-emerald-100/70'
-              }`}
-            >
-              <div
-                className={`text-[9px] font-bold uppercase leading-tight ${
-                  viewFocus === 'dealers' || onlyWithDealers ? 'text-emerald-100' : 'text-emerald-700'
-                }`}
-              >
-                Dealers
-              </div>
-              <div className="text-xs font-black leading-tight mt-0.5">{totalStats.dealers}</div>
-            </button>
-          </div>
-        )}
       </div>
 
       {statusBanner && (
@@ -1108,532 +1106,75 @@ export const LocationView: React.FC<Props> = ({ profile }) => {
         </div>
       )}
 
-      {/* Initial guidance before user selects Maharashtra, Karnataka, or All */}
-      {!selectedState && (
-        <div className="bg-white rounded-2xl border border-slate-200 p-5 text-center space-y-2 shadow-2xs">
-          <MapPin className="w-7 h-7 text-orange-500 mx-auto" />
-          <p className="text-xs font-bold text-slate-700">
-            माहिती पाहण्यासाठी वरीलपैकी <span className="text-red-600">Maharashtra</span>,{' '}
-            <span className="text-red-600">Karnataka</span> किंवा <span className="text-slate-900">All</span> निवडा.
-          </p>
-          <p className="text-[11px] font-medium text-slate-500">
-            क्षेत्रातील स्थानिक डीलर नोंदवण्यासाठी <span className="font-bold text-slate-700">डीलर फॉर्म</span> वापरा.
-          </p>
-        </div>
-      )}
-
-      {/* Search & Hierarchy Filter Bar (Visible after State / All selected) */}
-      {selectedState && (
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-3.5 space-y-3">
-          <div className="relative">
-            <Search className="w-4 h-4 absolute left-3.5 top-3 text-slate-400" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="गाव, तालुका, जिल्हा, पिनकोड किंवा डीलर शोधा..."
-              className="w-full pl-10 pr-9 py-2.5 text-xs sm:text-sm rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-red-500 font-medium"
-            />
-            {searchQuery && (
-              <button
-                type="button"
-                onClick={() => setSearchQuery('')}
-                className="absolute right-3 top-2.5 text-slate-400 hover:text-slate-600 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            )}
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-            {/* District Filter */}
-            <div>
-              <label className="block text-[10px] font-black text-slate-500 uppercase mb-1">
-                District (जिल्हा)
-              </label>
-              <select
-                value={selectedDistrict}
-                onChange={(e) => {
-                  setSelectedDistrict(e.target.value);
-                  setSelectedTaluka('all');
-                }}
-                className="w-full px-3 py-2 text-xs font-bold rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-red-500 cursor-pointer"
-              >
-                <option value="all">सर्व जिल्हे (All {districtSummaries.length})</option>
-                {districtSummaries.map((d) => (
-                  <option key={`${d.stateCode}-${d.code}`} value={d.district}>
-                    {d.label} — {d.villageCount.toLocaleString('en-IN')} गावे
-                    {d.dealerCount > 0 ? `, ${d.dealerCount} डीलर` : ''}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {/* Taluka Filter */}
-            <div>
-              <label className="block text-[10px] font-black text-slate-500 uppercase mb-1">
-                Taluka (तालुका)
-              </label>
-              <select
-                value={selectedTaluka}
-                disabled={selectedDistrict === 'all'}
-                onChange={(e) => setSelectedTaluka(e.target.value)}
-                className="w-full px-3 py-2 text-xs font-bold rounded-xl border border-slate-200 bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-red-500 disabled:opacity-60 cursor-pointer"
-              >
-                <option value="all">
-                  {selectedDistrict === 'all'
-                    ? 'प्रथम जिल्हा निवडा'
-                    : `सर्व तालुके (${talukaSummaries.length})`}
-                </option>
-                {talukaSummaries.map((t) => (
-                  <option key={`${t.code}-${t.taluka}`} value={t.taluka}>
-                    {t.taluka} — {t.villageCount.toLocaleString('en-IN')} गावे
-                    {t.dealerCount > 0 ? `, ${t.dealerCount} डीलर` : ''}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            {/* Quick Toggle Filter */}
-            <div className="flex flex-col justify-end">
-              <button
-                type="button"
-                onClick={() => {
-                  setOnlyWithDealers((v) => {
-                    const next = !v;
-                    setViewFocus(next ? 'dealers' : 'overview');
-                    return next;
-                  });
-                }}
-                className={`w-full px-3 py-2 rounded-xl text-xs font-bold border flex items-center justify-center gap-1.5 transition cursor-pointer ${
-                  onlyWithDealers
-                    ? 'bg-slate-900 text-white border-slate-900 shadow-xs'
-                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
-                }`}
-              >
-                <Filter className="w-3.5 h-3.5" />
-                <span>{onlyWithDealers ? 'फक्त डीलर नोंदी (Active)' : 'फक्त डीलर नोंदी पहा'}</span>
-              </button>
-            </div>
-          </div>
-
-          {/* Serial Hierarchy Breadcrumb */}
-          <div className="flex items-center flex-wrap gap-1.5 pt-1 text-xs font-bold text-slate-600 border-t border-slate-100">
-            <button
-              type="button"
-              onClick={() => {
-                setSelectedDistrict('all');
-                setSelectedTaluka('all');
-                setOnlyWithDealers(false);
-                setViewFocus('overview');
-              }}
-              className={`px-2 py-0.5 rounded-lg transition cursor-pointer ${
-                selectedDistrict === 'all'
-                  ? 'bg-orange-100 text-orange-800'
-                  : 'hover:bg-slate-100 text-slate-700'
-              }`}
-            >
-              {selectedState === 'all' ? 'All States' : selectedState}
-            </button>
-
-            {selectedDistrict !== 'all' && (
-              <>
-                <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
-                <button
-                  type="button"
-                  onClick={() => setSelectedTaluka('all')}
-                  className={`px-2 py-0.5 rounded-lg transition cursor-pointer ${
-                    selectedTaluka === 'all'
-                      ? 'bg-blue-100 text-blue-800'
-                      : 'hover:bg-slate-100 text-slate-700'
-                  }`}
-                >
-                  {getDistrictDisplayLabel(selectedDistrict)}
-                </button>
-              </>
-            )}
-
-            {selectedTaluka !== 'all' && (
-              <>
-                <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
-                <span className="px-2 py-0.5 rounded-lg bg-emerald-100 text-emerald-800">
-                  {selectedTaluka}
+      {/* Selected Village & Dealer Details Section */}
+      {selectedVillageObj && (
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+          <div className="bg-slate-900 text-white px-4 py-2.5 flex items-center justify-between gap-2 flex-wrap">
+            <div className="text-xs font-black tracking-wide flex items-center gap-2 flex-wrap">
+              <Store className="w-4 h-4 text-orange-400 shrink-0" />
+              <span>{toTitleCase(selectedVillageObj.village)}</span>
+              {selectedVillageObj.pinCode && (
+                <span className="text-[10px] font-mono bg-slate-800 text-blue-300 px-1.5 py-0.5 rounded">
+                  {selectedVillageObj.pinCode}
                 </span>
-              </>
-            )}
-
-            {(selectedDistrict !== 'all' || searchQuery || onlyWithDealers || viewFocus !== 'overview') && (
-              <button
-                type="button"
-                onClick={() => {
-                  setSelectedDistrict('all');
-                  setSelectedTaluka('all');
-                  setSearchQuery('');
-                  setOnlyWithDealers(false);
-                  setViewFocus('overview');
-                }}
-                className="ml-auto text-[11px] text-red-600 hover:underline font-bold cursor-pointer"
-              >
-                Reset
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* DEDICATED DEALERS DIRECTORY PANEL (When user taps Dealers button / filter) */}
-      {selectedState && (viewFocus === 'dealers' || onlyWithDealers) && (
-        <div className="bg-white rounded-2xl border border-emerald-200 shadow-sm overflow-hidden">
-          <div className="bg-emerald-900 text-white px-4 py-2.5 flex items-center justify-between gap-2 flex-wrap">
-            <div className="text-xs font-black uppercase tracking-wide flex items-center gap-2">
-              <Store className="w-4 h-4 text-emerald-300" />
-              <span>लोकेशन डीलर नोंदी ({filteredLocationDealers.length})</span>
+              )}
+              <span className="text-[11px] font-semibold text-slate-300">
+                • {selectedVillageObj.taluka} → {getDistrictDisplayLabel(selectedVillageObj.district)} ({selectedVillageObj.state})
+              </span>
             </div>
+
             <button
               type="button"
-              onClick={() => openDealerForm()}
-              className="text-[11px] font-bold bg-white text-emerald-900 hover:bg-emerald-50 px-2.5 py-1 rounded-lg flex items-center gap-1 cursor-pointer"
+              onClick={() =>
+                openDealerForm({
+                  state: selectedVillageObj.state,
+                  district: selectedVillageObj.district,
+                  taluka: selectedVillageObj.taluka,
+                  village: selectedVillageObj.village,
+                  villageCode: selectedVillageObj.villageCode,
+                  pinCode: selectedVillageObj.pinCode,
+                })
+              }
+              className="text-[11px] font-bold bg-red-600 hover:bg-red-700 text-white px-2.5 py-1 rounded-lg flex items-center gap-1 cursor-pointer"
             >
               <Plus className="w-3.5 h-3.5" />
               <span>नवीन डीलर जोडा</span>
             </button>
           </div>
 
-          {filteredLocationDealers.length === 0 ? (
-            <div className="p-6 text-center space-y-2.5">
-              <Store className="w-7 h-7 text-slate-300 mx-auto" />
-              <p className="text-xs font-bold text-slate-600">
-                या निवडलेल्या भागात अद्याप डीलर नोंद नाही.
-              </p>
-              <button
-                type="button"
-                onClick={() => openDealerForm()}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-bold rounded-xl shadow-xs cursor-pointer"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>डीलर फॉर्म भरा</span>
-              </button>
-            </div>
-          ) : (
-            <div className="divide-y divide-slate-100">
-              {filteredLocationDealers.map((d, idx) => {
-                const canModify = userIsAdmin || isUserRecord(d, profile);
-                const officer = getOfficerLabel(d);
-                return (
-                  <div
-                    key={d.id}
-                    className="p-3 sm:p-3.5 hover:bg-emerald-50/40 transition flex items-start justify-between gap-3"
-                  >
-                    <div className="min-w-0 space-y-1">
-                      <div className="flex items-center flex-wrap gap-1.5">
-                        <span className="text-[10px] font-mono font-black text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded">
-                          {idx + 1}.
-                        </span>
-                        <span className="text-xs sm:text-sm font-black text-slate-900">
-                          {toTitleCase(d.firmName)}
-                        </span>
-                        {d.category && (
-                          <span className="text-[10px] font-bold bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded">
-                            {d.category}
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-[11px] font-semibold text-slate-600 flex flex-wrap items-center gap-x-3 gap-y-0.5">
-                        {d.proprietorName && (
-                          <span className="inline-flex items-center gap-1">
-                            <UserCheck className="w-3 h-3 text-slate-400" />
-                            {toTitleCase(d.proprietorName)}
-                          </span>
-                        )}
-                        {d.contactNumber && (
-                          <span className="inline-flex items-center gap-1 font-mono text-slate-800">
-                            <Phone className="w-3 h-3 text-emerald-700" />
-                            {d.contactNumber}
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-[11px] font-semibold text-slate-500">
-                        {toTitleCase(d.village)} → {d.taluka} → {getDistrictDisplayLabel(d.district)} ({d.state})
-                        {d.pinCode ? ` • ${d.pinCode}` : ''}
-                        {officer ? ` • ${officer}` : ''}
-                      </div>
-                      {(d.address || d.notes) && (
-                        <div className="text-[10px] text-slate-500">
-                          {[d.address, d.notes].filter(Boolean).join(' · ')}
-                        </div>
-                      )}
-                    </div>
-
-                    {canModify && (
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => openDealerForm({ dealer: d })}
-                          className="p-1.5 rounded-lg text-slate-500 hover:text-blue-600 hover:bg-blue-50 cursor-pointer"
-                          title="Edit"
-                        >
-                          <Edit3 className="w-3.5 h-3.5" />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteLocationDealer(d)}
-                          className="p-1.5 rounded-lg text-slate-500 hover:text-red-600 hover:bg-red-50 cursor-pointer"
-                          title="Delete"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* MODE A: DISTRICT DIRECTORY OVERVIEW */}
-      {isDistrictOverviewMode && (
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-3.5 space-y-3">
-          <div className="flex items-center justify-between flex-wrap gap-2">
-            <h3 className="text-xs font-black text-slate-800 uppercase tracking-wider flex items-center gap-1.5">
-              <Layers className="w-4 h-4 text-orange-600" />
-              <span>
-                {selectedState === 'all' ? 'All' : selectedState} Districts ({districtSummaries.length}) — जिल्हा निवडा
-              </span>
-            </h3>
-          </div>
-
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
-            {[...districtSummaries]
-              .sort((a, b) => {
-                if (b.dealerCount !== a.dealerCount) return b.dealerCount - a.dealerCount;
-                return a.district.localeCompare(b.district);
-              })
-              .map((d, idx) => {
-                const hasDealers = d.dealerCount > 0;
-                return (
-                  <button
-                    key={`${d.stateCode}-${d.code}`}
-                    type="button"
-                    onClick={() => {
-                      if (selectedState === 'all') setSelectedState(d.stateName);
-                      setSelectedDistrict(d.district);
-                      setSelectedTaluka('all');
-                    }}
-                    className={`text-left p-2.5 rounded-xl border transition cursor-pointer active:scale-95 ${
-                      hasDealers
-                        ? 'bg-orange-50/50 border-orange-200 hover:border-orange-400 shadow-2xs'
-                        : 'bg-slate-50/70 border-slate-200 hover:border-slate-300'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-1">
-                      <span className="text-[10px] font-mono font-bold text-slate-500">
-                        #{String(idx + 1).padStart(2, '0')}
-                      </span>
-                      {d.dealerCount > 0 && (
-                        <span className="text-[10px] font-black bg-emerald-600 text-white px-1.5 py-0.5 rounded-md">
-                          {d.dealerCount} Dealers
-                        </span>
-                      )}
-                    </div>
-                    <div className="text-xs font-black text-slate-900 mt-1 truncate">{d.label}</div>
-                    <div className="text-[10px] text-slate-500 font-semibold mt-0.5">
-                      {d.totalTalukas} तालुके • {d.villageCount.toLocaleString('en-IN')} गावे
-                    </div>
-                  </button>
-                );
-              })}
-          </div>
-        </div>
-      )}
-
-      {/* MODE B: TALUKA DIRECTORY STRIP */}
-      {selectedState && selectedDistrict !== 'all' && selectedTaluka === 'all' && !searchQuery.trim() && (
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-3.5 space-y-2.5">
-          <div className="flex items-center justify-between flex-wrap gap-2">
-            <h3 className="text-xs font-black text-slate-800 uppercase tracking-wider">
-              {getDistrictDisplayLabel(selectedDistrict)} — Talukas ({talukaSummaries.length})
-            </h3>
-          </div>
-
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2">
-            {talukaSummaries.map((t, idx) => (
-              <button
-                key={`${t.code}-${t.taluka}`}
-                type="button"
-                onClick={() => setSelectedTaluka(t.taluka)}
-                className={`p-2 rounded-xl border transition text-left cursor-pointer active:scale-95 ${
-                  t.dealerCount > 0
-                    ? 'bg-blue-50/50 border-blue-200 hover:border-blue-400'
-                    : 'bg-slate-50 border-slate-200 hover:border-slate-300'
-                }`}
-              >
-                <div className="flex items-center justify-between gap-1">
-                  <span className="text-[10px] font-mono font-bold text-slate-500">{idx + 1}.</span>
-                  {t.dealerCount > 0 && (
-                    <span className="text-[10px] font-black text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">
-                      {t.dealerCount} डीलर
-                    </span>
-                  )}
-                </div>
-                <div className="text-xs font-black text-slate-900 truncate mt-0.5">{t.taluka}</div>
-                <div className="text-[10px] text-slate-500 font-semibold">
-                  {t.villageCount.toLocaleString('en-IN')} गावे
-                </div>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* VILLAGE -> LOCATION DEALERS LIST */}
-      {selectedState && !isDistrictOverviewMode && viewFocus !== 'dealers' && !onlyWithDealers && (
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-          <div className="bg-slate-900 text-white px-4 py-2.5 flex items-center justify-between gap-2 flex-wrap">
-            <div className="text-xs font-black uppercase tracking-wide flex items-center gap-2">
-              <Users className="w-4 h-4 text-orange-400" />
-              <span>Villages ({villageQueryResult.totalCount.toLocaleString('en-IN')})</span>
-            </div>
-          </div>
-
-          {villageQueryResult.items.length === 0 ? (
-            <div className="p-8 text-center space-y-2">
-              <MapPin className="w-8 h-8 text-slate-300 mx-auto" />
-              <div className="text-sm font-bold text-slate-700">
-                या निवडलेल्या लोकेशनसाठी गावे सापडली नाहीत.
+          <div className="p-3.5 space-y-2.5">
+            {dealersForSelectedVillage.length === 0 ? (
+              <div className="py-5 text-center space-y-2.5">
+                <Store className="w-7 h-7 text-slate-300 mx-auto" />
+                <p className="text-xs font-bold text-slate-600">
+                  या गावात अद्याप डीलर नोंद नाही.
+                </p>
+                <button
+                  type="button"
+                  onClick={() =>
+                    openDealerForm({
+                      state: selectedVillageObj.state,
+                      district: selectedVillageObj.district,
+                      taluka: selectedVillageObj.taluka,
+                      village: selectedVillageObj.village,
+                      villageCode: selectedVillageObj.villageCode,
+                      pinCode: selectedVillageObj.pinCode,
+                    })
+                  }
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-red-600 hover:bg-red-700 text-white text-xs font-bold rounded-xl shadow-xs cursor-pointer"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>डीलर फॉर्म भरा</span>
+                </button>
               </div>
-            </div>
-          ) : (
-            <>
-              <div className="divide-y divide-slate-100">
-                {villageQueryResult.items.map((b, index) => (
-                  <div
-                    key={`${b.id}_${index}`}
-                    className="p-3 sm:p-3.5 hover:bg-slate-50/80 transition flex flex-col sm:flex-row sm:items-start gap-3"
-                  >
-                    {/* Left: Serial + Village + Pincode + Hierarchy */}
-                    <div className="sm:w-72 shrink-0 space-y-1">
-                      <div className="flex items-center flex-wrap gap-1.5">
-                        <span className="text-[11px] font-mono font-black text-slate-500 bg-slate-100 px-1.5 py-0.5 rounded">
-                          {index + 1}.
-                        </span>
-                        <span className="text-sm font-black text-slate-900">
-                          {toTitleCase(b.village)}
-                        </span>
-                        {b.pinCode && (
-                          <span className="text-[10px] font-mono font-bold text-blue-700 bg-blue-50 border border-blue-200 px-1.5 py-0.5 rounded">
-                            {b.pinCode}
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-[11px] text-slate-500 font-semibold pl-7">
-                        {b.taluka} → {getDistrictDisplayLabel(b.district)} ({b.state})
-                      </div>
-                    </div>
-
-                    {/* Right: Recorded Location Dealers for this Village + Add Dealer button */}
-                    <div className="flex-1 min-w-0 flex flex-wrap items-center justify-between gap-2">
-                      {b.dealers.length === 0 ? (
-                        <span className="text-[11px] text-slate-400 font-semibold italic">
-                          अद्याप डीलर नोंद नाही
-                        </span>
-                      ) : (
-                        <div className="flex flex-wrap gap-2">
-                          {b.dealers.map((d) => {
-                            const canModify = userIsAdmin || isUserRecord(d, profile);
-                            const officer = getOfficerLabel(d);
-                            return (
-                              <div
-                                key={d.id}
-                                className="bg-emerald-50/70 border border-emerald-200 rounded-xl px-2.5 py-1.5 flex items-start gap-2 max-w-full"
-                              >
-                                <div className="min-w-0">
-                                  <div className="text-xs font-black text-slate-900 flex items-center gap-1.5 flex-wrap">
-                                    <span>{toTitleCase(d.firmName) || 'Unnamed Firm'}</span>
-                                    {d.category && (
-                                      <span className="text-[9px] font-bold bg-white text-emerald-800 border border-emerald-200 px-1 py-0.2 rounded">
-                                        {d.category}
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div className="text-[10px] text-slate-600 font-semibold flex flex-wrap items-center gap-x-2">
-                                    {d.proprietorName && <span>{toTitleCase(d.proprietorName)}</span>}
-                                    {d.contactNumber && (
-                                      <span className="inline-flex items-center gap-0.5 font-mono text-slate-700">
-                                        <Phone className="w-2.5 h-2.5 text-emerald-700" />
-                                        {d.contactNumber}
-                                      </span>
-                                    )}
-                                    {officer && <span className="text-slate-500">({officer})</span>}
-                                  </div>
-                                </div>
-                                {canModify && (
-                                  <div className="flex items-center gap-0.5 shrink-0">
-                                    <button
-                                      type="button"
-                                      onClick={() => openDealerForm({ dealer: d })}
-                                      className="p-1 rounded text-slate-400 hover:text-blue-600 cursor-pointer"
-                                      title="Edit"
-                                    >
-                                      <Edit3 className="w-3 h-3" />
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleDeleteLocationDealer(d)}
-                                      className="p-1 rounded text-slate-400 hover:text-red-600 cursor-pointer"
-                                      title="Delete"
-                                    >
-                                      <Trash2 className="w-3 h-3" />
-                                    </button>
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-
-                      <button
-                        type="button"
-                        onClick={() =>
-                          openDealerForm({
-                            state: b.state,
-                            district: b.district,
-                            taluka: b.taluka,
-                            village: b.village,
-                            villageCode: b.villageCode,
-                            pinCode: b.pinCode,
-                          })
-                        }
-                        className="text-[10px] font-bold text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 px-2 py-1 rounded-lg inline-flex items-center gap-1 shrink-0 cursor-pointer"
-                      >
-                        <Plus className="w-3 h-3" />
-                        <span>डीलर</span>
-                      </button>
-                    </div>
-                  </div>
-                ))}
+            ) : selectedDealerObj ? (
+              renderDealerCard(selectedDealerObj)
+            ) : (
+              <div className="space-y-2.5">
+                {dealersForSelectedVillage.map((d) => renderDealerCard(d))}
               </div>
-
-              {villageQueryResult.items.length < villageQueryResult.totalCount && (
-                <div className="p-3 bg-slate-50 border-t border-slate-200 flex items-center justify-between gap-2 flex-wrap">
-                  <span className="text-[11px] font-bold text-slate-600">
-                    दाखवलेली गावे: {villageQueryResult.items.length} /{' '}
-                    {villageQueryResult.totalCount.toLocaleString('en-IN')}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setVisibleLimit((prev) => prev + PAGE_STEP)}
-                    className="px-3.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer active:scale-95 transition"
-                  >
-                    पुढील {Math.min(PAGE_STEP, villageQueryResult.totalCount - villageQueryResult.items.length)}{' '}
-                    गावे पहा
-                  </button>
-                </div>
-              )}
-            </>
-          )}
+            )}
+          </div>
         </div>
       )}
 

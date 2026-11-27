@@ -66,6 +66,8 @@ import { compressImageFile } from '../../lib/imageCompression';
 import { Language } from '../../lib/i18n';
 import { cn, toTitleCase } from '../../lib/utils';
 import { CustomDialogModal } from '../CustomDialogModal';
+import { ModuleUpdateBanner, useModuleRecordHighlights } from '../ModuleUpdateBanner';
+import { getRecordUpdateMs } from '../../lib/moduleUpdates';
 import {
   getCleanGradeName,
   getWarehouseOrderStatus,
@@ -666,6 +668,27 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
       });
   }, [rawSharedOrders]);
 
+  const {
+    badge: warehouseBadge,
+    unreadById: warehouseUnreadById,
+    markViewed: markWarehouseItemViewed,
+    markAllViewed: markAllWarehouseViewed,
+  } = useModuleRecordHighlights(profile, 'office_staff', {
+    orders: rawSharedOrders,
+    officeStaff: staffMembers,
+    officeAttendance: attendanceRecords,
+  });
+
+  const warehouseUnreadCounts = useMemo(() => {
+    let orders = 0;
+    let attendance = 0;
+    (warehouseBadge?.unreadRecords || []).forEach((rec) => {
+      if (rec.subType === 'order') orders += 1;
+      else attendance += 1;
+    });
+    return { orders, attendance };
+  }, [warehouseBadge]);
+
   const orderStatusCounts = useMemo(() => {
     let fresh = 0;
     let dispatched = 0;
@@ -761,6 +784,11 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
   };
 
   const openStaffForm = (member: OfficeStaffMember, editMode: boolean = true) => {
+    markWarehouseItemViewed(`staff:${member.id}`, getRecordUpdateMs(member));
+    const currentRec = dateAttendanceMap.get(member.id);
+    if (currentRec?.id) {
+      markWarehouseItemViewed(`att:${currentRec.id}`, getRecordUpdateMs(currentRec));
+    }
     setEditingStaffId(member.id);
     setLinkedUserUidInput(member.linkedUserUid || '');
     setStaffCodeInput(member.staffCode || member.userCode || calculateNextStaffCode(combinedStaffRoster));
@@ -1242,6 +1270,8 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
         linkedUserUid: linkedUserUidInput || existing?.linkedUserUid || '',
         createdByUid: existing?.createdByUid || profile.uid || '',
         createdByName: existing?.createdByName || profile.fullName || 'Warehouse Incharge',
+        updatedByUid: profile.uid || '',
+        updatedByName: profile.fullName || profile.loginId || 'Warehouse Incharge',
         isArchived: false,
         createdAt: existing?.createdAt || nowIso,
         updatedAt: nowIso,
@@ -1357,11 +1387,15 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
         status,
         markedByUid: profile.uid || '',
         markedByName: profile.fullName || profile.loginId || 'Warehouse Incharge',
+        updatedByUid: profile.uid || '',
+        updatedByName: profile.fullName || profile.loginId || 'Warehouse Incharge',
         markedAt: nowIso,
         isArchived: false,
         createdAt: existing?.createdAt || nowIso,
         updatedAt: nowIso,
       };
+      markWarehouseItemViewed(`att:${docId}`, Date.now());
+      markWarehouseItemViewed(`staff:${member.id}`, getRecordUpdateMs(member));
 
       setOfficeAttendanceOptimistic((prev) => {
         const rest = prev.filter((r) => r.id !== docId);
@@ -1450,8 +1484,11 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
         dispatchNote: cleanTransport,
         warehouseDispatchedAt: nowIso,
         warehouseDispatchedBy: profile.fullName || profile.loginId || 'Warehouse Incharge',
+        updatedByUid: profile.uid || '',
+        updatedByName: profile.fullName || profile.loginId || 'Warehouse Incharge',
         updatedAt: nowIso,
       };
+      markWarehouseItemViewed(`order:${order.id}`, getRecordUpdateMs(order));
       setOrdersOptimistic((prev) =>
         prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
       );
@@ -1479,8 +1516,11 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
         transportName: cleanTransport,
         transportDetails: cleanTransport,
         dispatchNote: cleanTransport,
+        updatedByUid: profile.uid || '',
+        updatedByName: profile.fullName || profile.loginId || 'Warehouse Incharge',
         updatedAt: nowIso,
       };
+      markWarehouseItemViewed(`order:${order.id}`, getRecordUpdateMs(order));
       setOrdersOptimistic((prev) =>
         prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
       );
@@ -1509,8 +1549,11 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
             warehouseStatus: 'delivered' as const,
             warehouseDeliveredAt: nowIso,
             warehouseDeliveredBy: profile.fullName || profile.loginId || 'Warehouse Incharge',
+            updatedByUid: profile.uid || '',
+            updatedByName: profile.fullName || profile.loginId || 'Warehouse Incharge',
             updatedAt: nowIso,
           };
+          markWarehouseItemViewed(`order:${order.id}`, getRecordUpdateMs(order));
           setOrdersOptimistic((prev) =>
             prev.map((o) => (o.id === order.id ? { ...o, ...updatedData } : o))
           );
@@ -1630,6 +1673,11 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
               onClick={() => openSubTab('orders')}
               className="group relative flex flex-col items-center justify-center gap-3 p-5 sm:p-6 rounded-2xl bg-gradient-to-b from-white to-blue-50/60 border border-blue-200/80 hover:border-blue-400 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all cursor-pointer active:scale-95 text-center"
             >
+              {warehouseUnreadCounts.orders > 0 && (
+                <span className="absolute top-2.5 right-2.5 min-w-[20px] h-[20px] px-1 rounded-full bg-rose-600 text-white text-[10px] font-black font-mono tabular-nums flex items-center justify-center shadow-sm ring-2 ring-white">
+                  {warehouseUnreadCounts.orders > 99 ? '99+' : warehouseUnreadCounts.orders}
+                </span>
+              )}
               <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-gradient-to-br from-blue-600 to-indigo-600 text-white shadow-sm flex items-center justify-center group-hover:scale-105 transition-transform">
                 <PackageCheck className="w-7 h-7 sm:w-8 sm:h-8" />
               </div>
@@ -1649,6 +1697,11 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
               onClick={() => openSubTab('attendance')}
               className="group relative flex flex-col items-center justify-center gap-3 p-5 sm:p-6 rounded-2xl bg-gradient-to-b from-white to-emerald-50/60 border border-emerald-200/80 hover:border-emerald-400 shadow-xs hover:shadow-md hover:-translate-y-0.5 transition-all cursor-pointer active:scale-95 text-center"
             >
+              {warehouseUnreadCounts.attendance > 0 && (
+                <span className="absolute top-2.5 right-2.5 min-w-[20px] h-[20px] px-1 rounded-full bg-rose-600 text-white text-[10px] font-black font-mono tabular-nums flex items-center justify-center shadow-sm ring-2 ring-white">
+                  {warehouseUnreadCounts.attendance > 99 ? '99+' : warehouseUnreadCounts.attendance}
+                </span>
+              )}
               <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-gradient-to-br from-emerald-600 to-teal-600 text-white shadow-sm flex items-center justify-center group-hover:scale-105 transition-transform">
                 <ClipboardCheck className="w-7 h-7 sm:w-8 sm:h-8" />
               </div>
@@ -3076,6 +3129,26 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
       {/* ============================ TAB 1B: DAILY ATTENDANCE ROSTER ============================ */}
       {activeTab === 'attendance' && staffViewMode === 'list' && (
         <div className="space-y-3">
+          <ModuleUpdateBanner
+            badge={warehouseBadge}
+            onMarkAllViewed={() => markAllWarehouseViewed()}
+            onSelectRecord={(rec) => {
+              if (rec.subType === 'order') {
+                const rawOrderId = rec.id.replace(/^order:/, '');
+                openSubTab('orders');
+                markWarehouseItemViewed(rec.id, rec.updatedAtMs);
+                const ord = rawSharedOrders.find((o: any) => o && o.id === rawOrderId);
+                if (ord?.orderNumber) setOrderSearch(ord.orderNumber);
+              } else {
+                const rawId = rec.id.replace(/^(staff|att):/, '');
+                markWarehouseItemViewed(rec.id, rec.updatedAtMs);
+                const staffMatch = combinedStaffRoster.find((s) => s.id === rawId);
+                if (staffMatch) {
+                  setStaffSearch(staffMatch.fullName);
+                }
+              }
+            }}
+          />
           {/* Compact Control Surface: Date Bar + Summary Strip + Search/Filter */}
           <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-2xs">
             {/* Row 1: Date Picker & Mark All Present */}
@@ -3236,15 +3309,42 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
                   Boolean(member.workRole) &&
                   String(member.workRole).toLowerCase() !== String(member.category).toLowerCase() &&
                   String(member.workRole).toLowerCase() !== String(member.fullName).toLowerCase();
+                const unreadStaffMeta = warehouseUnreadById.get(`staff:${member.id}`);
+                const unreadAttMeta = currentRec?.id ? warehouseUnreadById.get(`att:${currentRec.id}`) : undefined;
+                const activeUnreadMeta = unreadAttMeta || unreadStaffMeta;
 
                 return (
                   <div
                     key={member.id}
                     className={cn(
-                      'bg-white rounded-2xl border border-slate-200 p-3.5 sm:p-4 transition space-y-3',
+                      'rounded-2xl border p-3.5 sm:p-4 transition space-y-3',
+                      activeUnreadMeta
+                        ? 'bg-amber-50/40 border-amber-400 ring-1 ring-amber-200'
+                        : 'bg-white border-slate-200',
                       isInactive && 'opacity-60'
                     )}
                   >
+                    {activeUnreadMeta && (
+                      <div className="flex items-center justify-between gap-2 pb-2 border-b border-amber-200/80 text-[11px]">
+                        <div className="min-w-0 truncate text-amber-950 font-semibold">
+                          <span className="font-bold">{activeUnreadMeta.actorName}</span>
+                          <span className="text-amber-700 mx-1">·</span>
+                          <span>{activeUnreadMeta.actionLabel}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (unreadStaffMeta) markWarehouseItemViewed(unreadStaffMeta.id, unreadStaffMeta.updatedAtMs);
+                            if (unreadAttMeta) markWarehouseItemViewed(unreadAttMeta.id, unreadAttMeta.updatedAtMs);
+                          }}
+                          className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-white border border-amber-300 hover:bg-amber-100 text-amber-900 font-bold text-[10px] cursor-pointer whitespace-nowrap"
+                        >
+                          <Check className="w-3 h-3 text-emerald-600" />
+                          <span>पाहिले</span>
+                        </button>
+                      </div>
+                    )}
                     {/* Top Row */}
                     <div className="flex items-start justify-between gap-2">
                       <div
@@ -3406,6 +3506,24 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
       {/* ============================ TAB 2: WAREHOUSE ORDER MANAGEMENT ============================ */}
       {activeTab === 'orders' && (
         <div className="space-y-3.5">
+          <ModuleUpdateBanner
+            badge={warehouseBadge}
+            onMarkAllViewed={() => markAllWarehouseViewed()}
+            onSelectRecord={(rec) => {
+              if (rec.subType === 'order') {
+                const rawOrderId = rec.id.replace(/^order:/, '');
+                markWarehouseItemViewed(rec.id, rec.updatedAtMs);
+                const ord = allApprovedOrders.find((o) => o.id === rawOrderId);
+                if (ord) {
+                  setWarehouseStatusFilter(getWarehouseOrderStatus(ord));
+                  setOrderSearch(ord.orderNumber || '');
+                }
+              } else {
+                markWarehouseItemViewed(rec.id, rec.updatedAtMs);
+                openSubTab('attendance');
+              }
+            }}
+          />
           {/* 4 Attractive Icon Filter Buttons in Exact Requested Sequence: Fresh Order -> Dispatched -> Delivered -> All Order */}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
             {(
@@ -3540,6 +3658,7 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
                 const resolvedCardItems = (o.items || []).map((it) =>
                   resolveOrderLineForBox(it, findProductForOrderItem(it))
                 );
+                const unreadMeta = warehouseUnreadById.get(`order:${o.id}`);
                 return (
                   <GodownOrderSlipCard
                     key={o.id}
@@ -3549,6 +3668,13 @@ export const GodownInchargeView: React.FC<Props> = ({ profile, lang }) => {
                     onDispatchOrder={handleDispatchOrder}
                     onUpdateTransport={handleUpdateTransport}
                     onConfirmDelivered={handleConfirmDelivered}
+                    unreadMeta={unreadMeta}
+                    onMarkViewed={() =>
+                      markWarehouseItemViewed(
+                        `order:${o.id}`,
+                        unreadMeta?.updatedAtMs || getRecordUpdateMs(o)
+                      )
+                    }
                   />
                 );
               })}

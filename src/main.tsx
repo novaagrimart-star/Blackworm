@@ -106,9 +106,17 @@ if (typeof window !== 'undefined') {
           if (typeof navigator !== 'undefined' && !navigator.onLine) return;
           try {
             const lastReload = Number(sessionStorage.getItem('blackworm_sw_reload_at') || '0');
-            if (Date.now() - lastReload > 60000) {
-              sessionStorage.setItem('blackworm_sw_reload_at', String(Date.now()));
+            if (Date.now() - lastReload > 30000) {
               void updateSW(true);
+              setTimeout(() => {
+                try {
+                  const reloadedAt = Number(sessionStorage.getItem('blackworm_sw_reload_at') || '0');
+                  if (Date.now() - reloadedAt > 30000 && (typeof navigator === 'undefined' || navigator.onLine)) {
+                    sessionStorage.setItem('blackworm_sw_reload_at', String(Date.now()));
+                    window.location.reload();
+                  }
+                } catch {}
+              }, 1400);
             }
           } catch {}
         },

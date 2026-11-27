@@ -1,12 +1,31 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { initializeApp } from 'firebase/app';
 import { collection, doc, getDocFromServer, getDocs, limit, query, initializeFirestore, terminate } from 'firebase/firestore';
 import { collectVisibleTodaysBirthdays, parseMonthDay } from '../src/lib/birthdayNotifier';
-import { computeModuleUpdates, computePricelistFingerprint } from '../src/lib/moduleUpdates';
+import {
+  areModuleSeenMapsEqual,
+  computeModuleUpdates,
+  computePricelistFingerprint,
+  getDefaultInitialBaselineMs,
+  getSeenCloudDocId,
+  mergeModuleSeenMaps,
+} from '../src/lib/moduleUpdates';
+import { isUserRecord } from '../src/lib/auth';
+import {
+  deduplicateOrders,
+  deriveOrderCreatedAt,
+  mergeOrderBaseFields,
+} from '../src/lib/dataService';
+import {
+  GOOGLE_APPS_SCRIPT_TEMPLATE,
+  SHEETS_FAILOVER_COLLECTIONS,
+  sanitizeDocForSheets,
+} from '../src/lib/sheetsFailover';
 
 const ROOT = process.cwd();
 
@@ -64,7 +83,19 @@ async function verifyCoreLocksAndSchemas() {
 
   const godownViewText = fs.readFileSync(path.join(ROOT, 'src/components/modules/GodownInchargeView.tsx'), 'utf-8');
   assert.ok(godownViewText.includes('warehouseTab'), 'GodownInchargeView must track sub-tabs in history state for mobile Back navigation');
-  logStep('Frontend routing, APK WebView, Location/Warehouse invariants, and offline SW verified');
+
+  assert.ok(!dashboardText.includes('<ModuleUpdatePopup'), 'Dashboard must NOT mount floating ModuleUpdatePopup box');
+  assert.ok(dashboardText.includes('badgeCount > 0'), 'Dashboard must retain red numbered badges on module grid');
+  assert.ok(dashboardText.includes('badgeCount={moduleBadges.order?.count}'), 'Dashboard bottom nav must retain order badgeCount');
+
+  const orderViewText = fs.readFileSync(path.join(ROOT, 'src/components/modules/OrderView.tsx'), 'utf-8');
+  assert.ok(orderViewText.includes('createdByUid'), 'OrderView must preserve createdByUid metadata');
+  assert.ok(orderViewText.includes('updatedByUid'), 'OrderView must preserve updatedByUid metadata');
+  assert.ok(orderViewText.includes('_syncUpdatedAtMs'), 'OrderView must preserve _syncUpdatedAtMs metadata');
+  assert.ok(orderViewText.includes('formatDisplayDate'), 'OrderView must use safe formatDisplayDate helper');
+  assert.ok(orderViewText.includes('userSelectedStatusFilterRef'), 'OrderView must switch off empty Pending (0) automatically');
+
+  logStep('Frontend routing, APK WebView, Location/Warehouse/Order/Dashboard invariants, and offline SW verified');
 }
 
 function verifyBirthdayNotifications() {
@@ -262,15 +293,68 @@ function verifyModuleUpdateBadges() {
   });
   assert.equal(restrictedRes.badges.price, undefined);
 
-  // 4. Godown Incharge sees Warehouse badge when Admin approves an order
+  // 4. Godown Incharge sees Warehouse badge for 'approved' and 'complete' fresh orders
+  const completeOrder = {
+    id: 'o_complete',
+    dealerName: 'Green Valley Agro',
+    userId: 'u_off1',
+    status: 'complete',
+    warehouseStatus: 'fresh',
+    createdAt: new Date(t0 - 2000).toISOString(),
+    updatedAt: new Date(t1 + 500).toISOString(),
+  };
   const whRes = computeModuleUpdates({
     profile: warehouseProfile,
     seenMap: { office_staff: { seenAtMs: t0 } },
-    orders: [approvedOrder],
+    orders: [approvedOrder, completeOrder],
   });
-  assert.equal(whRes.badges.office_staff?.count, 1, 'Warehouse must see badge 1 for newly approved order');
+  assert.equal(whRes.badges.office_staff?.count, 2, 'Warehouse must see badge 2 for approved + complete fresh orders');
 
-  // 5. After user opens the module (seenAtMs advances past t1), badges clear cleanly
+  // 5. Per-record viewedRecords decrements badge step-by-step (2 -> 1 -> 0) and preserves actorName + actionLabel
+  const secondPendingOrder = {
+    id: 'o_pending_2',
+    dealerName: 'Sahyadri Agro',
+    userId: 'u_off1',
+    createdByUid: 'u_off1',
+    created_by_name: 'Ramesh Patil',
+    status: 'pending_approval',
+    createdAt: new Date(t1 + 1000).toISOString(),
+  };
+  const adminTwoRes = computeModuleUpdates({
+    profile: adminProfile,
+    seenMap: { order: { seenAtMs: t0 } },
+    orders: [pendingOrder, secondPendingOrder],
+  });
+  assert.equal(adminTwoRes.badges.order?.count, 2, 'Admin must see 2 unread orders initially');
+  assert.equal(adminTwoRes.badges.order?.unreadRecords?.[0]?.actorName, 'Ramesh Patil');
+  assert.ok(Boolean(adminTwoRes.badges.order?.unreadRecords?.[0]?.actionLabel), 'Unread order must carry actionLabel');
+
+  const adminOneViewedRes = computeModuleUpdates({
+    profile: adminProfile,
+    seenMap: {
+      order: {
+        seenAtMs: t0,
+        viewedRecords: { o_pending: t1 + 500 },
+      },
+    },
+    orders: [pendingOrder, secondPendingOrder],
+  });
+  assert.equal(adminOneViewedRes.badges.order?.count, 1, 'Viewing 1 order must decrement badge from 2 -> 1');
+  assert.equal(adminOneViewedRes.badges.order?.unreadRecords?.[0]?.id, 'o_pending_2', 'Remaining unread order must stay highlighted');
+
+  const adminAllViewedRes = computeModuleUpdates({
+    profile: adminProfile,
+    seenMap: {
+      order: {
+        seenAtMs: t0,
+        viewedRecords: { o_pending: t1 + 500, o_pending_2: t1 + 1500 },
+      },
+    },
+    orders: [pendingOrder, secondPendingOrder],
+  });
+  assert.equal(adminAllViewedRes.badges.order, undefined, 'Viewing all orders must clear badge to 0');
+
+  // 6. After user opens/clears singleton/module, badges clear cleanly
   const clearedRes = computeModuleUpdates({
     profile: officerProfile,
     seenMap: {
@@ -284,9 +368,177 @@ function verifyModuleUpdateBadges() {
     pricelist: { products: newProducts, validityDate: '2026-11-22', updatedAtMs: t1 },
     remoteAppVersion: { hasUpdate: true, remoteBuildId: 'b_new' },
   });
-  assert.equal(clearedRes.totalCount, 0, 'Opening modules must clear update badges');
+  assert.equal(clearedRes.totalCount, 0, 'Clearing module seen markers must clear update badges');
 
-  logStep('Dashboard module update badges, permissions, and clear-on-open verified');
+  // 7. Monotonic cross-device seenMap merge preserves views across Device A & Device B + fixes pending approval seenAt
+  const mergedSeen = mergeModuleSeenMaps(
+    {
+      order: { seenAtMs: t0, viewedRecords: { o_pending: t1 + 500, o_old: t0 - 100 } },
+      price: { seenAtMs: t1, fingerprint: 'fp_new' },
+    },
+    {
+      order: { seenAtMs: t0, viewedRecords: { o_pending_2: t1 + 1500 } },
+      dealer: { seenAtMs: t1 + 2000 },
+      price: { seenAtMs: t0, fingerprint: 'fp_old' },
+    }
+  );
+  assert.equal(mergedSeen.order?.viewedRecords?.o_pending, t1 + 500);
+  assert.equal(mergedSeen.order?.viewedRecords?.o_pending_2, t1 + 1500);
+  assert.equal(mergedSeen.order?.viewedRecords?.o_old, undefined, 'Stale viewedRecords <= seenAtMs must be pruned');
+  assert.equal(mergedSeen.dealer?.seenAtMs, t1 + 2000);
+  assert.equal(mergedSeen.price?.fingerprint, 'fp_new', 'Higher seenAtMs fingerprint must win');
+  assert.equal(areModuleSeenMapsEqual(mergedSeen, mergeModuleSeenMaps(mergedSeen, mergedSeen)), true);
+  assert.equal(getSeenCloudDocId('uid/with..bad\\chars'), 'user_seen_uid_with__bad_chars');
+
+  const pendingReqCleared = computeModuleUpdates({
+    profile: adminProfile,
+    seenMap: { user: { seenAtMs: t1 + 5000 } },
+    userApprovalRequests: [
+      {
+        id: 'req_1',
+        requestedByName: 'Officer One',
+        fullName: 'Officer One',
+        status: 'pending',
+        createdAt: new Date(t1).toISOString(),
+        updatedAt: new Date(t1).toISOString(),
+      },
+    ],
+  });
+  assert.equal(pendingReqCleared.badges.user, undefined, 'Viewed pending user approval requests <= seenAtMs must stay cleared');
+
+  logStep('Dashboard module update badges, per-record viewedRecords decrement (2->1->0), cross-device merge, and permissions verified');
+}
+
+function verifyOrderVisibilityAndDeduplication() {
+  const officer = {
+    uid: 'user_rushi',
+    fullName: 'RUSHIKESH MARUTI JADHAV',
+    loginId: 'Rushikesh2004',
+    userCode: 'EMP-005',
+    role: 'sales_officer',
+    allowedModules: ['order', 'dealer', 'travel', 'location'],
+  };
+  const admin = {
+    uid: 'user_admin',
+    fullName: 'SHIDHAR BALKRUSHNA SHINDE',
+    role: 'admin',
+  };
+
+  // 1. Orphaned order missing primary owner metadata still matches updater; owned order approved by Admin stays with officer
+  assert.equal(
+    isUserRecord({ id: 'o_orphaned', updatedByUid: 'user_rushi', updatedByName: 'RUSHIKESH MARUTI JADHAV' }, officer),
+    true,
+    'Orphaned order with only updatedByUid/Name must still match officer'
+  );
+  assert.equal(
+    isUserRecord(
+      { id: 'o_owned', userId: 'user_other', createdByUid: 'user_other', updatedByUid: 'user_rushi' },
+      officer
+    ),
+    false,
+    'Order owned by another officer must NOT match a different updater'
+  );
+
+  // 2. deriveOrderCreatedAt recovers timestamp from order_<ms> ID cleanly
+  const sampleMs = 1795406022287;
+  assert.equal(
+    deriveOrderCreatedAt({ id: `order_${sampleMs}` }),
+    new Date(sampleMs).toISOString(),
+    'deriveOrderCreatedAt must recover exact ISO timestamp from order_<ms> ID'
+  );
+
+  // 3. deduplicateOrders must NOT collapse two different dealers that happen to have colliding random BW- numbers
+  const dedupDiffDealers = deduplicateOrders([
+    { id: 'order_1', orderNumber: 'BW-111222', dealerId: 'd_a', dealerName: 'ALPHA AGRO', totalAmount: 5000, createdAt: '2026-11-23T10:00:00Z' },
+    { id: 'order_2', orderNumber: 'BW-111222', dealerId: 'd_b', dealerName: 'BETA AGRO', totalAmount: 9000, createdAt: '2026-11-24T10:00:00Z' },
+  ]);
+  assert.equal(dedupDiffDealers.length, 2, 'Colliding orderNumber across different dealers must preserve BOTH orders');
+
+  // 4. deduplicateOrders + mergeOrderBaseFields must preserve base creator/orderNumber/createdAt when newer patch omits them
+  const dedupMerged = deduplicateOrders([
+    {
+      id: 'order_3',
+      orderNumber: 'BW-333444',
+      dealerId: 'd_a',
+      dealerName: 'ALPHA AGRO',
+      userId: 'user_rushi',
+      createdByUid: 'user_rushi',
+      createdByName: 'RUSHIKESH MARUTI JADHAV',
+      createdAt: '2026-11-20T10:00:00Z',
+    },
+    {
+      id: 'order_3',
+      dealerId: 'd_a',
+      dealerName: 'ALPHA AGRO',
+      updatedByUid: 'user_admin',
+      updatedByName: 'Admin',
+      updatedAt: '2026-11-24T10:00:00Z',
+    },
+  ]);
+  assert.equal(dedupMerged.length, 1);
+  assert.equal(dedupMerged[0].userId, 'user_rushi');
+  assert.equal(dedupMerged[0].createdByUid, 'user_rushi');
+  assert.equal(dedupMerged[0].orderNumber, 'BW-333444');
+  assert.equal(dedupMerged[0].createdAt, '2026-11-20T10:00:00Z');
+  assert.equal(
+    mergeOrderBaseFields({ id: 'x', userId: 'u1', orderNumber: 'BW-1' }, { id: 'x', totalAmount: 200 }).userId,
+    'u1'
+  );
+
+  // 5. Post-approval edit & Warehouse dispatch attribution + fresh baseline visibility for recent updates
+  const now = Date.now();
+  const oneHourAgoIso = new Date(now - 3600_000).toISOString();
+  const threeHoursAgoIso = new Date(now - 3 * 3600_000).toISOString();
+  const fourHoursAgoIso = new Date(now - 4 * 3600_000).toISOString();
+
+  const postApprovalEdited = {
+    id: 'o_edit_after_app',
+    orderNumber: 'BW-900001',
+    dealerName: 'BHOOMI AGRO',
+    userId: 'user_rushi',
+    createdByUid: 'user_rushi',
+    createdByName: 'RUSHIKESH MARUTI JADHAV',
+    status: 'complete',
+    approvedBy: 'SHIDHAR BALKRUSHNA SHINDE',
+    approvedAt: threeHoursAgoIso,
+    createdAt: fourHoursAgoIso,
+    updatedAt: oneHourAgoIso,
+    updatedByUid: 'user_rushi',
+    updatedByName: 'RUSHIKESH MARUTI JADHAV',
+  };
+  const whDispatchedWithStaleUid = {
+    id: 'o_wh_disp',
+    orderNumber: 'BW-900002',
+    dealerName: 'GANESH AGRO',
+    userId: 'user_rushi',
+    createdByUid: 'user_rushi',
+    createdByName: 'RUSHIKESH MARUTI JADHAV',
+    status: 'complete',
+    warehouseStatus: 'dispatched',
+    warehouseDispatchedBy: 'Vishal Shinde',
+    warehouseDispatchedAt: oneHourAgoIso,
+    approvedBy: 'SHIDHAR BALKRUSHNA SHINDE',
+    approvedAt: threeHoursAgoIso,
+    createdAt: fourHoursAgoIso,
+    updatedAt: oneHourAgoIso,
+    updatedByUid: 'user_admin',
+  };
+
+  assert.ok(getDefaultInitialBaselineMs(now) < now - 20 * 3600_000);
+  const freshAdminRes = computeModuleUpdates({
+    profile: admin,
+    seenMap: {},
+    orders: [postApprovalEdited, whDispatchedWithStaleUid],
+  });
+  assert.equal(freshAdminRes.badges.order?.count, 2, 'Admin fresh baseline must still surface recent officer edit & warehouse dispatch');
+  const editedMeta = freshAdminRes.badges.order?.unreadRecords?.find((r) => r.id === 'o_edit_after_app');
+  assert.equal(editedMeta?.actorName, 'Rushikesh Maruti Jadhav');
+  assert.equal(editedMeta?.actionLabel, 'Updated Order');
+  const whMeta = freshAdminRes.badges.order?.unreadRecords?.find((r) => r.id === 'o_wh_disp');
+  assert.equal(whMeta?.actorName, 'Vishal Shinde');
+  assert.equal(whMeta?.actionLabel, 'Dispatched');
+
+  logStep('Order deduplication, orphaned-order ownership, post-approval edit/dispatch attribution, and fresh-baseline updates verified');
 }
 
 async function verifyDistArtifacts() {
@@ -379,10 +631,21 @@ async function verifyHttpServer(baseUrl: string, expectedBuildId?: string) {
   assert.equal(syncSummaryJson.ok, true);
   assert.ok((syncSummaryJson.collections?.users || 0) > 0, 'SQLite secondary users count is 0');
 
-  const backupsRes = await fetch(`${baseUrl}/api/sync/backups`);
+  let backupsRes = await fetch(`${baseUrl}/api/sync/backups`);
   assert.equal(backupsRes.status, 200, '/api/sync/backups failed');
-  const backupsJson = await backupsRes.json();
+  let backupsJson = await backupsRes.json();
   assert.equal(backupsJson.ok, true);
+  if (!Array.isArray(backupsJson.backups) || backupsJson.backups.length === 0) {
+    const createBackupRes = await fetch(`${baseUrl}/api/sync/backup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'auto_probe' }),
+    });
+    assert.equal(createBackupRes.status, 200, 'POST /api/sync/backup failed');
+    backupsRes = await fetch(`${baseUrl}/api/sync/backups`);
+    assert.equal(backupsRes.status, 200, '/api/sync/backups re-check failed');
+    backupsJson = await backupsRes.json();
+  }
   assert.ok(backupsJson.backups.length > 0, 'No disk backups found');
 
   // Verify APK Cross-Origin headers work for Capacitor / WebViewAssetLoader / file:// ('null')
@@ -459,11 +722,108 @@ async function withTempProdServer(fn: (url: string) => Promise<void>) {
   }
 }
 
+function verifySyncContinuityAndStability() {
+  // 1. Zero programmatic deleteDoc() & zero { merge: false } across src/
+  const walkFiles = (dir: string, acc: string[] = []): string[] => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walkFiles(full, acc);
+      else if (/\.(ts|tsx)$/.test(entry.name)) acc.push(full);
+    }
+    return acc;
+  };
+  const srcFiles = walkFiles(path.join(ROOT, 'src'));
+  for (const file of srcFiles) {
+    const content = fs.readFileSync(file, 'utf-8');
+    assert.ok(
+      !/\bmerge\s*:\s*false\b/.test(content),
+      `Unsafe { merge: false } found in ${path.relative(ROOT, file)}`
+    );
+    const nonCommentLines = content
+      .split('\n')
+      .filter((line) => !line.trim().startsWith('//') && !line.trim().startsWith('*'))
+      .join('\n');
+    assert.ok(
+      !/\bdeleteDoc\s*\(/.test(nonCommentLines),
+      `Unsafe deleteDoc() call found in ${path.relative(ROOT, file)}`
+    );
+  }
+
+  // 2. React loop-prevention & hook stability invariants
+  const appText = fs.readFileSync(path.join(ROOT, 'src/App.tsx'), 'utf-8');
+  assert.ok(appText.includes('JSON.stringify(prev) === JSON.stringify(merged)'), 'App.tsx must short-circuit identical profile objects');
+
+  const dashText = fs.readFileSync(path.join(ROOT, 'src/components/Dashboard.tsx'), 'utf-8');
+  assert.ok(dashText.includes('lastBadgesSigRef'), 'Dashboard.tsx must guard module badge updates with lastBadgesSigRef');
+  assert.ok(dashText.includes('lastBirthdaysSigRef'), 'Dashboard.tsx must guard birthday updates with lastBirthdaysSigRef');
+
+  const popupText = fs.readFileSync(path.join(ROOT, 'src/components/ModuleUpdatePopup.tsx'), 'utf-8');
+  assert.ok(popupText.includes('seenMapRef'), 'ModuleUpdatePopup.tsx must avoid side-effects inside setSeenMap updaters');
+  assert.ok(popupText.includes('lastEmittedBadgesSigRef'), 'ModuleUpdatePopup.tsx must guard badge emission with lastEmittedBadgesSigRef');
+  assert.ok(popupText.includes('cloudHydrated'), 'ModuleUpdatePopup.tsx must gate baseline initialization on cloudHydrated');
+  assert.ok(popupText.includes("'target', 'price', 'scheme', 'setting'"), 'ModuleUpdatePopup.tsx must auto-mark singleton modules including target');
+
+  const bannerText = fs.readFileSync(path.join(ROOT, 'src/components/ModuleUpdateBanner.tsx'), 'utf-8');
+  assert.ok(!bannerText.includes('[profile, seenMap, moduleId, partialInput]'), 'ModuleUpdateBanner must destructure partialInput deps');
+  assert.ok(!bannerText.includes('सर्व पाहिले'), 'ModuleUpdateBanner must NOT render सर्व पाहिले button');
+  assert.ok(!bannerText.includes('नवीन अपडेट्स'), 'ModuleUpdateBanner must NOT render नवीन अपडेट्स banner');
+
+  // 3. Immediate cross-device build propagation & dynamic UI invariants
+  const serverText = fs.readFileSync(path.join(ROOT, 'server.ts'), 'utf-8');
+  assert.ok(!serverText.includes('const SERVER_BUILD_INFO ='), 'server.ts must resolve build metadata dynamically per request');
+  assert.ok(serverText.includes("broadcastEvent('build_update'"), 'server.ts must push live build_update SSE events');
+  assert.ok(serverText.includes('CDN-Cache-Control'), 'server.ts must send CDN-Cache-Control: no-store');
+
+  const viteText = fs.readFileSync(path.join(ROOT, 'vite.config.ts'), 'utf-8');
+  assert.ok(
+    viteText.includes('ignoreURLParametersMatching: [/^utm_/, /^fbclid$/]'),
+    'Workbox must NOT strip ?v= or ?apk_ota= cache-busting parameters'
+  );
+
+  const mainText = fs.readFileSync(path.join(ROOT, 'src/main.tsx'), 'utf-8');
+  assert.ok(mainText.includes('startAutoVersionControl();'), 'main.tsx must run startAutoVersionControl() unconditionally');
+
+  const appVerText = fs.readFileSync(path.join(ROOT, 'src/lib/appVersion.ts'), 'utf-8');
+  assert.ok(!appVerText.includes('isDevPair'), 'appVersion.ts must not suppress new build reloads via isDevPair');
+  assert.ok(appVerText.includes('purgeStaleServiceWorkerAndCachesSafely'), 'appVersion.ts must purge stale SW/Workbox caches on online updates');
+
+  const dashUiText = fs.readFileSync(path.join(ROOT, 'src/components/Dashboard.tsx'), 'utf-8');
+  assert.ok(dashUiText.includes('useUiConfig'), 'Dashboard.tsx must consume real-time useUiConfig()');
+
+  const settingUiText = fs.readFileSync(path.join(ROOT, 'src/components/modules/SettingView.tsx'), 'utf-8');
+  assert.ok(settingUiText.includes('useUiConfig'), 'SettingView.tsx must expose Admin UI & Options live editor');
+
+  // 4. Google Sheets Failover collection coverage & sanitization
+  for (const col of ['orders', 'dealers_application', 'collection_entries', 'travel_sheets', 'users']) {
+    assert.ok(SHEETS_FAILOVER_COLLECTIONS.has(col), `SHEETS_FAILOVER_COLLECTIONS missing ${col}`);
+  }
+  const bigDataUri = 'data:image/png;base64,' + 'A'.repeat(15000);
+  const sanitized = sanitizeDocForSheets({
+    id: 'ord_1',
+    orderNumber: 'ORD-101',
+    dealerName: 'Kisan Agro',
+    logoUrl: bigDataUri,
+    nested: { avatar: bigDataUri, city: 'Pune' },
+  });
+  assert.equal(sanitized.orderNumber, 'ORD-101');
+  assert.equal(sanitized.dealerName, 'Kisan Agro');
+  assert.equal(sanitized.logoUrl, '[binary_omitted]');
+  assert.equal(sanitized.nested.avatar, '[binary_omitted]');
+  assert.equal(sanitized.nested.city, 'Pune');
+  assert.ok(GOOGLE_APPS_SCRIPT_TEMPLATE.includes('function doGet'));
+  assert.ok(GOOGLE_APPS_SCRIPT_TEMPLATE.includes('function doPost'));
+  assert.ok(GOOGLE_APPS_SCRIPT_TEMPLATE.includes('LockService.getScriptLock()'));
+
+  logStep('Zero-data-loss, loop-prevention, live update sync, and Google Sheets failover verified');
+}
+
 async function main() {
   console.log('=== Blackworm Agritech MIS — Full System Regression Suite ===');
   await verifyCoreLocksAndSchemas();
+  verifySyncContinuityAndStability();
   verifyBirthdayNotifications();
   verifyModuleUpdateBadges();
+  verifyOrderVisibilityAndDeduplication();
   const distMeta = await verifyDistArtifacts();
   await verifyFirestoreLive();
 
@@ -488,8 +848,319 @@ async function main() {
     console.log('ℹ️ [INFO] Dev server port 3000 not currently active during script run');
   }
 
+  await verify25DevicesRealTimeSync(distMeta);
+
   console.log('🎉 ALL REGRESSION & CORE LOCK CHECKS PASSED!');
   process.exit(0);
+}
+
+interface SsePacket {
+  event: string;
+  data: any;
+}
+
+async function verify25DevicesRealTimeSync(distMeta: { version: string; buildId: string; firebaseProjectId: string; firestoreDatabaseId: string }) {
+  const DEVICE_COUNT = 25;
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bw-25dev-'));
+  const tempDataDir = path.join(tempRoot, 'data');
+  const tempVersionFile = path.join(tempRoot, 'version.json');
+  fs.mkdirSync(tempDataDir, { recursive: true });
+
+  const prodSqlite = path.join(ROOT, 'data', 'secondary_sync.sqlite');
+  if (fs.existsSync(prodSqlite)) {
+    fs.copyFileSync(prodSqlite, path.join(tempDataDir, 'secondary_sync.sqlite'));
+  }
+  const initialBuildId = `${distMeta.buildId}_init`;
+  fs.writeFileSync(
+    tempVersionFile,
+    JSON.stringify({ ...distMeta, buildId: initialBuildId, builtAt: new Date().toISOString() }, null, 2),
+    'utf-8'
+  );
+
+  const port = 3098;
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const proc: ChildProcess = spawn('node', ['dist/server.js'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      NODE_ENV: 'production',
+      PORT: String(port),
+      BLACKWORM_DATA_DIR: tempDataDir,
+      BLACKWORM_VERSION_FILE: tempVersionFile,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const controllers: AbortController[] = [];
+  const clientEvents: SsePacket[][] = Array.from({ length: DEVICE_COUNT }, () => []);
+
+  const waitForAllDevices = async (
+    label: string,
+    predicate: (events: SsePacket[]) => boolean,
+    timeoutMs = 5000
+  ) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const matched = clientEvents.filter((evts) => predicate(evts)).length;
+      if (matched === DEVICE_COUNT) {
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    const matched = clientEvents.filter((evts) => predicate(evts)).length;
+    assert.equal(matched, DEVICE_COUNT, `${label}: only ${matched}/${DEVICE_COUNT} devices received update`);
+  };
+
+  try {
+    let ready = false;
+    for (let i = 0; i < 40; i++) {
+      try {
+        const r = await fetch(`${baseUrl}/api/health`);
+        if (r.ok) {
+          ready = true;
+          break;
+        }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    assert.ok(ready, 'Isolated 25-device verification server failed to start');
+
+    // Verify strict no-store headers on live HTML, version, & SW endpoints
+    for (const ep of ['/', '/version.json', '/api/app-version', '/sw.js']) {
+      const r = await fetch(`${baseUrl}${ep}`);
+      assert.equal(r.status, 200);
+      const cc = String(r.headers.get('cache-control') || '').toLowerCase();
+      assert.ok(cc.includes('no-store'), `${ep} missing Cache-Control: no-store (got ${cc})`);
+    }
+
+    // Connect 25 simultaneous SSE clients representing 25 devices (web, PWA, Android APK)
+    await Promise.all(
+      Array.from({ length: DEVICE_COUNT }, async (_, idx) => {
+        const ctrl = new AbortController();
+        controllers.push(ctrl);
+        const res = await fetch(`${baseUrl}/api/sync/stream?sinceRevision=0`, {
+          signal: ctrl.signal,
+          headers: { Accept: 'text/event-stream' },
+        });
+        assert.equal(res.status, 200, `Device #${idx + 1} SSE failed`);
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        // Pump stream asynchronously until aborted
+        void (async () => {
+          try {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const frames = buffer.split('\n\n');
+              buffer = frames.pop() || '';
+              for (const frame of frames) {
+                const lines = frame.split('\n');
+                let eventName = 'message';
+                let dataStr = '';
+                for (const ln of lines) {
+                  if (ln.startsWith('event:')) eventName = ln.slice(6).trim();
+                  else if (ln.startsWith('data:')) dataStr += ln.slice(5).trim();
+                }
+                if (dataStr) {
+                  try {
+                    clientEvents[idx].push({ event: eventName, data: JSON.parse(dataStr) });
+                  } catch {}
+                }
+              }
+            }
+          } catch {}
+        })();
+      })
+    );
+
+    await waitForAllDevices('Initial 25-device SSE connect', (evts) =>
+      evts.some((e) => e.event === 'connected' && e.data?.buildId === initialBuildId)
+    );
+    logStep(`All ${DEVICE_COUNT} concurrent devices connected via SSE stream`);
+
+    // 1. Admin adds a custom UI option, renames built-in 'order', changes gridColumns=4 & layoutDensity='compact'
+    const tAdd = Date.now();
+    const upsertAddRes = await fetch(`${baseUrl}/api/sync/upsert`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        collection: 'config',
+        id: 'ui_layout',
+        updatedAtMs: tAdd,
+        doc: {
+          id: 'ui_layout',
+          appTitle: 'BLACKWORM AGRITECH LIVE',
+          gridColumns: 4,
+          layoutDensity: 'compact',
+          moduleOverrides: { order: { label: 'Live Orders' } },
+          customOptions: [{ id: 'custom_circular_1', label: 'Daily Circular', enabled: true, order: 100 }],
+          updatedAt: new Date(tAdd).toISOString(),
+        },
+      }),
+    });
+    assert.equal(upsertAddRes.status, 200);
+
+    await waitForAllDevices('UI Option ADD + Layout Change -> 25/25 devices', (evts) =>
+      evts.some(
+        (e) =>
+          e.event === 'delta' &&
+          e.data?.collection === 'config' &&
+          e.data?.id === 'ui_layout' &&
+          e.data?.doc?.gridColumns === 4 &&
+          e.data?.doc?.layoutDensity === 'compact' &&
+          e.data?.doc?.moduleOverrides?.order?.label === 'Live Orders' &&
+          Array.isArray(e.data?.doc?.customOptions) &&
+          e.data.doc.customOptions.length === 1 &&
+          e.data.doc.customOptions[0].label === 'Daily Circular'
+      )
+    );
+    logStep(`UI option ADD + layout resize propagated immediately to ${DEVICE_COUNT}/${DEVICE_COUNT} devices`);
+
+    // 2. Admin deletes custom option and modifies title & gridColumns=3
+    const tDel = tAdd + 500;
+    const upsertDelRes = await fetch(`${baseUrl}/api/sync/upsert`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        collection: 'config',
+        id: 'ui_layout',
+        updatedAtMs: tDel,
+        doc: {
+          id: 'ui_layout',
+          appTitle: 'BLACKWORM AGRITECH PVT LTD',
+          gridColumns: 3,
+          layoutDensity: 'standard',
+          moduleOverrides: { order: { label: 'Orders' } },
+          customOptions: [],
+          updatedAt: new Date(tDel).toISOString(),
+        },
+      }),
+    });
+    assert.equal(upsertDelRes.status, 200);
+
+    await waitForAllDevices('UI Option DELETE + Modify -> 25/25 devices', (evts) =>
+      evts.some(
+        (e) =>
+          e.event === 'delta' &&
+          e.data?.collection === 'config' &&
+          e.data?.id === 'ui_layout' &&
+          e.data?.updatedAtMs === tDel &&
+          e.data?.doc?.gridColumns === 3 &&
+          Array.isArray(e.data?.doc?.customOptions) &&
+          e.data.doc.customOptions.length === 0
+      )
+    );
+    logStep(`UI option DELETE + layout modify propagated immediately to ${DEVICE_COUNT}/${DEVICE_COUNT} devices`);
+
+    // 3. Admin updates an officer's permissions (allowedModules) & company branding
+    const tPerm = tDel + 500;
+    await fetch(`${baseUrl}/api/sync/upsert`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        collection: 'users',
+        id: 'sim_officer_25',
+        updatedAtMs: tPerm,
+        doc: {
+          id: 'sim_officer_25',
+          uid: 'sim_officer_25',
+          fullName: 'Simulated Officer',
+          role: 'sales_officer',
+          allowedModules: ['order', 'dealer', 'travel', 'scheme'],
+          updatedAt: new Date(tPerm).toISOString(),
+        },
+      }),
+    });
+    await waitForAllDevices('User allowedModules change -> 25/25 devices', (evts) =>
+      evts.some(
+        (e) =>
+          e.event === 'delta' &&
+          e.data?.collection === 'users' &&
+          e.data?.id === 'sim_officer_25' &&
+          Array.isArray(e.data?.doc?.allowedModules) &&
+          e.data.doc.allowedModules.includes('scheme')
+      )
+    );
+    logStep(`User permission update propagated immediately to ${DEVICE_COUNT}/${DEVICE_COUNT} devices`);
+
+    // 4. Cross-device per-user seen-state monotonic merge across concurrent devices -> 25/25 devices
+    const tSeen1 = tPerm + 400;
+    const tSeen2 = tSeen1 + 200;
+    await fetch(`${baseUrl}/api/sync/upsert`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        collection: 'config',
+        id: 'user_seen_u_admin_25',
+        updatedAtMs: tSeen1,
+        doc: {
+          id: 'user_seen_u_admin_25',
+          uid: 'u_admin_25',
+          seenMap: { order: { seenAtMs: 1000, viewedRecords: { ord_a: tSeen1 } } },
+          bdaySeen: { '2026-11-25': ['user:u_1'] },
+          isArchived: false,
+        },
+      }),
+    });
+    await fetch(`${baseUrl}/api/sync/upsert`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        collection: 'config',
+        id: 'user_seen_u_admin_25',
+        updatedAtMs: tSeen2,
+        doc: {
+          id: 'user_seen_u_admin_25',
+          uid: 'u_admin_25',
+          seenMap: { order: { seenAtMs: 1000, viewedRecords: { ord_b: tSeen2 } } },
+          bdaySeen: { '2026-11-25': ['dealer:d_1'] },
+          isArchived: false,
+        },
+      }),
+    });
+    await waitForAllDevices('Cross-device user_seen monotonic merge -> 25/25 devices', (evts) =>
+      evts.some(
+        (e) =>
+          e.event === 'delta' &&
+          e.data?.collection === 'config' &&
+          e.data?.id === 'user_seen_u_admin_25' &&
+          e.data?.doc?.seenMap?.order?.viewedRecords?.ord_a === tSeen1 &&
+          e.data?.doc?.seenMap?.order?.viewedRecords?.ord_b === tSeen2 &&
+          Array.isArray(e.data?.doc?.bdaySeen?.['2026-11-25']) &&
+          e.data.doc.bdaySeen['2026-11-25'].includes('user:u_1') &&
+          e.data.doc.bdaySeen['2026-11-25'].includes('dealer:d_1')
+      )
+    );
+    logStep(`Cross-device per-user seen/birthday monotonic merge verified across ${DEVICE_COUNT}/${DEVICE_COUNT} live devices`);
+
+    // 5. Simulate new Website build deployment -> verify server pushes event: build_update to ALL 25 devices without APK update or manual refresh
+    const nextBuildId = `${distMeta.buildId}_ota_next`;
+    fs.writeFileSync(
+      tempVersionFile,
+      JSON.stringify({ ...distMeta, buildId: nextBuildId, builtAt: new Date().toISOString() }, null, 2),
+      'utf-8'
+    );
+    await waitForAllDevices(
+      'Automatic build_update SSE broadcast -> 25/25 devices',
+      (evts) => evts.some((e) => e.event === 'build_update' && e.data?.buildId === nextBuildId),
+      6000
+    );
+    logStep(`Automatic build_update OTA push verified across ${DEVICE_COUNT}/${DEVICE_COUNT} live devices`);
+  } finally {
+    controllers.forEach((c) => {
+      try {
+        c.abort();
+      } catch {}
+    });
+    proc.kill('SIGTERM');
+    await new Promise((r) => setTimeout(r, 300));
+    try {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    } catch {}
+  }
 }
 
 main().catch((err) => {

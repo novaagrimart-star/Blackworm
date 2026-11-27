@@ -5,6 +5,8 @@ import {
   exportFullDatabaseBackup,
   restoreDatabaseFromJson,
   forceMultiTierSyncAll,
+  safeFirestoreSet,
+  syncWithSheetsFailover,
 } from '../../lib/dataService';
 import { hydrateAllChannelsFromSecondary } from '../../lib/realtimeStore';
 import { safeClearTransientCaches } from '../../lib/localVault';
@@ -13,6 +15,13 @@ import {
   checkRemoteAppVersion,
   resolveApiUrl,
 } from '../../lib/appVersion';
+import {
+  GOOGLE_APPS_SCRIPT_TEMPLATE,
+  getSheetsFailoverConfig,
+  isValidAppsScriptUrl,
+  saveSheetsFailoverConfigLocally,
+  testSheetsFailoverConnection,
+} from '../../lib/sheetsFailover';
 import { Language, translations } from '../../lib/i18n';
 import { CustomDialogModal } from '../CustomDialogModal';
 import {
@@ -29,9 +38,27 @@ import {
   Loader2,
   FileJson,
   Image as ImageIcon,
+  Table2,
+  Copy,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  LayoutGrid,
+  Plus,
+  Trash2,
+  Eye,
+  EyeOff,
+  RotateCcw,
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { useBranding } from '../../lib/branding';
+import {
+  useUiConfig,
+  CustomDashboardOption,
+  GridColumns,
+  LayoutDensity,
+  ModuleOptionOverride,
+} from '../../lib/uiConfig';
 
 interface Props {
   profile: UserProfile;
@@ -39,11 +66,43 @@ interface Props {
   onLogout: () => void;
 }
 
+const BUILTIN_OPTION_META: Array<{ id: string; defaultLabel: string }> = [
+  { id: 'target', defaultLabel: 'Target Sheet' },
+  { id: 'user', defaultLabel: 'User Form' },
+  { id: 'office_staff', defaultLabel: 'Warehouse Incharge' },
+  { id: 'order', defaultLabel: 'Orders' },
+  { id: 'collection', defaultLabel: 'Collections' },
+  { id: 'calculator', defaultLabel: 'Outstanding' },
+  { id: 'price', defaultLabel: 'Price List' },
+  { id: 'dealer', defaultLabel: 'Dealer' },
+  { id: 'location', defaultLabel: 'Location Mapping' },
+  { id: 'travel', defaultLabel: 'Traveling' },
+  { id: 'scheme', defaultLabel: 'Scheme' },
+  { id: 'report', defaultLabel: 'Report' },
+  { id: 'setting', defaultLabel: 'Settings' },
+];
+
 export const SettingView: React.FC<Props> = ({ profile, lang }) => {
   const t = translations[lang];
   const userIsAdmin = isAdmin(profile);
   const { logoUrl, logoSize, saveBranding } = useBranding();
-  const [activeTab, setActiveTab] = useState<'cache' | 'branding' | 'backup'>('cache');
+  const { uiConfig, saveUiConfig, resetUiConfig } = useUiConfig();
+  const [activeTab, setActiveTab] = useState<'cache' | 'ui_config' | 'branding' | 'backup'>('cache');
+  const [draftTitle, setDraftTitle] = useState<string>(uiConfig.appTitle);
+  const [draftColumns, setDraftColumns] = useState<GridColumns>(uiConfig.gridColumns);
+  const [draftDensity, setDraftDensity] = useState<LayoutDensity>(uiConfig.layoutDensity);
+  const [draftOverrides, setDraftOverrides] = useState<Record<string, ModuleOptionOverride>>(
+    uiConfig.moduleOverrides || {}
+  );
+  const [draftCustomOptions, setDraftCustomOptions] = useState<CustomDashboardOption[]>(
+    uiConfig.customOptions || []
+  );
+  const [newOptionLabel, setNewOptionLabel] = useState<string>('');
+  const [newOptionSubtitle, setNewOptionSubtitle] = useState<string>('');
+  const [newOptionDescription, setNewOptionDescription] = useState<string>('');
+  const [newOptionUrl, setNewOptionUrl] = useState<string>('');
+  const [isSavingUiConfig, setIsSavingUiConfig] = useState<boolean>(false);
+  const [uiConfigStatus, setUiConfigStatus] = useState<string>('');
   const [isSavingLogo, setIsSavingLogo] = useState<boolean>(false);
   const [brandingSavedToast, setBrandingSavedToast] = useState<boolean>(false);
   const [isClearingCache, setIsClearingCache] = useState<boolean>(false);
@@ -55,6 +114,14 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
     Array<{ filename: string; sizeBytes: number; modifiedAtMs: number }>
   >([]);
   const [backupStatusMessage, setBackupStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [sheetsUrl, setSheetsUrl] = useState<string>(() => getSheetsFailoverConfig().webhookUrl);
+  const [sheetsEnabled, setSheetsEnabled] = useState<boolean>(() => getSheetsFailoverConfig().enabled);
+  const [isSavingSheets, setIsSavingSheets] = useState<boolean>(false);
+  const [isTestingSheets, setIsTestingSheets] = useState<boolean>(false);
+  const [isSyncingSheets, setIsSyncingSheets] = useState<boolean>(false);
+  const [showAppsScriptCode, setShowAppsScriptCode] = useState<boolean>(false);
+  const [copiedScript, setCopiedScript] = useState<boolean>(false);
+  const [sheetsStatusMsg, setSheetsStatusMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   const [localLogoSize, setLocalLogoSize] = useState<number>(logoSize);
   const sizeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -62,6 +129,14 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
   useEffect(() => {
     setLocalLogoSize(logoSize);
   }, [logoSize]);
+
+  useEffect(() => {
+    setDraftTitle(uiConfig.appTitle);
+    setDraftColumns(uiConfig.gridColumns);
+    setDraftDensity(uiConfig.layoutDensity);
+    setDraftOverrides(uiConfig.moduleOverrides || {});
+    setDraftCustomOptions(uiConfig.customOptions || []);
+  }, [uiConfig]);
 
   useEffect(() => {
     return () => {
@@ -89,8 +164,99 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
   useEffect(() => {
     if (activeTab === 'backup' && userIsAdmin) {
       void loadServerBackups();
+      const cfg = getSheetsFailoverConfig();
+      if (cfg.webhookUrl) {
+        setSheetsUrl(cfg.webhookUrl);
+        setSheetsEnabled(cfg.enabled);
+      }
     }
   }, [activeTab, userIsAdmin, profile.uid]);
+
+  const handleSaveSheetsFailover = async () => {
+    const cleanUrl = sheetsUrl.trim();
+    if (cleanUrl && !isValidAppsScriptUrl(cleanUrl)) {
+      setSheetsStatusMsg({ type: 'error', text: 'कृपया वैध HTTPS Google Apps Script Web App URL प्रविष्ट करा.' });
+      return;
+    }
+    setIsSavingSheets(true);
+    setSheetsStatusMsg(null);
+    try {
+      const enabledFlag = Boolean(sheetsEnabled && isValidAppsScriptUrl(cleanUrl));
+      const payload = {
+        webhookUrl: cleanUrl,
+        enabled: enabledFlag,
+        updatedAt: new Date().toISOString(),
+        updatedBy: profile.uid,
+        updatedByName: profile.fullName || 'Admin',
+      };
+      saveSheetsFailoverConfigLocally(payload);
+      await safeFirestoreSet('config', 'sheets_failover', payload, { merge: true });
+      setSheetsEnabled(enabledFlag);
+      setSheetsStatusMsg({
+        type: 'success',
+        text: cleanUrl
+          ? 'Google Sheets Failover URL सर्व डिव्हाइसेससाठी सुरक्षित जतन झाला!'
+          : 'Google Sheets Failover बंद करण्यात आले.',
+      });
+    } catch (err: any) {
+      setSheetsStatusMsg({
+        type: 'error',
+        text: getFriendlyErrorMessage(err, 'सेटिंग जतन करताना त्रुटी आली.'),
+      });
+    } finally {
+      setIsSavingSheets(false);
+    }
+  };
+
+  const handleTestSheetsFailover = async () => {
+    setIsTestingSheets(true);
+    setSheetsStatusMsg(null);
+    try {
+      const res = await testSheetsFailoverConnection(sheetsUrl);
+      if (res.ok) {
+        setSheetsStatusMsg({
+          type: 'success',
+          text: `कनेक्शन यशस्वी! Google Sheet "${res.sheetName || 'Connected'}" फेलओव्हरसाठी तयार आहे.`,
+        });
+      } else {
+        setSheetsStatusMsg({
+          type: 'error',
+          text: res.error || 'Google Sheet शी संपर्क होऊ शकला नाही.',
+        });
+      }
+    } finally {
+      setIsTestingSheets(false);
+    }
+  };
+
+  const handleSyncSheetsNow = async () => {
+    setIsSyncingSheets(true);
+    setSheetsStatusMsg(null);
+    try {
+      const res = await syncWithSheetsFailover({ pushLocal: true, pullRemote: true });
+      if (res.ok) {
+        setSheetsStatusMsg({
+          type: 'success',
+          text: `Google Sheet सिंक पूर्ण! (${res.pushed} नोंदी पाठवल्या, ${res.pulled} नोंदी तपासल्या)`,
+        });
+      } else {
+        setSheetsStatusMsg({
+          type: 'error',
+          text: res.error || 'Google Sheet सिंक करता आले नाही.',
+        });
+      }
+    } finally {
+      setIsSyncingSheets(false);
+    }
+  };
+
+  const handleCopyAppsScript = async () => {
+    try {
+      await navigator.clipboard.writeText(GOOGLE_APPS_SCRIPT_TEMPLATE);
+      setCopiedScript(true);
+      setTimeout(() => setCopiedScript(false), 2500);
+    } catch {}
+  };
 
   const saveLogoConfig = async (newUrl: string, newSize: number) => {
     setIsSavingLogo(true);
@@ -430,6 +596,16 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
         {userIsAdmin && (
           <button
             type="button"
+            onClick={() => setActiveTab('ui_config')}
+            className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold transition shrink-0 cursor-pointer whitespace-nowrap ${activeTab === 'ui_config' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
+          >
+            <LayoutGrid className="w-3.5 h-3.5 text-rose-500" />
+            <span>UI &amp; Options</span>
+          </button>
+        )}
+        {userIsAdmin && (
+          <button
+            type="button"
             onClick={() => setActiveTab('branding')}
             className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold transition shrink-0 cursor-pointer whitespace-nowrap ${activeTab === 'branding' ? 'bg-slate-900 text-white shadow-xs' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}
           >
@@ -448,6 +624,314 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
           </button>
         )}
       </div>
+
+      {userIsAdmin && activeTab === 'ui_config' && (
+        <div className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 space-y-6 text-xs shadow-2xs">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-100">
+            <div>
+              <h3 className="text-sm sm:text-base font-bold text-slate-900 tracking-tight">
+                Live UI Design, Layout &amp; Dashboard Options
+              </h3>
+              <p className="text-xs text-slate-500 mt-0.5">
+                येथील कोणताही बदल (Add / Edit / Delete / Layout) सर्व डिव्हाइसेसवर रिफ्रेश किंवा APK अपडेटशिवाय लगेच लागू होतो
+              </p>
+            </div>
+            {uiConfigStatus && (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 font-bold text-xs">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                <span>{uiConfigStatus}</span>
+              </span>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="sm:col-span-3 space-y-1.5">
+              <label className="block font-bold text-slate-700">Company Header Title</label>
+              <input
+                type="text"
+                value={draftTitle}
+                onChange={(e) => setDraftTitle(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl border border-slate-200 text-xs font-bold text-slate-900 focus:outline-none focus:border-rose-500"
+                placeholder="BLACKWORM AGRITECH PVT LTD"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="block font-bold text-slate-700">Dashboard Grid Columns</label>
+              <div className="grid grid-cols-3 gap-1.5">
+                {([2, 3, 4] as GridColumns[]).map((cols) => (
+                  <button
+                    key={cols}
+                    type="button"
+                    onClick={() => setDraftColumns(cols)}
+                    className={cn(
+                      'py-2 rounded-lg font-bold border transition cursor-pointer',
+                      draftColumns === cols
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+                    )}
+                  >
+                    {cols} Cols
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="sm:col-span-2 space-y-1.5">
+              <label className="block font-bold text-slate-700">Card Spacing &amp; Layout Density</label>
+              <div className="grid grid-cols-3 gap-1.5">
+                {(['compact', 'standard', 'spacious'] as LayoutDensity[]).map((density) => (
+                  <button
+                    key={density}
+                    type="button"
+                    onClick={() => setDraftDensity(density)}
+                    className={cn(
+                      'py-2 rounded-lg font-bold border capitalize transition cursor-pointer',
+                      draftDensity === density
+                        ? 'bg-slate-900 text-white border-slate-900'
+                        : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+                    )}
+                  >
+                    {density}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Built-in Dashboard Options Manager (Rename / Hide / Reorder) */}
+          <div className="space-y-2.5 pt-2 border-t border-slate-100">
+            <h4 className="font-bold text-slate-800">Built-in Dashboard Options (Modify Name / Show-Hide / Order)</h4>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {BUILTIN_OPTION_META.map((item, idx) => {
+                const ov = draftOverrides[item.id] || {};
+                const isHidden = Boolean(ov.hidden && item.id !== 'setting');
+                return (
+                  <div
+                    key={item.id}
+                    className={cn(
+                      'flex items-center gap-2 p-2 rounded-xl border transition',
+                      isHidden ? 'bg-slate-50 border-slate-200 opacity-65' : 'bg-white border-slate-200'
+                    )}
+                  >
+                    <input
+                      type="text"
+                      value={ov.label ?? item.defaultLabel}
+                      onChange={(e) =>
+                        setDraftOverrides((prev) => ({
+                          ...prev,
+                          [item.id]: {
+                            ...prev[item.id],
+                            label: e.target.value,
+                          },
+                        }))
+                      }
+                      className="flex-1 min-w-0 px-2.5 py-1.5 rounded-lg border border-slate-200 text-xs font-semibold text-slate-800 focus:outline-none focus:border-rose-500"
+                    />
+                    <input
+                      type="number"
+                      value={typeof ov.order === 'number' ? ov.order : idx}
+                      onChange={(e) =>
+                        setDraftOverrides((prev) => ({
+                          ...prev,
+                          [item.id]: {
+                            ...prev[item.id],
+                            order: Number(e.target.value) || 0,
+                          },
+                        }))
+                      }
+                      className="w-14 px-2 py-1.5 rounded-lg border border-slate-200 text-xs font-mono text-center text-slate-700"
+                      title="Display Order"
+                    />
+                    {item.id !== 'setting' && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setDraftOverrides((prev) => ({
+                            ...prev,
+                            [item.id]: {
+                              ...prev[item.id],
+                              hidden: !prev[item.id]?.hidden,
+                            },
+                          }))
+                        }
+                        className={cn(
+                          'p-1.5 rounded-lg border cursor-pointer transition',
+                          isHidden
+                            ? 'bg-rose-50 border-rose-200 text-rose-600'
+                            : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                        )}
+                        title={isHidden ? 'Option Hidden — Click to Show' : 'Option Visible — Click to Hide'}
+                      >
+                        {isHidden ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Custom Dashboard Options (Add / Edit / Delete) */}
+          <div className="space-y-3 pt-3 border-t border-slate-100">
+            <h4 className="font-bold text-slate-800">Custom Dashboard Options (नवीन ऑप्शन Add / Edit / Delete करा)</h4>
+
+            {draftCustomOptions.length > 0 && (
+              <div className="space-y-2">
+                {draftCustomOptions.map((opt) => (
+                  <div
+                    key={opt.id}
+                    className="flex flex-wrap sm:flex-nowrap items-center gap-2 p-2.5 rounded-xl border border-slate-200 bg-slate-50"
+                  >
+                    <input
+                      type="text"
+                      value={opt.label}
+                      onChange={(e) =>
+                        setDraftCustomOptions((prev) =>
+                          prev.map((x) => (x.id === opt.id ? { ...x, label: e.target.value } : x))
+                        )
+                      }
+                      className="flex-1 min-w-[140px] px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-xs font-bold text-slate-800"
+                      placeholder="Option Name"
+                    />
+                    <input
+                      type="text"
+                      value={opt.subtitle || ''}
+                      onChange={(e) =>
+                        setDraftCustomOptions((prev) =>
+                          prev.map((x) => (x.id === opt.id ? { ...x, subtitle: e.target.value } : x))
+                        )
+                      }
+                      className="flex-1 min-w-[120px] px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-xs text-slate-700"
+                      placeholder="Subtitle (Optional)"
+                    />
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setDraftCustomOptions((prev) => prev.filter((x) => x.id !== opt.id))
+                      }
+                      className="p-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-600 cursor-pointer"
+                      title="Delete Option"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="p-3 rounded-xl border border-dashed border-slate-300 bg-slate-50/70 space-y-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <input
+                  type="text"
+                  value={newOptionLabel}
+                  onChange={(e) => setNewOptionLabel(e.target.value)}
+                  placeholder="नवीन ऑप्शनचे नाव (उदा. Circular / New Offer)"
+                  className="px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs font-semibold text-slate-800"
+                />
+                <input
+                  type="text"
+                  value={newOptionSubtitle}
+                  onChange={(e) => setNewOptionSubtitle(e.target.value)}
+                  placeholder="लहान उपशीर्षक (Optional)"
+                  className="px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs text-slate-700"
+                />
+                <input
+                  type="text"
+                  value={newOptionUrl}
+                  onChange={(e) => setNewOptionUrl(e.target.value)}
+                  placeholder="लिंक URL (Optional, उदा. https://...)"
+                  className="px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs text-slate-700"
+                />
+                <input
+                  type="text"
+                  value={newOptionDescription}
+                  onChange={(e) => setNewOptionDescription(e.target.value)}
+                  placeholder="सविस्तर सूचना किंवा माहिती (Optional)"
+                  className="px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs text-slate-700"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  const lbl = newOptionLabel.trim();
+                  if (!lbl) return;
+                  const nextOpt: CustomDashboardOption = {
+                    id: `custom_${Date.now()}`,
+                    label: lbl,
+                    subtitle: newOptionSubtitle.trim(),
+                    description: newOptionDescription.trim(),
+                    url: newOptionUrl.trim(),
+                    color: 'text-indigo-600',
+                    bg: 'bg-indigo-50',
+                    enabled: true,
+                    order: 100 + draftCustomOptions.length,
+                  };
+                  setDraftCustomOptions((prev) => [...prev, nextOpt]);
+                  setNewOptionLabel('');
+                  setNewOptionSubtitle('');
+                  setNewOptionDescription('');
+                  setNewOptionUrl('');
+                }}
+                disabled={!newOptionLabel.trim()}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-900 disabled:opacity-40 text-white font-bold text-xs cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>Add Option to List</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-100">
+            <button
+              type="button"
+              onClick={async () => {
+                setIsSavingUiConfig(true);
+                setUiConfigStatus('');
+                try {
+                  await resetUiConfig(profile.uid);
+                  setUiConfigStatus('डीफॉल्ट लेआउट सर्व डिव्हाइसेसवर लागू झाले!');
+                } finally {
+                  setIsSavingUiConfig(false);
+                }
+              }}
+              disabled={isSavingUiConfig}
+              className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 text-slate-700 font-bold text-xs cursor-pointer"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              <span>Reset Default Layout</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={async () => {
+                setIsSavingUiConfig(true);
+                setUiConfigStatus('');
+                try {
+                  await saveUiConfig(
+                    {
+                      appTitle: draftTitle,
+                      gridColumns: draftColumns,
+                      layoutDensity: draftDensity,
+                      moduleOverrides: draftOverrides,
+                      customOptions: draftCustomOptions,
+                    },
+                    profile.uid
+                  );
+                  setUiConfigStatus('सर्व 20-25 डिव्हाइसेसवर बदल लगेच सिंक झाले!');
+                } finally {
+                  setIsSavingUiConfig(false);
+                }
+              }}
+              disabled={isSavingUiConfig}
+              className="inline-flex items-center gap-2 px-6 py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white font-black text-xs shadow-xs cursor-pointer"
+            >
+              {isSavingUiConfig ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+              <span>Save &amp; Push Live to All Devices</span>
+            </button>
+          </div>
+        </div>
+      )}
 
       {activeTab === 'cache' && (
         <div className="bg-white rounded-2xl border border-slate-200 p-8 sm:p-10 flex flex-col items-center justify-center gap-4 text-center shadow-2xs">
@@ -746,6 +1230,145 @@ export const SettingView: React.FC<Props> = ({ profile, lang }) => {
                     </>
                   )}
                 </label>
+              </div>
+            </div>
+          )}
+
+          {/* 3. Free Google Sheets Failover Continuity Card (Quota Exhaustion Backup) */}
+          {isAdmin(profile) && (
+            <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-3 shadow-xs">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded-lg bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+                    <Table2 className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-xs sm:text-sm font-bold text-slate-900">
+                      Free Google Sheets Failover (Quota Backup Sync)
+                    </h3>
+                    <p className="text-[10.5px] text-slate-500 font-medium">
+                      Firebase मोफत कोटा संपल्यास ऑर्डर, डीलर, कलेक्शन व रूट डेटा Google Sheet द्वारे मोफत सिंक होतो
+                    </p>
+                  </div>
+                </div>
+                <span
+                  className={cn(
+                    'px-2 py-0.5 rounded text-[10px] font-bold shrink-0',
+                    sheetsEnabled && isValidAppsScriptUrl(sheetsUrl)
+                      ? 'bg-emerald-100 text-emerald-800'
+                      : 'bg-slate-100 text-slate-600'
+                  )}
+                >
+                  {sheetsEnabled && isValidAppsScriptUrl(sheetsUrl) ? 'Active' : 'Optional'}
+                </span>
+              </div>
+
+              {sheetsStatusMsg && (
+                <div
+                  className={cn(
+                    'p-2.5 rounded-lg border text-[11px] font-bold flex items-center gap-2',
+                    sheetsStatusMsg.type === 'success'
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                      : 'bg-rose-50 border-rose-200 text-rose-800'
+                  )}
+                >
+                  {sheetsStatusMsg.type === 'success' ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                  ) : (
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                  )}
+                  <span>{sheetsStatusMsg.text}</span>
+                </div>
+              )}
+
+              <div className="space-y-2">
+                <label className="block text-[11px] font-bold text-slate-700">
+                  Google Apps Script Web App URL
+                </label>
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    type="url"
+                    value={sheetsUrl}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setSheetsUrl(val);
+                      if (isValidAppsScriptUrl(val)) setSheetsEnabled(true);
+                    }}
+                    placeholder="https://script.google.com/macros/s/.../exec"
+                    className="flex-1 px-3 py-2 rounded-lg border border-slate-200 text-xs font-mono text-slate-800 focus:outline-none focus:border-emerald-500"
+                  />
+                  <label className="inline-flex items-center gap-1.5 px-2.5 py-2 rounded-lg border border-slate-200 bg-slate-50 text-[11px] font-bold text-slate-700 cursor-pointer shrink-0">
+                    <input
+                      type="checkbox"
+                      checked={sheetsEnabled}
+                      onChange={(e) => setSheetsEnabled(e.target.checked)}
+                      className="rounded accent-emerald-600"
+                    />
+                    <span>Enable Failover</span>
+                  </label>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  onClick={handleSaveSheetsFailover}
+                  disabled={isSavingSheets}
+                  className="py-2 px-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  {isSavingSheets ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckCircle2 className="w-3.5 h-3.5" />}
+                  <span>Save Across Devices</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleTestSheetsFailover}
+                  disabled={isTestingSheets || !sheetsUrl.trim()}
+                  className="py-2 px-3 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-800 rounded-lg text-xs font-bold border border-slate-200 transition flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  {isTestingSheets ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                  <span>Test Sheet URL</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSyncSheetsNow}
+                  disabled={isSyncingSheets || !sheetsEnabled || !isValidAppsScriptUrl(sheetsUrl)}
+                  className="py-2 px-3 bg-slate-800 hover:bg-slate-900 disabled:opacity-50 text-white rounded-lg text-xs font-bold transition flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  {isSyncingSheets ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
+                  <span>Sync Sheet Now</span>
+                </button>
+              </div>
+
+              <div className="border-t border-slate-100 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAppsScriptCode((prev) => !prev)}
+                  className="inline-flex items-center gap-1.5 text-[11px] font-bold text-slate-600 hover:text-slate-900 cursor-pointer"
+                >
+                  {showAppsScriptCode ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                  <span>Free Google Apps Script Code व सेटअप पद्धत पहा</span>
+                </button>
+
+                {showAppsScriptCode && (
+                  <div className="mt-2 p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-[11px] font-bold text-slate-700">
+                        1) Google Sheet मधून Extensions → Apps Script उघडा • 2) खालील कोड पेस्ट करा • 3) Deploy → Web app (Anyone) निवडा
+                      </p>
+                      <button
+                        type="button"
+                        onClick={handleCopyAppsScript}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 bg-slate-900 text-white rounded text-[11px] font-bold shrink-0 cursor-pointer"
+                      >
+                        {copiedScript ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                        <span>{copiedScript ? 'Copied' : 'Copy Code'}</span>
+                      </button>
+                    </div>
+                    <pre className="max-h-48 overflow-auto p-2 bg-white border border-slate-200 rounded text-[10px] font-mono text-slate-700 leading-relaxed">
+                      {GOOGLE_APPS_SCRIPT_TEMPLATE}
+                    </pre>
+                  </div>
+                )}
               </div>
             </div>
           )}

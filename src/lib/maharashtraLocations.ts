@@ -371,6 +371,8 @@ export interface LocationVillageItem {
   updatedAt?: string;
   createdByUid?: string;
   createdByName?: string;
+  updatedByUid?: string;
+  updatedByName?: string;
   isArchived?: boolean;
 }
 
@@ -386,6 +388,8 @@ export interface LocationTalukaItem {
   updatedAt?: string;
   createdByUid?: string;
   createdByName?: string;
+  updatedByUid?: string;
+  updatedByName?: string;
   isArchived?: boolean;
 }
 

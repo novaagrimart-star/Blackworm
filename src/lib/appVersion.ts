@@ -2,11 +2,26 @@ import firebaseConfig from '../../firebase-applet-config.json';
 import { safeClearTransientCaches } from './localVault';
 
 export const APP_VERSION: string =
-  (import.meta as any)?.env?.VITE_APP_VERSION || (typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.1');
+  (import.meta.env && import.meta.env.VITE_APP_VERSION) || '1.0.1';
 export const APP_BUILD_ID: string =
-  (import.meta as any)?.env?.VITE_APP_BUILD_ID || (typeof __APP_BUILD_ID__ !== 'undefined' ? __APP_BUILD_ID__ : 'dev');
+  (import.meta.env && import.meta.env.VITE_APP_BUILD_ID) || 'dev';
 export const APP_BUILD_TIME: string =
-  (import.meta as any)?.env?.VITE_APP_BUILD_TIME || (typeof __APP_BUILD_TIME__ !== 'undefined' ? __APP_BUILD_TIME__ : '');
+  (import.meta.env && import.meta.env.VITE_APP_BUILD_TIME) || '';
+
+export function isDevPreviewEnvironment(): boolean {
+  try {
+    if (import.meta.env && import.meta.env.DEV) return true;
+  } catch {}
+  if (typeof window === 'undefined') return false;
+  if (isPackagedApkShell()) return false;
+  try {
+    const host = String(window.location.hostname || '').toLowerCase();
+    if (host.startsWith('ais-dev-') || ((host === 'localhost' || host === '127.0.0.1') && window.location.port === '3000')) {
+      return String(APP_BUILD_ID || '').startsWith('dev');
+    }
+  } catch {}
+  return false;
+}
 
 export const SINGLE_SOURCE_OF_TRUTH = {
   firebaseProjectId: firebaseConfig.projectId,
@@ -81,7 +96,7 @@ function clearPoisonedOriginCache(badOrigin: string): void {
 export function getHostedWebAppOrigin(): string {
   if (typeof window === 'undefined') return DEFAULT_HOSTED_ORIGIN;
   try {
-    const envOrigin = String((import.meta as any)?.env?.VITE_PUBLIC_APP_URL || '').trim().replace(/\/+$/, '');
+    const envOrigin = String((import.meta.env && import.meta.env.VITE_PUBLIC_APP_URL) || '').trim().replace(/\/+$/, '');
     if (envOrigin && envOrigin.startsWith('http')) return envOrigin;
     const saved = String(localStorage.getItem(ORIGIN_STORAGE_KEY) || '').trim().replace(/\/+$/, '');
     const inPackagedShell = isPackagedApkShell();
@@ -205,7 +220,7 @@ function canAttemptReloadForBuild(targetBuildId: string, manual = false): boolea
   try {
     const prevBuild = sessionStorage.getItem(ATTEMPTED_BUILD_KEY) || '';
     const prevAt = Number(sessionStorage.getItem(ATTEMPTED_TIME_KEY) || '0');
-    if (prevBuild === targetBuildId && Date.now() - prevAt < 5 * 60 * 1000) {
+    if (prevBuild === targetBuildId && Date.now() - prevAt < 25 * 1000) {
       return false;
     }
     sessionStorage.setItem(ATTEMPTED_BUILD_KEY, targetBuildId);
@@ -248,6 +263,27 @@ async function isOriginHtmlReachable(origin: string): Promise<boolean> {
   return false;
 }
 
+async function purgeStaleServiceWorkerAndCachesSafely(): Promise<void> {
+  try {
+    if ('serviceWorker' in navigator) {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg) {
+        if (reg.waiting) {
+          try {
+            reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+          } catch {}
+        }
+        await Promise.race([reg.update(), new Promise((r) => setTimeout(r, 1400))]);
+      }
+    }
+  } catch {}
+
+  await Promise.race([
+    safeClearTransientCaches({ includeServiceWorker: true }),
+    new Promise((r) => setTimeout(r, 1500)),
+  ]);
+}
+
 export async function applyRemoteAppUpdate(remoteBuildId?: string, version?: string): Promise<boolean> {
   if (typeof window === 'undefined') return false;
   if (typeof navigator !== 'undefined' && !navigator.onLine) return false;
@@ -261,27 +297,12 @@ export async function applyRemoteAppUpdate(remoteBuildId?: string, version?: str
     );
   } catch {}
 
-  // Update active Service Worker smoothly while preserving offline precache safety
-  try {
-    if ('serviceWorker' in navigator) {
-      const reg = await navigator.serviceWorker.getRegistration();
-      if (reg) {
-        await Promise.race([reg.update(), new Promise((r) => setTimeout(r, 1800))]);
-      }
-    }
-  } catch {}
-
-  await Promise.race([
-    safeClearTransientCaches({ includeServiceWorker: false }),
-    new Promise((r) => setTimeout(r, 1500)),
-  ]);
-  await new Promise((r) => setTimeout(r, 250));
-
   try {
     if (isPackagedApkShell()) {
       const hostedOrigin = getHostedWebAppOrigin();
       const reachable = await isOriginHtmlReachable(hostedOrigin);
       if (reachable) {
+        await purgeStaleServiceWorkerAndCachesSafely();
         const target = new URL(`${hostedOrigin}/`);
         target.searchParams.set('v', tag);
         target.searchParams.set('apk_ota', '1');
@@ -295,15 +316,26 @@ export async function applyRemoteAppUpdate(remoteBuildId?: string, version?: str
     if (origin && origin.startsWith('http')) {
       const reachable = await isOriginHtmlReachable(origin);
       if (reachable) {
-        const nextUrl = new URL(`${origin}/`);
-        nextUrl.searchParams.set('v', tag);
-        if (window.location.hash) {
-          nextUrl.hash = window.location.hash;
+        await purgeStaleServiceWorkerAndCachesSafely();
+        try {
+          const nextUrl = new URL(window.location.href);
+          nextUrl.searchParams.set('v', tag);
+          if (window.location.hash) {
+            nextUrl.hash = window.location.hash;
+          }
+          window.location.replace(nextUrl.toString());
+          return true;
+        } catch {
+          window.location.reload();
+          return true;
         }
-        window.location.replace(nextUrl.toString());
-        return true;
       }
-      // Same-origin API confirmed a new build, reload current document cleanly without redirecting
+
+      // Origin HTML probe couldn't verify body snippet; clear only non-SW transient caches and reload safely
+      await Promise.race([
+        safeClearTransientCaches({ includeServiceWorker: false }),
+        new Promise((r) => setTimeout(r, 1200)),
+      ]);
       window.location.reload();
       return true;
     }
@@ -367,7 +399,8 @@ export async function checkRemoteAppVersion(options: {
     latestRemoteInfo = remote;
 
     const remoteBuildId = String(remote.buildId || '').trim();
-    const hasUpdate = Boolean(remoteBuildId && remoteBuildId !== APP_BUILD_ID);
+    const isFallbackDevSentinel = remoteBuildId === 'dev' && String(APP_BUILD_ID || '') === 'dev';
+    const hasUpdate = Boolean(remoteBuildId && remoteBuildId !== APP_BUILD_ID && !isFallbackDevSentinel);
 
     if (hasUpdate && options.forceReloadOnUpdate !== false) {
       if (canAttemptReloadForBuild(remoteBuildId, Boolean(options.manual))) {
@@ -401,6 +434,7 @@ export async function checkRemoteAppVersion(options: {
 export function triggerVersionCheckFromSse(remoteBuildId?: string): void {
   const cleanRemote = String(remoteBuildId || '').trim();
   if (!cleanRemote || cleanRemote === APP_BUILD_ID) return;
+  if (cleanRemote === 'dev' && APP_BUILD_ID === 'dev') return;
   void checkRemoteAppVersion({ bypassThrottle: true, forceReloadOnUpdate: true });
 }
 
@@ -408,14 +442,14 @@ export function startAutoVersionControl(): void {
   if (typeof window === 'undefined' || autoVersionStarted) return;
   autoVersionStarted = true;
 
-  // Initial non-blocking check right after boot
+  // Immediate non-blocking check right after boot
   setTimeout(() => {
     void checkRemoteAppVersion({ bypassThrottle: true, forceReloadOnUpdate: true });
-  }, 900);
+  }, 50);
 
   const onWake = () => {
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
-    void checkRemoteAppVersion({ forceReloadOnUpdate: true });
+    void checkRemoteAppVersion({ bypassThrottle: true, forceReloadOnUpdate: true });
   };
 
   window.addEventListener('focus', onWake);
@@ -427,9 +461,9 @@ export function startAutoVersionControl(): void {
     });
   }
 
-  // Zero-Firebase-credit lightweight check every 20s when active
+  // Zero-Firebase-credit lightweight check every 10s when active (instant backup if SSE is blocked by proxy)
   versionPollTimer = setInterval(() => {
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
     void checkRemoteAppVersion({ forceReloadOnUpdate: true });
-  }, 20 * 1000);
+  }, 10 * 1000);
 }

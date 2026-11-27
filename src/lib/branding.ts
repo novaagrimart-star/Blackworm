@@ -66,7 +66,7 @@ function applyBrandingUpdate(data: any, authoritativeServer = false) {
 }
 
 function pullBrandingFromSecondary() {
-  void fetchSecondaryCollection('config', { limit: 50 }).then((res) => {
+  void fetchSecondaryCollection('config', { limit: 1000 }).then((res) => {
     if (!res.ok) return;
     const match = res.items.find((it) => it?.id === 'branding');
     if (match) applyBrandingUpdate(match);
